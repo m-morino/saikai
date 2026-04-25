@@ -901,7 +901,13 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool):
                     env=env,
                 )
             except FileNotFoundError:
-                print("fzf not found. Install: winget install junegunn.fzf", file=sys.stderr)
+                if sys.platform == "win32":
+                    hint = "winget install junegunn.fzf"
+                elif sys.platform == "darwin":
+                    hint = "brew install fzf"
+                else:
+                    hint = "sudo apt install fzf  # or: brew install fzf"
+                print(f"fzf not found. Install: {hint}", file=sys.stderr)
                 sys.exit(1)
 
         try:
