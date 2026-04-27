@@ -188,6 +188,27 @@ def _is_real_user_msg(text: str) -> bool:
     return True
 
 
+# Distinct prompt patterns from automation hooks (personal-names, etc.) that
+# spawn `claude -p` and leave behind JSONL files in ~/.claude/projects/.
+# Sessions whose first user message matches these are filtered out of recap.
+HOOK_PROMPT_MARKERS = (
+    "以下は git commit で **新しく追加される行のみ**",  # personal-names hook
+    "実在する個人情報 (実在人名 kanji",                    # personal-names hook variant
+    "回答は JSON のみで",                                  # generic JSON-only hook prompt
+    "Reply with ONLY",                                     # English JSON-only hook
+    "Extract 3-5 short topic keywords",                    # recap's own topic extractor
+)
+
+
+def _is_hook_session(real_msgs: list[str], n_turns: int) -> bool:
+    """Detect ephemeral sessions created by automation hooks (claude -p calls).
+    Pattern: ≤2 user turns AND first message starts with a known hook prompt."""
+    if n_turns > 2 or not real_msgs:
+        return False
+    head = real_msgs[0][:200]
+    return any(m in head for m in HOOK_PROMPT_MARKERS)
+
+
 def _is_pid_alive(pid: int) -> bool:
     """Check if a PID is currently a running process."""
     if pid <= 0:
@@ -251,6 +272,10 @@ def parse_session(jsonl_path: Path) -> dict | None:
         try:
             c = json.loads(cache_file.read_text(encoding="utf-8"))
             if abs(c.get("mtime", 0) - mtime) < 0.5:
+                cached_msgs = c.get("real_msgs", [])
+                cached_turns = c.get("n_turns", 0)
+                if _is_hook_session(cached_msgs, cached_turns):
+                    return None
                 import time as _time
                 age_sec = _time.time() - mtime
                 active = _load_active_sessions()
@@ -260,8 +285,8 @@ def parse_session(jsonl_path: Path) -> dict | None:
                     "first_ts": c["first_ts"],
                     "last_ts": c["last_ts"],
                     "ai_title": c.get("ai_title", ""),
-                    "real_msgs": c.get("real_msgs", []),
-                    "n_turns": c.get("n_turns", 0),
+                    "real_msgs": cached_msgs,
+                    "n_turns": cached_turns,
                     "jsonl_path": jsonl_path,
                     "cwd": c.get("cwd", ""),
                     "git_branch": c.get("git_branch", ""),
@@ -306,6 +331,10 @@ def parse_session(jsonl_path: Path) -> dict | None:
         return None
 
     if first_ts is None:
+        return None
+
+    # Filter out ephemeral hook sessions (personal-names, topic extractor, etc.)
+    if _is_hook_session(real_msgs, n_user):
         return None
 
     import time as _time
@@ -436,6 +465,17 @@ def call_claude_haiku(prompt: str, timeout: int = 45) -> str:
         _delete_session_files(session_id)
 
 
+def _looks_like_refusal(text: str) -> bool:
+    """Detect Haiku refusal/apology responses that should not be cached as a summary."""
+    if not text:
+        return False
+    head = text[:40]
+    return any(m in head for m in (
+        "申し訳", "ご質問", "要約できません", "できませんでした",
+        "I'm sorry", "I cannot", "I am unable", "I apologize",
+    ))
+
+
 def summarize_session(s: dict) -> str:
     """Get summary for a session: cache → AI title → LLM."""
     if s["ai_title"]:
@@ -447,7 +487,7 @@ def summarize_session(s: dict) -> str:
 
     mtime = s["jsonl_path"].stat().st_mtime
     cached = _load_cache(s["id"], mtime)
-    if cached is not None:
+    if cached is not None and not _looks_like_refusal(cached):
         return cached
 
     if not s["real_msgs"]:
@@ -467,10 +507,10 @@ def summarize_session(s: dict) -> str:
     )
 
     summary = call_claude_haiku(prompt)
-    if summary:
+    if summary and not _looks_like_refusal(summary):
         _save_cache(s["id"], mtime, summary)
         return summary
-    # LLM unavailable (quota/rate limit) — fallback to first message, don't cache
+    # LLM unavailable / refusal — fallback to first message, don't cache
     return s["real_msgs"][0][:60] if s["real_msgs"] else ""
 
 
