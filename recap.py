@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -39,8 +40,36 @@ RED   = "\033[31m"
 GOLD  = "\033[93m"  # bright yellow for favorite stars
 HIDDEN_DIM = "\033[2;90m"  # dim + gray for hidden sessions
 
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
 def _c(text, *codes):
     return "".join(codes) + str(text) + RESET
+
+
+# ── Small shared helpers ────────────────────────────────────────────────────
+def _trim_sid(s: str) -> str:
+    """Strip fzf field padding from a session-id arg."""
+    return s.strip().split()[0] if s and s.strip() else ""
+
+
+def _first_msg(s: dict, n: int = 60) -> str:
+    """First real user message truncated to N chars, or empty string."""
+    msgs = s.get("real_msgs")
+    return msgs[0][:n] if msgs else ""
+
+
+def _read_json(path: Path, default):
+    """Read JSON file, returning `default` on any error (missing/corrupt/etc.)."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _write_json(path: Path, obj) -> None:
+    """Write JSON to path, creating parent dirs. Indent=2, ensure_ascii=False."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # ── Cache ───────────────────────────────────────────────────────────────────
@@ -56,39 +85,36 @@ PREVIEW_FULL_DIR = CACHE_DIR / "preview-full"
 
 
 def _load_options() -> dict:
-    try:
-        return json.loads(OPTIONS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return _read_json(OPTIONS_FILE, {})
 
 
 def _save_options(opts: dict) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    OPTIONS_FILE.write_text(json.dumps(opts, indent=2), encoding="utf-8")
+    _write_json(OPTIONS_FILE, opts)
+
+
+def _load_set(path: Path) -> set[str]:
+    return set(_read_json(path, []))
+
+
+def _save_set(path: Path, ids: set[str]) -> None:
+    _write_json(path, sorted(ids))
+
+
+def _toggle_in_set(path: Path, sid: str) -> bool:
+    """Toggle membership of `sid` in the set stored at `path`. Returns new state (True=present)."""
+    s = _load_set(path)
+    now_present = sid not in s
+    (s.add if now_present else s.discard)(sid)
+    _save_set(path, s)
+    return now_present
 
 
 def _load_hidden() -> set[str]:
-    try:
-        return set(json.loads(HIDDEN_FILE.read_text(encoding="utf-8")))
-    except Exception:
-        return set()
+    return _load_set(HIDDEN_FILE)
 
 
-def _save_hidden(ids: set[str]) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    HIDDEN_FILE.write_text(json.dumps(sorted(ids), indent=2), encoding="utf-8")
-
-
-def _toggle_hide(sid: str) -> str:
-    h = _load_hidden()
-    if sid in h:
-        h.remove(sid)
-        action = "unhidden"
-    else:
-        h.add(sid)
-        action = "hidden"
-    _save_hidden(h)
-    return action
+def _load_favorites() -> set[str]:
+    return _load_set(FAVORITE_FILE)
 
 
 def _get_view_mode() -> str:
@@ -104,53 +130,24 @@ def _toggle_view_mode() -> str:
     VIEW_MODE_FILE.write_text(new_mode, encoding="utf-8")
     return new_mode
 
-
-def _load_favorites() -> set[str]:
-    try:
-        return set(json.loads(FAVORITE_FILE.read_text(encoding="utf-8")))
-    except Exception:
-        return set()
-
-
-def _save_favorites(ids: set[str]) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    FAVORITE_FILE.write_text(json.dumps(sorted(ids), indent=2), encoding="utf-8")
-
-
-def _toggle_favorite(sid: str) -> str:
-    favs = _load_favorites()
-    if sid in favs:
-        favs.remove(sid)
-        action = "unstarred"
-    else:
-        favs.add(sid)
-        action = "starred"
-    _save_favorites(favs)
-    return action
-
 def _load_cache(sid: str, mtime: float) -> str | None:
-    cache_file = CACHE_DIR / f"{sid}.json"
-    if not cache_file.exists():
+    d = _read_json(CACHE_DIR / f"{sid}.json", None)
+    if d is None:
         return None
-    try:
-        d = json.loads(cache_file.read_text(encoding="utf-8"))
-        # Cache is valid if file mtime matches (session not updated)
-        if abs(d.get("mtime", 0) - mtime) < 1.0:
-            return d.get("summary", "") or None
-    except Exception:
-        pass
+    # Cache is valid if file mtime matches (session not updated)
+    if abs(d.get("mtime", 0) - mtime) < 1.0:
+        return d.get("summary", "") or None
     return None
 
+
 def _save_cache(sid: str, mtime: float, summary: str):
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = CACHE_DIR / f"{sid}.json"
-    cache_file.write_text(json.dumps({
+    _write_json(CACHE_DIR / f"{sid}.json", {
         "session_id": sid,
         "summary": summary,
         "mtime": mtime,
         "model": SUMMARY_MODEL,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-    }, ensure_ascii=False), encoding="utf-8")
+    })
 
 
 # ── Session parsing ──────────────────────────────────────────────────────────
@@ -262,41 +259,46 @@ def _load_active_sessions() -> dict[str, str]:
     return out
 
 
+def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> dict:
+    """Wrap parsed session data with runtime state (active/recent/status)."""
+    age_sec = time.time() - mtime
+    active = _load_active_sessions()
+    result = {
+        "id": sid,
+        "first_ts": parsed["first_ts"],
+        "last_ts": parsed.get("last_ts") or parsed["first_ts"],
+        "ai_title": parsed.get("ai_title", ""),
+        "real_msgs": parsed.get("real_msgs", []),
+        "n_turns": parsed.get("n_turns", 0),
+        "jsonl_path": jsonl_path,
+        "mtime": mtime,
+        "cwd": parsed.get("cwd", ""),
+        "git_branch": parsed.get("git_branch", ""),
+        "is_open": sid in active,
+        "session_status": active.get(sid, ""),
+        "is_active": (sid in active) or age_sec < 300,
+        "is_recent": age_sec < 1800,
+    }
+    # Only set topics if previously extracted; absence triggers lazy Haiku extraction
+    if "topics" in parsed:
+        result["topics"] = parsed["topics"]
+    return result
+
+
 def parse_session(jsonl_path: Path) -> dict | None:
     sid = jsonl_path.stem
     mtime = jsonl_path.stat().st_mtime
+    cache_file = PARSED_DIR / f"{sid}.json"
 
     # Disk cache: skip JSONL re-parsing if mtime is unchanged
-    cache_file = PARSED_DIR / f"{sid}.json"
-    if cache_file.exists():
-        try:
-            c = json.loads(cache_file.read_text(encoding="utf-8"))
-            if abs(c.get("mtime", 0) - mtime) < 0.5:
-                cached_msgs = c.get("real_msgs", [])
-                cached_turns = c.get("n_turns", 0)
-                if _is_hook_session(cached_msgs, cached_turns):
-                    return None
-                import time as _time
-                age_sec = _time.time() - mtime
-                active = _load_active_sessions()
-                status = active.get(sid, "")
-                return {
-                    "id": sid,
-                    "first_ts": c["first_ts"],
-                    "last_ts": c["last_ts"],
-                    "ai_title": c.get("ai_title", ""),
-                    "real_msgs": cached_msgs,
-                    "n_turns": cached_turns,
-                    "jsonl_path": jsonl_path,
-                    "cwd": c.get("cwd", ""),
-                    "git_branch": c.get("git_branch", ""),
-                    "is_open": sid in active,
-                    "session_status": status,           # "busy" / "idle" / ""
-                    "is_active": (sid in active) or age_sec < 300,
-                    "is_recent": age_sec < 1800,
-                }
-        except Exception:
-            pass
+    cached = _read_json(cache_file, None)
+    if cached and abs(cached.get("mtime", 0) - mtime) < 0.5:
+        if _is_hook_session(cached.get("real_msgs", []), cached.get("n_turns", 0)):
+            return None
+        return _enrich_session(sid, cached, jsonl_path, mtime)
+
+    # Preserve topics across re-parse (JSONL append shouldn't invalidate Haiku-derived topics)
+    prior_topics = (cached or {}).get("topics") or []
 
     first_ts = last_ts = ai_title = cwd = git_branch = None
     real_msgs: list[str] = []
@@ -325,7 +327,6 @@ def parse_session(jsonl_path: Path) -> dict | None:
                     n_user += 1
                     text = _extract_text(obj.get("message", {}).get("content", ""))
                     if _is_real_user_msg(text):
-                        # Limit per-message length to keep prompts small
                         real_msgs.append(text[:800].replace("\n", " "))
     except Exception:
         return None
@@ -333,46 +334,27 @@ def parse_session(jsonl_path: Path) -> dict | None:
     if first_ts is None:
         return None
 
-    # Filter out ephemeral hook sessions (personal-names, topic extractor, etc.)
     if _is_hook_session(real_msgs, n_user):
         return None
 
-    import time as _time
-    age_sec = _time.time() - mtime
-
-    # Persist parse result for next run
-    try:
-        PARSED_DIR.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps({
-            "mtime": mtime,
-            "first_ts": first_ts,
-            "last_ts": last_ts or first_ts,
-            "ai_title": ai_title or "",
-            "real_msgs": real_msgs,
-            "n_turns": n_user,
-            "cwd": cwd or "",
-            "git_branch": git_branch or "",
-        }, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
-
-    active = _load_active_sessions()
-    status = active.get(sid, "")
-    return {
-        "id": sid,
+    parsed = {
+        "mtime": mtime,
         "first_ts": first_ts,
         "last_ts": last_ts or first_ts,
         "ai_title": ai_title or "",
         "real_msgs": real_msgs,
         "n_turns": n_user,
-        "jsonl_path": jsonl_path,
         "cwd": cwd or "",
         "git_branch": git_branch or "",
-        "is_open": sid in active,
-        "session_status": status,
-        "is_active": (sid in active) or age_sec < 300,
-        "is_recent": age_sec < 1800,
     }
+    if prior_topics:
+        parsed["topics"] = prior_topics
+    try:
+        _write_json(cache_file, parsed)
+    except Exception:
+        pass
+
+    return _enrich_session(sid, parsed, jsonl_path, mtime)
 
 
 def load_sessions_in_dir(project_dir: Path, since: datetime | None) -> list[dict]:
@@ -397,7 +379,7 @@ PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 
 
 def _delete_session_files(session_id: str):
-    """Remove any JSONL/dir created by an ephemeral claude -p call."""
+    """Remove any JSONL created by an ephemeral claude -p call."""
     if not session_id:
         return
     for jsonl in PROJECTS_ROOT.rglob(f"{session_id}.jsonl"):
@@ -405,25 +387,13 @@ def _delete_session_files(session_id: str):
             jsonl.unlink()
         except Exception:
             pass
-    # Also remove the per-session subagents dir if it exists
-    for d in PROJECTS_ROOT.rglob(session_id):
-        if d.is_dir():
-            try:
-                import shutil
-                shutil.rmtree(d, ignore_errors=True)
-            except Exception:
-                pass
 
 
 def call_claude_haiku(prompt: str, timeout: int = 45) -> str:
     """Call claude -p --model haiku and return stripped output.
     Suppresses all side effects: hooks, MCP, skills, session persistence.
-    Even the residual ai-title JSONL is deleted after the call.
-
-    Uses Popen + explicit communicate(timeout) so that on Windows a hung
-    claude.exe is always killed and pipes drained — preventing orphan processes
-    caused by inherited console handle deadlocks (observed 2026-04-27).
-    """
+    Uses Popen + communicate(timeout) so a hung claude.exe is always killed
+    and pipes drained, even when grandchildren inherit console handles."""
     cmd = ["claude", "-p", "--model", SUMMARY_MODEL,
            "--setting-sources", "",
            "--strict-mcp-config",
@@ -483,9 +453,9 @@ def summarize_session(s: dict) -> str:
 
     # Active sessions: JSONL mtime changes every turn → cache always invalid → skip LLM
     if s.get("is_open"):
-        return s["real_msgs"][0][:60] if s["real_msgs"] else ""
+        return _first_msg(s)
 
-    mtime = s["jsonl_path"].stat().st_mtime
+    mtime = s["mtime"]
     cached = _load_cache(s["id"], mtime)
     if cached is not None and not _looks_like_refusal(cached):
         return cached
@@ -495,9 +465,7 @@ def summarize_session(s: dict) -> str:
         _save_cache(s["id"], mtime, "")
         return ""
 
-    # Build prompt
-    sample = "\n---\n".join(s["real_msgs"][:5])
-    sample = sample[:3000]  # cap input
+    sample = "\n---\n".join(s["real_msgs"][:5])[:3000]
     prompt = (
         "以下はClaude Codeセッションでのユーザー発言の冒頭です。"
         "このセッションで何をしようとしていたかを、日本語の体言止め1フレーズ"
@@ -510,15 +478,14 @@ def summarize_session(s: dict) -> str:
     if summary and not _looks_like_refusal(summary):
         _save_cache(s["id"], mtime, summary)
         return summary
-    # LLM unavailable / refusal — fallback to first message, don't cache
-    return s["real_msgs"][0][:60] if s["real_msgs"] else ""
+    return _first_msg(s)
 
 
 def summarize_all_parallel(sessions: list[dict], max_workers: int = 5):
     """Summarize all sessions in parallel, showing progress."""
     pending = [s for s in sessions if not s["ai_title"]
                and not s.get("is_open")   # active JSONL mtime changes → cache always stale
-               and _load_cache(s["id"], s["jsonl_path"].stat().st_mtime) is None]
+               and _load_cache(s["id"], s["mtime"]) is None]
     if not pending:
         for s in sessions:
             s["summary"] = summarize_session(s)  # cache hit / ai_title
@@ -535,12 +502,11 @@ def summarize_all_parallel(sessions: list[dict], max_workers: int = 5):
             try:
                 s["summary"] = fut.result()
             except Exception:
-                s["summary"] = s["real_msgs"][0][:60] if s["real_msgs"] else ""
+                s["summary"] = _first_msg(s)
             done += 1
             print(f"\r  [{done}/{len(pending)}] ", end="", file=sys.stderr, flush=True)
     print(file=sys.stderr)
 
-    # Fill in remaining sessions (those that already had ai_title or cached summary)
     for s in sessions:
         if "summary" not in s:
             s["summary"] = summarize_session(s)
@@ -609,7 +575,7 @@ def short_id(sid: str) -> str:
 
 
 def visible_len(s: str) -> int:
-    return len(re.sub(r"\033\[[0-9;]*m", "", s))
+    return len(_ANSI_RE.sub("", s))
 
 
 def pad(s: str, width: int) -> str:
@@ -654,14 +620,13 @@ def label_for(s: dict) -> str:
     summary = s.get("summary", "") or ""
     if summary:
         return summary
-    if s["real_msgs"]:
-        return s["real_msgs"][0][:80]
-    return _c("(empty)", GRAY)
+    fallback = _first_msg(s, 80)
+    return fallback if fallback else _c("(empty)", GRAY)
 
 
 # ── Display ──────────────────────────────────────────────────────────────────
 def _find_session_jsonl(sid_prefix: str) -> Path | None:
-    sid_prefix = sid_prefix.strip().split()[0]  # tolerate fzf field padding
+    sid_prefix = _trim_sid(sid_prefix)
     projects = Path.home() / ".claude" / "projects"
     for p in projects.rglob(f"{sid_prefix}*.jsonl"):
         if "subagents" not in str(p):
@@ -745,37 +710,34 @@ def _render_preview_full(s: dict) -> str:
     return "\n".join(lines)
 
 
-def _write_preview_cache(s: dict) -> None:
-    # Pre-render so fzf preview can `cat` instead of cold-starting Python (~150ms → ~5ms per cursor move)
-    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
-    PREVIEW_FULL_DIR.mkdir(parents=True, exist_ok=True)
-    sid = s["id"]
-    try:
-        (PREVIEW_DIR / f"{sid}.txt").write_text(_render_preview(s), encoding="utf-8")
-    except Exception:
-        pass
-    full_file = PREVIEW_FULL_DIR / f"{sid}.txt"
-    try:
-        mtime = s["jsonl_path"].stat().st_mtime
-    except Exception:
-        return
-    # Full preview re-reads JSONL — gate by mtime so reloads (Ctrl-x/p/r) don't repay the cost
-    if full_file.exists():
+def _write_if_stale(path: Path, mtime: float, render) -> None:
+    """Write `render()` to path only if path is missing or its mtime drifts from `mtime`."""
+    if path.exists():
         try:
-            if abs(full_file.stat().st_mtime - mtime) < 1.0:
+            if abs(path.stat().st_mtime - mtime) < 1.0:
                 return
         except Exception:
             pass
     try:
-        full_file.write_text(_render_preview_full(s), encoding="utf-8")
-        os.utime(full_file, (mtime, mtime))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(render(), encoding="utf-8")
+        os.utime(path, (mtime, mtime))
     except Exception:
         pass
 
 
-def preview_session(session_id: str) -> None:
-    sid = session_id.strip().split()[0]
-    cache_file = PREVIEW_DIR / f"{sid}.txt"
+def _write_preview_cache(s: dict) -> None:
+    # Pre-render so fzf preview can `cat` instead of cold-starting Python (~150ms → ~5ms per cursor move).
+    # Both files are mtime-gated; reloads (Ctrl-x/p/r) skip rewrites for unchanged sessions.
+    sid = s["id"]
+    mtime = s.get("mtime", 0.0)
+    _write_if_stale(PREVIEW_DIR / f"{sid}.txt", mtime, lambda: _render_preview(s))
+    _write_if_stale(PREVIEW_FULL_DIR / f"{sid}.txt", mtime, lambda: _render_preview_full(s))
+
+
+def _preview_impl(session_id: str, cache_dir: Path, render) -> None:
+    sid = _trim_sid(session_id)
+    cache_file = cache_dir / f"{sid}.txt"
     if cache_file.exists():
         sys.stdout.write(cache_file.read_text(encoding="utf-8"))
         return
@@ -787,24 +749,15 @@ def preview_session(session_id: str) -> None:
     if not s:
         print("(unable to parse session)")
         return
-    print(_render_preview(s))
+    print(render(s))
+
+
+def preview_session(session_id: str) -> None:
+    _preview_impl(session_id, PREVIEW_DIR, _render_preview)
 
 
 def preview_session_full(session_id: str) -> None:
-    sid = session_id.strip().split()[0]
-    cache_file = PREVIEW_FULL_DIR / f"{sid}.txt"
-    if cache_file.exists():
-        sys.stdout.write(cache_file.read_text(encoding="utf-8"))
-        return
-    found = _find_session_jsonl(sid)
-    if not found:
-        print(f"(session {sid[:8]} not found)")
-        return
-    s = parse_session(found)
-    if not s:
-        print("(unable to parse session)")
-        return
-    print(_render_preview_full(s))
+    _preview_impl(session_id, PREVIEW_FULL_DIR, _render_preview_full)
 
 
 def _activity_marker(s: dict) -> str:
@@ -832,8 +785,7 @@ def _state_marker(s: dict, hidden: set, favorites: set) -> str:
 
 def fmt_last_active(s: dict) -> str:
     """Human-friendly 'last activity' column: '5m', '2h', '3d', '04/22'."""
-    import time as _time
-    age = _time.time() - s["jsonl_path"].stat().st_mtime
+    age = time.time() - s.get("mtime", 0.0)
     if age < 60:
         return "now"
     if age < 3600:
@@ -942,26 +894,7 @@ def build_fzf_lines(sessions: list[dict], repo: Path | None, show_project: bool,
         is_hidden = s["id"] in hidden
         if is_hidden and view_mode != "show-hidden":
             continue
-        # Activity column
-        if s.get("is_open"):
-            if s.get("session_status") == "busy":
-                act = f"{BOLD}{CYAN}◉{RESET}"
-            else:
-                act = f"{BOLD}{GREEN}◉{RESET}"
-        elif s.get("is_active"):
-            act = f"{GREEN}●{RESET}"
-        elif s.get("is_recent"):
-            act = f"{YELLOW}○{RESET}"
-        else:
-            act = " "
-        # State column
-        if s["id"] in favorites:
-            st = f"{GOLD}★{RESET}"
-        elif is_hidden:
-            st = f"{RED}✗{RESET}"
-        else:
-            st = " "
-        marker = f"{act}{st}"
+        marker = f"{_activity_marker(s)}{_state_marker(s, hidden, favorites)}"
         start = fmt_ts(s["first_ts"])
         last = fmt_last_active(s)
         sid8 = short_id(s["id"])
@@ -989,15 +922,8 @@ def build_fzf_lines(sessions: list[dict], repo: Path | None, show_project: bool,
     return lines
 
 
-# Module-level state captured by main() so reload bindings can rebuild the
-# same session view. Set in main() before calling fzf_pick.
-_pick_days: int = 0
-_pick_here: bool = False
-_pick_project: str | None = None
-_pick_tree: bool = False
-
-
-def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool, flat: bool = False):
+def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
+             flat: bool = False, reload_args: list[str] | None = None):
     """Pipe session list to fzf and run claude --resume on selection.
     Uses temp file for stdin/stdout so fzf gets a clean tty for its TUI."""
     lines = build_fzf_lines(sessions, repo, show_project, flat=flat)
@@ -1011,26 +937,15 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool, flat: 
         tf.write(("\n".join(lines) + "\n").encode("utf-8"))
         tmp_path = tf.name
 
-    # Selection is written to a temp file via fzf's `--expect=enter` and shell
-    # redirect from a file so we don't intercept stdout (which on Windows
-    # PowerShell can break fzf's full-screen TUI when combined with subprocess).
     out_path = tmp_path + ".out"
     env = os.environ.copy()
     env.setdefault("TERM", "xterm-256color")
     try:
         with open(tmp_path, "rb") as stdin_file, open(out_path, "wb") as stdout_file:
             try:
-                # Build reload command: re-emit list via stdin to fzf.
-                # We need to call the same recap with the same session-source flags
-                # that produced the current view (here / project / all-projects).
-                reload_args = ["--list", "--days", str(_pick_days)]
-                if _pick_here:
-                    reload_args.append("--here")
-                if _pick_project:
-                    reload_args += ["--project", _pick_project]
-                if _pick_tree:
-                    reload_args.append("--tree")
-                reload_cmd = "recap " + " ".join(f'"{a}"' if " " in a else a for a in reload_args)
+                # Reload re-runs recap with the session-source flags captured by main()
+                ra = reload_args or ["--list"]
+                reload_cmd = "recap " + " ".join(f'"{a}"' if " " in a else a for a in ra)
 
                 # `recap --preview` reads the pre-rendered cache; portable across cmd / bash / pwsh
                 preview_cmd      = "recap --preview {2}"
@@ -1245,17 +1160,33 @@ def _topic_similarity(a: dict, b: dict) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
+# Structural-similarity weights (must sum to 1.0). Tuned so cross-cwd same-branch
+# pairs still surface at "med" tier when paired with strong topic overlap.
+_W_CWD, _W_BRANCH, _W_TITLE, _W_TOPIC = 0.45, 0.35, 0.10, 0.10
+_TIME_TAU_MIN = 4320.0  # 3 days; exp decay constant for the time factor
+
+
+def _fmt_gap(gap_min: float) -> str | None:
+    if gap_min == 0.0:
+        return _c("⚠ concurrent", YELLOW)
+    if gap_min == float("inf"):
+        return None
+    if gap_min < 60:
+        return f"{int(gap_min)}m gap"
+    if gap_min < 60 * 24:
+        return f"{gap_min/60:.1f}h gap"
+    return f"{int(gap_min/(60*24))}d gap"
+
+
 def _score_relation(target: dict, other: dict) -> tuple[float, list[str]]:
     cwd_s    = _cwd_similarity(target.get("cwd", ""), other.get("cwd", ""))
     branch_s = 1.0 if (target.get("git_branch") and target.get("git_branch") == other.get("git_branch")) else 0.0
     gap_min  = _interval_gap_minutes(target, other)
-    time_s   = math.exp(-gap_min / 4320.0) if gap_min != float("inf") else 0.0  # τ = 3 days
+    time_s   = math.exp(-gap_min / _TIME_TAU_MIN) if gap_min != float("inf") else 0.0
     title_s  = _title_similarity(target, other)
     topic_s  = _topic_similarity(target, other)
-    # Structural likeness: independent of when they happened
-    # topic_s adds semantic precision; weights rebalanced from (0.50/0.40/0.10) → (0.45/0.35/0.10/0.10)
-    structural = 0.45 * cwd_s + 0.35 * branch_s + 0.10 * title_s + 0.10 * topic_s
-    # Time factor: small floor (0.10) keeps far-past matches discoverable but heavily damped
+    structural = _W_CWD*cwd_s + _W_BRANCH*branch_s + _W_TITLE*title_s + _W_TOPIC*topic_s
+    # Time factor: small floor keeps far-past matches discoverable but heavily damped
     time_factor = 0.10 + 0.90 * time_s
     score = structural * time_factor
 
@@ -1266,14 +1197,9 @@ def _score_relation(target: dict, other: dict) -> tuple[float, list[str]]:
         reasons.append("same project")
     if branch_s == 1.0:
         reasons.append(f"branch {other.get('git_branch','')}")
-    if gap_min == 0.0:
-        reasons.append(_c("⚠ concurrent", YELLOW))
-    elif gap_min < 60:
-        reasons.append(f"{int(gap_min)}m gap")
-    elif gap_min < 60 * 24:
-        reasons.append(f"{gap_min/60:.1f}h gap")
-    elif gap_min != float("inf"):
-        reasons.append(f"{int(gap_min/(60*24))}d gap")
+    gap_label = _fmt_gap(gap_min)
+    if gap_label:
+        reasons.append(gap_label)
     if title_s >= 0.3:
         reasons.append(f"title sim {title_s:.0%}")
     if topic_s >= 0.3:
@@ -1292,7 +1218,7 @@ def _confidence_marker(score: float) -> str:
 
 
 def cmd_related(target_id_prefix: str, sessions: list[dict]) -> None:
-    target_id_prefix = target_id_prefix.strip().split()[0]
+    target_id_prefix = _trim_sid(target_id_prefix)
     target = next((s for s in sessions if s["id"].startswith(target_id_prefix)), None)
     if not target:
         print(f"(session {target_id_prefix[:8]} not found in current scope)", file=sys.stderr)
@@ -1461,10 +1387,10 @@ def main():
         preview_session_full(args.preview_full)
         return
     if args.hide:
-        _toggle_hide(args.hide.strip().split()[0])
+        _toggle_in_set(HIDDEN_FILE, _trim_sid(args.hide))
         return
     if args.favorite:
-        _toggle_favorite(args.favorite.strip().split()[0])
+        _toggle_in_set(FAVORITE_FILE, _trim_sid(args.favorite))
         return
     if args.toggle_view:
         _toggle_view_mode()
@@ -1535,7 +1461,7 @@ def main():
 
     if args.no_summary or args.related:
         for s in sessions:
-            s["summary"] = s["ai_title"] or (s["real_msgs"][0][:60] if s["real_msgs"] else "")
+            s["summary"] = s["ai_title"] or _first_msg(s)
     else:
         summarize_all_parallel(sessions)
 
@@ -1571,12 +1497,14 @@ def main():
         display_table(visible, repo, args.all_projects, flat=flat)
     else:
         # Default: interactive fzf picker
-        global _pick_days, _pick_here, _pick_project, _pick_tree
-        _pick_days    = args.days
-        _pick_here    = args.here
-        _pick_project = args.project
-        _pick_tree    = args.tree
-        fzf_pick(sessions, repo, args.all_projects, flat=flat)
+        reload_args = ["--list", "--days", str(args.days)]
+        if args.here:
+            reload_args.append("--here")
+        if args.project:
+            reload_args += ["--project", args.project]
+        if args.tree:
+            reload_args.append("--tree")
+        fzf_pick(sessions, repo, args.all_projects, flat=flat, reload_args=reload_args)
 
 
 if __name__ == "__main__":
