@@ -280,6 +280,13 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
     """Wrap parsed session data with runtime state (active/recent/status)."""
     age_sec = time.time() - mtime
     active = _load_active_sessions()
+    cwd = parsed.get("cwd", "")
+    # origin_cwd = where Claude originally indexed the session (first cwd in JSONL).
+    # Required for `claude --resume` to find the session on disk: Claude derives
+    # the projects/<key>/ directory from the cwd it was invoked in. Sessions that
+    # later moved into a worktree have a different LAST cwd, so resume from
+    # last cwd → "No conversation found".
+    origin_cwd = parsed.get("origin_cwd") or cwd
     result = {
         "id": sid,
         "first_ts": parsed["first_ts"],
@@ -289,14 +296,14 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
         "n_turns": parsed.get("n_turns", 0),
         "jsonl_path": jsonl_path,
         "mtime": mtime,
-        "cwd": parsed.get("cwd", ""),
+        "cwd": cwd,
+        "origin_cwd": origin_cwd,
         "git_branch": parsed.get("git_branch", ""),
         "is_open": sid in active,
         "session_status": active.get(sid, ""),
         "is_active": (sid in active) or age_sec < 300,
         "is_recent": age_sec < 1800,
     }
-    # Only set topics if previously extracted; absence triggers lazy Haiku extraction
     if "topics" in parsed:
         result["topics"] = parsed["topics"]
     return result
@@ -307,9 +314,13 @@ def parse_session(jsonl_path: Path) -> dict | None:
     mtime = jsonl_path.stat().st_mtime
     cache_file = PARSED_DIR / f"{sid}.json"
 
-    # Disk cache: skip JSONL re-parsing if mtime is unchanged
+    # Disk cache: skip JSONL re-parsing if mtime is unchanged AND schema is current.
+    # `origin_cwd` was added 2026-04-30 to fix `claude --resume` for sessions
+    # whose cwd changed mid-flight (e.g. moved into a worktree). Caches predating
+    # that field force a re-parse.
     cached = _read_json(cache_file, None)
-    if cached and abs(cached.get("mtime", 0) - mtime) < 0.5:
+    if (cached and abs(cached.get("mtime", 0) - mtime) < 0.5
+            and "origin_cwd" in cached):
         if _is_hook_session(cached.get("real_msgs", []), cached.get("n_turns", 0)):
             return None
         return _enrich_session(sid, cached, jsonl_path, mtime)
@@ -317,7 +328,7 @@ def parse_session(jsonl_path: Path) -> dict | None:
     # Preserve topics across re-parse (JSONL append shouldn't invalidate Haiku-derived topics)
     prior_topics = (cached or {}).get("topics") or []
 
-    first_ts = last_ts = ai_title = cwd = git_branch = None
+    first_ts = last_ts = ai_title = cwd = origin_cwd = git_branch = None
     real_msgs: list[str] = []
     n_user = 0
 
@@ -334,10 +345,13 @@ def parse_session(jsonl_path: Path) -> dict | None:
                     if first_ts is None:
                         first_ts = ts
                     last_ts = ts
-                # Capture LAST occurrence so branch-switches / cwd changes /
-                # title regenerations are reflected (was first-only, which made
-                # branch_s scoring stale and displays misleading)
                 if isinstance(obj.get("cwd"), str):
+                    # origin_cwd = first non-null cwd (used for `claude --resume` so
+                    # Claude finds the session in the project dir it was indexed in).
+                    # cwd = last non-null cwd (reflects branch-switches / worktree moves
+                    # for display + relation scoring).
+                    if origin_cwd is None:
+                        origin_cwd = obj["cwd"]
                     cwd = obj["cwd"]
                 if isinstance(obj.get("gitBranch"), str):
                     git_branch = obj["gitBranch"]
@@ -365,6 +379,7 @@ def parse_session(jsonl_path: Path) -> dict | None:
         "real_msgs": real_msgs,
         "n_turns": n_user,
         "cwd": cwd or "",
+        "origin_cwd": origin_cwd or cwd or "",
         "git_branch": git_branch or "",
     }
     if prior_topics:
@@ -1019,12 +1034,16 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     if not full_id:
         return
 
-    # Find the session's working directory so claude --resume runs in the right
-    # project context (tools/CLAUDE.md/git status all match the original session)
+    # Try origin_cwd first (where Claude originally indexed the session — required
+    # for --resume to find it). Fall back to last cwd, then jsonl_path's parent.
     selected = next((s for s in sessions if s["id"] == full_id), None)
-    target_cwd = (selected.get("cwd") if selected else "") or None
-    if target_cwd and not Path(target_cwd).is_dir():
-        target_cwd = None
+    candidates = []
+    if selected:
+        for k in ("origin_cwd", "cwd"):
+            v = selected.get(k)
+            if v and Path(v).is_dir():
+                candidates.append(v)
+    target_cwd = candidates[0] if candidates else None
 
     print(f"\nResuming {full_id[:8]}" + (f"  (cwd: {target_cwd})" if target_cwd else ""))
     env = os.environ.copy()
