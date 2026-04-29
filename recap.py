@@ -67,9 +67,20 @@ def _read_json(path: Path, default):
 
 
 def _write_json(path: Path, obj) -> None:
-    """Write JSON to path, creating parent dirs. Indent=2, ensure_ascii=False."""
+    """Atomically write JSON to path. Uses tempfile + os.replace so concurrent
+    readers/writers (worker pool, fzf reload) cannot observe a torn write."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    payload = json.dumps(obj, indent=2, ensure_ascii=False)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
 
 
 # ── Cache ───────────────────────────────────────────────────────────────────
@@ -89,7 +100,11 @@ def _load_options() -> dict:
 
 
 def _save_options(opts: dict) -> None:
-    _write_json(OPTIONS_FILE, opts)
+    """Merge `opts` into the persisted options so future fields aren't dropped
+    by an older recap version that doesn't know about them."""
+    merged = _load_options()
+    merged.update(opts)
+    _write_json(OPTIONS_FILE, merged)
 
 
 def _load_set(path: Path) -> set[str]:
@@ -171,14 +186,16 @@ def _extract_text(content) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        for b in content:
-            if isinstance(b, dict) and b.get("type") == "text":
-                return b.get("text", "")
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return " ".join(p for p in parts if p)
     return ""
 
 
 def _is_real_user_msg(text: str) -> bool:
-    if not text or len(text) < 15:
+    # Floor at 6 chars so legitimate short prompts ("approve", "go ahead", "yes")
+    # still surface — they were previously dropped, leaving rows showing "(empty)".
+    if not text or len(text) < 6:
         return False
     if any(m in text for m in SKIP_MARKERS):
         return False
@@ -317,12 +334,15 @@ def parse_session(jsonl_path: Path) -> dict | None:
                     if first_ts is None:
                         first_ts = ts
                     last_ts = ts
-                if cwd is None and isinstance(obj.get("cwd"), str):
+                # Capture LAST occurrence so branch-switches / cwd changes /
+                # title regenerations are reflected (was first-only, which made
+                # branch_s scoring stale and displays misleading)
+                if isinstance(obj.get("cwd"), str):
                     cwd = obj["cwd"]
-                if git_branch is None and isinstance(obj.get("gitBranch"), str):
+                if isinstance(obj.get("gitBranch"), str):
                     git_branch = obj["gitBranch"]
-                if t == "ai-title" and ai_title is None:
-                    ai_title = obj.get("aiTitle", "")
+                if t == "ai-title":
+                    ai_title = obj.get("aiTitle", "") or ai_title
                 if t == "user":
                     n_user += 1
                     text = _extract_text(obj.get("message", {}).get("content", ""))
@@ -1061,17 +1081,24 @@ def _interval_gap_minutes(a: dict, b: dict) -> float:
     return 0.0
 
 
+def _title_bigrams(s: dict) -> set:
+    """Build (and memoise on the session dict) bigrams over title + first msg.
+    Cached so O(N²) `_build_forest` doesn't rebuild N-1 times per session."""
+    cached = s.get("_bigrams")
+    if cached is not None:
+        return cached
+    text = (s.get("ai_title") or "")
+    if s.get("real_msgs"):
+        text += " " + s["real_msgs"][0][:200]
+    text = text.lower()
+    bg = {text[i:i+2] for i in range(len(text)-1)} if len(text) >= 2 else set()
+    s["_bigrams"] = bg
+    return bg
+
+
 def _title_similarity(a: dict, b: dict) -> float:
     """Bigram Jaccard on ai_title + first user msg (lowercased)."""
-    def bigrams(s: dict) -> set:
-        text = (s.get("ai_title") or "")
-        if s.get("real_msgs"):
-            text += " " + s["real_msgs"][0][:200]
-        text = text.lower()
-        if len(text) < 2:
-            return set()
-        return {text[i:i+2] for i in range(len(text)-1)}
-    sa, sb = bigrams(a), bigrams(b)
+    sa, sb = _title_bigrams(a), _title_bigrams(b)
     if not sa or not sb:
         return 0.0
     return len(sa & sb) / len(sa | sb)
@@ -1223,7 +1250,6 @@ def cmd_related(target_id_prefix: str, sessions: list[dict]) -> None:
     if not target:
         print(f"(session {target_id_prefix[:8]} not found in current scope)", file=sys.stderr)
         sys.exit(1)
-    batch_ensure_topics(sessions, show_progress=True)
 
     print(_c("Target:  ", BOLD) + f"{short_id(target['id'])}  {label_for(target)}")
     print(f"  cwd:    {target.get('cwd','') or '(none)'}")
@@ -1231,12 +1257,35 @@ def cmd_related(target_id_prefix: str, sessions: list[dict]) -> None:
     print(f"  time:   {fmt_ts(target['first_ts'])} → {fmt_ts(target['last_ts'])}")
     print()
 
-    candidates: list[tuple[dict, float, list[str]]] = []
+    # Prefilter: score WITHOUT topics (cheap), keep sessions whose best-case
+    # score (assuming perfect topic match = +_W_TOPIC) could clear the floor.
+    # This caps Haiku calls at TOP_K instead of N for the topic extraction below.
+    floor = 0.20
+    TOP_K = 50
+    prefiltered: list[tuple[dict, float]] = []
     for s in sessions:
         if s["id"] == target["id"]:
             continue
+        cwd_s = _cwd_similarity(target.get("cwd",""), s.get("cwd",""))
+        branch_s = 1.0 if (target.get("git_branch") and target.get("git_branch") == s.get("git_branch")) else 0.0
+        gap_min = _interval_gap_minutes(target, s)
+        time_s = math.exp(-gap_min / _TIME_TAU_MIN) if gap_min != float("inf") else 0.0
+        title_s = _title_similarity(target, s)
+        struct_no_topic = _W_CWD*cwd_s + _W_BRANCH*branch_s + _W_TITLE*title_s
+        time_factor = 0.10 + 0.90 * time_s
+        max_possible = (struct_no_topic + _W_TOPIC) * time_factor
+        if max_possible >= floor:
+            prefiltered.append((s, max_possible))
+
+    prefiltered.sort(key=lambda x: -x[1])
+    top_candidates = [s for s, _ in prefiltered[:TOP_K]]
+    if top_candidates:
+        batch_ensure_topics([target] + top_candidates, show_progress=True)
+
+    candidates: list[tuple[dict, float, list[str]]] = []
+    for s in top_candidates:
         score, reasons = _score_relation(target, s)
-        if score >= 0.2:
+        if score >= floor:
             candidates.append((s, score, reasons))
     candidates.sort(key=lambda x: -x[1])
 
@@ -1425,7 +1474,12 @@ def main():
     args.all_projects = not (args.here or args.project)
 
     if args.refresh_summary and CACHE_DIR.exists():
+        # Only delete summary cache files (named after session UUIDs).
+        # Must NOT touch hidden.json/favorite.json/options.json.
+        protected = {HIDDEN_FILE.name, FAVORITE_FILE.name, OPTIONS_FILE.name}
         for f in CACHE_DIR.glob("*.json"):
+            if f.name in protected:
+                continue
             f.unlink()
 
     since = None if args.days == 0 else datetime.now(tz=timezone.utc) - timedelta(days=args.days)
@@ -1459,9 +1513,16 @@ def main():
         print(f"No sessions in {period}.")
         return
 
-    if args.no_summary or args.related:
+    # --list is invoked by fzf reload bindings (Ctrl-x/p/r). Reloads should be
+    # instant; skip Haiku entirely and rely on whatever cache the initial run
+    # already filled. Cache misses fall back to the first user message.
+    if args.no_summary or args.related or args.list:
         for s in sessions:
-            s["summary"] = s["ai_title"] or _first_msg(s)
+            cached = _load_cache(s["id"], s["mtime"]) if not s.get("is_open") else None
+            if cached and not _looks_like_refusal(cached):
+                s["summary"] = cached
+            else:
+                s["summary"] = s["ai_title"] or _first_msg(s)
     else:
         summarize_all_parallel(sessions)
 
