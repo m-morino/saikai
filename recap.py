@@ -531,13 +531,19 @@ def summarize_all_parallel(sessions: list[dict], max_workers: int = 5):
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(summarize_session, s): s for s in pending}
         for fut in as_completed(futures):
+            s = futures[fut]
+            try:
+                s["summary"] = fut.result()
+            except Exception:
+                s["summary"] = s["real_msgs"][0][:60] if s["real_msgs"] else ""
             done += 1
             print(f"\r  [{done}/{len(pending)}] ", end="", file=sys.stderr, flush=True)
     print(file=sys.stderr)
 
-    # Now fill in summary for all sessions (cached)
+    # Fill in remaining sessions (those that already had ai_title or cached summary)
     for s in sessions:
-        s["summary"] = summarize_session(s)
+        if "summary" not in s:
+            s["summary"] = summarize_session(s)
 
 
 # ── Git correlation ──────────────────────────────────────────────────────────
