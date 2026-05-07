@@ -1048,6 +1048,18 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     print(f"\nResuming {full_id[:8]}" + (f"  (cwd: {target_cwd})" if target_cwd else ""))
     env = os.environ.copy()
     env["RECAP_RESUME"] = "1"   # signal to teams-notify.py: suppress idle_prompt
+    # The recap wrapper invokes us via `uv run --no-project`, which sets
+    # VIRTUAL_ENV to its ephemeral env and prepends the venv's Scripts/bin
+    # to PATH. Inherit-as-is would make the resumed session's `uv` warn
+    # "VIRTUAL_ENV does not match project environment .venv". Strip both.
+    leaked_venv = env.pop("VIRTUAL_ENV", None)
+    env.pop("VIRTUAL_ENV_PROMPT", None)
+    if leaked_venv:
+        bin_dir = "Scripts" if sys.platform == "win32" else "bin"
+        venv_bin = str(Path(leaked_venv) / bin_dir)
+        cmp = (lambda p: p.lower()) if sys.platform == "win32" else (lambda p: p)
+        parts = [p for p in env.get("PATH", "").split(os.pathsep) if cmp(p) != cmp(venv_bin)]
+        env["PATH"] = os.pathsep.join(parts)
     subprocess.run(["claude", "--resume", full_id], cwd=target_cwd, env=env)
 
 
