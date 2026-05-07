@@ -278,7 +278,9 @@ def _load_active_sessions() -> dict[str, str]:
 
 def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> dict:
     """Wrap parsed session data with runtime state (active/recent/status)."""
-    age_sec = time.time() - mtime
+    # Clock skew (NTP correction, restored backup) can put mtime in the future
+    # → negative age_sec was incorrectly < 300 → falsely is_active. Floor at 0.
+    age_sec = max(0.0, time.time() - mtime)
     active = _load_active_sessions()
     cwd = parsed.get("cwd", "")
     # origin_cwd = where Claude originally indexed the session (first cwd in JSONL).
@@ -413,9 +415,14 @@ def load_sessions_in_dir(project_dir: Path, since: datetime | None) -> list[dict
 PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 
 
+# UUID v4 shape — prevents glob metacharacters in `claude -p` JSON output
+# from being interpreted by rglob and mass-deleting unrelated JSONLs.
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
 def _delete_session_files(session_id: str):
     """Remove any JSONL created by an ephemeral claude -p call."""
-    if not session_id:
+    if not session_id or not _UUID_RE.fullmatch(session_id):
         return
     for jsonl in PROJECTS_ROOT.rglob(f"{session_id}.jsonl"):
         try:
@@ -643,9 +650,9 @@ def truncate_visual(s: str, width: int) -> str:
 
 
 def project_short(name: str) -> str:
-    """C--Users-user-CLI-project-one → project-one"""
+    """Strip the home-path prefix ("C--Users-user-") so the column shows
+    a recognizable suffix. e.g. C--Users-user-CLI-project-one → CLI-project-one."""
     parts = name.split("-")
-    # Drop drive prefix (e.g. 'c', '', 'Users', 'user', 'name')
     if len(parts) > 4:
         return "-".join(parts[5:])[:14] or name[:14]
     return name[:14]
@@ -1084,9 +1091,17 @@ def find_project_dir(cwd: Path) -> Path | None:
 
 
 # ── Related sessions ─────────────────────────────────────────────────────────
+def _norm_cwd(s: str) -> str:
+    """Normalize path so mixed separators / case differences (Windows) compare equal."""
+    if not s:
+        return ""
+    return os.path.normcase(os.path.normpath(s))
+
+
 def _cwd_similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
+    a, b = _norm_cwd(a), _norm_cwd(b)
     if a == b:
         return 1.0
     # Conservative on prefix matches — siblings under a common parent shouldn't dominate
@@ -1096,19 +1111,31 @@ def _cwd_similarity(a: str, b: str) -> float:
     return 0.0
 
 
+def _interval_dts(s: dict) -> tuple:
+    """Return (first_dt, last_dt) parsed once and memoised on the session dict.
+    Hot path: O(N^2) forest scoring rebuilds these otherwise."""
+    cached = s.get("_dts")
+    if cached is not None:
+        return cached
+    try:
+        first = datetime.fromisoformat(s["first_ts"].replace("Z", "+00:00"))
+        last  = datetime.fromisoformat(s["last_ts"].replace("Z", "+00:00"))
+    except Exception:
+        first = last = None
+    s["_dts"] = (first, last)
+    return (first, last)
+
+
 def _interval_gap_minutes(a: dict, b: dict) -> float:
     """Minutes between two session intervals; 0.0 if they overlapped."""
-    try:
-        as_ = datetime.fromisoformat(a["first_ts"].replace("Z", "+00:00"))
-        ae  = datetime.fromisoformat(a["last_ts"].replace("Z", "+00:00"))
-        bs  = datetime.fromisoformat(b["first_ts"].replace("Z", "+00:00"))
-        be  = datetime.fromisoformat(b["last_ts"].replace("Z", "+00:00"))
-    except Exception:
+    af, al = _interval_dts(a)
+    bf, bl = _interval_dts(b)
+    if af is None or bf is None:
         return float("inf")
-    if ae < bs:
-        return (bs - ae).total_seconds() / 60.0
-    if be < as_:
-        return (as_ - be).total_seconds() / 60.0
+    if al < bf:
+        return (bf - al).total_seconds() / 60.0
+    if bl < af:
+        return (af - bl).total_seconds() / 60.0
     return 0.0
 
 
@@ -1138,22 +1165,18 @@ def _title_similarity(a: dict, b: dict) -> float:
 # ── Topic keywords (Option B) ────────────────────────────────────────────────
 
 def _get_cached_topics(sid: str) -> list[str] | None:
-    cache_file = PARSED_DIR / f"{sid}.json"
-    try:
-        c = json.loads(cache_file.read_text(encoding="utf-8"))
-        if "topics" in c:
-            return c["topics"]
-    except Exception:
-        pass
-    return None
+    c = _read_json(PARSED_DIR / f"{sid}.json", None)
+    return c.get("topics") if isinstance(c, dict) and "topics" in c else None
 
 
 def _save_topics_to_cache(sid: str, topics: list[str]) -> None:
     cache_file = PARSED_DIR / f"{sid}.json"
+    c = _read_json(cache_file, None)
+    if not isinstance(c, dict):
+        return
+    c["topics"] = topics
     try:
-        c = json.loads(cache_file.read_text(encoding="utf-8"))
-        c["topics"] = topics
-        cache_file.write_text(json.dumps(c, ensure_ascii=False), encoding="utf-8")
+        _write_json(cache_file, c)
     except Exception:
         pass
 
@@ -1222,6 +1245,8 @@ def _topic_similarity(a: dict, b: dict) -> float:
 # pairs still surface at "med" tier when paired with strong topic overlap.
 _W_CWD, _W_BRANCH, _W_TITLE, _W_TOPIC = 0.45, 0.35, 0.10, 0.10
 _TIME_TAU_MIN = 4320.0  # 3 days; exp decay constant for the time factor
+RELATION_FLOOR = 0.20    # min score to qualify in --related and --tree
+RELATION_TOP_K = 50      # max candidates to extract topics for in --related
 
 
 def _fmt_gap(gap_min: float) -> str | None:
@@ -1236,30 +1261,40 @@ def _fmt_gap(gap_min: float) -> str | None:
     return f"{int(gap_min/(60*24))}d gap"
 
 
+def _structural_components(a: dict, b: dict) -> dict:
+    """Cheap pairwise similarity components (no Haiku required for topic_s=0).
+    Reused by _score_relation and cmd_related's prefilter so the formula lives
+    in one place."""
+    return {
+        "cwd_s":    _cwd_similarity(a.get("cwd", ""), b.get("cwd", "")),
+        "branch_s": 1.0 if (a.get("git_branch") and a.get("git_branch") == b.get("git_branch")) else 0.0,
+        "title_s":  _title_similarity(a, b),
+        "gap_min":  _interval_gap_minutes(a, b),
+    }
+
+
 def _score_relation(target: dict, other: dict) -> tuple[float, list[str]]:
-    cwd_s    = _cwd_similarity(target.get("cwd", ""), other.get("cwd", ""))
-    branch_s = 1.0 if (target.get("git_branch") and target.get("git_branch") == other.get("git_branch")) else 0.0
-    gap_min  = _interval_gap_minutes(target, other)
-    time_s   = math.exp(-gap_min / _TIME_TAU_MIN) if gap_min != float("inf") else 0.0
-    title_s  = _title_similarity(target, other)
+    c = _structural_components(target, other)
+    time_s   = math.exp(-c["gap_min"] / _TIME_TAU_MIN) if c["gap_min"] != float("inf") else 0.0
     topic_s  = _topic_similarity(target, other)
-    structural = _W_CWD*cwd_s + _W_BRANCH*branch_s + _W_TITLE*title_s + _W_TOPIC*topic_s
+    structural = (_W_CWD*c["cwd_s"] + _W_BRANCH*c["branch_s"]
+                  + _W_TITLE*c["title_s"] + _W_TOPIC*topic_s)
     # Time factor: small floor keeps far-past matches discoverable but heavily damped
     time_factor = 0.10 + 0.90 * time_s
     score = structural * time_factor
 
     reasons: list[str] = []
-    if cwd_s == 1.0:
+    if c["cwd_s"] == 1.0:
         reasons.append("same cwd")
-    elif cwd_s >= 0.7:
+    elif c["cwd_s"] >= 0.7:
         reasons.append("same project")
-    if branch_s == 1.0:
+    if c["branch_s"] == 1.0:
         reasons.append(f"branch {other.get('git_branch','')}")
-    gap_label = _fmt_gap(gap_min)
+    gap_label = _fmt_gap(c["gap_min"])
     if gap_label:
         reasons.append(gap_label)
-    if title_s >= 0.3:
-        reasons.append(f"title sim {title_s:.0%}")
+    if c["title_s"] >= 0.3:
+        reasons.append(f"title sim {c['title_s']:.0%}")
     if topic_s >= 0.3:
         reasons.append(f"topic sim {topic_s:.0%}")
     return (score, reasons)
@@ -1288,40 +1323,35 @@ def cmd_related(target_id_prefix: str, sessions: list[dict]) -> None:
     print(f"  time:   {fmt_ts(target['first_ts'])} → {fmt_ts(target['last_ts'])}")
     print()
 
-    # Prefilter: score WITHOUT topics (cheap), keep sessions whose best-case
-    # score (assuming perfect topic match = +_W_TOPIC) could clear the floor.
-    # This caps Haiku calls at TOP_K instead of N for the topic extraction below.
-    floor = 0.20
-    TOP_K = 50
+    # Prefilter: cheap structural-only score (no topic). Drop sessions whose
+    # best-case score (assuming perfect topic match) cannot clear the floor;
+    # pay for Haiku topic extraction only on the top-K survivors.
     prefiltered: list[tuple[dict, float]] = []
     for s in sessions:
         if s["id"] == target["id"]:
             continue
-        cwd_s = _cwd_similarity(target.get("cwd",""), s.get("cwd",""))
-        branch_s = 1.0 if (target.get("git_branch") and target.get("git_branch") == s.get("git_branch")) else 0.0
-        gap_min = _interval_gap_minutes(target, s)
-        time_s = math.exp(-gap_min / _TIME_TAU_MIN) if gap_min != float("inf") else 0.0
-        title_s = _title_similarity(target, s)
-        struct_no_topic = _W_CWD*cwd_s + _W_BRANCH*branch_s + _W_TITLE*title_s
+        c = _structural_components(target, s)
+        time_s = math.exp(-c["gap_min"] / _TIME_TAU_MIN) if c["gap_min"] != float("inf") else 0.0
+        struct_no_topic = _W_CWD*c["cwd_s"] + _W_BRANCH*c["branch_s"] + _W_TITLE*c["title_s"]
         time_factor = 0.10 + 0.90 * time_s
         max_possible = (struct_no_topic + _W_TOPIC) * time_factor
-        if max_possible >= floor:
+        if max_possible >= RELATION_FLOOR:
             prefiltered.append((s, max_possible))
 
     prefiltered.sort(key=lambda x: -x[1])
-    top_candidates = [s for s, _ in prefiltered[:TOP_K]]
+    top_candidates = [s for s, _ in prefiltered[:RELATION_TOP_K]]
     if top_candidates:
         batch_ensure_topics([target] + top_candidates, show_progress=True)
 
     candidates: list[tuple[dict, float, list[str]]] = []
     for s in top_candidates:
         score, reasons = _score_relation(target, s)
-        if score >= floor:
+        if score >= RELATION_FLOOR:
             candidates.append((s, score, reasons))
     candidates.sort(key=lambda x: -x[1])
 
     if not candidates:
-        print(_c("(no related sessions found above confidence floor 0.20)", GRAY))
+        print(_c(f"(no related sessions found above confidence floor {RELATION_FLOOR:.2f})", GRAY))
         return
 
     print(_c(f"Related ({len(candidates)} candidates, sorted by score):", BOLD))
@@ -1345,8 +1375,12 @@ def cmd_related(target_id_prefix: str, sessions: list[dict]) -> None:
 # ── Forest building ──────────────────────────────────────────────────────────
 def _build_forest(sessions: list[dict], floor: float = 0.20) -> None:
     """Mutates sessions in place: assigns each its highest-scoring earlier session as parent.
-    Adds keys: parent_id (or None), parent_score (0.0 if root), parent_reasons (list)."""
-    batch_ensure_topics(sessions, show_progress=True)
+    Adds keys: parent_id (or None), parent_score (0.0 if root), parent_reasons (list).
+
+    Topics are NOT batch-extracted here — for N up to 1000 sessions that would
+    be a 30+ minute Haiku call. _topic_similarity returns 0 for missing topics,
+    so the forest still builds on cwd/branch/title. Run --related <sid> to get
+    topic-aware scoring on demand."""
     by_time = sorted(sessions, key=lambda s: s["first_ts"])
     for i, s in enumerate(by_time):
         best_score, best_parent, best_reasons = floor, None, []
@@ -1423,8 +1457,13 @@ def main():
     )
     # default=None on persisted flags so we can detect "not provided" and use
     # the last saved value instead.
-    p.add_argument("--days", type=int, default=None, metavar="N",
-                   help="Show sessions from the last N days (saved across runs)")
+    def _nonneg_int(v: str) -> int:
+        n = int(v)
+        if n < 0:
+            raise argparse.ArgumentTypeError(f"--days must be >= 0 (got {n})")
+        return n
+    p.add_argument("--days", type=_nonneg_int, default=None, metavar="N",
+                   help="Show sessions from the last N days (0 = all, saved across runs)")
     p.add_argument("--here", "--this-project-only", action="store_true",
                    default=None, dest="here",
                    help="Show only sessions for the current project")
