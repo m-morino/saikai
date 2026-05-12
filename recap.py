@@ -1075,8 +1075,10 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"ctrl-f:change-preview({preview_full_cmd})",
                     f"ctrl-s:change-preview({preview_cmd})",
                 ])
-                header = ("Enter:resume  Ctrl-p:★fav  Ctrl-x:hide  "
-                          "Ctrl-r:toggle-hidden  Ctrl-f/s:full/summary  Ctrl-C:cancel")
+                view_tag = "show-hidden" if _get_view_mode() == "show-hidden" else "default"
+                header = (f"Enter:resume  Ctrl-p:★fav  Ctrl-x:hide  "
+                          f"Ctrl-r:toggle-hidden(now:{view_tag})  "
+                          f"Ctrl-f/s:full/summary  Ctrl-C:cancel")
                 result = subprocess.run(
                     ["fzf", "--ansi", "--no-sort", "--reverse",
                      "--delimiter=\t", "--with-nth=1", "--nth=1,3",
@@ -1681,7 +1683,11 @@ def _tree_walk(sessions: list[dict]) -> list[tuple[dict, str]]:
 def main():
     p = argparse.ArgumentParser(
         description="Claude Code session history viewer  "
-                    "(flags --days/--here/--all are remembered between runs)"
+                    "(--days/--here/--all are one-shot; pass --save-defaults to persist)",
+        epilog="Environment variables:\n"
+               "  RECAP_RESUME=1  set on the resumed `claude` child so teams-notify hook\n"
+               "                  suppresses its idle-prompt nag. Not set elsewhere.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # default=None on persisted flags so we can detect "not provided" and use
     # the last saved value instead.
@@ -1691,7 +1697,8 @@ def main():
             raise argparse.ArgumentTypeError(f"--days must be >= 0 (got {n})")
         return n
     p.add_argument("--days", type=_nonneg_int, default=None, metavar="N",
-                   help="Show sessions from the last N days (0 = all, saved across runs)")
+                   help="Show sessions from the last N days (0 = all). One-shot unless "
+                        "--save-defaults is also passed.")
     p.add_argument("--here", "--this-project-only", action="store_true",
                    default=None, dest="here",
                    help="Show only sessions for the current project")
@@ -1699,7 +1706,12 @@ def main():
                    default=None, dest="all_scope",
                    help="Show sessions across all projects")
     p.add_argument("--reset-options", action="store_true",
-                   help="Forget saved --days/--here/--all defaults")
+                   help="Forget saved --days/--here/--all defaults. Does NOT clear "
+                        "hidden/favorite/view-mode — toggle those via Ctrl-x / Ctrl-p / "
+                        "Ctrl-r in the picker (or --hide / --favorite / --toggle-view).")
+    p.add_argument("--save-defaults", action="store_true",
+                   help="Persist the current --days/--here/--all values as new defaults. "
+                        "Without this flag, CLI args are one-shot and saved options stay untouched.")
     p.add_argument("--pick", action="store_true",
                    help="Open interactive fzf picker (default behavior)")
     p.add_argument("--table", action="store_true",
@@ -1708,13 +1720,15 @@ def main():
     p.add_argument("--no-summary", action="store_true",
                    help="Skip Haiku summarization (use AI title or first user msg)")
     p.add_argument("--refresh-summary", action="store_true",
-                   help="Discard cached summaries and regenerate")
+                   help="Discard cached Haiku summaries and regenerate. Does NOT touch "
+                        "parsed/topic caches; delete ~/.cache/recap/parsed/ for that.")
     p.add_argument("--preview", metavar="SESSION_ID",
                    help="Print session content preview (used internally by --pick)")
     p.add_argument("--preview-full", metavar="SESSION_ID",
                    help="Print full conversation preview (used internally by --pick)")
     p.add_argument("--list", action="store_true",
-                   help="Emit fzf-formatted lines (used internally by --pick reload)")
+                   help="Emit fzf-formatted lines (used internally by --pick reload). "
+                        "Implies --no-summary (skips Haiku).")
     p.add_argument("--hide", metavar="SESSION_ID",
                    help="Toggle hidden state for a session")
     p.add_argument("--favorite", metavar="SESSION_ID",
@@ -1736,13 +1750,21 @@ def main():
         preview_session_full(args.preview_full)
         return
     if args.hide:
-        _toggle_in_set(HIDDEN_FILE, _trim_sid(args.hide))
+        sid = _trim_sid(args.hide)
+        now_hidden = _toggle_in_set(HIDDEN_FILE, sid)
+        state = _c("HIDDEN", GRAY) if now_hidden else _c("visible", GREEN)
+        print(f"  {sid[:8]}: {state}", file=sys.stderr)
         return
     if args.favorite:
-        _toggle_in_set(FAVORITE_FILE, _trim_sid(args.favorite))
+        sid = _trim_sid(args.favorite)
+        now_fav = _toggle_in_set(FAVORITE_FILE, sid)
+        state = _c("★ favorite", YELLOW) if now_fav else _c("not favorite", GRAY)
+        print(f"  {sid[:8]}: {state}", file=sys.stderr)
         return
     if args.toggle_view:
-        _toggle_view_mode()
+        new_mode = _toggle_view_mode()
+        color = YELLOW if new_mode == "show-hidden" else GREEN
+        print(f"  view-mode: {_c(new_mode, color)}", file=sys.stderr)
         return
     # --tree SID: in-session sidechain tree. Handled here (no need to load all
     # sessions across the project — we open the target JSONL directly).
@@ -1756,12 +1778,24 @@ def main():
         print("Saved options cleared.", file=sys.stderr)
         return
 
-    # --related needs cross-project scope so the target can be found wherever it lives
+    # --related needs cross-project scope so the target can be found wherever it lives.
+    # Warn if the user explicitly asked for here/project — those would be silently
+    # overridden otherwise and the result wouldn't match expectations.
     if args.related:
+        if args.here:
+            print(_c("  note: --related forces cross-project scope; --here ignored",
+                    YELLOW), file=sys.stderr)
+        if args.project:
+            print(_c("  note: --related searches across all projects; --project ignored",
+                    YELLOW), file=sys.stderr)
         args.all_scope = True
         args.here = False
 
-    # Resolve --days / --here / --all from CLI vs saved defaults
+    # Resolve --days / --here / --all from CLI vs saved defaults.
+    # CLI args are ONE-SHOT: they only become the new default if the user passes
+    # --save-defaults. This prevents test/exploratory invocations from silently
+    # overwriting the user's preferred filter (e.g. running `recap --days 7`
+    # once would otherwise pin every future `recap` to 7 days).
     saved_opts = _load_options()
     if args.days is None:
         args.days = saved_opts.get("days", 0)   # 0 = all history
@@ -1772,8 +1806,10 @@ def main():
     else:
         scope = saved_opts.get("scope", "all")
     args.here = (scope == "here")
-    if not args.related:
+    if args.save_defaults and not args.related:
         _save_options({"days": args.days, "scope": scope})
+        print(_c(f"  saved defaults: days={args.days}, scope={scope}", GREEN),
+              file=sys.stderr)
 
     # --project always wins for scope; otherwise scope follows --here/--all
     args.all_projects = not (args.here or args.project)
