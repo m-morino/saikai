@@ -28,6 +28,10 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
+# CREATE_NO_WINDOW prevents a console window flash when launching command-line
+# helpers (git, taskkill) from a GUI terminal on Windows. No-op on POSIX.
+NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
 # ── ANSI helpers ────────────────────────────────────────────────────────────
 RESET = "\033[0m"
 BOLD  = "\033[1m"
@@ -337,7 +341,16 @@ def parse_session(jsonl_path: Path) -> dict | None:
 
     try:
         with open(jsonl_path, "rb") as f:
+            first = True
             for line in f:
+                # Tolerate a UTF-8 BOM on the first line. Claude Code itself
+                # doesn't emit one, but a user editing a JSONL in Notepad can
+                # introduce one and would otherwise silently lose the session
+                # (json.loads fails, all subsequent lines never link to ts/cwd).
+                if first:
+                    if line.startswith(b"\xef\xbb\xbf"):
+                        line = line[3:]
+                    first = False
                 try:
                     obj = json.loads(line)
                 except Exception:
@@ -432,11 +445,38 @@ def _delete_session_files(session_id: str):
             pass
 
 
+_haiku_missing_warned = False  # surface "claude not on PATH" at most once per run
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Kill a process and ALL descendants.
+
+    On Windows, `proc.kill()` calls TerminateProcess only on the immediate child,
+    so `claude.exe`'s `node.exe` workers (and any Haiku helpers under them) become
+    orphans that keep running — observed as recap-originated zombies after Haiku
+    summarisation timeouts. Use `taskkill /F /T` to walk the tree. POSIX kernels
+    reap descendants when the session/group leader dies, so this is Windows-only."""
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW,
+                timeout=5,
+            )
+        except Exception:
+            pass
+    try:
+        proc.kill()   # idempotent — taskkill above may already have terminated it
+    except Exception:
+        pass
+
+
 def call_claude_haiku(prompt: str, timeout: int = 45) -> str:
     """Call claude -p --model haiku and return stripped output.
     Suppresses all side effects: hooks, MCP, skills, session persistence.
-    Uses Popen + communicate(timeout) so a hung claude.exe is always killed
-    and pipes drained, even when grandchildren inherit console handles."""
+    Uses Popen + communicate(timeout); on timeout calls _kill_process_tree
+    so grandchildren (node.exe workers under claude.exe) don't leak as zombies."""
     cmd = ["claude", "-p", "--model", SUMMARY_MODEL,
            "--setting-sources", "",
            "--strict-mcp-config",
@@ -446,7 +486,7 @@ def call_claude_haiku(prompt: str, timeout: int = 45) -> str:
            prompt]
     extra: dict = {}
     if sys.platform == "win32":
-        extra["creationflags"] = 0x08000000  # CREATE_NO_WINDOW — no inherited console handles
+        extra["creationflags"] = NO_WINDOW  # no inherited console handles
 
     session_id = ""
     try:
@@ -455,8 +495,13 @@ def call_claude_haiku(prompt: str, timeout: int = 45) -> str:
             try:
                 raw_out, _ = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.communicate()  # drain pipes to unblock
+                _kill_process_tree(proc)
+                # Drain pipes so the with-block's __exit__ doesn't hang. Short
+                # timeout in case the descendant kill didn't release the pipe.
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
                 return ""
         raw_text = raw_out.decode("utf-8", errors="replace")
         if proc.returncode != 0:
@@ -471,6 +516,15 @@ def call_claude_haiku(prompt: str, timeout: int = 45) -> str:
             line = line.strip()
             if line and not line.startswith("```"):
                 return line[:100]
+        return ""
+    except FileNotFoundError:
+        # `claude` binary not on PATH — warn once per run so the user understands
+        # why summaries are empty instead of seeing a silent fallback to first msg.
+        global _haiku_missing_warned
+        if not _haiku_missing_warned:
+            _haiku_missing_warned = True
+            print(_c("  warn: `claude` not found on PATH — summaries will be raw user msgs", YELLOW),
+                  file=sys.stderr)
         return ""
     except Exception:
         return ""
@@ -570,7 +624,7 @@ def _load_all_commits(repo: Path, since_days: int = 60) -> list[tuple]:
             ["git", "log", "--all", "--format=%h\t%cI\t%s",
              f"--since={since_days}.days.ago"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            cwd=repo, timeout=15,
+            cwd=repo, timeout=15, creationflags=NO_WINDOW,
         )
         out = []
         for line in result.stdout.splitlines():
@@ -965,6 +1019,26 @@ def build_fzf_lines(sessions: list[dict], repo: Path | None, show_project: bool,
     return lines
 
 
+def _reset_terminal_modes() -> None:
+    """Emit ANSI disable sequences for terminal modes fzf may have enabled.
+
+    Targets focus tracking (?1004), all mouse tracking variants (?1000/1002/1003/
+    1006/1015), bracketed paste (?2004), and ensures the cursor is visible (?25).
+    These are no-ops if the mode is already off — safe to send unconditionally.
+
+    Why this exists: on Windows, fzf occasionally exits without sending the matching
+    'l' sequence for focus / mouse SGR, so the shell receives literal '[I' (focus
+    in) or stray 'm' (SGR mouse release terminator) characters."""
+    try:
+        sys.stderr.write(
+            "\033[?1000l\033[?1002l\033[?1003l\033[?1004l"
+            "\033[?1006l\033[?1015l\033[?2004l\033[?25h"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
              flat: bool = False, reload_args: list[str] | None = None):
     """Pipe session list to fzf and run claude --resume on selection.
@@ -983,9 +1057,10 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     out_path = tmp_path + ".out"
     env = os.environ.copy()
     env.setdefault("TERM", "xterm-256color")
+    result = None
     try:
-        with open(tmp_path, "rb") as stdin_file, open(out_path, "wb") as stdout_file:
-            try:
+        try:
+            with open(tmp_path, "rb") as stdin_file, open(out_path, "wb") as stdout_file:
                 # Reload re-runs recap with the session-source flags captured by main()
                 ra = reload_args or ["--list"]
                 reload_cmd = "recap " + " ".join(f'"{a}"' if " " in a else a for a in ra)
@@ -1015,35 +1090,46 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     stderr=None,
                     env=env,
                 )
-            except FileNotFoundError:
-                if sys.platform == "win32":
-                    hint = "winget install junegunn.fzf"
-                elif sys.platform == "darwin":
-                    hint = "brew install fzf"
-                else:
-                    hint = "sudo apt install fzf  # or: brew install fzf"
-                print(f"fzf not found. Install: {hint}", file=sys.stderr)
-                sys.exit(1)
+        except FileNotFoundError:
+            if sys.platform == "win32":
+                hint = "winget install junegunn.fzf"
+            elif sys.platform == "darwin":
+                hint = "brew install fzf"
+            else:
+                hint = "sudo apt install fzf  # or: brew install fzf"
+            print(f"fzf not found. Install: {hint}", file=sys.stderr)
+            sys.exit(1)
 
         try:
-            chosen = open(out_path, "rb").read().decode("utf-8", errors="replace").strip()
+            with open(out_path, "rb") as f:
+                chosen = f.read().decode("utf-8", errors="replace").strip()
         except Exception:
             chosen = ""
     finally:
+        # Defensively reset terminal modes fzf may have left enabled. Observed on
+        # Windows: fzf exit (esp. via Ctrl-C / non-zero or any exception path)
+        # sometimes fails to disable focus tracking (\e[?1004h) and SGR mouse
+        # (\e[?1006h), so the shell prompt then receives stray '[I' / 'm' from
+        # focus and mouse events. Sending the disable sequences here is idempotent
+        # and safe on any VT100-compatible terminal. In `finally` so even an
+        # unexpected subprocess error doesn't leak modes back to the shell.
+        _reset_terminal_modes()
         for p in (tmp_path, out_path):
             try:
                 os.unlink(p)
             except Exception:
                 pass
 
-    if result.returncode != 0 or not chosen:
+    if result is None or result.returncode != 0 or not chosen:
         return
     full_id = chosen.split("\t")[1].strip()   # field 1 = UUID (0=display, 2=searchable)
     if not full_id:
         return
 
     # Try origin_cwd first (where Claude originally indexed the session — required
-    # for --resume to find it). Fall back to last cwd, then jsonl_path's parent.
+    # for --resume to find it). Fall back to last cwd, then to an existing user
+    # directory whose path-key matches the JSONL's project dir name (handles
+    # sessions whose original cwd was deleted but a sibling/parent still exists).
     selected = next((s for s in sessions if s["id"] == full_id), None)
     candidates = []
     if selected:
@@ -1051,7 +1137,20 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             v = selected.get(k)
             if v and Path(v).is_dir():
                 candidates.append(v)
+        # Last-resort: borrow a still-existing cwd from any other session in the
+        # same project directory (worktree gone, parent still present, etc.)
+        if not candidates and selected.get("jsonl_path"):
+            project_dir = selected["jsonl_path"].parent
+            for other in sessions:
+                if other.get("jsonl_path") and other["jsonl_path"].parent == project_dir:
+                    v = other.get("origin_cwd") or other.get("cwd")
+                    if v and Path(v).is_dir():
+                        candidates.append(v)
+                        break
     target_cwd = candidates[0] if candidates else None
+    if not target_cwd:
+        print(_c(f"  warn: session's recorded cwd no longer exists — running from current dir", YELLOW),
+              file=sys.stderr)
 
     print(f"\nResuming {full_id[:8]}" + (f"  (cwd: {target_cwd})" if target_cwd else ""))
     env = os.environ.copy()
@@ -1074,10 +1173,17 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     # Otherwise: if the user closes the terminal mid-session, recap.py + its
     # claude --resume child both linger as zombies (observed 2026-05-10).
     if target_cwd:
+        # TOCTOU: directory passed `is_dir()` earlier but could vanish before
+        # chdir (worktree removed, USB ejected). Warn instead of silently
+        # falling back to recap's own cwd — the user can then re-resume from
+        # the right place.
         try:
             os.chdir(target_cwd)
-        except Exception:
-            pass
+        except OSError as e:
+            print(_c(f"  warn: chdir to {target_cwd} failed ({e}); "
+                    f"resuming from current dir instead", YELLOW),
+                  file=sys.stderr)
+            target_cwd = None
     # Find the resolved claude binary path so execvpe doesn't depend on PATH
     # being intact after the VIRTUAL_ENV-strip above (Windows resolves via PATH
     # lookup inside execvpe; explicit path is more reliable).
@@ -1288,9 +1394,13 @@ def _structural_components(a: dict, b: dict) -> dict:
     """Cheap pairwise similarity components (no Haiku required for topic_s=0).
     Reused by _score_relation and cmd_related's prefilter so the formula lives
     in one place."""
+    # Detached HEAD records git_branch == "HEAD" — unrelated detached sessions
+    # would falsely match. Treat "HEAD" as no-info so it never contributes 1.0.
+    ab, bb = a.get("git_branch", ""), b.get("git_branch", "")
+    branch_s = 1.0 if (ab and ab != "HEAD" and ab == bb) else 0.0
     return {
         "cwd_s":    _cwd_similarity(a.get("cwd", ""), b.get("cwd", "")),
-        "branch_s": 1.0 if (a.get("git_branch") and a.get("git_branch") == b.get("git_branch")) else 0.0,
+        "branch_s": branch_s,
         "title_s":  _title_similarity(a, b),
         "gap_min":  _interval_gap_minutes(a, b),
     }
@@ -1340,9 +1450,11 @@ def cmd_related(target_id_prefix: str, sessions: list[dict]) -> None:
         print(f"(session {target_id_prefix[:8]} not found in current scope)", file=sys.stderr)
         sys.exit(1)
 
+    tb = target.get("git_branch", "")
+    branch_label = "(detached HEAD)" if tb == "HEAD" else (tb or "(none)")
     print(_c("Target:  ", BOLD) + f"{short_id(target['id'])}  {label_for(target)}")
     print(f"  cwd:    {target.get('cwd','') or '(none)'}")
-    print(f"  branch: {target.get('git_branch','') or '(none)'}")
+    print(f"  branch: {branch_label}")
     print(f"  time:   {fmt_ts(target['first_ts'])} → {fmt_ts(target['last_ts'])}")
     print()
 
@@ -1393,6 +1505,99 @@ def cmd_related(target_id_prefix: str, sessions: list[dict]) -> None:
     if len(candidates) > 20:
         print()
         print(_c(f"  ... and {len(candidates)-20} more (showing top 20)", DIM))
+
+
+# ── In-session sidechain tree ────────────────────────────────────────────────
+def _read_subagent_summary(agent_file: Path) -> dict:
+    """Return {agent_id, n_msgs, first_user, last_assistant, first_ts, last_ts}
+    for a single subagent JSONL. All sidechain messages have isSidechain=true."""
+    agent_id = agent_file.stem.replace("agent-", "")
+    summary = {
+        "agent_id": agent_id, "n_msgs": 0,
+        "first_user": "", "last_assistant": "",
+        "first_ts": "", "last_ts": "",
+    }
+    try:
+        with open(agent_file, "rb") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                summary["n_msgs"] += 1
+                ts = obj.get("timestamp") or ""
+                if ts and not summary["first_ts"]:
+                    summary["first_ts"] = ts
+                if ts:
+                    summary["last_ts"] = ts
+                t = obj.get("type", "")
+                text = _extract_text(obj.get("message", {}).get("content", "")) or ""
+                text = " ".join(text.split())
+                if t == "user" and not summary["first_user"]:
+                    summary["first_user"] = text
+                elif t == "assistant" and text:
+                    summary["last_assistant"] = text
+    except Exception:
+        pass
+    return summary
+
+
+def cmd_sidechain_tree(target_id_prefix: str) -> None:
+    """Show subagent (sidechain) branches for a single session.
+
+    Subagents spawned via the Task tool persist to
+    `<project>/<sid>/subagents/agent-<agentId>.jsonl` + `.meta.json`.
+    Each file is a branch — we list them with agentType, description, prompt,
+    and last reply. Uses confirmed metadata only (no heuristic scoring)."""
+    sid = _trim_sid(target_id_prefix)
+    jsonl = _find_session_jsonl(sid)
+    if not jsonl:
+        print(f"(session {sid[:8]} not found)", file=sys.stderr)
+        sys.exit(1)
+
+    full_sid = jsonl.stem
+    subagents_dir = jsonl.parent / full_sid / "subagents"
+    agent_files = sorted(subagents_dir.glob("agent-*.jsonl")) if subagents_dir.exists() else []
+
+    print(_c("Sidechain (subagent) tree:", BOLD) + f"  {short_id(full_sid)}")
+    print(f"  jsonl:    {jsonl}")
+    print(f"  agents:   {len(agent_files)}")
+    print()
+
+    if not agent_files:
+        print(_c("(no subagent invocations found — session has no Task-tool calls)", GRAY))
+        return
+
+    # Order branches by first timestamp so the tree reads chronologically.
+    summaries = [(af, _read_subagent_summary(af)) for af in agent_files]
+    summaries.sort(key=lambda x: x[1]["first_ts"] or "")
+
+    for i, (agent_file, summary) in enumerate(summaries):
+        meta_file = agent_file.with_suffix(".meta.json")
+        meta = {}
+        if meta_file.exists():
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        agent_type = meta.get("agentType", "?")
+        description = meta.get("description", "")
+
+        is_last = (i == len(summaries) - 1)
+        branch = "└─ " if is_last else "├─ "
+        cont = "   " if is_last else "│  "
+        ts = (summary["first_ts"] or "")[:19].replace("T", " ")
+        head = (_c(branch, GRAY) + _c(agent_type, CYAN, BOLD) +
+                _c(f"  ({summary['agent_id'][:8]}, {summary['n_msgs']} msgs, {ts})", DIM))
+        print(head)
+        if description:
+            print(_c(cont + "  description: ", DIM) + description[:120])
+        if summary["first_user"]:
+            print(_c(cont + "  prompt:      ", DIM) + summary["first_user"][:120])
+        if summary["last_assistant"]:
+            print(_c(cont + "  last reply:  ", DIM) + summary["last_assistant"][:120])
+        if not is_last:
+            print(_c(cont, GRAY))
 
 
 # ── Forest building ──────────────────────────────────────────────────────────
@@ -1518,8 +1723,10 @@ def main():
                    help="Toggle default/show-hidden view mode")
     p.add_argument("--related", metavar="SESSION_ID",
                    help="Show sessions related to SESSION_ID with confidence scores and reasons")
-    p.add_argument("--tree", action="store_true",
-                   help="Group sessions into an inferred parent/child forest (heuristic, may be wrong)")
+    p.add_argument("--tree", nargs="?", const=True, default=False, metavar="SESSION_ID",
+                   help="No arg: group sessions into an inferred parent/child forest (heuristic). "
+                        "With SESSION_ID: show the in-session sidechain (subagent) tree using "
+                        "isSidechain+parentUuid metadata (confirmed, not heuristic).")
     args = p.parse_args()
 
     if args.preview:
@@ -1536,6 +1743,11 @@ def main():
         return
     if args.toggle_view:
         _toggle_view_mode()
+        return
+    # --tree SID: in-session sidechain tree. Handled here (no need to load all
+    # sessions across the project — we open the target JSONL directly).
+    if isinstance(args.tree, str):
+        cmd_sidechain_tree(args.tree)
         return
 
     if args.reset_options:
@@ -1581,7 +1793,8 @@ def main():
 
     try:
         r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                          capture_output=True, text=True, cwd=cwd, timeout=3)
+                          capture_output=True, text=True, cwd=cwd, timeout=3,
+                          creationflags=NO_WINDOW)
         repo = Path(r.stdout.strip()) if r.returncode == 0 else None
     except Exception:
         repo = None
@@ -1623,9 +1836,11 @@ def main():
         cmd_related(args.related, sessions)
         return
 
-    # Tree mode is opt-in via --tree (heuristic, may produce wrong edges)
-    use_tree = args.tree and len(sessions) <= 1000
-    if use_tree:
+    # Always build the cross-session forest so the fzf preview header can surface
+    # the top-related session, even when --tree (nested display) is off. The forest
+    # is O(N²) but each comparison is a cheap structural score (no Haiku); guard
+    # with N <= 1000 to keep startup snappy on very large histories.
+    if len(sessions) <= 1000:
         _build_forest(sessions)
     else:
         for s in sessions:
@@ -1633,6 +1848,9 @@ def main():
             s["parent_score"] = 0.0
             s["parent_reasons"] = []
 
+    # --tree (flag-only form) controls *display* — flat list vs nested tree in fzf.
+    # The forest itself is built unconditionally above for the preview header.
+    use_tree = (args.tree is True) and len(sessions) <= 1000
     flat = not use_tree
     if args.list:
         # Emit fzf-formatted lines without launching fzf (used by reload)
@@ -1656,7 +1874,7 @@ def main():
             reload_args.append("--here")
         if args.project:
             reload_args += ["--project", args.project]
-        if args.tree:
+        if args.tree is True:   # explicit bool — string (SID form) was early-returned above
             reload_args.append("--tree")
         fzf_pick(sessions, repo, args.all_projects, flat=flat, reload_args=reload_args)
 
