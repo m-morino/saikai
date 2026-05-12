@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -1039,6 +1040,29 @@ def _reset_terminal_modes() -> None:
         pass
 
 
+# Threshold for "frequent cwd": a directory must have hosted at least this many
+# sessions before recap auto-applies --permission-mode auto on resume. Tuned by
+# eye on a working history of ~hundreds of sessions; a handful of long-lived
+# repos comfortably clear it while one-off cwds (downloaded folders, temp
+# experiments) don't. Override with RECAP_FREQ_CWD_MIN env var.
+FREQ_CWD_MIN_DEFAULT = 5
+
+
+def _frequent_cwds(sessions: list[dict]) -> set[str]:
+    """Return the set of normalised cwds that appear in >= N sessions.
+
+    Used to identify "trusted" working directories (the user's own repos they
+    return to repeatedly) so that resuming a session there can auto-apply
+    --permission-mode auto, avoiding the per-tool-use approval prompts that
+    interrupt flow in well-known projects."""
+    try:
+        min_count = max(2, int(os.environ.get("RECAP_FREQ_CWD_MIN") or FREQ_CWD_MIN_DEFAULT))
+    except ValueError:
+        min_count = FREQ_CWD_MIN_DEFAULT
+    counts = Counter(_norm_cwd(s.get("cwd") or "") for s in sessions)
+    return {cwd for cwd, n in counts.items() if cwd and n >= min_count}
+
+
 def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
              flat: bool = False, reload_args: list[str] | None = None):
     """Pipe session list to fzf and run claude --resume on selection.
@@ -1154,7 +1178,21 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         print(_c(f"  warn: session's recorded cwd no longer exists — running from current dir", YELLOW),
               file=sys.stderr)
 
-    print(f"\nResuming {full_id[:8]}" + (f"  (cwd: {target_cwd})" if target_cwd else ""))
+    # Auto-permission: if the target cwd is a "frequent" workspace (i.e. the user
+    # has run many sessions there, so they presumably trust it), pass
+    # --permission-mode auto so claude doesn't pause for per-tool-use approval.
+    # Opt-out via RECAP_NO_AUTO_PERMISSION=1 if the user wants the prompts back.
+    extra_args: list[str] = []
+    auto_perm_note = ""
+    if (target_cwd
+            and not os.environ.get("RECAP_NO_AUTO_PERMISSION")
+            and _norm_cwd(target_cwd) in _frequent_cwds(sessions)):
+        extra_args = ["--permission-mode", "auto"]
+        auto_perm_note = _c("  [--permission-mode auto: frequent cwd]", DIM)
+
+    print(f"\nResuming {full_id[:8]}"
+          + (f"  (cwd: {target_cwd})" if target_cwd else "")
+          + (f"\n{auto_perm_note}" if auto_perm_note else ""))
     env = os.environ.copy()
     env["RECAP_RESUME"] = "1"   # signal to teams-notify.py: suppress idle_prompt
     # The recap wrapper invokes us via `uv run --no-project`, which sets
@@ -1186,19 +1224,25 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"resuming from current dir instead", YELLOW),
                   file=sys.stderr)
             target_cwd = None
-    # Find the resolved claude binary path so execvpe doesn't depend on PATH
-    # being intact after the VIRTUAL_ENV-strip above (Windows resolves via PATH
-    # lookup inside execvpe; explicit path is more reliable).
-    claude_bin = shutil.which("claude", path=env.get("PATH"))
-    if claude_bin is None:
-        # Fall back to blocking run if we can't find claude on PATH
-        subprocess.run(["claude", "--resume", full_id], cwd=target_cwd, env=env)
-        return
+    # Always try execvpe first so recap is replaced (POSIX) or spawn-then-exits
+    # (Windows). Either way recap doesn't linger as middleware while claude runs.
+    # Resolve binary path manually so Windows' execvpe doesn't depend on PATH
+    # parsing inside the C runtime after we stripped VIRTUAL_ENV above.
+    claude_bin = shutil.which("claude", path=env.get("PATH")) or "claude"
+    claude_argv = [claude_bin, "--resume", full_id, *extra_args]
     try:
-        os.execvpe(claude_bin, [claude_bin, "--resume", full_id], env)
-    except Exception:
-        # execvpe failed (shouldn't, but never crash the launcher)
-        subprocess.run(["claude", "--resume", full_id], cwd=target_cwd, env=env)
+        os.execvpe(claude_bin, claude_argv, env)
+    except FileNotFoundError:
+        print(_c("  warn: claude not on PATH — falling back to blocking subprocess",
+                YELLOW), file=sys.stderr)
+    except Exception as e:
+        print(_c(f"  warn: execvpe failed ({e}) — falling back to blocking subprocess",
+                YELLOW), file=sys.stderr)
+    # Last resort: blocking run. Recap stays alive until claude exits, which is
+    # the original zombie scenario — but better than crashing the launcher with
+    # no fallback at all. sys.exit forwards claude's returncode so the shell
+    # sees the same exit status as if execvpe had succeeded.
+    sys.exit(subprocess.run(claude_argv, cwd=target_cwd, env=env).returncode)
 
 
 # ── Project lookup ───────────────────────────────────────────────────────────
@@ -1685,8 +1729,12 @@ def main():
         description="Claude Code session history viewer  "
                     "(--days/--here/--all are one-shot; pass --save-defaults to persist)",
         epilog="Environment variables:\n"
-               "  RECAP_RESUME=1  set on the resumed `claude` child so teams-notify hook\n"
-               "                  suppresses its idle-prompt nag. Not set elsewhere.",
+               "  RECAP_RESUME=1            set on the resumed `claude` child so teams-notify\n"
+               "                            hook suppresses its idle-prompt nag.\n"
+               "  RECAP_NO_AUTO_PERMISSION  if set, do NOT auto-apply --permission-mode auto\n"
+               "                            on resume even when the target cwd is frequent.\n"
+               "  RECAP_FREQ_CWD_MIN=N      minimum session count to flag a cwd as\n"
+               "                            \"frequent\" for auto-permission (default 5).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # default=None on persisted flags so we can detect "not provided" and use
@@ -1737,10 +1785,12 @@ def main():
                    help="Toggle default/show-hidden view mode")
     p.add_argument("--related", metavar="SESSION_ID",
                    help="Show sessions related to SESSION_ID with confidence scores and reasons")
-    p.add_argument("--tree", nargs="?", const=True, default=False, metavar="SESSION_ID",
-                   help="No arg: group sessions into an inferred parent/child forest (heuristic). "
-                        "With SESSION_ID: show the in-session sidechain (subagent) tree using "
-                        "isSidechain+parentUuid metadata (confirmed, not heuristic).")
+    p.add_argument("--tree", action="store_true",
+                   help="Group sessions into an inferred parent/child forest (heuristic, "
+                        "scores cwd / branch / title / topic + time decay).")
+    p.add_argument("--sidechain", metavar="SESSION_ID",
+                   help="Show the in-session sidechain (subagent) tree for SESSION_ID "
+                        "using isSidechain+parentUuid metadata (confirmed, not heuristic).")
     args = p.parse_args()
 
     if args.preview:
@@ -1766,10 +1816,10 @@ def main():
         color = YELLOW if new_mode == "show-hidden" else GREEN
         print(f"  view-mode: {_c(new_mode, color)}", file=sys.stderr)
         return
-    # --tree SID: in-session sidechain tree. Handled here (no need to load all
-    # sessions across the project — we open the target JSONL directly).
-    if isinstance(args.tree, str):
-        cmd_sidechain_tree(args.tree)
+    # --sidechain SID: in-session subagent tree. Handled here (no need to load
+    # all sessions across the project — we open the target JSONL directly).
+    if args.sidechain:
+        cmd_sidechain_tree(args.sidechain)
         return
 
     if args.reset_options:
@@ -1884,9 +1934,9 @@ def main():
             s["parent_score"] = 0.0
             s["parent_reasons"] = []
 
-    # --tree (flag-only form) controls *display* — flat list vs nested tree in fzf.
-    # The forest itself is built unconditionally above for the preview header.
-    use_tree = (args.tree is True) and len(sessions) <= 1000
+    # --tree controls *display* — flat list vs nested tree in fzf. The forest
+    # itself is built unconditionally above for the preview header.
+    use_tree = args.tree and len(sessions) <= 1000
     flat = not use_tree
     if args.list:
         # Emit fzf-formatted lines without launching fzf (used by reload)
@@ -1910,7 +1960,7 @@ def main():
             reload_args.append("--here")
         if args.project:
             reload_args += ["--project", args.project]
-        if args.tree is True:   # explicit bool — string (SID form) was early-returned above
+        if args.tree:
             reload_args.append("--tree")
         fzf_pick(sessions, repo, args.all_projects, flat=flat, reload_args=reload_args)
 
