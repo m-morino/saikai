@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -1067,7 +1068,29 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         cmp = (lambda p: p.lower()) if sys.platform == "win32" else (lambda p: p)
         parts = [p for p in env.get("PATH", "").split(os.pathsep) if cmp(p) != cmp(venv_bin)]
         env["PATH"] = os.pathsep.join(parts)
-    subprocess.run(["claude", "--resume", full_id], cwd=target_cwd, env=env)
+
+    # Replace recap.py with claude.exe so the terminal's direct child becomes
+    # claude (not recap.py blocking on subprocess.run for the entire session).
+    # Otherwise: if the user closes the terminal mid-session, recap.py + its
+    # claude --resume child both linger as zombies (observed 2026-05-10).
+    if target_cwd:
+        try:
+            os.chdir(target_cwd)
+        except Exception:
+            pass
+    # Find the resolved claude binary path so execvpe doesn't depend on PATH
+    # being intact after the VIRTUAL_ENV-strip above (Windows resolves via PATH
+    # lookup inside execvpe; explicit path is more reliable).
+    claude_bin = shutil.which("claude", path=env.get("PATH"))
+    if claude_bin is None:
+        # Fall back to blocking run if we can't find claude on PATH
+        subprocess.run(["claude", "--resume", full_id], cwd=target_cwd, env=env)
+        return
+    try:
+        os.execvpe(claude_bin, [claude_bin, "--resume", full_id], env)
+    except Exception:
+        # execvpe failed (shouldn't, but never crash the launcher)
+        subprocess.run(["claude", "--resume", full_id], cwd=target_cwd, env=env)
 
 
 # ── Project lookup ───────────────────────────────────────────────────────────
