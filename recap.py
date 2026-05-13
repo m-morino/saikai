@@ -1274,6 +1274,19 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"resuming from current dir instead", YELLOW),
                   file=sys.stderr)
             target_cwd = None
+    # Show a "loading" line so the multi-second gap between recap exit and the
+    # claude TUI taking over the screen doesn't feel like a hang. The text sits
+    # at the bottom of the terminal until claude enters alternate-screen mode,
+    # which clears it. Sent to stderr so it bypasses any stdout redirection.
+    sys.stderr.write(_c("  Loading claude session ...", DIM) + "\n")
+    sys.stderr.flush()
+    # Second terminal reset right before handoff. fzf's reset earlier covered
+    # focus / mouse / bracketed-paste, but claude.exe sometimes emits a DA1
+    # query (\e[c) at startup; if the response comes back before claude binds
+    # the input handler, the shell sees the leftover '?65;...c' on the prompt
+    # after claude exits. A defensive disable-everything pass here narrows the
+    # window where stray bytes could leak.
+    _reset_terminal_modes()
     # Always try execvpe first so recap is replaced (POSIX) or spawn-then-exits
     # (Windows). Either way recap doesn't linger as middleware while claude runs.
     # Resolve binary path manually so Windows' execvpe doesn't depend on PATH
