@@ -1480,15 +1480,33 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                  flat: bool = False, cluster_mode: bool = False,
                  reload_args: list[str] | None = None) -> None:
-    """Textual-based picker (Phase 1: minimum viable).
+    """Textual-based picker (Phase 2: preview pane + search + mode toggles).
 
-    Shows sessions in a DataTable; Enter on a row resumes that session.
-    Falls back to fzf if `textual` isn't importable. Phase 2 will add
-    preview pane / mode toggles; Phase 3 adds column-click sort."""
+    Layout:
+      ┌─────────────────────────────────────────┐
+      │ Search:                                 │  Input — filter title/msgs/sid/proj
+      ├──────────────────┬──────────────────────┤
+      │ DataTable        │ Preview (RichLog)    │
+      │ ↑↓ Enter         │ Updates on cursor    │
+      └──────────────────┴──────────────────────┘
+      Footer (key bindings)
+
+    Bindings (fzf parity):
+      Enter        resume                Esc / Ctrl-C  cancel
+      Ctrl-x       hide/unhide row       Ctrl-p        favorite toggle
+      Ctrl-r       toggle hidden vis     Ctrl-t        toggle tree mode *
+      Ctrl-g       toggle cluster *      Ctrl-f / s    full / summary preview
+      Alt-1/2/3    cycle sort col N      Alt-q/w/e     toggle priority N dir
+
+    *  tree / cluster changes are saved but require a restart to apply
+       (the in-app refresh is row-level; mode changes restructure the list).
+    """
     try:
         from textual.app import App, ComposeResult
-        from textual.widgets import DataTable, Footer
         from textual.binding import Binding
+        from textual.containers import Horizontal
+        from textual.widgets import DataTable, Footer, Input, RichLog
+        from rich.text import Text
     except ImportError as e:
         print(_c(f"  textual not available ({e}) — falling back to fzf", YELLOW),
               file=sys.stderr)
@@ -1496,61 +1514,207 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                  cluster_mode=cluster_mode, reload_args=reload_args)
         return
 
-    # Filter hidden in-place for the picker view (same rule as fzf path).
-    hidden = _load_hidden()
-    favorites = _load_favorites()
-    view_mode = _get_view_mode()
-    visible = [s for s in sessions
-               if view_mode == "show-hidden" or s["id"] not in hidden]
+    all_sessions = list(sessions)
 
     class PickerApp(App):
         TITLE = "recap"
-        SUB_TITLE = f"{len(visible)} sessions"
         BINDINGS = [
             Binding("escape", "quit", "Cancel"),
-            Binding("ctrl+c", "quit", "Cancel", show=False),
-            Binding("q", "quit", "Quit"),
+            Binding("ctrl+c", "quit", show=False),
+            Binding("ctrl+x", "toggle_hide", "Hide"),
+            Binding("ctrl+p", "toggle_fav", "*Fav"),
+            Binding("ctrl+r", "toggle_view", "Show hidden"),
+            Binding("ctrl+t", "toggle_tree", "Tree*"),
+            Binding("ctrl+g", "toggle_cluster", "Cluster*"),
+            Binding("ctrl+f", "preview_full", "Full"),
+            Binding("ctrl+s", "preview_summary", "Summary"),
+            Binding("alt+1", "cycle_sort('1')", "Sort1"),
+            Binding("alt+2", "cycle_sort('2')", "Sort2"),
+            Binding("alt+3", "cycle_sort('3')", "Sort3"),
+            Binding("alt+q", "toggle_dir('1')", "Dir1"),
+            Binding("alt+w", "toggle_dir('2')", "Dir2"),
+            Binding("alt+e", "toggle_dir('3')", "Dir3"),
         ]
         CSS = """
         Screen { layout: vertical; }
-        DataTable { height: 1fr; }
+        #search { dock: top; height: 3; border: tall $accent; }
+        #main { layout: horizontal; height: 1fr; }
+        #table { width: 60%; }
+        #preview { width: 40%; padding: 0 1; border-left: solid $accent; }
         """
 
+        preview_mode = "summary"   # "summary" or "full"
+
         def compose(self) -> ComposeResult:
-            yield DataTable(cursor_type="row", zebra_stripes=True)
+            yield Input(placeholder="Search title / message / SID / project ...",
+                        id="search")
+            with Horizontal(id="main"):
+                yield DataTable(cursor_type="row", zebra_stripes=True, id="table")
+                yield RichLog(id="preview", wrap=True, highlight=False, markup=False)
             yield Footer()
 
         def on_mount(self) -> None:
-            table = self.query_one(DataTable)
+            self._refresh_table()
+            self.query_one("#table", DataTable).focus()
+            self._update_subtitle()
+
+        def _filter(self, q: str) -> list[dict]:
+            q = q.strip().lower()
+            if not q:
+                return all_sessions
+            return [s for s in all_sessions
+                    if q in (s.get("ai_title") or "").lower()
+                    or q in " ".join(s.get("real_msgs") or []).lower()
+                    or q in s["id"]
+                    or q in (s.get("project_name") or "").lower()]
+
+        def _refresh_table(self) -> None:
+            table = self.query_one("#table", DataTable)
+            saved_cursor = table.cursor_row
+            table.clear(columns=True)
             cols = ["", "Start", "Last"]
             if show_project:
                 cols.append("Project")
             cols += ["ID", "Title"]
             table.add_columns(*cols)
+
+            query = self.query_one("#search", Input).value
+            visible = self._filter(query)
+            hidden = _load_hidden()
+            favorites = _load_favorites()
+            view_mode = _get_view_mode()
+            n = 0
             for s in visible:
-                marker_a = "@" if s.get("is_open") else ("+" if s.get("is_active") else
-                          ("." if s.get("is_recent") else " "))
-                marker_s = "*" if s["id"] in favorites else (
-                          "x" if s["id"] in hidden else " ")
+                is_hidden = s["id"] in hidden
+                if is_hidden and view_mode != "show-hidden":
+                    continue
+                marker_a = ("@" if s.get("is_open") else "+" if s.get("is_active")
+                            else "." if s.get("is_recent") else " ")
+                marker_s = ("*" if s["id"] in favorites
+                            else "x" if is_hidden else " ")
                 marker = f"{marker_a}{marker_s}"
-                start = fmt_ts(s["first_ts"])
-                last = fmt_last_active(s)
-                sid8 = short_id(s["id"])
-                title = (s.get("ai_title") or _first_msg(s) or "")[:80]
-                row = [marker, start, last]
+                row = [marker, fmt_ts(s["first_ts"]), fmt_last_active(s)]
                 if show_project:
                     row.append(project_short(s["project_name"]))
-                row += [sid8, title]
+                row.append(short_id(s["id"]))
+                row.append((s.get("ai_title") or _first_msg(s) or "")[:80])
                 table.add_row(*row, key=s["id"])
-            table.focus()
+                n += 1
+            if n and saved_cursor < n:
+                try:
+                    table.move_cursor(row=saved_cursor)
+                except Exception:
+                    pass
+            self._update_subtitle()
+
+        def _update_subtitle(self) -> None:
+            table = self.query_one("#table", DataTable)
+            sort_keys = _load_sort()
+            parts = []
+            for i, k in enumerate(sort_keys, 1):
+                if k["col"] == "-":
+                    parts.append(f"[{i} -]")
+                else:
+                    arrow = "v" if k["dir"] == "desc" else "^"
+                    parts.append(f"[{i}{arrow}{k['col']}]")
+            view = _get_view_mode()
+            tree = "T" if _get_tree_mode() else "-"
+            cluster = "C" if _get_cluster_mode() else "-"
+            self.sub_title = (f"{table.row_count} sessions  "
+                              f"view:{view}  layout:{tree}{cluster}  "
+                              f"sort:{' '.join(parts)}")
+
+        def _cursor_sid(self) -> str | None:
+            table = self.query_one("#table", DataTable)
+            if table.row_count == 0:
+                return None
+            try:
+                row_key, _ = table.coordinate_to_cell_key((table.cursor_row, 0))
+                return str(row_key.value) if row_key else None
+            except Exception:
+                return None
+
+        def _update_preview(self, sid: str | None) -> None:
+            preview = self.query_one("#preview", RichLog)
+            preview.clear()
+            if not sid:
+                return
+            cache_dir = (PREVIEW_FULL_DIR if self.preview_mode == "full"
+                         else PREVIEW_DIR)
+            cache_file = cache_dir / f"{sid}.txt"
+            if cache_file.exists():
+                preview.write(Text.from_ansi(cache_file.read_text(encoding="utf-8")))
+            else:
+                preview.write(f"(no cached preview for {sid[:8]} — open the session once to populate the cache)")
+
+        # ── events ──────────────────────────────────────────────────────────
+
+        def on_data_table_row_highlighted(self, event) -> None:
+            sid = str(event.row_key.value) if event.row_key else None
+            self._update_preview(sid)
 
         def on_data_table_row_selected(self, event) -> None:
             if event.row_key and event.row_key.value:
                 self.exit(str(event.row_key.value))
 
+        def on_input_changed(self, event) -> None:
+            self._refresh_table()
+
+        # ── actions ─────────────────────────────────────────────────────────
+
+        def action_toggle_hide(self) -> None:
+            sid = self._cursor_sid()
+            if sid:
+                _toggle_in_set(HIDDEN_FILE, sid)
+                self._refresh_table()
+
+        def action_toggle_fav(self) -> None:
+            sid = self._cursor_sid()
+            if sid:
+                _toggle_in_set(FAVORITE_FILE, sid)
+                self._refresh_table()
+
+        def action_toggle_view(self) -> None:
+            _toggle_view_mode()
+            self._refresh_table()
+
+        def action_toggle_tree(self) -> None:
+            new_on = _toggle_tree_mode()
+            self.notify(
+                f"tree-mode: {'nested' if new_on else 'flat'} — restart recap to apply.",
+                title="Layout changed", timeout=3,
+            )
+            self._update_subtitle()
+
+        def action_toggle_cluster(self) -> None:
+            new_on = _toggle_cluster_mode()
+            self.notify(
+                f"cluster-mode: {'on' if new_on else 'off'} — restart recap to apply.",
+                title="Layout changed", timeout=3,
+            )
+            self._update_subtitle()
+
+        def action_preview_full(self) -> None:
+            self.preview_mode = "full"
+            self._update_preview(self._cursor_sid())
+
+        def action_preview_summary(self) -> None:
+            self.preview_mode = "summary"
+            self._update_preview(self._cursor_sid())
+
+        def action_cycle_sort(self, priority: str) -> None:
+            _cycle_sort_col(int(priority))
+            _apply_sort(all_sessions, _load_sort())
+            self._refresh_table()
+
+        def action_toggle_dir(self, priority: str) -> None:
+            _toggle_sort_dir(int(priority))
+            _apply_sort(all_sessions, _load_sort())
+            self._refresh_table()
+
     chosen = PickerApp().run()
     if chosen:
-        _resume_claude(chosen, sessions)
+        _resume_claude(chosen, all_sessions)
 
 
 def _resume_claude(full_id: str, sessions: list[dict]) -> None:
