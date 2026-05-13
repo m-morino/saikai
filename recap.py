@@ -304,13 +304,16 @@ def _apply_sort(sessions: list[dict], keys: list[dict]) -> None:
     favs = _load_favorites() if any(k["col"] == "fav" for k in active) else set()
 
     def keyfn(s: dict, col: str):
-        if col == "date":  return s.get("first_ts", "")
-        if col == "last":  return s.get("last_ts", "")
+        # All branches return a non-None comparable value, so sort() never
+        # raises TypeError on mixed None/str even when a session is missing
+        # a timestamp or other field.
+        if col == "date":  return s.get("first_ts") or ""
+        if col == "last":  return s.get("last_ts") or ""
         if col == "proj":  return (s.get("project_name") or "").lower()
         if col == "title": return (s.get("ai_title") or _first_msg(s) or "").lower()
-        if col == "turns": return s.get("n_turns", 0)
+        if col == "turns": return s.get("n_turns") or 0
         if col == "fav":   return 1 if s["id"] in favs else 0
-        if col == "topic": return s.get("primary_topic", "") or "~"
+        if col == "topic": return s.get("primary_topic") or "~"
         return 0
 
     for k in reversed(active):
@@ -1551,6 +1554,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
     all_sessions = list(sessions)
 
+    # Send Textual's internal logs to a file so we have a trail to inspect
+    # when something goes wrong inside the framework's event loop.
+    os.environ.setdefault("TEXTUAL_LOG", str(CACHE_DIR / "textual-debug.log"))
+
     class PickerApp(App):
         TITLE = "recap"
         BINDINGS = [
@@ -1843,7 +1850,31 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             _apply_sort(all_sessions, _load_sort())
             self._refresh_table()
 
-    chosen = PickerApp().run()
+    # Wrap the app's run() so a Textual / Rich crash never leaves the user
+    # at a frozen alternate screen with no way out. On exception: reset
+    # terminal modes, leave alternate screen, dump the traceback so we can
+    # actually see what blew up (the prior failure was 'screen disappears
+    # and doesn't come back' = unrecoverable terminal state).
+    try:
+        chosen = PickerApp().run()
+    except KeyboardInterrupt:
+        chosen = None
+    except Exception:
+        import traceback
+        # Aggressive recovery: leave alternate screen, disable all modes,
+        # finally full RIS (Reset to Initial State) as a last resort. Without
+        # this the user is stuck at a frozen alternate screen with no input
+        # echo — "doesn't come back".
+        sys.stderr.write("\033[?1049l")   # leave alternate screen
+        _reset_terminal_modes()
+        sys.stderr.write("\033c")          # RIS — last-ditch full reset
+        sys.stderr.flush()
+        log_path = CACHE_DIR / "textual-debug.log"
+        print(_c("\n  textual UI crashed:", RED), file=sys.stderr)
+        traceback.print_exc()
+        print(_c(f"  textual debug log: {log_path}", YELLOW), file=sys.stderr)
+        print(_c("  fall back to fzf with: recap --ui fzf", YELLOW), file=sys.stderr)
+        return
     if chosen:
         _resume_claude(chosen, all_sessions)
 
