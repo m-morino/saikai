@@ -1748,7 +1748,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # the "screen disappears when I click around" symptom: the click
             # was meant for a header but landed on a row, posted RowSelected,
             # exited the app, and launched claude.
-            Binding("enter", "resume", "Resume"),
+            # priority=True so Enter resumes regardless of which widget has
+            # focus — without it, focus on the Search Input swallows Enter
+            # into Input.Submitted and the picker never exits.
+            Binding("enter", "resume", "Resume", priority=True),
             Binding("ctrl+x", "toggle_hide", "Hide"),
             Binding("ctrl+p", "toggle_fav", "*Fav"),
             Binding("ctrl+r", "toggle_view", "Show hidden"),
