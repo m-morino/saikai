@@ -688,8 +688,26 @@ def short_id(sid: str) -> str:
     return sid[:8]
 
 
+def _cell_width(ch: str) -> int:
+    """Approximate terminal display cell count for a single char.
+
+    Counts box-drawing / geometric shapes / dingbats (0x2500-0x2BFF) and
+    CJK ranges (>= 0x2E80) as 2 cells. This is the East-Asian-Wide
+    convention used by WezTerm/Windows Terminal in CJK contexts, where
+    `●`, `◉`, `○`, `★`, `✗`, and box-drawing chars all render as 2
+    cells. Without this, mixed marker/no-marker rows misalign in the
+    tree view because recap thinks they're 1 cell but the terminal
+    paints 2."""
+    cp = ord(ch)
+    if 0x2500 <= cp <= 0x2BFF:
+        return 2
+    if cp > 0x2E80:
+        return 2
+    return 1
+
+
 def visible_len(s: str) -> int:
-    return len(_ANSI_RE.sub("", s))
+    return sum(_cell_width(ch) for ch in _ANSI_RE.sub("", s))
 
 
 def pad(s: str, width: int) -> str:
@@ -697,7 +715,7 @@ def pad(s: str, width: int) -> str:
 
 
 def truncate_visual(s: str, width: int) -> str:
-    """Truncate to visual width, accounting for wide chars (CJK = 2 cols) and ANSI escapes."""
+    """Truncate to visual width, accounting for wide chars (CJK + ambiguous symbols) and ANSI escapes."""
     out = []
     cur = 0
     i = 0
@@ -712,7 +730,7 @@ def truncate_visual(s: str, width: int) -> str:
             i = j
             continue
         ch = s[i]
-        w = 2 if ord(ch) > 0x2E80 else 1
+        w = _cell_width(ch)
         if cur + w > width:
             break
         out.append(ch)
@@ -887,6 +905,14 @@ def preview_session_full(session_id: str) -> None:
     _preview_impl(session_id, PREVIEW_FULL_DIR, _render_preview_full)
 
 
+# Width-stable placeholder for empty marker slots. The active markers
+# (●◉○★✗) are all East-Asian-Ambiguous → 2 cells in CJK-wide terminals
+# (WezTerm/Windows Terminal default for ja_JP). A plain ASCII space is only
+# 1 cell, so rows without a marker would shift left relative to rows with
+# one. Ideographic space (U+3000) is always 2 cells, so columns stay aligned.
+_MARKER_BLANK = "　"
+
+
 def _activity_marker(s: dict) -> str:
     """Activity column: open-busy / open-idle / active / recent."""
     if s.get("is_open"):
@@ -897,7 +923,7 @@ def _activity_marker(s: dict) -> str:
         return _c("●", GREEN)
     if s.get("is_recent"):
         return _c("○", YELLOW)
-    return " "
+    return _MARKER_BLANK
 
 
 def _state_marker(s: dict, hidden: set, favorites: set) -> str:
@@ -907,7 +933,7 @@ def _state_marker(s: dict, hidden: set, favorites: set) -> str:
         return _c("★", GOLD)
     if sid in hidden:
         return _c("✗", RED)
-    return " "
+    return _MARKER_BLANK
 
 
 def fmt_last_active(s: dict) -> str:
