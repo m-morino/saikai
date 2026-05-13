@@ -1702,18 +1702,25 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if show_project:
                     row.append(project_short(s["project_name"]))
                 row.append(short_id(s["id"]))
+                # Plain title — every cell in the column must be a plain str of
+                # comparable cell_len, otherwise DataTable's auto column width
+                # is computed per-row and rows render at different widths (the
+                # "only the selected row shows the full content" bug). Also
+                # collapse any newline / tab so a multi-line ai_title doesn't
+                # blow up the row to two terminal lines.
                 raw_title = (s.get("ai_title") or _first_msg(s) or "")[:80]
-                # Title cell: prepend tree prefix (with color via Text.from_ansi)
-                # or topic-cluster tag, depending on mode.
+                raw_title = (raw_title.replace("\n", " ")
+                                       .replace("\r", " ")
+                                       .replace("\t", " "))
                 if cluster_mode:
                     topic = (s.get("primary_topic") or "(no topic)")[:12].ljust(12)
-                    title_cell = Text.assemble(
-                        (f"[{topic}] ", "magenta"),
-                        (raw_title, ""),
-                    )
+                    title_cell = f"[{topic}] {raw_title}"
                 elif tree_mode and tree_prefixes.get(s["id"]):
-                    prefix_text = Text.from_ansi(tree_prefixes[s["id"]])
-                    title_cell = prefix_text + Text(raw_title)
+                    # Strip ANSI from the tree prefix so the cell stays a plain
+                    # str — the same prefix is already encoded structurally by
+                    # the leading characters (e.g. "|  +- ").
+                    prefix = _ANSI_RE.sub("", tree_prefixes[s["id"]])
+                    title_cell = f"{prefix}{raw_title}"
                 else:
                     title_cell = raw_title
                 row.append(title_cell)
