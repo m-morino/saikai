@@ -1645,18 +1645,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         return f"{base} {i}{arrow}"
                 return base
 
-            # Each column carries (label, key); key drives HeaderSelected
-            # routing. Keys starting with "_" are non-sortable (marker / id).
-            cols_spec: list[tuple[str, str]] = [
-                ("", "_marker"),
-                (col_label("date", "Start"), "date"),
-                (col_label("last", "Last"), "last"),
+            # Each column carries (label, key, width). Width is FIXED (not auto)
+            # so every row reserves the same cell width — Textual's auto-width
+            # path was producing per-row widths in our usage and rendering
+            # unselected rows as truncated mid-cell.
+            specs: list[tuple[str, str, int]] = [
+                ("", "_marker", 3),
+                (col_label("date", "Start"), "date", 13),
+                (col_label("last", "Last"), "last", 7),
             ]
             if show_project:
-                cols_spec.append((col_label("proj", "Project"), "proj"))
-            cols_spec.append(("ID", "_id"))
-            cols_spec.append((col_label("title", "Title"), "title"))
-            table.add_columns(*cols_spec)
+                specs.append((col_label("proj", "Project"), "proj", 17))
+            specs.append(("ID", "_id", 10))
+            specs.append((col_label("title", "Title"), "title", 80))
+            for label, key, width in specs:
+                table.add_column(label, key=key, width=width)
 
             query = self.query_one("#search", Input).value
             visible = self._filter(query)
@@ -1671,11 +1674,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             tree_prefixes: dict[str, str] = {}
 
             if cluster_mode:
-                # Mirror build_cluster_lines ordering: largest topic clusters first,
-                # (no topic) last; sessions inside each cluster newest first.
+                # Apply the user sort first so cluster members keep that order
+                # inside each group (stable sort below preserves it). Then
+                # bucket by primary topic with the cluster-ordering key.
+                _apply_sort(visible, _load_sort())
                 _assign_primary_topic(visible)
                 topic_count = Counter(s["primary_topic"] for s in visible)
-                visible = sorted(visible, key=lambda s: s["first_ts"], reverse=True)
                 visible.sort(key=lambda s: (
                     1 if not s["primary_topic"] else 0,
                     -topic_count[s["primary_topic"]] if s["primary_topic"] else 0,
