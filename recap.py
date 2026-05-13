@@ -1362,14 +1362,17 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"ctrl-f:change-preview({preview_full_cmd})",
                     f"ctrl-s:change-preview({preview_cmd})",
                 ]
-                # Sort controls — Ctrl-1/2/3 cycle the column at priority N,
-                # Alt-1/2/3 toggle that priority's direction. Reload re-applies
-                # the saved sort spec.
-                for n in (1, 2, 3):
+                # Sort controls. fzf in many distros doesn't recognise ctrl-1
+                # through ctrl-9 (terminal can't disambiguate the modifier), so
+                # we use the alt modifier exclusively:
+                #   Alt-1 / Alt-2 / Alt-3       cycle column at priority N
+                #   Alt-q / Alt-w / Alt-e       toggle priority N's direction
+                # Reload re-applies the saved sort spec.
+                for n, dkey in zip((1, 2, 3), ("q", "w", "e")):
                     bindings_list.append(
-                        f"ctrl-{n}:execute-silent(recap --cycle-sort {n})+reload({reload_cmd})")
+                        f"alt-{n}:execute-silent(recap --cycle-sort {n})+reload({reload_cmd})")
                     bindings_list.append(
-                        f"alt-{n}:execute-silent(recap --toggle-sort-dir {n})+reload({reload_cmd})")
+                        f"alt-{dkey}:execute-silent(recap --toggle-sort-dir {n})+reload({reload_cmd})")
                 bindings = ",".join(bindings_list)
 
                 view_tag = "show-hidden" if _get_view_mode() == "show-hidden" else "default"
@@ -1397,7 +1400,7 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                           f"Ctrl-r:hidden(now:{view_tag})  "
                           f"{layout_tag}  "
                           f"Ctrl-f/s:full/summary  Ctrl-C:cancel"
-                          f"\nCtrl-N:cycle sort col  Alt-N:toggle dir{sort_tag}")
+                          f"\nAlt-1/2/3:cycle sort  Alt-q/w/e:toggle dir{sort_tag}")
                 result = subprocess.run(
                     # Layout (default fzf, preview pane below):
                     #   top:    list pane (the session / topic selector)
@@ -2081,8 +2084,8 @@ def main():
                    help="Forget saved --days/--here/--all defaults. Does NOT clear "
                         "hidden/favorite/view-mode/tree-mode/cluster-mode/sort — "
                         "toggle those via Ctrl-x / Ctrl-p / Ctrl-r / Ctrl-t / Ctrl-g "
-                        "/ Ctrl-1..3 in the picker (or the matching --toggle-* / "
-                        "--cycle-sort / --reset-sort flags).")
+                        "/ Alt-1..3 / Alt-q..e in the picker (or the matching "
+                        "--toggle-* / --cycle-sort / --reset-sort flags).")
     p.add_argument("--save-defaults", action="store_true",
                    help="Persist the current --days/--here/--all values as new defaults. "
                         "Without this flag, CLI args are one-shot and saved options stay untouched.")
@@ -2121,10 +2124,10 @@ def main():
                         "Mutually exclusive with tree display.")
     p.add_argument("--cycle-sort", type=int, metavar="N", choices=[1, 2, 3],
                    help="Advance the Nth sort priority to the next column. Persistent. "
-                        "Same effect as Ctrl-N inside the picker.")
+                        "Same effect as Alt-N inside the picker.")
     p.add_argument("--toggle-sort-dir", type=int, metavar="N", choices=[1, 2, 3],
                    help="Toggle the Nth sort priority's direction (asc/desc). Persistent. "
-                        "Same effect as Alt-N inside the picker.")
+                        "Same effect as Alt-q/w/e (for priority 1/2/3) inside the picker.")
     p.add_argument("--reset-sort", action="store_true",
                    help="Reset all sort priorities to defaults (date desc, then none).")
     p.add_argument("--related", metavar="SESSION_ID",
