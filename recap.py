@@ -262,23 +262,33 @@ def _reset_sort() -> None:
 
 
 def _promote_sort_col(col: str) -> None:
-    """Promote `col` to priority 1. Excel-like: clicking a column repeatedly
-    toggles its direction; clicking a new column pushes the previous
-    priority-1 down to 2, the previous 2 down to 3, drops the old 3.
-    Date-like columns default to descending on first click; everything else
-    defaults to ascending."""
+    """3-state click cycle for a column at priority 1:
+        click 1 (new column) → default direction (desc for time/count, asc for text)
+        click 2 (same col)   → opposite direction
+        click 3 (same col)   → remove from sort spec (priorities 2/3 shift up)
+        click 4 (new again)  → back to click-1 state
+
+    Clicking a column that is NOT currently priority 1 promotes it: the
+    previous priority 1 becomes priority 2, the previous 2 becomes 3, the
+    previous 3 drops off. Duplicate columns are removed so the same key
+    can't occupy two priorities."""
     if col not in SORT_COLS or col == "-":
         return
     keys = _load_sort()
+    default_dir = "desc" if col in ("date", "last", "turns", "fav") else "asc"
+
     if keys[0]["col"] == col:
-        keys[0]["dir"] = "asc" if keys[0]["dir"] == "desc" else "desc"
+        current_dir = keys[0]["dir"]
+        if current_dir == default_dir:
+            # Click 2: flip to the opposite of the default.
+            keys[0]["dir"] = "asc" if default_dir == "desc" else "desc"
+        else:
+            # Click 3: remove this column; promote the lower priorities up.
+            keys = keys[1:] + [{"col": "-", "dir": "desc"}]
     else:
-        # Default direction picked so the first click feels natural: most
-        # recent first for time / large first for counts / A-Z for names.
-        new_dir = "desc" if col in ("date", "last", "turns", "fav") else "asc"
-        # Drop any prior occurrence so the same column doesn't appear twice.
+        # Click 1 on a fresh column.
         filtered = [k for k in keys if k["col"] != col]
-        keys = ([{"col": col, "dir": new_dir}] + filtered)[:3]
+        keys = ([{"col": col, "dir": default_dir}] + filtered)[:3]
         while len(keys) < 3:
             keys.append({"col": "-", "dir": "desc"})
     _save_sort(keys)
@@ -1546,6 +1556,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         BINDINGS = [
             Binding("escape", "quit", "Cancel"),
             Binding("ctrl+c", "quit", show=False),
+            # Resume only on Enter. We deliberately do NOT use RowSelected, so
+            # a stray mouse click on a row never triggers resume — that was
+            # the "screen disappears when I click around" symptom: the click
+            # was meant for a header but landed on a row, posted RowSelected,
+            # exited the app, and launched claude.
+            Binding("enter", "resume", "Resume"),
             Binding("ctrl+x", "toggle_hide", "Hide"),
             Binding("ctrl+p", "toggle_fav", "*Fav"),
             Binding("ctrl+r", "toggle_view", "Show hidden"),
@@ -1594,6 +1610,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     or q in (s.get("project_name") or "").lower()]
 
         def _refresh_table(self) -> None:
+            # Catch-all so a row-build exception (bad session dict, Textual
+            # rendering quirk, etc.) shows up as a toast instead of crashing
+            # the app and dumping the user back to the shell ("the screen
+            # disappears when I click around" bug).
+            try:
+                self._do_refresh_table()
+            except Exception as e:
+                import traceback
+                self.notify(
+                    f"refresh failed: {e!r}\n{traceback.format_exc()[-400:]}",
+                    severity="error", title="recap", timeout=15,
+                )
+
+        def _do_refresh_table(self) -> None:
             table = self.query_one("#table", DataTable)
             saved_cursor = table.cursor_row
             table.clear(columns=True)
@@ -1682,7 +1712,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 row.append(title_cell)
                 table.add_row(*row, key=s["id"])
                 n += 1
-            if n and saved_cursor < n:
+            if n and 0 <= saved_cursor < n:
                 try:
                     table.move_cursor(row=saved_cursor)
                 except Exception:
@@ -1735,20 +1765,30 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             sid = str(event.row_key.value) if event.row_key else None
             self._update_preview(sid)
 
-        def on_data_table_row_selected(self, event) -> None:
-            if event.row_key and event.row_key.value:
-                self.exit(str(event.row_key.value))
+        def action_resume(self) -> None:
+            sid = self._cursor_sid()
+            if sid:
+                self.exit(sid)
 
         def on_data_table_header_selected(self, event) -> None:
-            # Excel-like: click a sortable column header → that column becomes
-            # priority 1; click it again → direction toggles. Non-sortable
-            # columns (marker, ID) carry keys starting with "_" and are ignored.
-            col_key = str(event.column_key.value) if event.column_key else ""
-            if not col_key or col_key.startswith("_"):
-                return
-            _promote_sort_col(col_key)
-            _apply_sort(all_sessions, _load_sort())
-            self._refresh_table()
+            # Excel-like: click a sortable column → 3-state cycle
+            # (default-dir → opposite-dir → removed) at priority 1, pushing
+            # other priorities down. Non-sortable columns (marker, ID) carry
+            # keys starting with "_" and are ignored. Wrapped in try/except so
+            # a sort/render failure shows as a toast, never tears the app down.
+            try:
+                col_key = str(event.column_key.value) if event.column_key else ""
+                if not col_key or col_key.startswith("_"):
+                    return
+                _promote_sort_col(col_key)
+                _apply_sort(all_sessions, _load_sort())
+                self._refresh_table()
+            except Exception as e:
+                import traceback
+                self.notify(
+                    f"sort failed: {e!r}\n{traceback.format_exc()[-400:]}",
+                    severity="error", title="recap", timeout=15,
+                )
 
         def on_input_changed(self, event) -> None:
             self._refresh_table()
