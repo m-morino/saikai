@@ -1651,10 +1651,35 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # inside each group (stable sort below preserves it).
                 _apply_sort(visible, _load_sort())
                 _assign_primary_topic(visible)
+                # Coarsen the grouping: clusters smaller than MIN are folded
+                # into "(other)" so the user isn't drowning in 1-2-session
+                # buckets. RECAP_CLUSTER_MIN_SIZE controls the threshold;
+                # default 5 matches the existing FREQ_CWD_MIN_DEFAULT for
+                # symmetry.
+                try:
+                    min_size = max(1, int(os.environ.get("RECAP_CLUSTER_MIN_SIZE") or 5))
+                except ValueError:
+                    min_size = 5
                 topic_count = Counter(s["primary_topic"] for s in visible)
+                for s in visible:
+                    pt = s["primary_topic"]
+                    if pt and topic_count[pt] < min_size:
+                        s["primary_topic"] = "(other)"
+                # Recompute after relabeling so (other) has a count too.
+                topic_count = Counter(s["primary_topic"] for s in visible)
+                # Sort key buckets:
+                #   0 = named cluster (sorted by size desc, then name asc)
+                #   1 = "(other)"     (single small-cluster bucket)
+                #   2 = ""            (sessions with no cached topics)
+                def _bucket(pt: str) -> int:
+                    if not pt:
+                        return 2
+                    if pt == "(other)":
+                        return 1
+                    return 0
                 visible.sort(key=lambda s: (
-                    1 if not s["primary_topic"] else 0,
-                    -topic_count[s["primary_topic"]] if s["primary_topic"] else 0,
+                    _bucket(s["primary_topic"]),
+                    -topic_count[s["primary_topic"]] if _bucket(s["primary_topic"]) == 0 else 0,
                     s["primary_topic"],
                 ))
             elif tree_mode:
@@ -1674,8 +1699,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return base
 
             # Column definitions. Fixed widths (Textual auto-width was producing
-            # per-row widths in our cell mix). The Topic column appears only in
-            # cluster mode — clicking its header sorts by topic.
+            # per-row widths in our cell mix). The ID column is intentionally
+            # NOT included — the SID is already visible in the preview pane
+            # and the row's RowKey carries it for resume; the user said it's
+            # not useful as a sort/search target.
             specs: list[tuple[str, str, int]] = [
                 ("", "_marker", 3),
                 (col_label("date", "Start"), "date", 13),
@@ -1683,7 +1710,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             ]
             if show_project:
                 specs.append((col_label("proj", "Project"), "proj", 17))
-            specs.append(("ID", "_id", 10))
             if cluster_mode:
                 specs.append((col_label("topic", "Topic"), "topic", 16))
             specs.append((col_label("title", "Title"), "title", 80))
@@ -1703,7 +1729,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 row = [marker, fmt_ts(s["first_ts"]), fmt_last_active(s)]
                 if show_project:
                     row.append(project_short(s["project_name"]))
-                row.append(short_id(s["id"]))
                 if cluster_mode:
                     row.append((s.get("primary_topic") or "(none)")[:14])
                 # Plain title cell; collapse any newline/tab so a multi-line
@@ -2474,7 +2499,10 @@ def main():
                "  RECAP_NO_AUTO_PERMISSION  if set, do NOT auto-apply --permission-mode auto\n"
                "                            on resume even when the target cwd is frequent.\n"
                "  RECAP_FREQ_CWD_MIN=N      minimum session count to flag a cwd as\n"
-               "                            \"frequent\" for auto-permission (default 5).",
+               "                            \"frequent\" for auto-permission (default 5).\n"
+               "  RECAP_CLUSTER_MIN_SIZE=N  minimum session count for a topic cluster to\n"
+               "                            display as its own group; smaller clusters\n"
+               "                            collapse into \"(other)\" (default 5).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # default=None on persisted flags so we can detect "not provided" and use
