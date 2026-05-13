@@ -95,6 +95,7 @@ SUMMARY_MODEL = "haiku"
 HIDDEN_FILE = CACHE_DIR / "hidden.json"
 FAVORITE_FILE = CACHE_DIR / "favorite.json"
 VIEW_MODE_FILE = CACHE_DIR / "view-mode.txt"
+TREE_MODE_FILE = CACHE_DIR / "tree-mode.txt"
 OPTIONS_FILE = CACHE_DIR / "options.json"
 PARSED_DIR = CACHE_DIR / "parsed"
 PREVIEW_DIR = CACHE_DIR / "preview"
@@ -150,6 +151,21 @@ def _toggle_view_mode() -> str:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     VIEW_MODE_FILE.write_text(new_mode, encoding="utf-8")
     return new_mode
+
+
+def _get_tree_mode() -> bool:
+    """Saved nested-tree display preference. False (flat) by default."""
+    try:
+        return TREE_MODE_FILE.read_text(encoding="utf-8").strip() == "on"
+    except Exception:
+        return False
+
+
+def _toggle_tree_mode() -> bool:
+    new = not _get_tree_mode()
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    TREE_MODE_FILE.write_text("on" if new else "off", encoding="utf-8")
+    return new
 
 def _load_cache(sid: str, mtime: float) -> str | None:
     d = _read_json(CACHE_DIR / f"{sid}.json", None)
@@ -1048,18 +1064,36 @@ def _reset_terminal_modes() -> None:
 FREQ_CWD_MIN_DEFAULT = 5
 
 
+def _canonical_workspace(cwd: str) -> str:
+    """Collapse a git worktree path back to its parent repo.
+
+    The user thinks of `feature-x` as a branch of `project-one`, but recap sees
+    `project-one/.worktrees/feature-x/` as a distinct cwd. Without this, every
+    worktree splits its parent repo's session count, so a workspace the user
+    visits constantly (just on different branches) can fall below the frequent
+    threshold. Collapse to the parent so the count reflects user intent."""
+    if not cwd:
+        return cwd
+    norm = _norm_cwd(cwd)
+    marker = os.sep + ".worktrees" + os.sep
+    idx = norm.find(marker)
+    return norm[:idx] if idx >= 0 else norm
+
+
 def _frequent_cwds(sessions: list[dict]) -> set[str]:
-    """Return the set of normalised cwds that appear in >= N sessions.
+    """Return the set of normalised workspaces that appear in >= N sessions.
 
     Used to identify "trusted" working directories (the user's own repos they
     return to repeatedly) so that resuming a session there can auto-apply
     --permission-mode auto, avoiding the per-tool-use approval prompts that
-    interrupt flow in well-known projects."""
+    interrupt flow in well-known projects. Worktrees are folded into their
+    parent repo via `_canonical_workspace` so branch-switching doesn't split
+    the count."""
     try:
         min_count = max(2, int(os.environ.get("RECAP_FREQ_CWD_MIN") or FREQ_CWD_MIN_DEFAULT))
     except ValueError:
         min_count = FREQ_CWD_MIN_DEFAULT
-    counts = Counter(_norm_cwd(s.get("cwd") or "") for s in sessions)
+    counts = Counter(_canonical_workspace(s.get("cwd") or "") for s in sessions)
     return {cwd for cwd, n in counts.items() if cwd and n >= min_count}
 
 
@@ -1096,12 +1130,15 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"ctrl-x:execute-silent(recap --hide {{2}})+reload({reload_cmd})",
                     f"ctrl-p:execute-silent(recap --favorite {{2}})+reload({reload_cmd})",
                     f"ctrl-r:execute-silent(recap --toggle-view)+reload({reload_cmd})",
+                    f"ctrl-t:execute-silent(recap --toggle-tree)+reload({reload_cmd})",
                     f"ctrl-f:change-preview({preview_full_cmd})",
                     f"ctrl-s:change-preview({preview_cmd})",
                 ])
                 view_tag = "show-hidden" if _get_view_mode() == "show-hidden" else "default"
+                tree_tag = "nested" if use_tree else "flat"
                 header = (f"Enter:resume  Ctrl-p:★fav  Ctrl-x:hide  "
-                          f"Ctrl-r:toggle-hidden(now:{view_tag})  "
+                          f"Ctrl-r:hidden(now:{view_tag})  "
+                          f"Ctrl-t:tree(now:{tree_tag})  "
                           f"Ctrl-f/s:full/summary  Ctrl-C:cancel")
                 result = subprocess.run(
                     ["fzf", "--ansi", "--no-sort", "--reverse",
@@ -1186,7 +1223,7 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     auto_perm_note = ""
     if (target_cwd
             and not os.environ.get("RECAP_NO_AUTO_PERMISSION")
-            and _norm_cwd(target_cwd) in _frequent_cwds(sessions)):
+            and _canonical_workspace(target_cwd) in _frequent_cwds(sessions)):
         extra_args = ["--permission-mode", "auto"]
         auto_perm_note = _c("  [--permission-mode auto: frequent cwd]", DIM)
 
@@ -1726,8 +1763,9 @@ def _tree_walk(sessions: list[dict]) -> list[tuple[dict, str]]:
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     p = argparse.ArgumentParser(
-        description="Claude Code session history viewer  "
-                    "(--days/--here/--all are one-shot; pass --save-defaults to persist)",
+        description="Claude Code session history viewer. Shows all history by default; "
+                    "use --days N to limit. Filters (--days/--here/--all) are one-shot "
+                    "unless --save-defaults is also passed.",
         epilog="Environment variables:\n"
                "  RECAP_RESUME=1            set on the resumed `claude` child so teams-notify\n"
                "                            hook suppresses its idle-prompt nag.\n"
@@ -1745,8 +1783,8 @@ def main():
             raise argparse.ArgumentTypeError(f"--days must be >= 0 (got {n})")
         return n
     p.add_argument("--days", type=_nonneg_int, default=None, metavar="N",
-                   help="Show sessions from the last N days (0 = all). One-shot unless "
-                        "--save-defaults is also passed.")
+                   help="Limit to the last N days. Omit (or pass 0) for full history. "
+                        "One-shot unless --save-defaults is also passed.")
     p.add_argument("--here", "--this-project-only", action="store_true",
                    default=None, dest="here",
                    help="Show only sessions for the current project")
@@ -1782,7 +1820,10 @@ def main():
     p.add_argument("--favorite", metavar="SESSION_ID",
                    help="Toggle favorite (★) state for a session")
     p.add_argument("--toggle-view", action="store_true",
-                   help="Toggle default/show-hidden view mode")
+                   help="Toggle saved default/show-hidden view mode (persistent).")
+    p.add_argument("--toggle-tree", action="store_true",
+                   help="Toggle saved flat/nested tree-display mode (persistent). "
+                        "Same effect as Ctrl-t inside the picker.")
     p.add_argument("--related", metavar="SESSION_ID",
                    help="Show sessions related to SESSION_ID with confidence scores and reasons")
     p.add_argument("--tree", action="store_true",
@@ -1815,6 +1856,11 @@ def main():
         new_mode = _toggle_view_mode()
         color = YELLOW if new_mode == "show-hidden" else GREEN
         print(f"  view-mode: {_c(new_mode, color)}", file=sys.stderr)
+        return
+    if args.toggle_tree:
+        new_on = _toggle_tree_mode()
+        label = "nested (tree)" if new_on else "flat"
+        print(f"  tree-mode: {_c(label, YELLOW if new_on else GREEN)}", file=sys.stderr)
         return
     # --sidechain SID: in-session subagent tree. Handled here (no need to load
     # all sessions across the project — we open the target JSONL directly).
@@ -1934,9 +1980,11 @@ def main():
             s["parent_score"] = 0.0
             s["parent_reasons"] = []
 
-    # --tree controls *display* — flat list vs nested tree in fzf. The forest
-    # itself is built unconditionally above for the preview header.
-    use_tree = args.tree and len(sessions) <= 1000
+    # Display mode (flat vs nested): saved tree-mode is the source of truth so
+    # `Ctrl-t` inside the picker can toggle between them via reload. CLI --tree
+    # is a one-shot override for the initial invocation only — it is NOT carried
+    # into reload_args, so a Ctrl-t toggle wins.
+    use_tree = (args.tree or _get_tree_mode()) and len(sessions) <= 1000
     flat = not use_tree
     if args.list:
         # Emit fzf-formatted lines without launching fzf (used by reload)
@@ -1960,8 +2008,10 @@ def main():
             reload_args.append("--here")
         if args.project:
             reload_args += ["--project", args.project]
-        if args.tree:
-            reload_args.append("--tree")
+        # Intentionally NOT propagating --tree into reload_args: the saved
+        # tree-mode (toggled via Ctrl-t inside the picker) is the source of
+        # truth on reload. Otherwise an initial `recap --tree` would override
+        # subsequent toggles forever.
         fzf_pick(sessions, repo, args.all_projects, flat=flat, reload_args=reload_args)
 
 
