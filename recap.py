@@ -1351,11 +1351,18 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
             s["primary_topic"] = assignments.get(s["id"], "")
         return
 
+    # Each input line gets the title PLUS the per-session topic keywords
+    # the earlier Haiku extraction produced. The classifier sees concrete
+    # vocabulary already attached to each session and can group on those
+    # keywords directly — gives noticeably more specific themes than title
+    # alone (which buries the topic in narrative prose).
     items: list[str] = []
     for s in targets:
         sid = s["id"][:8]
         title = (s.get("ai_title") or _first_msg(s) or "").replace("\n", " ")[:120]
-        items.append(f"[{sid}] {title}")
+        topics = ", ".join((s.get("topics") or [])[:5])
+        items.append(f"[{sid}] {title} | topics: {topics}" if topics
+                     else f"[{sid}] {title}")
 
     existing_themes = cache.get("clusters") or []
     theme_hint = ""
@@ -1378,13 +1385,23 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
     lo = max(3, target_n - 2)
     hi = min(12, target_n + 2)
     prompt = (
-        f"Below are {len(items)} Claude Code session titles. Group them into "
-        f"about {target_n} coherent themes (between {lo} and {hi}, choose the "
-        "number that gives the cleanest grouping) that describe the WORK "
-        "being done. Themes should be short English nouns / noun-phrases "
-        "(e.g. 'email drafting', 'recap development', 'meeting scheduling'). "
-        "Every session MUST be assigned to exactly one theme — no 'other' / "
-        "'misc' / 'general' bucket. Reply with ONLY valid JSON, no prose:\n"
+        f"Group {len(items)} Claude Code sessions into about {target_n} "
+        f"(between {lo} and {hi}) coherent themes describing the WORK done.\n\n"
+        "RULES:\n"
+        "1. Theme names are SPECIFIC work areas — pick the most concrete\n"
+        "   label that still covers ~10-30 sessions.\n"
+        "     GOOD: 'recap CLI development', 'meeting-room booking',\n"
+        "           'patent classification (Salesforce)', 'email drafting'.\n"
+        "     BAD : 'tool development' (too generic), 'personal\n"
+        "           productivity' (vague), 'general work', 'misc'.\n"
+        "2. Every session must land in exactly one theme. No 'other' or\n"
+        "   catch-all bucket. If a theme would only contain 1-2 sessions,\n"
+        "   merge those into the nearest larger theme instead.\n"
+        "3. Themes must be semantically distinct from each other — avoid\n"
+        "   pairs like 'work-tools development' + 'tool development'.\n"
+        "4. Use the 'topics:' keywords on each line as your primary signal;\n"
+        "   the title is supporting context.\n\n"
+        "Reply with ONLY valid JSON, no prose:\n"
         '{"clusters": ["theme1", "theme2", ...], '
         '"assignments": {"<8-char-sid>": "<theme>", ...}}'
         f"{theme_hint}\n\nSessions:\n" + "\n".join(items)
@@ -2184,6 +2201,11 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
     except FileNotFoundError:
         print(_c("  error: claude not on PATH", RED), file=sys.stderr)
         rc = 127
+    except KeyboardInterrupt:
+        # Ctrl-C while claude is running is a normal user exit — claude
+        # already received the signal and is winding down. Don't dump a
+        # Python traceback over its shutdown output.
+        rc = 130   # POSIX convention for SIGINT (128 + 2)
     finally:
         _reset_terminal_modes()
     sys.exit(rc)
