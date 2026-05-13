@@ -707,19 +707,14 @@ def short_id(sid: str) -> str:
 def _cell_width(ch: str) -> int:
     """Approximate terminal display cell count for a single char.
 
-    Counts box-drawing / geometric shapes / dingbats (0x2500-0x2BFF) and
-    CJK ranges (>= 0x2E80) as 2 cells. This is the East-Asian-Wide
-    convention used by WezTerm/Windows Terminal in CJK contexts, where
-    `●`, `◉`, `○`, `★`, `✗`, and box-drawing chars all render as 2
-    cells. Without this, mixed marker/no-marker rows misalign in the
-    tree view because recap thinks they're 1 cell but the terminal
-    paints 2."""
-    cp = ord(ch)
-    if 0x2500 <= cp <= 0x2BFF:
-        return 2
-    if cp > 0x2E80:
-        return 2
-    return 1
+    Treats only "always wide" code-point ranges as 2 cells (CJK proper,
+    Hangul, fullwidth forms — all > 0x2E80). East-Asian-Ambiguous chars
+    like `★ ◉ ● ○ ✗` and box-drawing `│ └ ├ ─` are LEFT at 1 cell because
+    WezTerm/Windows Terminal default to narrow for them, and treating them
+    as 2 cells caused favorite/activity rows to mis-align relative to empty
+    rows (the empty placeholder `\\u3000` would always be 2 cells, but
+    `★` would be 1 cell, so columns drifted by 1)."""
+    return 2 if ord(ch) > 0x2E80 else 1
 
 
 def visible_len(s: str) -> int:
@@ -889,6 +884,11 @@ def _write_preview_cache(s: dict) -> None:
 
 def _preview_impl(session_id: str, cache_dir: Path, render) -> None:
     sid = _trim_sid(session_id)
+    if not sid:
+        # Cluster-mode group-header / separator rows carry an empty SID column.
+        # Returning silently avoids fzf spinning a "loading" indicator while
+        # it waits for the preview command to do nothing useful.
+        return
     # Exact cache hit (fzf passes the full UUID — fast path)
     cache_file = cache_dir / f"{sid}.txt"
     if cache_file.exists():
@@ -921,12 +921,11 @@ def preview_session_full(session_id: str) -> None:
     _preview_impl(session_id, PREVIEW_FULL_DIR, _render_preview_full)
 
 
-# Width-stable placeholder for empty marker slots. The active markers
-# (●◉○★✗) are all East-Asian-Ambiguous → 2 cells in CJK-wide terminals
-# (WezTerm/Windows Terminal default for ja_JP). A plain ASCII space is only
-# 1 cell, so rows without a marker would shift left relative to rows with
-# one. Ideographic space (U+3000) is always 2 cells, so columns stay aligned.
-_MARKER_BLANK = "　"
+# Empty marker placeholder. WezTerm/Windows Terminal default to NARROW for
+# East-Asian-Ambiguous chars (★◉●○✗), so a marker is 1 cell wide. Use an
+# ASCII space (also 1 cell) to align with that — using 　 here caused
+# favorite/activity rows to gain an extra cell relative to empty rows.
+_MARKER_BLANK = " "
 
 
 def _activity_marker(s: dict) -> str:
@@ -1236,9 +1235,9 @@ def build_cluster_lines(sessions: list[dict], repo: Path | None,
             # member rows in addition to the header.
             lines.append(f"{disp}\t{s['id']}\t{label}  {searchable}")
             _write_preview_cache(s)
-        lines.append("\t\t")    # blank visual separator (empty SID → no-op on Enter)
-    if lines and lines[-1] == "\t\t":
-        lines.pop()
+        # No blank separator between groups: fzf would still spin its preview
+        # spinner on empty-SID rows on every cursor pass. The colored group
+        # header already provides enough visual delimitation.
     return lines
 
 
@@ -1295,7 +1294,11 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                           f"{layout_tag}  "
                           f"Ctrl-f/s:full/summary  Ctrl-C:cancel")
                 result = subprocess.run(
-                    ["fzf", "--ansi", "--no-sort", "--reverse",
+                    # --layout=reverse-list puts the result list at the top and
+                    # the prompt + header (= keybinding hints) at the BOTTOM of
+                    # the screen, so the user's eye reads the recent sessions
+                    # first and the shortcuts stay near the cursor.
+                    ["fzf", "--ansi", "--no-sort", "--layout=reverse-list",
                      "--delimiter=\t", "--with-nth=1", "--nth=1,3",
                      "--preview", preview_cmd,
                      "--preview-window", "right:55%:wrap",
