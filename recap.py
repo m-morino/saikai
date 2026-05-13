@@ -1635,6 +1635,34 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             saved_cursor = table.cursor_row
             table.clear(columns=True)
 
+            # Read state first; layout mode decides whether the Topic column
+            # is added, so we need to know it before defining columns.
+            query = self.query_one("#search", Input).value
+            visible = self._filter(query)
+            hidden = _load_hidden()
+            favorites = _load_favorites()
+            view_mode = _get_view_mode()
+            tree_mode = _get_tree_mode() and len(all_sessions) <= 1000
+            cluster_mode = _get_cluster_mode()
+            tree_prefixes: dict[str, str] = {}
+
+            if cluster_mode:
+                # Apply the user sort first so cluster members keep that order
+                # inside each group (stable sort below preserves it).
+                _apply_sort(visible, _load_sort())
+                _assign_primary_topic(visible)
+                topic_count = Counter(s["primary_topic"] for s in visible)
+                visible.sort(key=lambda s: (
+                    1 if not s["primary_topic"] else 0,
+                    -topic_count[s["primary_topic"]] if s["primary_topic"] else 0,
+                    s["primary_topic"],
+                ))
+            elif tree_mode:
+                walked = _tree_walk(visible)
+                tree_prefixes = {s["id"]: p for s, p in walked}
+                visible = [s for s, _ in walked]
+            # else: keep main()'s sort order (date desc + user sort spec)
+
             # Column labels carry a sort indicator (priority + direction arrow)
             # so a glance at the header tells the user the current sort spec.
             sort_keys = _load_sort()
@@ -1645,10 +1673,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         return f"{base} {i}{arrow}"
                 return base
 
-            # Each column carries (label, key, width). Width is FIXED (not auto)
-            # so every row reserves the same cell width — Textual's auto-width
-            # path was producing per-row widths in our usage and rendering
-            # unselected rows as truncated mid-cell.
+            # Column definitions. Fixed widths (Textual auto-width was producing
+            # per-row widths in our cell mix). The Topic column appears only in
+            # cluster mode — clicking its header sorts by topic.
             specs: list[tuple[str, str, int]] = [
                 ("", "_marker", 3),
                 (col_label("date", "Start"), "date", 13),
@@ -1657,40 +1684,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if show_project:
                 specs.append((col_label("proj", "Project"), "proj", 17))
             specs.append(("ID", "_id", 10))
+            if cluster_mode:
+                specs.append((col_label("topic", "Topic"), "topic", 16))
             specs.append((col_label("title", "Title"), "title", 80))
             for label, key, width in specs:
                 table.add_column(label, key=key, width=width)
-
-            query = self.query_one("#search", Input).value
-            visible = self._filter(query)
-            hidden = _load_hidden()
-            favorites = _load_favorites()
-            view_mode = _get_view_mode()
-
-            # Layout mode is read fresh on every refresh so Ctrl-t / Ctrl-g
-            # toggles take effect in-app without restarting recap.
-            tree_mode = _get_tree_mode() and len(all_sessions) <= 1000
-            cluster_mode = _get_cluster_mode()
-            tree_prefixes: dict[str, str] = {}
-
-            if cluster_mode:
-                # Apply the user sort first so cluster members keep that order
-                # inside each group (stable sort below preserves it). Then
-                # bucket by primary topic with the cluster-ordering key.
-                _apply_sort(visible, _load_sort())
-                _assign_primary_topic(visible)
-                topic_count = Counter(s["primary_topic"] for s in visible)
-                visible.sort(key=lambda s: (
-                    1 if not s["primary_topic"] else 0,
-                    -topic_count[s["primary_topic"]] if s["primary_topic"] else 0,
-                    s["primary_topic"],
-                ))
-            elif tree_mode:
-                # Forest walk gives pre-order [(session, ansi_prefix), ...]
-                walked = _tree_walk(visible)
-                tree_prefixes = {s["id"]: p for s, p in walked}
-                visible = [s for s, _ in walked]
-            # else: keep main()'s sort order (date desc + user sort spec)
 
             n = 0
             for s in visible:
@@ -1706,23 +1704,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if show_project:
                     row.append(project_short(s["project_name"]))
                 row.append(short_id(s["id"]))
-                # Plain title — every cell in the column must be a plain str of
-                # comparable cell_len, otherwise DataTable's auto column width
-                # is computed per-row and rows render at different widths (the
-                # "only the selected row shows the full content" bug). Also
-                # collapse any newline / tab so a multi-line ai_title doesn't
-                # blow up the row to two terminal lines.
+                if cluster_mode:
+                    row.append((s.get("primary_topic") or "(none)")[:14])
+                # Plain title cell; collapse any newline/tab so a multi-line
+                # ai_title doesn't push the row to multiple terminal lines.
                 raw_title = (s.get("ai_title") or _first_msg(s) or "")[:80]
                 raw_title = (raw_title.replace("\n", " ")
                                        .replace("\r", " ")
                                        .replace("\t", " "))
-                if cluster_mode:
-                    topic = (s.get("primary_topic") or "(no topic)")[:12].ljust(12)
-                    title_cell = f"[{topic}] {raw_title}"
-                elif tree_mode and tree_prefixes.get(s["id"]):
+                if tree_mode and tree_prefixes.get(s["id"]):
                     # Strip ANSI from the tree prefix so the cell stays a plain
-                    # str — the same prefix is already encoded structurally by
-                    # the leading characters (e.g. "|  +- ").
+                    # str of consistent width.
                     prefix = _ANSI_RE.sub("", tree_prefixes[s["id"]])
                     title_cell = f"{prefix}{raw_title}"
                 else:
