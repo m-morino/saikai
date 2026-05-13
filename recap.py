@@ -1291,14 +1291,16 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                           f"{layout_tag}  "
                           f"Ctrl-f/s:full/summary  Ctrl-C:cancel")
                 result = subprocess.run(
-                    # --layout=reverse-list puts the result list at the top and
-                    # the prompt + header (= keybinding hints) at the BOTTOM of
-                    # the screen, so the user's eye reads the recent sessions
-                    # first and the shortcuts stay near the cursor.
-                    ["fzf", "--ansi", "--no-sort", "--layout=reverse-list",
+                    # --preview-window=top:55%:wrap puts the preview pane on top
+                    # so the bottom of the screen is entirely the list pane —
+                    # which means the prompt + header (= keybinding hints) sit
+                    # at the very bottom in their FULL screen width, never
+                    # truncated by the preview pane. Default layout (prompt at
+                    # the bottom) is intentional here for the same reason.
+                    ["fzf", "--ansi", "--no-sort",
                      "--delimiter=\t", "--with-nth=1", "--nth=1,3",
                      "--preview", preview_cmd,
-                     "--preview-window", "right:55%:wrap",
+                     "--preview-window", "top:55%:wrap",
                      "--bind", bindings,
                      "--header", header,
                      "--prompt", "Search> "],
@@ -1833,8 +1835,9 @@ def cmd_sidechain_tree(target_id_prefix: str) -> None:
         description = meta.get("description", "")
 
         is_last = (i == len(summaries) - 1)
-        branch = "└─ " if is_last else "├─ "
-        cont = "   " if is_last else "│  "
+        # ASCII glyphs (same rationale as _tree_walk) for terminal-width safety
+        branch = "\\- " if is_last else "+- "
+        cont = "   " if is_last else "|  "
         ts = (summary["first_ts"] or "")[:19].replace("T", " ")
         head = (_c(branch, GRAY) + _c(agent_type, CYAN, BOLD) +
                 _c(f"  ({summary['agent_id'][:8]}, {summary['n_msgs']} msgs, {ts})", DIM))
@@ -1898,26 +1901,33 @@ def _tree_walk(sessions: list[dict]) -> list[tuple[dict, str]]:
 
     out: list[tuple[dict, str]] = []
 
+    # Tree glyphs are ASCII (`| \-  +- \.`) instead of box-drawing `│ └─ ├─ └┄`
+    # so the prefix has predictable 1-cell-per-char width. Box-drawing chars
+    # are East-Asian-Ambiguous and WezTerm/Windows Terminal render them at 1
+    # or 2 cells depending on `cjk_width` settings — which recap can't probe,
+    # so deep tree branches drifted by 1 cell per level when the terminal
+    # disagreed with our static assumption.
     def walk(sid: str, prefix: str, is_last: bool):
         s = by_id.get(sid)
         if not s:
             return
         if prefix:
-            base = "└─" if is_last else "├─"
+            base = "\\-" if is_last else "+-"
             score = s.get("parent_score", 0.0)
             if score >= 0.7:
                 glyph = _c(base, GREEN)
             elif score >= 0.4:
                 glyph = _c(base, YELLOW)
             else:
-                glyph = _c(base.replace("─", "┄"), GRAY)
+                # weak parent link: low-confidence glyph (dot instead of dash)
+                glyph = _c(base[0] + ".", GRAY)
             node_prefix = prefix + glyph + " "
         else:
             node_prefix = ""
         out.append((s, node_prefix))
         kids = sorted(children.get(sid, []), key=newest_in_tree, reverse=True)
         for i, kid in enumerate(kids):
-            cont = "   " if is_last else "│  "
+            cont = "   " if is_last else "|  "
             walk(kid, prefix + cont, i == len(kids) - 1)
 
     roots.sort(key=newest_in_tree, reverse=True)
