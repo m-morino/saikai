@@ -1491,15 +1491,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
       └──────────────────┴──────────────────────┘
       Footer (key bindings)
 
-    Bindings (fzf parity):
+    All toggles reflect in-app (no restart required):
       Enter        resume                Esc / Ctrl-C  cancel
       Ctrl-x       hide/unhide row       Ctrl-p        favorite toggle
-      Ctrl-r       toggle hidden vis     Ctrl-t        toggle tree mode *
-      Ctrl-g       toggle cluster *      Ctrl-f / s    full / summary preview
+      Ctrl-r       toggle hidden vis     Ctrl-t        toggle tree display
+      Ctrl-g       toggle cluster        Ctrl-f / s    full / summary preview
       Alt-1/2/3    cycle sort col N      Alt-q/w/e     toggle priority N dir
-
-    *  tree / cluster changes are saved but require a restart to apply
-       (the in-app refresh is row-level; mode changes restructure the list).
     """
     try:
         from textual.app import App, ComposeResult
@@ -1524,8 +1521,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("ctrl+x", "toggle_hide", "Hide"),
             Binding("ctrl+p", "toggle_fav", "*Fav"),
             Binding("ctrl+r", "toggle_view", "Show hidden"),
-            Binding("ctrl+t", "toggle_tree", "Tree*"),
-            Binding("ctrl+g", "toggle_cluster", "Cluster*"),
+            Binding("ctrl+t", "toggle_tree", "Tree"),
+            Binding("ctrl+g", "toggle_cluster", "Cluster"),
             Binding("ctrl+f", "preview_full", "Full"),
             Binding("ctrl+s", "preview_summary", "Summary"),
             Binding("alt+1", "cycle_sort('1')", "Sort1"),
@@ -1583,6 +1580,31 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             hidden = _load_hidden()
             favorites = _load_favorites()
             view_mode = _get_view_mode()
+
+            # Layout mode is read fresh on every refresh so Ctrl-t / Ctrl-g
+            # toggles take effect in-app without restarting recap.
+            tree_mode = _get_tree_mode() and len(all_sessions) <= 1000
+            cluster_mode = _get_cluster_mode()
+            tree_prefixes: dict[str, str] = {}
+
+            if cluster_mode:
+                # Mirror build_cluster_lines ordering: largest topic clusters first,
+                # (no topic) last; sessions inside each cluster newest first.
+                _assign_primary_topic(visible)
+                topic_count = Counter(s["primary_topic"] for s in visible)
+                visible = sorted(visible, key=lambda s: s["first_ts"], reverse=True)
+                visible.sort(key=lambda s: (
+                    1 if not s["primary_topic"] else 0,
+                    -topic_count[s["primary_topic"]] if s["primary_topic"] else 0,
+                    s["primary_topic"],
+                ))
+            elif tree_mode:
+                # Forest walk gives pre-order [(session, ansi_prefix), ...]
+                walked = _tree_walk(visible)
+                tree_prefixes = {s["id"]: p for s, p in walked}
+                visible = [s for s, _ in walked]
+            # else: keep main()'s sort order (date desc + user sort spec)
+
             n = 0
             for s in visible:
                 is_hidden = s["id"] in hidden
@@ -1597,7 +1619,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if show_project:
                     row.append(project_short(s["project_name"]))
                 row.append(short_id(s["id"]))
-                row.append((s.get("ai_title") or _first_msg(s) or "")[:80])
+                raw_title = (s.get("ai_title") or _first_msg(s) or "")[:80]
+                # Title cell: prepend tree prefix (with color via Text.from_ansi)
+                # or topic-cluster tag, depending on mode.
+                if cluster_mode:
+                    topic = (s.get("primary_topic") or "(no topic)")[:12].ljust(12)
+                    title_cell = Text.assemble(
+                        (f"[{topic}] ", "magenta"),
+                        (raw_title, ""),
+                    )
+                elif tree_mode and tree_prefixes.get(s["id"]):
+                    prefix_text = Text.from_ansi(tree_prefixes[s["id"]])
+                    title_cell = prefix_text + Text(raw_title)
+                else:
+                    title_cell = raw_title
+                row.append(title_cell)
                 table.add_row(*row, key=s["id"])
                 n += 1
             if n and saved_cursor < n:
@@ -1680,19 +1716,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def action_toggle_tree(self) -> None:
             new_on = _toggle_tree_mode()
-            self.notify(
-                f"tree-mode: {'nested' if new_on else 'flat'} — restart recap to apply.",
-                title="Layout changed", timeout=3,
-            )
-            self._update_subtitle()
+            # Tree and cluster are mutually exclusive in display — turn off the
+            # other to keep the saved state consistent.
+            if new_on and _get_cluster_mode():
+                _toggle_cluster_mode()
+            self._refresh_table()
 
         def action_toggle_cluster(self) -> None:
             new_on = _toggle_cluster_mode()
-            self.notify(
-                f"cluster-mode: {'on' if new_on else 'off'} — restart recap to apply.",
-                title="Layout changed", timeout=3,
-            )
-            self._update_subtitle()
+            if new_on and _get_tree_mode():
+                _toggle_tree_mode()
+            self._refresh_table()
 
         def action_preview_full(self) -> None:
             self.preview_mode = "full"
