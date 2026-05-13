@@ -921,23 +921,25 @@ def preview_session_full(session_id: str) -> None:
     _preview_impl(session_id, PREVIEW_FULL_DIR, _render_preview_full)
 
 
-# Empty marker placeholder. WezTerm/Windows Terminal default to NARROW for
-# East-Asian-Ambiguous chars (★◉●○✗), so a marker is 1 cell wide. Use an
-# ASCII space (also 1 cell) to align with that — using 　 here caused
-# favorite/activity rows to gain an extra cell relative to empty rows.
 _MARKER_BLANK = " "
 
 
+# Markers are intentionally ASCII (1 cell, terminal-width-independent). The
+# previous Unicode glyphs (◉●○★✗) were East-Asian-Ambiguous, which made their
+# cell count depend on the terminal's CJK-width setting — and recap can't
+# reliably probe that, so columns drifted whenever the user's terminal didn't
+# match the static assumption. Letters trade a bit of visual flair for
+# reliable column alignment everywhere.
 def _activity_marker(s: dict) -> str:
     """Activity column: open-busy / open-idle / active / recent."""
     if s.get("is_open"):
         if s.get("session_status") == "busy":
-            return _c("◉", CYAN, BOLD)   # open & currently responding
-        return _c("◉", GREEN, BOLD)       # open & idle in another Claude window
+            return _c("@", CYAN, BOLD)   # open & currently responding
+        return _c("@", GREEN, BOLD)      # open & idle in another Claude window
     if s.get("is_active"):
-        return _c("●", GREEN)
+        return _c("+", GREEN)
     if s.get("is_recent"):
-        return _c("○", YELLOW)
+        return _c(".", YELLOW)
     return _MARKER_BLANK
 
 
@@ -945,9 +947,9 @@ def _state_marker(s: dict, hidden: set, favorites: set) -> str:
     """State column: favorite or hidden (mutually exclusive)."""
     sid = s["id"]
     if sid in favorites:
-        return _c("★", GOLD)
+        return _c("*", GOLD)
     if sid in hidden:
-        return _c("✗", RED)
+        return _c("x", RED)
     return _MARKER_BLANK
 
 
@@ -1036,9 +1038,9 @@ def display_table(sessions: list[dict], repo: Path | None, show_project: bool,
     view_mode = _get_view_mode()
     mode_tag = _c(" [show-hidden mode]", RED) if view_mode == "show-hidden" else ""
     legend = (f"  {len(sessions)} sessions{mode_tag}  ·  "
-              f"{_c('★', GOLD)} fav  {_c('●', GREEN)} active(<5m)  "
-              f"{_c('○', YELLOW)} recent(<30m)  {_c('✗', RED)} hidden  "
-              f"·  recap --pick to resume")
+              f"{_c('*', GOLD)} fav  {_c('+', GREEN)} active(<5m)  "
+              f"{_c('.', YELLOW)} recent(<30m)  {_c('x', RED)} hidden  "
+              f"{_c('@', CYAN)} open  ·  recap to resume")
     print(_c(legend, DIM))
     print()
 
@@ -1168,76 +1170,71 @@ def _assign_primary_topic(sessions: list[dict]) -> None:
         s["primary_topic"] = max(topics, key=lambda t: topic_count[t]) if topics else ""
 
 
+_CLUSTER_TOPIC_W = 14   # fixed width for the `[topic]` prefix column
+
+
 def build_cluster_lines(sessions: list[dict], repo: Path | None,
                         show_project: bool) -> list[str]:
-    """Build fzf lines grouped by primary topic.
+    """Build fzf lines as a flat list ordered by primary topic.
 
-    Layout:
-        ★ topic: 'project-one' (9)         ← non-selectable header (empty SID)
-          ◉★ 05/12 ... <session line>     ← member rows
-          ...
-        ★ topic: 'email' (10)
-        ...
-        ★ topic: '(no topic)' (39)        ← sessions without cached topics
-
-    Group headers carry an empty SID column so the existing `if not full_id`
-    guard in fzf_pick turns Enter into a no-op when one is selected."""
+    Every row is a normal selectable session row with a colored `[topic]`
+    prefix. Sessions sharing the same primary topic land next to each other
+    (sort key = -member_count, topic_name, -first_ts), so the visual effect
+    is the same as a clustered list — but without inserting non-selectable
+    header rows that confused fzf's preview pump (causing the spinner-loop
+    bug). The topic prefix is also in the searchable column, so `email` in
+    the query box still jumps straight to the email cluster."""
     _assign_primary_topic(sessions)
-    by_topic: dict[str, list[dict]] = defaultdict(list)
-    for s in sessions:
-        by_topic[s["primary_topic"]].append(s)
+    topic_count: Counter = Counter(s["primary_topic"] for s in sessions)
+    # Stable two-pass sort: first by time desc (intra-cluster ordering), then
+    # by (-member_count, topic_name) (inter-cluster ordering). '' (no topic)
+    # sorts last because we map it to a high-value placeholder name.
+    sessions_sorted = sorted(sessions, key=lambda s: s["first_ts"], reverse=True)
+    # Sort key tuple:
+    #   1) "no topic" sessions go LAST (regardless of how many there are)
+    #   2) within "real topic" sessions, larger clusters first, then name asc
+    #   3) (stable from step 1's sort): time desc inside the cluster
+    sessions_sorted.sort(key=lambda s: (
+        1 if not s["primary_topic"] else 0,
+        -topic_count[s["primary_topic"]] if s["primary_topic"] else 0,
+        s["primary_topic"],
+    ))
+
     hidden = _load_hidden()
     favorites = _load_favorites()
     view_mode = _get_view_mode()
-
-    # Order: real topics first (by member count desc, then name), '(no topic)' last.
-    keyed_topics = [t for t in by_topic if t]
-    keyed_topics.sort(key=lambda t: (-len(by_topic[t]), t))
-    ordered = keyed_topics + (["" ] if "" in by_topic else [])
-
     lines: list[str] = []
-    for topic in ordered:
-        # Filter hidden in advance so the header count matches what's shown.
-        group = [s for s in by_topic[topic]
-                 if view_mode == "show-hidden" or s["id"] not in hidden]
-        if not group:
+    for s in sessions_sorted:
+        is_hidden = s["id"] in hidden
+        if is_hidden and view_mode != "show-hidden":
             continue
-        group.sort(key=lambda s: s["first_ts"], reverse=True)
-        label = topic or "(no topic)"
-        header_disp = _c(f"★ topic: {label!r} ({len(group)})", BOLD, MAGENTA)
-        # searchable column gets the topic name so fzf typeahead jumps here.
-        lines.append(f"{header_disp}\t\ttopic {label}")
-        for s in group:
-            is_hidden = s["id"] in hidden
-            marker = f"{_activity_marker(s)}{_state_marker(s, hidden, favorites)}"
-            start = fmt_ts(s["first_ts"])
-            last = fmt_last_active(s)
-            sid8 = short_id(s["id"])
-            proj = project_short(s["project_name"]) if show_project else ""
-            lbl = truncate_visual(label_for(s), 60)
-            commits = ""
-            if repo:
-                cc = git_commits_in_range(s["first_ts"], s["last_ts"], repo)
-                if cc:
-                    commits = "  " + truncate_visual(cc[0], 38)
-            if show_project:
-                body = f"{start}  [{last:>4}]  [{proj:<14}]  {sid8}  {lbl}{commits}"
-            else:
-                body = f"{start}  [{last:>4}]  {sid8}  {lbl}{commits}"
-            indent = "  "   # nest under the topic header
-            if is_hidden:
-                disp = f"{indent}{marker} {HIDDEN_DIM}{body}  (hidden){RESET}"
-            else:
-                disp = f"{indent}{marker} {body}"
-            searchable = (s["ai_title"] + "  " + "  ".join(s["real_msgs"]))[:3000]
-            searchable = searchable.replace("\t", " ").replace("\n", " ").replace("\r", " ")
-            # Topic name is also in searchable so a query like `project-one` matches
-            # member rows in addition to the header.
-            lines.append(f"{disp}\t{s['id']}\t{label}  {searchable}")
-            _write_preview_cache(s)
-        # No blank separator between groups: fzf would still spin its preview
-        # spinner on empty-SID rows on every cursor pass. The colored group
-        # header already provides enough visual delimitation.
+        topic_label = (s["primary_topic"] or "(no topic)")
+        topic_label = topic_label[:_CLUSTER_TOPIC_W - 2].ljust(_CLUSTER_TOPIC_W - 2)
+        topic_tag = _c(f"[{topic_label}]", MAGENTA)
+        marker = f"{_activity_marker(s)}{_state_marker(s, hidden, favorites)}"
+        start = fmt_ts(s["first_ts"])
+        last = fmt_last_active(s)
+        sid8 = short_id(s["id"])
+        proj = project_short(s["project_name"]) if show_project else ""
+        lbl = truncate_visual(label_for(s), 55)
+        commits = ""
+        if repo:
+            cc = git_commits_in_range(s["first_ts"], s["last_ts"], repo)
+            if cc:
+                commits = "  " + truncate_visual(cc[0], 38)
+        if show_project:
+            body = f"{topic_tag} {start}  [{last:>4}]  [{proj:<14}]  {sid8}  {lbl}{commits}"
+        else:
+            body = f"{topic_tag} {start}  [{last:>4}]  {sid8}  {lbl}{commits}"
+        if is_hidden:
+            disp = f"{marker} {HIDDEN_DIM}{body}  (hidden){RESET}"
+        else:
+            disp = f"{marker} {body}"
+        searchable = (s["ai_title"] + "  " + "  ".join(s["real_msgs"]))[:3000]
+        searchable = searchable.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+        # Topic name in searchable so `email`-typed query selects email rows.
+        lines.append(f"{disp}\t{s['id']}\t{s['primary_topic']}  {searchable}")
+        _write_preview_cache(s)
     return lines
 
 
@@ -1289,7 +1286,7 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 else:
                     tree_tag = "flat" if flat else "nested"
                     layout_tag = f"Ctrl-t:tree(now:{tree_tag})  Ctrl-g:cluster(off)"
-                header = (f"Enter:resume  Ctrl-p:★fav  Ctrl-x:hide  "
+                header = (f"Enter:resume  Ctrl-p:*fav  Ctrl-x:hide  "
                           f"Ctrl-r:hidden(now:{view_tag})  "
                           f"{layout_tag}  "
                           f"Ctrl-f/s:full/summary  Ctrl-C:cancel")
@@ -2027,7 +2024,7 @@ def main():
     if args.favorite:
         sid = _trim_sid(args.favorite)
         now_fav = _toggle_in_set(FAVORITE_FILE, sid)
-        state = _c("★ favorite", YELLOW) if now_fav else _c("not favorite", GRAY)
+        state = _c("* favorite", YELLOW) if now_fav else _c("not favorite", GRAY)
         print(f"  {sid[:8]}: {state}", file=sys.stderr)
         return
     if args.toggle_view:
