@@ -759,8 +759,12 @@ def _render_header(s: dict) -> list[str]:
     if pid:
         score = s.get("parent_score", 0.0)
         reasons = s.get("parent_reasons", [])
+        # Confidence marker reuses --related's legend: ● green ≥0.70, ● yellow
+        # ≥0.40, ○ gray ≥0.20 — so a low-confidence "parent" link is visually
+        # distinguishable from a strong one (the forest is heuristic).
+        marker = _confidence_marker(score)
         rs = "  ·  ".join(reasons) if reasons else ""
-        lines.append(f"  parent:   {pid[:8]}  [score {score:.2f}]  {_c(rs, GRAY)}")
+        lines.append(f"  parent:   {marker} {pid[:8]}  [score {score:.2f}]  {_c(rs, GRAY)}")
     lines.extend([
         f"  project:  {found.parent.name}",
         f"  cwd:      {s.get('cwd','')}",
@@ -851,13 +855,22 @@ def _write_preview_cache(s: dict) -> None:
 
 def _preview_impl(session_id: str, cache_dir: Path, render) -> None:
     sid = _trim_sid(session_id)
+    # Exact cache hit (fzf passes the full UUID — fast path)
     cache_file = cache_dir / f"{sid}.txt"
     if cache_file.exists():
         sys.stdout.write(cache_file.read_text(encoding="utf-8"))
         return
+    # Cache miss: probably a partial SID typed by the user on the CLI. Resolve
+    # to the full SID via the JSONL filename and retry cache before falling
+    # back to a fresh parse (which is missing forest-derived parent info, so
+    # the user would otherwise see a degraded preview).
     found = _find_session_jsonl(sid)
     if not found:
         print(f"(session {sid[:8]} not found)")
+        return
+    full_cache = cache_dir / f"{found.stem}.txt"
+    if full_cache.exists():
+        sys.stdout.write(full_cache.read_text(encoding="utf-8"))
         return
     s = parse_session(found)
     if not s:
@@ -1793,13 +1806,16 @@ def main():
                    help="Show sessions across all projects")
     p.add_argument("--reset-options", action="store_true",
                    help="Forget saved --days/--here/--all defaults. Does NOT clear "
-                        "hidden/favorite/view-mode — toggle those via Ctrl-x / Ctrl-p / "
-                        "Ctrl-r in the picker (or --hide / --favorite / --toggle-view).")
+                        "hidden/favorite/view-mode/tree-mode — toggle those via "
+                        "Ctrl-x/Ctrl-p/Ctrl-r/Ctrl-t in the picker (or --hide / "
+                        "--favorite / --toggle-view / --toggle-tree).")
     p.add_argument("--save-defaults", action="store_true",
                    help="Persist the current --days/--here/--all values as new defaults. "
                         "Without this flag, CLI args are one-shot and saved options stay untouched.")
     p.add_argument("--pick", action="store_true",
-                   help="Open interactive fzf picker (default behavior)")
+                   help="Open the interactive fzf picker. This is the default when "
+                        "no other action flag is given; --pick is kept as an explicit "
+                        "no-op for clarity in shell aliases.")
     p.add_argument("--table", action="store_true",
                    help="Show static table instead of fzf picker")
     p.add_argument("--project", metavar="PATH")
@@ -1907,7 +1923,12 @@ def main():
         print(_c(f"  saved defaults: days={args.days}, scope={scope}", GREEN),
               file=sys.stderr)
 
-    # --project always wins for scope; otherwise scope follows --here/--all
+    # --project always wins for scope; otherwise scope follows --here/--all.
+    # Warn on the silent override so the user isn't surprised when "show current
+    # project's sessions" was actually "show /some/other/path's sessions".
+    if args.here and args.project:
+        print(_c(f"  note: --project {args.project} overrides --here; using that path",
+                YELLOW), file=sys.stderr)
     args.all_projects = not (args.here or args.project)
 
     if args.refresh_summary and CACHE_DIR.exists():
