@@ -97,7 +97,16 @@ FAVORITE_FILE = CACHE_DIR / "favorite.json"
 VIEW_MODE_FILE = CACHE_DIR / "view-mode.txt"
 TREE_MODE_FILE = CACHE_DIR / "tree-mode.txt"
 CLUSTER_MODE_FILE = CACHE_DIR / "cluster-mode.txt"
+SORT_FILE = CACHE_DIR / "sort.json"
 OPTIONS_FILE = CACHE_DIR / "options.json"
+
+# Sort columns selectable via Ctrl-1/2/3. "-" = inactive (no sort at this priority).
+SORT_COLS = ("-", "date", "last", "proj", "title", "turns", "fav", "topic")
+SORT_DEFAULT = [
+    {"col": "date", "dir": "desc"},
+    {"col": "-",    "dir": "desc"},
+    {"col": "-",    "dir": "desc"},
+]
 PARSED_DIR = CACHE_DIR / "parsed"
 PREVIEW_DIR = CACHE_DIR / "preview"
 PREVIEW_FULL_DIR = CACHE_DIR / "preview-full"
@@ -182,6 +191,81 @@ def _toggle_cluster_mode() -> bool:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     CLUSTER_MODE_FILE.write_text("on" if new else "off", encoding="utf-8")
     return new
+
+
+def _load_sort() -> list[dict]:
+    """Load the 3-level sort spec from disk, or fall back to defaults.
+    Always returns exactly 3 entries; bad/missing entries get filled from the
+    defaults so the rest of the code doesn't have to defensively check."""
+    raw = _read_json(SORT_FILE, None)
+    out = [dict(d) for d in SORT_DEFAULT]   # mutable copies
+    if isinstance(raw, list):
+        for i, entry in enumerate(raw[:3]):
+            if isinstance(entry, dict):
+                col = entry.get("col")
+                if col in SORT_COLS:
+                    out[i]["col"] = col
+                if entry.get("dir") in ("asc", "desc"):
+                    out[i]["dir"] = entry["dir"]
+    return out
+
+
+def _save_sort(keys: list[dict]) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _write_json(SORT_FILE, keys[:3])
+
+
+def _cycle_sort_col(priority: int) -> dict:
+    """Advance priority (1/2/3) to the next column in SORT_COLS; returns new entry."""
+    idx = max(1, min(3, priority)) - 1
+    keys = _load_sort()
+    current = keys[idx]["col"]
+    try:
+        next_idx = (SORT_COLS.index(current) + 1) % len(SORT_COLS)
+    except ValueError:
+        next_idx = 1   # fall back to first real column
+    keys[idx]["col"] = SORT_COLS[next_idx]
+    _save_sort(keys)
+    return keys[idx]
+
+
+def _toggle_sort_dir(priority: int) -> dict:
+    idx = max(1, min(3, priority)) - 1
+    keys = _load_sort()
+    keys[idx]["dir"] = "asc" if keys[idx]["dir"] == "desc" else "desc"
+    _save_sort(keys)
+    return keys[idx]
+
+
+def _reset_sort() -> None:
+    try:
+        SORT_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _apply_sort(sessions: list[dict], keys: list[dict]) -> None:
+    """Stable multi-level sort, lowest priority applied first so the highest
+    priority wins on tie-breaks. '-' entries contribute nothing."""
+    active = [k for k in keys if k["col"] != "-"]
+    if not active:
+        return
+    # Cache disk-backed lookups once per sort invocation.
+    favs = _load_favorites() if any(k["col"] == "fav" for k in active) else set()
+
+    def keyfn(s: dict, col: str):
+        if col == "date":  return s.get("first_ts", "")
+        if col == "last":  return s.get("last_ts", "")
+        if col == "proj":  return (s.get("project_name") or "").lower()
+        if col == "title": return (s.get("ai_title") or _first_msg(s) or "").lower()
+        if col == "turns": return s.get("n_turns", 0)
+        if col == "fav":   return 1 if s["id"] in favs else 0
+        if col == "topic": return s.get("primary_topic", "") or "~"
+        return 0
+
+    for k in reversed(active):
+        sessions.sort(key=lambda s, c=k["col"]: keyfn(s, c),
+                      reverse=(k["dir"] == "desc"))
 
 def _load_cache(sid: str, mtime: float) -> str | None:
     d = _read_json(CACHE_DIR / f"{sid}.json", None)
@@ -1269,7 +1353,7 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # `recap --preview` reads the pre-rendered cache; portable across cmd / bash / pwsh
                 preview_cmd      = "recap --preview {2}"
                 preview_full_cmd = "recap --preview-full {2}"
-                bindings = ",".join([
+                bindings_list = [
                     f"ctrl-x:execute-silent(recap --hide {{2}})+reload({reload_cmd})",
                     f"ctrl-p:execute-silent(recap --favorite {{2}})+reload({reload_cmd})",
                     f"ctrl-r:execute-silent(recap --toggle-view)+reload({reload_cmd})",
@@ -1277,7 +1361,17 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"ctrl-g:execute-silent(recap --toggle-cluster)+reload({reload_cmd})",
                     f"ctrl-f:change-preview({preview_full_cmd})",
                     f"ctrl-s:change-preview({preview_cmd})",
-                ])
+                ]
+                # Sort controls — Ctrl-1/2/3 cycle the column at priority N,
+                # Alt-1/2/3 toggle that priority's direction. Reload re-applies
+                # the saved sort spec.
+                for n in (1, 2, 3):
+                    bindings_list.append(
+                        f"ctrl-{n}:execute-silent(recap --cycle-sort {n})+reload({reload_cmd})")
+                    bindings_list.append(
+                        f"alt-{n}:execute-silent(recap --toggle-sort-dir {n})+reload({reload_cmd})")
+                bindings = ",".join(bindings_list)
+
                 view_tag = "show-hidden" if _get_view_mode() == "show-hidden" else "default"
                 # tree/cluster are mutually exclusive in the *display*; show the
                 # active one so the user knows which keystroke does what.
@@ -1286,10 +1380,24 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 else:
                     tree_tag = "flat" if flat else "nested"
                     layout_tag = f"Ctrl-t:tree(now:{tree_tag})  Ctrl-g:cluster(off)"
+                # Sort indicator: `[1↓date] [2↑proj] [3 -]` style. Down arrow
+                # for desc, up for asc, `-` placeholder for inactive priority.
+                # Only meaningful in flat-non-cluster mode; muted otherwise.
+                sort_active = (not cluster_mode) and flat
+                sort_tag = "  Sort:"
+                for i, k in enumerate(_load_sort(), 1):
+                    if k["col"] == "-":
+                        sort_tag += f" [{i} -]"
+                    else:
+                        arrow = "v" if k["dir"] == "desc" else "^"
+                        sort_tag += f" [{i}{arrow}{k['col']}]"
+                if not sort_active:
+                    sort_tag = _c(sort_tag + "(N/A)", DIM)
                 header = (f"Enter:resume  Ctrl-p:*fav  Ctrl-x:hide  "
                           f"Ctrl-r:hidden(now:{view_tag})  "
                           f"{layout_tag}  "
-                          f"Ctrl-f/s:full/summary  Ctrl-C:cancel")
+                          f"Ctrl-f/s:full/summary  Ctrl-C:cancel"
+                          f"\nCtrl-N:cycle sort col  Alt-N:toggle dir{sort_tag}")
                 result = subprocess.run(
                     # Layout (default fzf, preview pane below):
                     #   top:    list pane (the session / topic selector)
@@ -1971,10 +2079,10 @@ def main():
                    help="Show sessions across all projects")
     p.add_argument("--reset-options", action="store_true",
                    help="Forget saved --days/--here/--all defaults. Does NOT clear "
-                        "hidden/favorite/view-mode/tree-mode/cluster-mode — toggle "
-                        "those via Ctrl-x / Ctrl-p / Ctrl-r / Ctrl-t / Ctrl-g in the "
-                        "picker (or --hide / --favorite / --toggle-view / "
-                        "--toggle-tree / --toggle-cluster).")
+                        "hidden/favorite/view-mode/tree-mode/cluster-mode/sort — "
+                        "toggle those via Ctrl-x / Ctrl-p / Ctrl-r / Ctrl-t / Ctrl-g "
+                        "/ Ctrl-1..3 in the picker (or the matching --toggle-* / "
+                        "--cycle-sort / --reset-sort flags).")
     p.add_argument("--save-defaults", action="store_true",
                    help="Persist the current --days/--here/--all values as new defaults. "
                         "Without this flag, CLI args are one-shot and saved options stay untouched.")
@@ -2011,6 +2119,14 @@ def main():
                         "sessions are grouped by their most widely-shared cached "
                         "topic keyword. Same effect as Ctrl-g inside the picker. "
                         "Mutually exclusive with tree display.")
+    p.add_argument("--cycle-sort", type=int, metavar="N", choices=[1, 2, 3],
+                   help="Advance the Nth sort priority to the next column. Persistent. "
+                        "Same effect as Ctrl-N inside the picker.")
+    p.add_argument("--toggle-sort-dir", type=int, metavar="N", choices=[1, 2, 3],
+                   help="Toggle the Nth sort priority's direction (asc/desc). Persistent. "
+                        "Same effect as Alt-N inside the picker.")
+    p.add_argument("--reset-sort", action="store_true",
+                   help="Reset all sort priorities to defaults (date desc, then none).")
     p.add_argument("--related", metavar="SESSION_ID",
                    help="Show sessions related to SESSION_ID with confidence scores and reasons")
     p.add_argument("--tree", action="store_true",
@@ -2053,6 +2169,20 @@ def main():
         new_on = _toggle_cluster_mode()
         label = "on (group by topic)" if new_on else "off"
         print(f"  cluster-mode: {_c(label, YELLOW if new_on else GREEN)}", file=sys.stderr)
+        return
+    if args.cycle_sort is not None:
+        entry = _cycle_sort_col(args.cycle_sort)
+        print(f"  sort[{args.cycle_sort}]: {_c(entry['col'], CYAN)} {entry['dir']}",
+              file=sys.stderr)
+        return
+    if args.toggle_sort_dir is not None:
+        entry = _toggle_sort_dir(args.toggle_sort_dir)
+        print(f"  sort[{args.toggle_sort_dir}]: {entry['col']} "
+              f"{_c(entry['dir'], CYAN)}", file=sys.stderr)
+        return
+    if args.reset_sort:
+        _reset_sort()
+        print(_c("  sort: reset to defaults (date desc)", GREEN), file=sys.stderr)
         return
     # --sidechain SID: in-session subagent tree. Handled here (no need to load
     # all sessions across the project — we open the target JSONL directly).
@@ -2141,6 +2271,9 @@ def main():
             sys.exit(1)
         sessions = load_sessions_in_dir(target, since)
 
+    # Initial chronological sort gives _build_forest a deterministic order; the
+    # user-configurable sort spec is applied AFTER forest building / clustering
+    # so it controls only the displayed order.
     sessions.sort(key=lambda s: s["first_ts"], reverse=True)
 
     if not sessions:
@@ -2186,6 +2319,11 @@ def main():
     cluster_mode = _get_cluster_mode()
     use_tree = (not cluster_mode) and (args.tree or _get_tree_mode()) and len(sessions) <= 1000
     flat = not use_tree
+    # Apply user-configurable sort (Ctrl-1/2/3 / Alt-1/2/3 from the picker)
+    # only in flat mode. Tree mode is structural (forest topology) and cluster
+    # mode is topic-bucketed, so a free-form sort would override their layout.
+    if flat and not cluster_mode:
+        _apply_sort(sessions, _load_sort())
     if args.list:
         # Emit fzf-formatted lines without launching fzf (used by reload)
         emitter = (build_cluster_lines(sessions, repo, args.all_projects) if cluster_mode
