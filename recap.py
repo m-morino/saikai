@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -96,6 +96,7 @@ HIDDEN_FILE = CACHE_DIR / "hidden.json"
 FAVORITE_FILE = CACHE_DIR / "favorite.json"
 VIEW_MODE_FILE = CACHE_DIR / "view-mode.txt"
 TREE_MODE_FILE = CACHE_DIR / "tree-mode.txt"
+CLUSTER_MODE_FILE = CACHE_DIR / "cluster-mode.txt"
 OPTIONS_FILE = CACHE_DIR / "options.json"
 PARSED_DIR = CACHE_DIR / "parsed"
 PREVIEW_DIR = CACHE_DIR / "preview"
@@ -165,6 +166,21 @@ def _toggle_tree_mode() -> bool:
     new = not _get_tree_mode()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     TREE_MODE_FILE.write_text("on" if new else "off", encoding="utf-8")
+    return new
+
+
+def _get_cluster_mode() -> bool:
+    """Saved topic-cluster display preference. False (no cluster) by default."""
+    try:
+        return CLUSTER_MODE_FILE.read_text(encoding="utf-8").strip() == "on"
+    except Exception:
+        return False
+
+
+def _toggle_cluster_mode() -> bool:
+    new = not _get_cluster_mode()
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CLUSTER_MODE_FILE.write_text("on" if new else "off", encoding="utf-8")
     return new
 
 def _load_cache(sid: str, mtime: float) -> str | None:
@@ -1136,11 +1152,103 @@ def _frequent_cwds(sessions: list[dict]) -> set[str]:
     return {cwd for cwd, n in counts.items() if cwd and n >= min_count}
 
 
+def _assign_primary_topic(sessions: list[dict]) -> None:
+    """Pick the most widely-shared topic for each session in place.
+
+    'Primary' = the topic from this session's topics list that the maximum
+    number of OTHER sessions also have. This produces clusters around common-
+    interest topics (e.g. 'email', 'work-tools') rather than singleton groups
+    around session-unique topics. Sets s["primary_topic"] (lowercase) or ""
+    when the session has no cached topics yet."""
+    topic_count: Counter = Counter()
+    for s in sessions:
+        for t in (s.get("topics") or []):
+            topic_count[t.lower()] += 1
+    for s in sessions:
+        topics = [t.lower() for t in (s.get("topics") or [])]
+        s["primary_topic"] = max(topics, key=lambda t: topic_count[t]) if topics else ""
+
+
+def build_cluster_lines(sessions: list[dict], repo: Path | None,
+                        show_project: bool) -> list[str]:
+    """Build fzf lines grouped by primary topic.
+
+    Layout:
+        ★ topic: 'work-tools' (9)         ← non-selectable header (empty SID)
+          ◉★ 05/12 ... <session line>     ← member rows
+          ...
+        ★ topic: 'email' (10)
+        ...
+        ★ topic: '(no topic)' (39)        ← sessions without cached topics
+
+    Group headers carry an empty SID column so the existing `if not full_id`
+    guard in fzf_pick turns Enter into a no-op when one is selected."""
+    _assign_primary_topic(sessions)
+    by_topic: dict[str, list[dict]] = defaultdict(list)
+    for s in sessions:
+        by_topic[s["primary_topic"]].append(s)
+    hidden = _load_hidden()
+    favorites = _load_favorites()
+    view_mode = _get_view_mode()
+
+    # Order: real topics first (by member count desc, then name), '(no topic)' last.
+    keyed_topics = [t for t in by_topic if t]
+    keyed_topics.sort(key=lambda t: (-len(by_topic[t]), t))
+    ordered = keyed_topics + (["" ] if "" in by_topic else [])
+
+    lines: list[str] = []
+    for topic in ordered:
+        # Filter hidden in advance so the header count matches what's shown.
+        group = [s for s in by_topic[topic]
+                 if view_mode == "show-hidden" or s["id"] not in hidden]
+        if not group:
+            continue
+        group.sort(key=lambda s: s["first_ts"], reverse=True)
+        label = topic or "(no topic)"
+        header_disp = _c(f"★ topic: {label!r} ({len(group)})", BOLD, MAGENTA)
+        # searchable column gets the topic name so fzf typeahead jumps here.
+        lines.append(f"{header_disp}\t\ttopic {label}")
+        for s in group:
+            is_hidden = s["id"] in hidden
+            marker = f"{_activity_marker(s)}{_state_marker(s, hidden, favorites)}"
+            start = fmt_ts(s["first_ts"])
+            last = fmt_last_active(s)
+            sid8 = short_id(s["id"])
+            proj = project_short(s["project_name"]) if show_project else ""
+            lbl = truncate_visual(label_for(s), 60)
+            commits = ""
+            if repo:
+                cc = git_commits_in_range(s["first_ts"], s["last_ts"], repo)
+                if cc:
+                    commits = "  " + truncate_visual(cc[0], 38)
+            if show_project:
+                body = f"{start}  [{last:>4}]  [{proj:<14}]  {sid8}  {lbl}{commits}"
+            else:
+                body = f"{start}  [{last:>4}]  {sid8}  {lbl}{commits}"
+            indent = "  "   # nest under the topic header
+            if is_hidden:
+                disp = f"{indent}{marker} {HIDDEN_DIM}{body}  (hidden){RESET}"
+            else:
+                disp = f"{indent}{marker} {body}"
+            searchable = (s["ai_title"] + "  " + "  ".join(s["real_msgs"]))[:3000]
+            searchable = searchable.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+            # Topic name is also in searchable so a query like `work-tools` matches
+            # member rows in addition to the header.
+            lines.append(f"{disp}\t{s['id']}\t{label}  {searchable}")
+            _write_preview_cache(s)
+        lines.append("\t\t")    # blank visual separator (empty SID → no-op on Enter)
+    if lines and lines[-1] == "\t\t":
+        lines.pop()
+    return lines
+
+
 def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
-             flat: bool = False, reload_args: list[str] | None = None):
+             flat: bool = False, cluster_mode: bool = False,
+             reload_args: list[str] | None = None):
     """Pipe session list to fzf and run claude --resume on selection.
     Uses temp file for stdin/stdout so fzf gets a clean tty for its TUI."""
-    lines = build_fzf_lines(sessions, repo, show_project, flat=flat)
+    lines = (build_cluster_lines(sessions, repo, show_project) if cluster_mode
+             else build_fzf_lines(sessions, repo, show_project, flat=flat))
 
     # Write to temp file (binary mode → no CRLF translation that confuses fzf).
     # fzf needs a non-pipe stdin on Windows to start its TUI properly.
@@ -1170,14 +1278,21 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"ctrl-p:execute-silent(recap --favorite {{2}})+reload({reload_cmd})",
                     f"ctrl-r:execute-silent(recap --toggle-view)+reload({reload_cmd})",
                     f"ctrl-t:execute-silent(recap --toggle-tree)+reload({reload_cmd})",
+                    f"ctrl-g:execute-silent(recap --toggle-cluster)+reload({reload_cmd})",
                     f"ctrl-f:change-preview({preview_full_cmd})",
                     f"ctrl-s:change-preview({preview_cmd})",
                 ])
                 view_tag = "show-hidden" if _get_view_mode() == "show-hidden" else "default"
-                tree_tag = "flat" if flat else "nested"
+                # tree/cluster are mutually exclusive in the *display*; show the
+                # active one so the user knows which keystroke does what.
+                if cluster_mode:
+                    layout_tag = "Ctrl-g:cluster(ON)"
+                else:
+                    tree_tag = "flat" if flat else "nested"
+                    layout_tag = f"Ctrl-t:tree(now:{tree_tag})  Ctrl-g:cluster(off)"
                 header = (f"Enter:resume  Ctrl-p:★fav  Ctrl-x:hide  "
                           f"Ctrl-r:hidden(now:{view_tag})  "
-                          f"Ctrl-t:tree(now:{tree_tag})  "
+                          f"{layout_tag}  "
                           f"Ctrl-f/s:full/summary  Ctrl-C:cancel")
                 result = subprocess.run(
                     ["fzf", "--ansi", "--no-sort", "--reverse",
@@ -1844,9 +1959,10 @@ def main():
                    help="Show sessions across all projects")
     p.add_argument("--reset-options", action="store_true",
                    help="Forget saved --days/--here/--all defaults. Does NOT clear "
-                        "hidden/favorite/view-mode/tree-mode — toggle those via "
-                        "Ctrl-x/Ctrl-p/Ctrl-r/Ctrl-t in the picker (or --hide / "
-                        "--favorite / --toggle-view / --toggle-tree).")
+                        "hidden/favorite/view-mode/tree-mode/cluster-mode — toggle "
+                        "those via Ctrl-x / Ctrl-p / Ctrl-r / Ctrl-t / Ctrl-g in the "
+                        "picker (or --hide / --favorite / --toggle-view / "
+                        "--toggle-tree / --toggle-cluster).")
     p.add_argument("--save-defaults", action="store_true",
                    help="Persist the current --days/--here/--all values as new defaults. "
                         "Without this flag, CLI args are one-shot and saved options stay untouched.")
@@ -1878,6 +1994,11 @@ def main():
     p.add_argument("--toggle-tree", action="store_true",
                    help="Toggle saved flat/nested tree-display mode (persistent). "
                         "Same effect as Ctrl-t inside the picker.")
+    p.add_argument("--toggle-cluster", action="store_true",
+                   help="Toggle saved topic-cluster view (persistent). When on, "
+                        "sessions are grouped by their most widely-shared cached "
+                        "topic keyword. Same effect as Ctrl-g inside the picker. "
+                        "Mutually exclusive with tree display.")
     p.add_argument("--related", metavar="SESSION_ID",
                    help="Show sessions related to SESSION_ID with confidence scores and reasons")
     p.add_argument("--tree", action="store_true",
@@ -1915,6 +2036,11 @@ def main():
         new_on = _toggle_tree_mode()
         label = "nested (tree)" if new_on else "flat"
         print(f"  tree-mode: {_c(label, YELLOW if new_on else GREEN)}", file=sys.stderr)
+        return
+    if args.toggle_cluster:
+        new_on = _toggle_cluster_mode()
+        label = "on (group by topic)" if new_on else "off"
+        print(f"  cluster-mode: {_c(label, YELLOW if new_on else GREEN)}", file=sys.stderr)
         return
     # --sidechain SID: in-session subagent tree. Handled here (no need to load
     # all sessions across the project — we open the target JSONL directly).
@@ -2039,15 +2165,20 @@ def main():
             s["parent_score"] = 0.0
             s["parent_reasons"] = []
 
-    # Display mode (flat vs nested): saved tree-mode is the source of truth so
-    # `Ctrl-t` inside the picker can toggle between them via reload. CLI --tree
-    # is a one-shot override for the initial invocation only — it is NOT carried
-    # into reload_args, so a Ctrl-t toggle wins.
-    use_tree = (args.tree or _get_tree_mode()) and len(sessions) <= 1000
+    # Display mode (flat / nested-tree / topic-cluster). Saved modes are the
+    # source of truth so Ctrl-t / Ctrl-g inside the picker can toggle between
+    # them via reload. CLI --tree is a one-shot override for the initial
+    # invocation only — it is NOT carried into reload_args, so a Ctrl-* toggle
+    # wins. tree and cluster are mutually exclusive in display: cluster wins
+    # when both happen to be on (e.g. saved cluster + CLI --tree).
+    cluster_mode = _get_cluster_mode()
+    use_tree = (not cluster_mode) and (args.tree or _get_tree_mode()) and len(sessions) <= 1000
     flat = not use_tree
     if args.list:
         # Emit fzf-formatted lines without launching fzf (used by reload)
-        for line in build_fzf_lines(sessions, repo, args.all_projects, flat=flat):
+        emitter = (build_cluster_lines(sessions, repo, args.all_projects) if cluster_mode
+                   else build_fzf_lines(sessions, repo, args.all_projects, flat=flat))
+        for line in emitter:
             sys.stdout.write(line + "\n")
         return
 
@@ -2071,7 +2202,8 @@ def main():
         # tree-mode (toggled via Ctrl-t inside the picker) is the source of
         # truth on reload. Otherwise an initial `recap --tree` would override
         # subsequent toggles forever.
-        fzf_pick(sessions, repo, args.all_projects, flat=flat, reload_args=reload_args)
+        fzf_pick(sessions, repo, args.all_projects, flat=flat,
+                 cluster_mode=cluster_mode, reload_args=reload_args)
 
 
 if __name__ == "__main__":
