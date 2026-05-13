@@ -1274,38 +1274,37 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"resuming from current dir instead", YELLOW),
                   file=sys.stderr)
             target_cwd = None
-    # Show a "loading" line so the multi-second gap between recap exit and the
-    # claude TUI taking over the screen doesn't feel like a hang. The text sits
-    # at the bottom of the terminal until claude enters alternate-screen mode,
-    # which clears it. Sent to stderr so it bypasses any stdout redirection.
+    # Show a "loading" line so the multi-second claude.exe cold start doesn't
+    # feel like a hang. Sits at the bottom of the terminal until claude enters
+    # alternate-screen mode and clears it.
     sys.stderr.write(_c("  Loading claude session ...", DIM) + "\n")
     sys.stderr.flush()
-    # Second terminal reset right before handoff. fzf's reset earlier covered
-    # focus / mouse / bracketed-paste, but claude.exe sometimes emits a DA1
-    # query (\e[c) at startup; if the response comes back before claude binds
-    # the input handler, the shell sees the leftover '?65;...c' on the prompt
-    # after claude exits. A defensive disable-everything pass here narrows the
-    # window where stray bytes could leak.
     _reset_terminal_modes()
-    # Always try execvpe first so recap is replaced (POSIX) or spawn-then-exits
-    # (Windows). Either way recap doesn't linger as middleware while claude runs.
-    # Resolve binary path manually so Windows' execvpe doesn't depend on PATH
-    # parsing inside the C runtime after we stripped VIRTUAL_ENV above.
+    # We INTENTIONALLY use subprocess.run + post-exit reset instead of execvpe.
+    # Rationale: claude.exe enables SGR mouse / focus / bracketed-paste on
+    # startup and is expected to disable them on exit — but on early crash
+    # (bad session id, missing binary on a subdep, etc.) it terminates without
+    # the matching `l` sequences, and the shell prompt is then poisoned with
+    # stray bytes on key press (Enter showed `m`, the SGR-release terminator).
+    # With execvpe, recap is gone before claude exits, so we can't reset.
+    # Trade-off: recap.py stays alive as the parent until claude exits, so a
+    # terminal close that doesn't propagate CTRL_CLOSE_EVENT to claude could
+    # in theory leave a `recap.py + claude.exe` zombie pair. In practice the
+    # console close DOES propagate, and the broken-terminal symptom is far
+    # more user-visible than that edge case. (`~/.local/bin/recap` also has a
+    # belt-and-braces EXIT trap that resets modes if recap itself dies hard.)
     claude_bin = shutil.which("claude", path=env.get("PATH")) or "claude"
     claude_argv = [claude_bin, "--resume", full_id, *extra_args]
     try:
-        os.execvpe(claude_bin, claude_argv, env)
+        rc = subprocess.run(claude_argv, cwd=target_cwd, env=env).returncode
     except FileNotFoundError:
-        print(_c("  warn: claude not on PATH — falling back to blocking subprocess",
-                YELLOW), file=sys.stderr)
-    except Exception as e:
-        print(_c(f"  warn: execvpe failed ({e}) — falling back to blocking subprocess",
-                YELLOW), file=sys.stderr)
-    # Last resort: blocking run. Recap stays alive until claude exits, which is
-    # the original zombie scenario — but better than crashing the launcher with
-    # no fallback at all. sys.exit forwards claude's returncode so the shell
-    # sees the same exit status as if execvpe had succeeded.
-    sys.exit(subprocess.run(claude_argv, cwd=target_cwd, env=env).returncode)
+        print(_c("  error: claude not on PATH", RED), file=sys.stderr)
+        rc = 127
+    finally:
+        # Defensive reset: handles the case where claude exited without
+        # disabling the modes it enabled, or where we never reached run() at all.
+        _reset_terminal_modes()
+    sys.exit(rc)
 
 
 # ── Project lookup ───────────────────────────────────────────────────────────
