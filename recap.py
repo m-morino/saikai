@@ -1366,13 +1366,25 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
             f"{', '.join(existing_themes)}"
         )
 
+    # Theme-count bounds inspired by Miller (1956) "Magical Number 7 ± 2": the
+    # human limit for at-a-glance absolute judgement across categories. 5 keeps
+    # each theme meaningful (avoids 2-3 mega-buckets); 9 keeps the picker
+    # scannable. Sweet spot ~7. RECAP_CLUSTER_TARGET_N tunes the suggestion
+    # (Haiku still picks the actual count); RECAP_CLUSTER_MAX caps it hard.
+    try:
+        target_n = max(3, min(12, int(os.environ.get("RECAP_CLUSTER_TARGET_N") or 7)))
+    except ValueError:
+        target_n = 7
+    lo = max(3, target_n - 2)
+    hi = min(12, target_n + 2)
     prompt = (
         f"Below are {len(items)} Claude Code session titles. Group them into "
-        "6 to 10 coherent themes that describe the WORK being done. Themes "
-        "should be short English nouns / noun-phrases (e.g. 'email drafting', "
-        "'recap development', 'meeting scheduling'). Every session MUST be "
-        "assigned to exactly one theme — no 'other' / 'misc' / 'general' "
-        "bucket. Reply with ONLY valid JSON, no prose:\n"
+        f"about {target_n} coherent themes (between {lo} and {hi}, choose the "
+        "number that gives the cleanest grouping) that describe the WORK "
+        "being done. Themes should be short English nouns / noun-phrases "
+        "(e.g. 'email drafting', 'recap development', 'meeting scheduling'). "
+        "Every session MUST be assigned to exactly one theme — no 'other' / "
+        "'misc' / 'general' bucket. Reply with ONLY valid JSON, no prose:\n"
         '{"clusters": ["theme1", "theme2", ...], '
         '"assignments": {"<8-char-sid>": "<theme>", ...}}'
         f"{theme_hint}\n\nSessions:\n" + "\n".join(items)
@@ -1422,6 +1434,54 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
 
 
 _CLUSTER_TOPIC_W = 14   # fixed width for the `[topic]` prefix column
+
+
+# Colour palettes for Textual cell tinting. Distinct values inside a column
+# (project / topic) get a stable hash-derived colour so the same value renders
+# in the same colour every time and the eye can group rows by colour even
+# faster than by reading the cell text.
+_PROJECT_PALETTE = ("cyan", "yellow", "green", "magenta", "bright_blue",
+                    "bright_red", "white", "bright_cyan", "bright_yellow",
+                    "bright_green", "bright_magenta")
+_TOPIC_PALETTE = ("magenta", "cyan", "yellow", "green", "bright_blue",
+                  "bright_red", "white", "bright_magenta", "bright_cyan",
+                  "bright_yellow", "bright_green")
+
+
+def _stable_color(value: str, palette) -> str:
+    """Hash-only fallback when no collision-resolving mapping is in play.
+    Prefer _build_color_map for the picker: it linearly probes the palette
+    so distinct values are guaranteed distinct colours when count ≤ palette
+    size."""
+    if not value:
+        return ""
+    import hashlib
+    h = int(hashlib.md5(value.encode("utf-8")).hexdigest(), 16)
+    return palette[h % len(palette)]
+
+
+def _build_color_map(values, palette) -> dict[str, str]:
+    """Assign each unique value a distinct palette colour (linear-probe over
+    the hash slot). When unique_count ≤ palette size we get an injective
+    mapping — same input → same colour across runs, and no two visible
+    values share a colour. Values overflow by hashing to the same slot only
+    once the palette is full."""
+    import hashlib
+    used: dict[str, str] = {}
+    occupied: set[str] = set()
+    # Sort so the assignment is deterministic regardless of iteration order
+    # of the input collection (sets etc.).
+    for v in sorted({v for v in values if v}):
+        h = int(hashlib.md5(v.encode("utf-8")).hexdigest(), 16) % len(palette)
+        for i in range(len(palette)):
+            c = palette[(h + i) % len(palette)]
+            if c not in occupied:
+                used[v] = c
+                occupied.add(c)
+                break
+        else:
+            used[v] = palette[h]   # palette exhausted — wrap
+    return used
 
 
 def build_cluster_lines(sessions: list[dict], repo: Path | None,
@@ -1771,7 +1831,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # inside each group (stable sort below preserves it).
                 _apply_sort(visible, _load_sort())
                 # Global Haiku-based clustering: every session gets assigned
-                # to one of ~6-10 themes by a single one-shot LLM call. Cached
+                # to one of ~5-9 themes by a single one-shot LLM call. Cached
                 # in ~/.cache/recap/global-clusters.json so the LLM only runs
                 # for new sessions (or on `--refresh-clusters`).
                 _global_cluster_assign(visible)
@@ -1818,6 +1878,23 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             for label, key, width in specs:
                 table.add_column(label, key=key, width=width)
 
+            # Precompute one colour-mapping per column so a given project /
+            # topic gets the same colour everywhere it appears, and (when the
+            # unique count fits the palette) distinct values get distinct
+            # colours.
+            project_color: dict[str, str] = {}
+            topic_color: dict[str, str] = {}
+            if show_project:
+                project_color = _build_color_map(
+                    (project_short(s["project_name"]) for s in visible),
+                    _PROJECT_PALETTE,
+                )
+            if cluster_mode:
+                topic_color = _build_color_map(
+                    (s.get("primary_topic") or "(none)" for s in visible),
+                    _TOPIC_PALETTE,
+                )
+
             n = 0
             for s in visible:
                 is_hidden = s["id"] in hidden
@@ -1830,9 +1907,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 marker = f"{marker_a}{marker_s}"
                 row = [marker, fmt_ts(s["first_ts"]), fmt_last_active(s)]
                 if show_project:
-                    row.append(project_short(s["project_name"]))
+                    proj_txt = project_short(s["project_name"])
+                    row.append(Text(proj_txt, style=project_color.get(proj_txt, "")))
                 if cluster_mode:
-                    row.append((s.get("primary_topic") or "(none)")[:14])
+                    topic_full = s.get("primary_topic") or "(none)"
+                    row.append(Text(topic_full[:14], style=topic_color.get(topic_full, "")))
                 # Plain title cell; collapse any newline/tab so a multi-line
                 # ai_title doesn't push the row to multiple terminal lines.
                 raw_title = (s.get("ai_title") or _first_msg(s) or "")[:80]
@@ -2610,7 +2689,11 @@ def main():
                "                            cluster mode is now driven by a one-shot\n"
                "                            Haiku classification cached in\n"
                "                            ~/.cache/recap/global-clusters.json; run\n"
-               "                            `recap --refresh-clusters` to regenerate).",
+               "                            `recap --refresh-clusters` to regenerate).\n"
+               "  RECAP_CLUSTER_TARGET_N=N  target theme count for the global classifier\n"
+               "                            (clamped to [3,12]; Haiku is asked for N±2).\n"
+               "                            Default 7 — Miller (1956)'s '7 ± 2' for\n"
+               "                            at-a-glance absolute judgement.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # default=None on persisted flags so we can detect "not provided" and use
