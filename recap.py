@@ -99,6 +99,7 @@ TREE_MODE_FILE = CACHE_DIR / "tree-mode.txt"
 CLUSTER_MODE_FILE = CACHE_DIR / "cluster-mode.txt"
 UI_MODE_FILE = CACHE_DIR / "ui-mode.txt"
 SORT_FILE = CACHE_DIR / "sort.json"
+GLOBAL_CLUSTERS_FILE = CACHE_DIR / "global-clusters.json"
 OPTIONS_FILE = CACHE_DIR / "options.json"
 
 # Sort columns selectable via Ctrl-1/2/3. "-" = inactive (no sort at this priority).
@@ -642,11 +643,16 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
         pass
 
 
-def call_claude_haiku(prompt: str, timeout: int = 45) -> str:
-    """Call claude -p --model haiku and return stripped output.
+def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False) -> str:
+    """Call claude -p --model haiku and return Haiku's `result` text.
     Suppresses all side effects: hooks, MCP, skills, session persistence.
     Uses Popen + communicate(timeout); on timeout calls _kill_process_tree
-    so grandchildren (node.exe workers under claude.exe) don't leak as zombies."""
+    so grandchildren (node.exe workers under claude.exe) don't leak as zombies.
+
+    Default behaviour (raw=False) is summary-friendly: returns the first
+    non-fence line, truncated to 100 chars. Pass `raw=True` to get the full
+    stripped output — required for structured (e.g. JSON) replies that
+    span multiple lines."""
     cmd = ["claude", "-p", "--model", SUMMARY_MODEL,
            "--setting-sources", "",
            "--strict-mcp-config",
@@ -682,6 +688,8 @@ def call_claude_haiku(prompt: str, timeout: int = 45) -> str:
             text = (payload.get("result") or "").strip()
         except Exception:
             text = raw_text.strip()
+        if raw:
+            return text
         for line in text.split("\n"):
             line = line.strip()
             if line and not line.startswith("```"):
@@ -1307,6 +1315,112 @@ def _assign_primary_topic(sessions: list[dict]) -> None:
         s["primary_topic"] = max(topics, key=lambda t: topic_count[t]) if topics else ""
 
 
+def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) -> None:
+    """One-shot Haiku call to bucket every session into one of ~6-10 themes.
+
+    Unlike _assign_primary_topic (which picks a per-session keyword from each
+    session's own cached topics), this asks Haiku to look across the whole
+    history and propose a small set of coherent themes, then assign every
+    session to exactly one of them. Result is cached in
+    ~/.cache/recap/global-clusters.json keyed by SID. Sessions added since
+    the last classification fall back to the per-session primary topic until
+    the next --refresh-clusters.
+
+    Writes the resulting theme name to s["primary_topic"] in place."""
+    cache = _read_json(GLOBAL_CLUSTERS_FILE, {})
+    assignments: dict[str, str] = cache.get("assignments") or {}
+
+    # Find sessions still missing a cluster assignment.
+    missing = [s for s in sessions if s["id"] not in assignments]
+
+    if force_refresh or (assignments == {} and sessions):
+        # Refresh: classify ALL sessions in one call.
+        targets = sessions
+    elif missing:
+        # Incremental: classify only the new sessions, reusing the existing
+        # theme list so cache stays coherent. If we don't have a theme list
+        # yet (corrupt cache), fall through to a full refresh.
+        if cache.get("clusters"):
+            targets = missing
+        else:
+            targets = sessions
+    else:
+        # Nothing to do — just write the cached assignments back into the
+        # session dicts.
+        for s in sessions:
+            s["primary_topic"] = assignments.get(s["id"], "")
+        return
+
+    items: list[str] = []
+    for s in targets:
+        sid = s["id"][:8]
+        title = (s.get("ai_title") or _first_msg(s) or "").replace("\n", " ")[:120]
+        items.append(f"[{sid}] {title}")
+
+    existing_themes = cache.get("clusters") or []
+    theme_hint = ""
+    if existing_themes and not force_refresh:
+        theme_hint = (
+            "\n\nExisting theme list (assign new sessions to these whenever "
+            f"reasonable; only introduce a new theme if none fit):\n"
+            f"{', '.join(existing_themes)}"
+        )
+
+    prompt = (
+        f"Below are {len(items)} Claude Code session titles. Group them into "
+        "6 to 10 coherent themes that describe the WORK being done. Themes "
+        "should be short English nouns / noun-phrases (e.g. 'email drafting', "
+        "'recap development', 'meeting scheduling'). Every session MUST be "
+        "assigned to exactly one theme — no 'other' / 'misc' / 'general' "
+        "bucket. Reply with ONLY valid JSON, no prose:\n"
+        '{"clusters": ["theme1", "theme2", ...], '
+        '"assignments": {"<8-char-sid>": "<theme>", ...}}'
+        f"{theme_hint}\n\nSessions:\n" + "\n".join(items)
+    )
+
+    print(_c(f"  classifying {len(targets)} session(s) via Haiku "
+            "(this can take ~30-60 s on first run; cached afterwards)...",
+            DIM), file=sys.stderr)
+    raw = call_claude_haiku(prompt, timeout=180, raw=True)
+    parsed = None
+    if raw:
+        try:
+            # Tolerate ```json fences if Haiku wrapped its output.
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", cleaned).strip()
+            parsed = json.loads(cleaned)
+        except Exception:
+            parsed = None
+
+    if isinstance(parsed, dict) and isinstance(parsed.get("assignments"), dict):
+        new_clusters = parsed.get("clusters") or list(set(parsed["assignments"].values()))
+        new_assigns = {}
+        # Map back 8-char SIDs the LLM returned to full SIDs.
+        sid_lookup = {s["id"][:8]: s["id"] for s in sessions}
+        for short, theme in parsed["assignments"].items():
+            full = sid_lookup.get(short)
+            if full and isinstance(theme, str):
+                new_assigns[full] = theme.lower().strip()
+
+        if force_refresh or not cache.get("assignments"):
+            assignments = new_assigns
+            cache = {"clusters": [c.lower() for c in new_clusters], "assignments": assignments}
+        else:
+            assignments.update(new_assigns)
+            cluster_set = set(cache.get("clusters") or []) | {c.lower() for c in new_clusters}
+            cache = {"clusters": sorted(cluster_set), "assignments": assignments}
+        _write_json(GLOBAL_CLUSTERS_FILE, cache)
+    else:
+        print(_c("  warn: Haiku did not return parseable JSON — falling back "
+                "to per-session primary topic.", YELLOW), file=sys.stderr)
+
+    # Apply assignments; sessions still missing fall back to per-session topic.
+    fallback = {s["id"]: s.get("primary_topic", "") for s in sessions}
+    for s in sessions:
+        s["primary_topic"] = assignments.get(s["id"], fallback.get(s["id"], ""))
+
+
 _CLUSTER_TOPIC_W = 14   # fixed width for the `[topic]` prefix column
 
 
@@ -1321,7 +1435,13 @@ def build_cluster_lines(sessions: list[dict], repo: Path | None,
     header rows that confused fzf's preview pump (causing the spinner-loop
     bug). The topic prefix is also in the searchable column, so `email` in
     the query box still jumps straight to the email cluster."""
-    _assign_primary_topic(sessions)
+    # Use the global Haiku classification (shared with the textual picker)
+    # if it's cached; otherwise fall back to the per-session primary topic.
+    if (GLOBAL_CLUSTERS_FILE.exists()
+            and _read_json(GLOBAL_CLUSTERS_FILE, {}).get("assignments")):
+        _global_cluster_assign(sessions)
+    else:
+        _assign_primary_topic(sessions)
     topic_count: Counter = Counter(s["primary_topic"] for s in sessions)
     # Stable two-pass sort: first by time desc (intra-cluster ordering), then
     # by (-member_count, topic_name) (inter-cluster ordering). '' (no topic)
@@ -1650,36 +1770,18 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # Apply the user sort first so cluster members keep that order
                 # inside each group (stable sort below preserves it).
                 _apply_sort(visible, _load_sort())
-                _assign_primary_topic(visible)
-                # Coarsen the grouping: clusters smaller than MIN are folded
-                # into "(other)" so the user isn't drowning in 1-2-session
-                # buckets. RECAP_CLUSTER_MIN_SIZE controls the threshold;
-                # default 5 matches the existing FREQ_CWD_MIN_DEFAULT for
-                # symmetry.
-                try:
-                    min_size = max(1, int(os.environ.get("RECAP_CLUSTER_MIN_SIZE") or 5))
-                except ValueError:
-                    min_size = 5
+                # Global Haiku-based clustering: every session gets assigned
+                # to one of ~6-10 themes by a single one-shot LLM call. Cached
+                # in ~/.cache/recap/global-clusters.json so the LLM only runs
+                # for new sessions (or on `--refresh-clusters`).
+                _global_cluster_assign(visible)
                 topic_count = Counter(s["primary_topic"] for s in visible)
-                for s in visible:
-                    pt = s["primary_topic"]
-                    if pt and topic_count[pt] < min_size:
-                        s["primary_topic"] = "(other)"
-                # Recompute after relabeling so (other) has a count too.
-                topic_count = Counter(s["primary_topic"] for s in visible)
-                # Sort key buckets:
+                # Sort buckets:
                 #   0 = named cluster (sorted by size desc, then name asc)
-                #   1 = "(other)"     (single small-cluster bucket)
-                #   2 = ""            (sessions with no cached topics)
-                def _bucket(pt: str) -> int:
-                    if not pt:
-                        return 2
-                    if pt == "(other)":
-                        return 1
-                    return 0
+                #   1 = "" (sessions the classifier couldn't place; rare)
                 visible.sort(key=lambda s: (
-                    _bucket(s["primary_topic"]),
-                    -topic_count[s["primary_topic"]] if _bucket(s["primary_topic"]) == 0 else 0,
+                    1 if not s["primary_topic"] else 0,
+                    -topic_count[s["primary_topic"]] if s["primary_topic"] else 0,
                     s["primary_topic"],
                 ))
             elif tree_mode:
@@ -1773,13 +1875,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if _get_tree_mode():
                 layout = "tree"
             elif _get_cluster_mode():
-                _assign_primary_topic(all_sessions)
-                cluster_counts = Counter(
-                    s.get("primary_topic") or "" for s in all_sessions
-                )
-                top = [(t, n) for t, n in cluster_counts.most_common() if t][:3]
-                bits = ", ".join(f"{t}({n})" for t, n in top)
-                layout = f"cluster {bits}" if bits else "cluster (no cached topics)"
+                # Read assignments from the global classification cache so
+                # the subtitle reflects exactly what's on screen.
+                cache = _read_json(GLOBAL_CLUSTERS_FILE, {})
+                assigns = cache.get("assignments") or {}
+                if assigns:
+                    cluster_counts = Counter(assigns.values())
+                    top = cluster_counts.most_common(3)
+                    bits = ", ".join(f"{t}({n})" for t, n in top)
+                    layout = f"cluster {bits}"
+                else:
+                    layout = "cluster (run --refresh-clusters)"
             else:
                 layout = "flat"
 
@@ -2500,9 +2606,11 @@ def main():
                "                            on resume even when the target cwd is frequent.\n"
                "  RECAP_FREQ_CWD_MIN=N      minimum session count to flag a cwd as\n"
                "                            \"frequent\" for auto-permission (default 5).\n"
-               "  RECAP_CLUSTER_MIN_SIZE=N  minimum session count for a topic cluster to\n"
-               "                            display as its own group; smaller clusters\n"
-               "                            collapse into \"(other)\" (default 5).",
+               "  RECAP_CLUSTER_MIN_SIZE=N  (legacy, no longer used by --ui textual —\n"
+               "                            cluster mode is now driven by a one-shot\n"
+               "                            Haiku classification cached in\n"
+               "                            ~/.cache/recap/global-clusters.json; run\n"
+               "                            `recap --refresh-clusters` to regenerate).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # default=None on persisted flags so we can detect "not provided" and use
@@ -2571,6 +2679,11 @@ def main():
                         "Same effect as Alt-q/w/e (for priority 1/2/3) inside the picker.")
     p.add_argument("--reset-sort", action="store_true",
                    help="Reset all sort priorities to defaults (date desc, then none).")
+    p.add_argument("--refresh-clusters", action="store_true",
+                   help="Re-run the global Haiku classification used by cluster mode. "
+                        "One LLM call buckets every session into 6-10 coherent themes; "
+                        "result is cached. Run after a flurry of new sessions or when "
+                        "the existing themes feel stale.")
     p.add_argument("--ui", choices=["fzf", "textual"], default=None,
                    help="Picker UI: 'fzf' (default, fast, external binary) or "
                         "'textual' (Python TUI with mouse support, in development). "
@@ -2632,6 +2745,24 @@ def main():
     if args.reset_sort:
         _reset_sort()
         print(_c("  sort: reset to defaults (date desc)", GREEN), file=sys.stderr)
+        return
+    if args.refresh_clusters:
+        # Need sessions loaded for the classifier. Reuse the same scope the
+        # picker uses (defaults to all projects so the cache covers everything).
+        since = None if args.days in (None, 0) else datetime.now(tz=timezone.utc) - timedelta(days=args.days)
+        projects_root = Path.home() / ".claude" / "projects"
+        sessions = []
+        for d in projects_root.iterdir():
+            if d.is_dir() and d.name != "memory":
+                sessions.extend(load_sessions_in_dir(d, since))
+        _global_cluster_assign(sessions, force_refresh=True)
+        cache = _read_json(GLOBAL_CLUSTERS_FILE, {})
+        clusters = cache.get("clusters") or []
+        print(_c(f"  clusters refreshed: {len(clusters)} themes for "
+                f"{len(cache.get('assignments') or {})} sessions", GREEN),
+              file=sys.stderr)
+        if clusters:
+            print(_c("  " + ", ".join(clusters), DIM), file=sys.stderr)
         return
     # --sidechain SID: in-session subagent tree. Handled here (no need to load
     # all sessions across the project — we open the target JSONL directly).
