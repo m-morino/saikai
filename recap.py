@@ -1148,7 +1148,7 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"ctrl-s:change-preview({preview_cmd})",
                 ])
                 view_tag = "show-hidden" if _get_view_mode() == "show-hidden" else "default"
-                tree_tag = "nested" if use_tree else "flat"
+                tree_tag = "flat" if flat else "nested"
                 header = (f"Enter:resume  Ctrl-p:★fav  Ctrl-x:hide  "
                           f"Ctrl-r:hidden(now:{view_tag})  "
                           f"Ctrl-t:tree(now:{tree_tag})  "
