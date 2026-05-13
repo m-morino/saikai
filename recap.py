@@ -1291,16 +1291,18 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                           f"{layout_tag}  "
                           f"Ctrl-f/s:full/summary  Ctrl-C:cancel")
                 result = subprocess.run(
-                    # --preview-window=top:55%:wrap puts the preview pane on top
-                    # so the bottom of the screen is entirely the list pane —
-                    # which means the prompt + header (= keybinding hints) sit
-                    # at the very bottom in their FULL screen width, never
-                    # truncated by the preview pane. Default layout (prompt at
-                    # the bottom) is intentional here for the same reason.
+                    # Layout (default fzf, preview pane below):
+                    #   top:    list pane (the session / topic selector)
+                    #   middle: prompt + header (= keybinding hints), full width
+                    #   bottom: preview pane
+                    # `--layout=default` (the fzf default) keeps the prompt at
+                    # the bottom of the list pane, which puts it just above the
+                    # preview pane → header sits in the screen middle, list
+                    # above it, preview below it.
                     ["fzf", "--ansi", "--no-sort",
                      "--delimiter=\t", "--with-nth=1", "--nth=1,3",
                      "--preview", preview_cmd,
-                     "--preview-window", "top:55%:wrap",
+                     "--preview-window", "down:55%:wrap",
                      "--bind", bindings,
                      "--header", header,
                      "--prompt", "Search> "],
