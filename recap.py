@@ -261,6 +261,29 @@ def _reset_sort() -> None:
         pass
 
 
+def _promote_sort_col(col: str) -> None:
+    """Promote `col` to priority 1. Excel-like: clicking a column repeatedly
+    toggles its direction; clicking a new column pushes the previous
+    priority-1 down to 2, the previous 2 down to 3, drops the old 3.
+    Date-like columns default to descending on first click; everything else
+    defaults to ascending."""
+    if col not in SORT_COLS or col == "-":
+        return
+    keys = _load_sort()
+    if keys[0]["col"] == col:
+        keys[0]["dir"] = "asc" if keys[0]["dir"] == "desc" else "desc"
+    else:
+        # Default direction picked so the first click feels natural: most
+        # recent first for time / large first for counts / A-Z for names.
+        new_dir = "desc" if col in ("date", "last", "turns", "fav") else "asc"
+        # Drop any prior occurrence so the same column doesn't appear twice.
+        filtered = [k for k in keys if k["col"] != col]
+        keys = ([{"col": col, "dir": new_dir}] + filtered)[:3]
+        while len(keys) < 3:
+            keys.append({"col": "-", "dir": "desc"})
+    _save_sort(keys)
+
+
 def _apply_sort(sessions: list[dict], keys: list[dict]) -> None:
     """Stable multi-level sort, lowest priority applied first so the highest
     priority wins on tie-breaks. '-' entries contribute nothing."""
@@ -1480,7 +1503,7 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                  flat: bool = False, cluster_mode: bool = False,
                  reload_args: list[str] | None = None) -> None:
-    """Textual-based picker (Phase 2: preview pane + search + mode toggles).
+    """Textual-based picker (Phase 3 — adds mouse-click column sort).
 
     Layout:
       ┌─────────────────────────────────────────┐
@@ -1497,6 +1520,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
       Ctrl-r       toggle hidden vis     Ctrl-t        toggle tree display
       Ctrl-g       toggle cluster        Ctrl-f / s    full / summary preview
       Alt-1/2/3    cycle sort col N      Alt-q/w/e     toggle priority N dir
+
+    Mouse — click a column header to promote it to priority 1; click the
+    same header again to flip its direction. The previous priority 1
+    becomes priority 2, and so on (priority 3 drops off). The column
+    label shows the current state, e.g. "Start 1v" = priority 1, desc.
     """
     try:
         from textual.app import App, ComposeResult
@@ -1569,11 +1597,29 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             table = self.query_one("#table", DataTable)
             saved_cursor = table.cursor_row
             table.clear(columns=True)
-            cols = ["", "Start", "Last"]
+
+            # Column labels carry a sort indicator (priority + direction arrow)
+            # so a glance at the header tells the user the current sort spec.
+            sort_keys = _load_sort()
+            def col_label(col_key: str, base: str) -> str:
+                for i, k in enumerate(sort_keys, 1):
+                    if k["col"] == col_key:
+                        arrow = "v" if k["dir"] == "desc" else "^"
+                        return f"{base} {i}{arrow}"
+                return base
+
+            # Each column carries (label, key); key drives HeaderSelected
+            # routing. Keys starting with "_" are non-sortable (marker / id).
+            cols_spec: list[tuple[str, str]] = [
+                ("", "_marker"),
+                (col_label("date", "Start"), "date"),
+                (col_label("last", "Last"), "last"),
+            ]
             if show_project:
-                cols.append("Project")
-            cols += ["ID", "Title"]
-            table.add_columns(*cols)
+                cols_spec.append((col_label("proj", "Project"), "proj"))
+            cols_spec.append(("ID", "_id"))
+            cols_spec.append((col_label("title", "Title"), "title"))
+            table.add_columns(*cols_spec)
 
             query = self.query_one("#search", Input).value
             visible = self._filter(query)
@@ -1692,6 +1738,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def on_data_table_row_selected(self, event) -> None:
             if event.row_key and event.row_key.value:
                 self.exit(str(event.row_key.value))
+
+        def on_data_table_header_selected(self, event) -> None:
+            # Excel-like: click a sortable column header → that column becomes
+            # priority 1; click it again → direction toggles. Non-sortable
+            # columns (marker, ID) carry keys starting with "_" and are ignored.
+            col_key = str(event.column_key.value) if event.column_key else ""
+            if not col_key or col_key.startswith("_"):
+                return
+            _promote_sort_col(col_key)
+            _apply_sort(all_sessions, _load_sort())
+            self._refresh_table()
 
         def on_input_changed(self, event) -> None:
             self._refresh_table()
