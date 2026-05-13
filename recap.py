@@ -643,33 +643,44 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
         pass
 
 
-def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False) -> str:
-    """Call claude -p --model haiku and return Haiku's `result` text.
-    Suppresses all side effects: hooks, MCP, skills, session persistence.
-    Uses Popen + communicate(timeout); on timeout calls _kill_process_tree
-    so grandchildren (node.exe workers under claude.exe) don't leak as zombies.
+def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
+                      model: str | None = None) -> str:
+    """Call claude -p with the given (or default Haiku) model and return its
+    `result` text. Suppresses all side effects: hooks, MCP, skills, session
+    persistence. Uses Popen + communicate(timeout); on timeout calls
+    _kill_process_tree so grandchildren (node.exe workers under claude.exe)
+    don't leak as zombies.
 
     Default behaviour (raw=False) is summary-friendly: returns the first
     non-fence line, truncated to 100 chars. Pass `raw=True` to get the full
     stripped output — required for structured (e.g. JSON) replies that
-    span multiple lines."""
-    cmd = ["claude", "-p", "--model", SUMMARY_MODEL,
+    span multiple lines.
+
+    `model` overrides SUMMARY_MODEL when reasoning quality matters more than
+    cost (e.g. one-shot clustering across the full session list).
+
+    The prompt is delivered over STDIN, not as a command-line argument —
+    Windows' CreateProcess caps argv at 32,767 chars total, which a
+    cluster-classification prompt (170+ sessions × ~150 chars) bumps right
+    up against. Stdin has no such limit."""
+    cmd = ["claude", "-p", "--model", model or SUMMARY_MODEL,
            "--setting-sources", "",
            "--strict-mcp-config",
            "--disable-slash-commands",
            "--no-session-persistence",
-           "--output-format", "json",
-           prompt]
+           "--output-format", "json"]
     extra: dict = {}
     if sys.platform == "win32":
         extra["creationflags"] = NO_WINDOW  # no inherited console handles
 
     session_id = ""
     try:
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        with subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               **extra) as proc:
             try:
-                raw_out, _ = proc.communicate(timeout=timeout)
+                raw_out, _ = proc.communicate(input=prompt.encode("utf-8"),
+                                              timeout=timeout)
             except subprocess.TimeoutExpired:
                 _kill_process_tree(proc)
                 # Drain pipes so the with-block's __exit__ doesn't hang. Short
@@ -1407,10 +1418,24 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
         f"{theme_hint}\n\nSessions:\n" + "\n".join(items)
     )
 
-    print(_c(f"  classifying {len(targets)} session(s) via Haiku "
-            "(this can take ~30-60 s on first run; cached afterwards)...",
-            DIM), file=sys.stderr)
-    raw = call_claude_haiku(prompt, timeout=180, raw=True)
+    # Haiku is the default classifier: ~30s for the user's full history,
+    # and with the keyword-augmented prompt (each session line carries its
+    # extracted topics) the output quality is workable. Sonnet does give
+    # cleaner partitions but on 170+ sessions it can take 2-3 minutes —
+    # not interactive. Opt into Sonnet with RECAP_CLUSTER_MODEL=sonnet when
+    # quality matters more than latency.
+    cluster_model = os.environ.get("RECAP_CLUSTER_MODEL") or "haiku"
+    # Haiku usually finishes in 30-60s for ~200 sessions, but the API
+    # latency tail is long — give it 4 minutes before giving up.
+    timeout_s = 600 if cluster_model == "sonnet" else 240
+    eta = "1-3 min" if cluster_model == "sonnet" else "30-60 s"
+    print(_c(f"  classifying {len(targets)} session(s) via {cluster_model} "
+            f"({eta}; cached afterwards)...", DIM), file=sys.stderr)
+    raw = call_claude_haiku(prompt, timeout=timeout_s, raw=True, model=cluster_model)
+    if not raw:
+        print(_c(f"  warn: {cluster_model} returned no output "
+                f"(likely timeout after {timeout_s}s or claude error).",
+                YELLOW), file=sys.stderr)
     parsed = None
     if raw:
         try:
@@ -1422,7 +1447,19 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
         except Exception:
             parsed = None
 
-    if isinstance(parsed, dict) and isinstance(parsed.get("assignments"), dict):
+    valid_parsed = (isinstance(parsed, dict)
+                    and isinstance(parsed.get("assignments"), dict))
+    if raw and not valid_parsed:
+        # Help debug malformed LLM output — dump structure clues so we can
+        # see whether the model prefaced the JSON with prose, returned a
+        # different shape, hit a length cap, etc.
+        snippet = raw.strip()[:400].replace("\n", " ")
+        kind = type(parsed).__name__ if parsed is not None else "None"
+        keys = list(parsed.keys())[:8] if isinstance(parsed, dict) else "(not a dict)"
+        print(_c(f"  debug: parsed type={kind} keys={keys}", DIM), file=sys.stderr)
+        print(_c(f"  debug: raw[0:400] = {snippet!r}", DIM), file=sys.stderr)
+
+    if valid_parsed:
         new_clusters = parsed.get("clusters") or list(set(parsed["assignments"].values()))
         new_assigns = {}
         # Map back 8-char SIDs the LLM returned to full SIDs.
@@ -1441,8 +1478,9 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
             cache = {"clusters": sorted(cluster_set), "assignments": assignments}
         _write_json(GLOBAL_CLUSTERS_FILE, cache)
     else:
-        print(_c("  warn: Haiku did not return parseable JSON — falling back "
-                "to per-session primary topic.", YELLOW), file=sys.stderr)
+        print(_c(f"  warn: {cluster_model} did not return parseable JSON — "
+                "falling back to per-session primary topic.", YELLOW),
+              file=sys.stderr)
 
     # Apply assignments; sessions still missing fall back to per-session topic.
     fallback = {s["id"]: s.get("primary_topic", "") for s in sessions}
@@ -2716,9 +2754,12 @@ def main():
                "                            ~/.cache/recap/global-clusters.json; run\n"
                "                            `recap --refresh-clusters` to regenerate).\n"
                "  RECAP_CLUSTER_TARGET_N=N  target theme count for the global classifier\n"
-               "                            (clamped to [3,12]; Haiku is asked for N±2).\n"
-               "                            Default 7 — Miller (1956)'s '7 ± 2' for\n"
-               "                            at-a-glance absolute judgement.",
+               "                            (clamped to [3,12]; the LLM is asked for\n"
+               "                            N±2). Default 7 — Miller (1956)'s '7 ± 2'\n"
+               "                            for at-a-glance absolute judgement.\n"
+               "  RECAP_CLUSTER_MODEL=...   model used by --refresh-clusters:\n"
+               "                            'haiku' (default, ~30 s on ~200 sessions),\n"
+               "                            'sonnet' (cleaner partitions, 1-3 min).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # default=None on persisted flags so we can detect "not provided" and use
