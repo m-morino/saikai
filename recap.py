@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = []
+# dependencies = ["textual>=0.50"]
 # ///
 """
 recap — Claude Code session history viewer with LLM summarization
@@ -97,6 +97,7 @@ FAVORITE_FILE = CACHE_DIR / "favorite.json"
 VIEW_MODE_FILE = CACHE_DIR / "view-mode.txt"
 TREE_MODE_FILE = CACHE_DIR / "tree-mode.txt"
 CLUSTER_MODE_FILE = CACHE_DIR / "cluster-mode.txt"
+UI_MODE_FILE = CACHE_DIR / "ui-mode.txt"
 SORT_FILE = CACHE_DIR / "sort.json"
 OPTIONS_FILE = CACHE_DIR / "options.json"
 
@@ -191,6 +192,22 @@ def _toggle_cluster_mode() -> bool:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     CLUSTER_MODE_FILE.write_text("on" if new else "off", encoding="utf-8")
     return new
+
+
+def _get_ui_mode() -> str:
+    """Picker UI: 'fzf' (default) or 'textual'."""
+    try:
+        v = UI_MODE_FILE.read_text(encoding="utf-8").strip()
+        return v if v in ("fzf", "textual") else "fzf"
+    except Exception:
+        return "fzf"
+
+
+def _set_ui_mode(mode: str) -> None:
+    if mode not in ("fzf", "textual"):
+        raise ValueError(f"ui mode must be 'fzf' or 'textual', got {mode!r}")
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    UI_MODE_FILE.write_text(mode, encoding="utf-8")
 
 
 def _load_sort() -> list[dict]:
@@ -1457,7 +1474,90 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     full_id = chosen.split("\t")[1].strip()   # field 1 = UUID (0=display, 2=searchable)
     if not full_id:
         return
+    _resume_claude(full_id, sessions)
 
+
+def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
+                 flat: bool = False, cluster_mode: bool = False,
+                 reload_args: list[str] | None = None) -> None:
+    """Textual-based picker (Phase 1: minimum viable).
+
+    Shows sessions in a DataTable; Enter on a row resumes that session.
+    Falls back to fzf if `textual` isn't importable. Phase 2 will add
+    preview pane / mode toggles; Phase 3 adds column-click sort."""
+    try:
+        from textual.app import App, ComposeResult
+        from textual.widgets import DataTable, Footer
+        from textual.binding import Binding
+    except ImportError as e:
+        print(_c(f"  textual not available ({e}) — falling back to fzf", YELLOW),
+              file=sys.stderr)
+        fzf_pick(sessions, repo, show_project, flat=flat,
+                 cluster_mode=cluster_mode, reload_args=reload_args)
+        return
+
+    # Filter hidden in-place for the picker view (same rule as fzf path).
+    hidden = _load_hidden()
+    favorites = _load_favorites()
+    view_mode = _get_view_mode()
+    visible = [s for s in sessions
+               if view_mode == "show-hidden" or s["id"] not in hidden]
+
+    class PickerApp(App):
+        TITLE = "recap"
+        SUB_TITLE = f"{len(visible)} sessions"
+        BINDINGS = [
+            Binding("escape", "quit", "Cancel"),
+            Binding("ctrl+c", "quit", "Cancel", show=False),
+            Binding("q", "quit", "Quit"),
+        ]
+        CSS = """
+        Screen { layout: vertical; }
+        DataTable { height: 1fr; }
+        """
+
+        def compose(self) -> ComposeResult:
+            yield DataTable(cursor_type="row", zebra_stripes=True)
+            yield Footer()
+
+        def on_mount(self) -> None:
+            table = self.query_one(DataTable)
+            cols = ["", "Start", "Last"]
+            if show_project:
+                cols.append("Project")
+            cols += ["ID", "Title"]
+            table.add_columns(*cols)
+            for s in visible:
+                marker_a = "@" if s.get("is_open") else ("+" if s.get("is_active") else
+                          ("." if s.get("is_recent") else " "))
+                marker_s = "*" if s["id"] in favorites else (
+                          "x" if s["id"] in hidden else " ")
+                marker = f"{marker_a}{marker_s}"
+                start = fmt_ts(s["first_ts"])
+                last = fmt_last_active(s)
+                sid8 = short_id(s["id"])
+                title = (s.get("ai_title") or _first_msg(s) or "")[:80]
+                row = [marker, start, last]
+                if show_project:
+                    row.append(project_short(s["project_name"]))
+                row += [sid8, title]
+                table.add_row(*row, key=s["id"])
+            table.focus()
+
+        def on_data_table_row_selected(self, event) -> None:
+            if event.row_key and event.row_key.value:
+                self.exit(str(event.row_key.value))
+
+    chosen = PickerApp().run()
+    if chosen:
+        _resume_claude(chosen, sessions)
+
+
+def _resume_claude(full_id: str, sessions: list[dict]) -> None:
+    """Resume `claude --resume <full_id>` from the right cwd. Self-terminating:
+    `sys.exit`s with claude's return code. Shared by every picker frontend so
+    cwd resolution / auto-permission / venv strip / terminal reset stay in
+    exactly one place."""
     # Try origin_cwd first (where Claude originally indexed the session — required
     # for --resume to find it). Fall back to last cwd, then to an existing user
     # directory whose path-key matches the JSONL's project dir name (handles
@@ -1469,8 +1569,6 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             v = selected.get(k)
             if v and Path(v).is_dir():
                 candidates.append(v)
-        # Last-resort: borrow a still-existing cwd from any other session in the
-        # same project directory (worktree gone, parent still present, etc.)
         if not candidates and selected.get("jsonl_path"):
             project_dir = selected["jsonl_path"].parent
             for other in sessions:
@@ -1484,10 +1582,7 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         print(_c(f"  warn: session's recorded cwd no longer exists — running from current dir", YELLOW),
               file=sys.stderr)
 
-    # Auto-permission: if the target cwd is a "frequent" workspace (i.e. the user
-    # has run many sessions there, so they presumably trust it), pass
-    # --permission-mode auto so claude doesn't pause for per-tool-use approval.
-    # Opt-out via RECAP_NO_AUTO_PERMISSION=1 if the user wants the prompts back.
+    # Auto --permission-mode auto for frequent (= trusted) workspaces.
     extra_args: list[str] = []
     auto_perm_note = ""
     if (target_cwd
@@ -1501,10 +1596,8 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
           + (f"\n{auto_perm_note}" if auto_perm_note else ""))
     env = os.environ.copy()
     env["RECAP_RESUME"] = "1"   # signal to teams-notify.py: suppress idle_prompt
-    # The recap wrapper invokes us via `uv run --no-project`, which sets
-    # VIRTUAL_ENV to its ephemeral env and prepends the venv's Scripts/bin
-    # to PATH. Inherit-as-is would make the resumed session's `uv` warn
-    # "VIRTUAL_ENV does not match project environment .venv". Strip both.
+    # Strip uv's ephemeral VIRTUAL_ENV so the resumed session's `uv` doesn't
+    # warn about a stale venv.
     leaked_venv = env.pop("VIRTUAL_ENV", None)
     env.pop("VIRTUAL_ENV_PROMPT", None)
     if leaked_venv:
@@ -1514,41 +1607,18 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         parts = [p for p in env.get("PATH", "").split(os.pathsep) if cmp(p) != cmp(venv_bin)]
         env["PATH"] = os.pathsep.join(parts)
 
-    # Replace recap.py with claude.exe so the terminal's direct child becomes
-    # claude (not recap.py blocking on subprocess.run for the entire session).
-    # Otherwise: if the user closes the terminal mid-session, recap.py + its
-    # claude --resume child both linger as zombies (observed 2026-05-10).
     if target_cwd:
-        # TOCTOU: directory passed `is_dir()` earlier but could vanish before
-        # chdir (worktree removed, USB ejected). Warn instead of silently
-        # falling back to recap's own cwd — the user can then re-resume from
-        # the right place.
+        # TOCTOU: directory passed `is_dir()` earlier but could vanish before chdir.
         try:
             os.chdir(target_cwd)
         except OSError as e:
             print(_c(f"  warn: chdir to {target_cwd} failed ({e}); "
-                    f"resuming from current dir instead", YELLOW),
-                  file=sys.stderr)
+                    f"resuming from current dir instead", YELLOW), file=sys.stderr)
             target_cwd = None
-    # Show a "loading" line so the multi-second claude.exe cold start doesn't
-    # feel like a hang. Sits at the bottom of the terminal until claude enters
-    # alternate-screen mode and clears it.
+
     sys.stderr.write(_c("  Loading claude session ...", DIM) + "\n")
     sys.stderr.flush()
     _reset_terminal_modes()
-    # We INTENTIONALLY use subprocess.run + post-exit reset instead of execvpe.
-    # Rationale: claude.exe enables SGR mouse / focus / bracketed-paste on
-    # startup and is expected to disable them on exit — but on early crash
-    # (bad session id, missing binary on a subdep, etc.) it terminates without
-    # the matching `l` sequences, and the shell prompt is then poisoned with
-    # stray bytes on key press (Enter showed `m`, the SGR-release terminator).
-    # With execvpe, recap is gone before claude exits, so we can't reset.
-    # Trade-off: recap.py stays alive as the parent until claude exits, so a
-    # terminal close that doesn't propagate CTRL_CLOSE_EVENT to claude could
-    # in theory leave a `recap.py + claude.exe` zombie pair. In practice the
-    # console close DOES propagate, and the broken-terminal symptom is far
-    # more user-visible than that edge case. (`~/.local/bin/recap` also has a
-    # belt-and-braces EXIT trap that resets modes if recap itself dies hard.)
     claude_bin = shutil.which("claude", path=env.get("PATH")) or "claude"
     claude_argv = [claude_bin, "--resume", full_id, *extra_args]
     try:
@@ -1557,8 +1627,6 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         print(_c("  error: claude not on PATH", RED), file=sys.stderr)
         rc = 127
     finally:
-        # Defensive reset: handles the case where claude exited without
-        # disabling the modes it enabled, or where we never reached run() at all.
         _reset_terminal_modes()
     sys.exit(rc)
 
@@ -2130,6 +2198,11 @@ def main():
                         "Same effect as Alt-q/w/e (for priority 1/2/3) inside the picker.")
     p.add_argument("--reset-sort", action="store_true",
                    help="Reset all sort priorities to defaults (date desc, then none).")
+    p.add_argument("--ui", choices=["fzf", "textual"], default=None,
+                   help="Picker UI: 'fzf' (default, fast, external binary) or "
+                        "'textual' (Python TUI with mouse support, in development). "
+                        "Persistent — sets the new default. Use without --ui to "
+                        "fall back to fzf.")
     p.add_argument("--related", metavar="SESSION_ID",
                    help="Show sessions related to SESSION_ID with confidence scores and reasons")
     p.add_argument("--tree", action="store_true",
@@ -2345,7 +2418,13 @@ def main():
             visible = sessions
         display_table(visible, repo, args.all_projects, flat=flat)
     else:
-        # Default: interactive fzf picker
+        # Default: interactive picker. UI choice = CLI --ui (one-shot, also
+        # persists) > saved ui-mode > 'fzf' fallback.
+        if args.ui:
+            _set_ui_mode(args.ui)
+            ui_mode = args.ui
+        else:
+            ui_mode = _get_ui_mode()
         reload_args = ["--list", "--days", str(args.days)]
         if args.here:
             reload_args.append("--here")
@@ -2355,8 +2434,12 @@ def main():
         # tree-mode (toggled via Ctrl-t inside the picker) is the source of
         # truth on reload. Otherwise an initial `recap --tree` would override
         # subsequent toggles forever.
-        fzf_pick(sessions, repo, args.all_projects, flat=flat,
-                 cluster_mode=cluster_mode, reload_args=reload_args)
+        if ui_mode == "textual":
+            textual_pick(sessions, repo, args.all_projects, flat=flat,
+                         cluster_mode=cluster_mode, reload_args=reload_args)
+        else:
+            fzf_pick(sessions, repo, args.all_projects, flat=flat,
+                     cluster_mode=cluster_mode, reload_args=reload_args)
 
 
 if __name__ == "__main__":
