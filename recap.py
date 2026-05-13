@@ -1748,10 +1748,26 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     arrow = "v" if k["dir"] == "desc" else "^"
                     parts.append(f"[{i}{arrow}{k['col']}]")
             view = _get_view_mode()
-            tree = "T" if _get_tree_mode() else "-"
-            cluster = "C" if _get_cluster_mode() else "-"
+
+            # Layout indicator: plain flat / tree / cluster. For cluster mode
+            # also surface the top groups + sizes so the user can see at a
+            # glance that the grouping is actually applied (the "I toggled
+            # cluster but nothing visibly changed" symptom).
+            if _get_tree_mode():
+                layout = "tree"
+            elif _get_cluster_mode():
+                _assign_primary_topic(all_sessions)
+                cluster_counts = Counter(
+                    s.get("primary_topic") or "" for s in all_sessions
+                )
+                top = [(t, n) for t, n in cluster_counts.most_common() if t][:3]
+                bits = ", ".join(f"{t}({n})" for t, n in top)
+                layout = f"cluster {bits}" if bits else "cluster (no cached topics)"
+            else:
+                layout = "flat"
+
             self.sub_title = (f"{table.row_count} sessions  "
-                              f"view:{view}  layout:{tree}{cluster}  "
+                              f"view:{view}  layout:{layout}  "
                               f"sort:{' '.join(parts)}")
 
         def _cursor_sid(self) -> str | None:
