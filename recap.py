@@ -767,19 +767,8 @@ def summarize_session(s: dict) -> str:
     return _first_msg(s)
 
 
-_SUMMARIZE_AUTO_CAP = 30  # max sessions to auto-summarize per run; avoids spawning
-
-
-def summarize_all_parallel(sessions: list[dict], max_workers: int = 2,
-                           cap: int = _SUMMARIZE_AUTO_CAP):
-    """Summarize sessions in parallel, showing progress.
-
-    `cap` limits how many unseen sessions get LLM summarization on a single
-    run. Default 30 prevents a first-run flood of claude subprocesses (each
-    `claude -p` spawns several Node workers; 5 concurrent × many workers =
-    hundreds of visible processes). Set cap=0 to process all pending sessions
-    (equivalent to --summarize-all).
-    """
+def summarize_all_parallel(sessions: list[dict], max_workers: int = 5):
+    """Summarize all sessions in parallel, showing progress."""
     pending = [s for s in sessions if not s["ai_title"]
                and not s.get("is_open")   # active JSONL mtime changes → cache always stale
                and _load_cache(s["id"], s["mtime"]) is None]
@@ -788,14 +777,7 @@ def summarize_all_parallel(sessions: list[dict], max_workers: int = 2,
             s["summary"] = summarize_session(s)  # cache hit / ai_title
         return
 
-    skipped = 0
-    if cap and len(pending) > cap:
-        skipped = len(pending) - cap
-        pending = pending[:cap]  # sessions are newest-first; cap to most recent
-
-    print(_c(f"  Summarizing {len(pending)} session(s) via Claude Haiku"
-             + (f" ({skipped} older sessions skipped; use --summarize-all to include)"
-                if skipped else "") + "...", DIM),
+    print(_c(f"  Summarizing {len(pending)} sessions via Claude Haiku...", DIM),
           file=sys.stderr)
 
     done = 0
@@ -2814,10 +2796,6 @@ def main():
     p.add_argument("--project", metavar="PATH")
     p.add_argument("--no-summary", action="store_true",
                    help="Skip Haiku summarization (use AI title or first user msg)")
-    p.add_argument("--summarize-all", action="store_true",
-                   help=f"Summarize ALL unseen sessions (no cap). By default only the "
-                        f"{_SUMMARIZE_AUTO_CAP} most recent unseen sessions are summarized "
-                        f"per run to avoid spawning too many claude subprocesses.")
     p.add_argument("--refresh-summary", action="store_true",
                    help="Discard cached Haiku summaries and regenerate. Does NOT touch "
                         "parsed/topic caches; delete ~/.cache/recap/parsed/ for that.")
@@ -3043,8 +3021,7 @@ def main():
             else:
                 s["summary"] = s["ai_title"] or _first_msg(s)
     else:
-        summarize_all_parallel(sessions,
-                               cap=0 if args.summarize_all else _SUMMARIZE_AUTO_CAP)
+        summarize_all_parallel(sessions)
 
     if args.related:
         cmd_related(args.related, sessions)
