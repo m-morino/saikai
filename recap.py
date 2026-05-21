@@ -1832,7 +1832,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         preview_mode = "summary"   # "summary" or "full"
 
         def compose(self) -> ComposeResult:
-            yield Input(placeholder="Search title / message / SID / project ...",
+            yield Input(placeholder="Search title / msg / SID / proj    "
+                                    "•  :fav  :hidden  :open  :active  :recent",
                         id="search")
             with Horizontal(id="main"):
                 yield DataTable(cursor_type="row", zebra_stripes=True, id="table")
@@ -1844,15 +1845,44 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.query_one("#table", DataTable).focus()
             self._update_subtitle()
 
+        # Status-filter prefixes: typed alongside text in the search input.
+        # `:fav python` = favorites whose searchable text matches "python".
+        # `:hidden` alone surfaces sessions normally skipped by default view.
+        _STATUS_TOKENS = {":fav", ":hidden", ":open", ":active", ":recent"}
+
+        def _parse_query(self, q: str) -> tuple[set[str], str]:
+            tokens = q.strip().lower().split()
+            statuses = {t for t in tokens if t in self._STATUS_TOKENS}
+            text = " ".join(t for t in tokens if t not in statuses)
+            return statuses, text
+
         def _filter(self, q: str) -> list[dict]:
-            q = q.strip().lower()
-            if not q:
+            statuses, text = self._parse_query(q)
+            if not statuses and not text:
                 return all_sessions
-            return [s for s in all_sessions
-                    if q in (s.get("ai_title") or "").lower()
-                    or q in " ".join(s.get("real_msgs") or []).lower()
-                    or q in s["id"]
-                    or q in (s.get("project_name") or "").lower()]
+            favs = _load_favorites() if ":fav" in statuses else set()
+            hidden = _load_hidden() if ":hidden" in statuses else set()
+
+            def keep(s: dict) -> bool:
+                sid = s["id"]
+                if ":fav" in statuses and sid not in favs:
+                    return False
+                if ":hidden" in statuses and sid not in hidden:
+                    return False
+                if ":open" in statuses and not s.get("is_open"):
+                    return False
+                if ":active" in statuses and not s.get("is_active"):
+                    return False
+                if ":recent" in statuses and not s.get("is_recent"):
+                    return False
+                if text:
+                    return (text in (s.get("ai_title") or "").lower()
+                            or text in " ".join(s.get("real_msgs") or []).lower()
+                            or text in sid
+                            or text in (s.get("project_name") or "").lower())
+                return True
+
+            return [s for s in all_sessions if keep(s)]
 
         def _refresh_table(self) -> None:
             # Catch-all so a row-build exception (bad session dict, Textual
@@ -1953,10 +1983,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _TOPIC_PALETTE,
                 )
 
+            # `:hidden` in the query is an explicit request for hidden rows,
+            # so bypass the default-view auto-skip — otherwise the filter
+            # would match them but the renderer would drop every one.
+            show_hidden = (view_mode == "show-hidden"
+                           or ":hidden" in self._parse_query(query)[0])
             n = 0
             for s in visible:
                 is_hidden = s["id"] in hidden
-                if is_hidden and view_mode != "show-hidden":
+                if is_hidden and not show_hidden:
                     continue
                 marker_a = ("@" if s.get("is_open") else "+" if s.get("is_active")
                             else "." if s.get("is_recent") else " ")
@@ -2054,6 +2089,33 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 preview.write(f"(no cached preview for {sid[:8]} — open the session once to populate the cache)")
 
         # ── events ──────────────────────────────────────────────────────────
+
+        def on_key(self, event) -> None:
+            # fzf-like: typing while the table is focused redirects into the
+            # search input. Arrow keys / control bindings still route normally
+            # because we only intercept printable single characters and
+            # Backspace. Down arrow from the search input jumps to the table
+            # so the user can drive a result without reaching for the mouse.
+            try:
+                search = self.query_one("#search", Input)
+                table = self.query_one("#table", DataTable)
+            except Exception:
+                return
+            if self.focused is table:
+                char = event.character
+                if char and len(char) == 1 and char.isprintable():
+                    search.focus()
+                    search.value = search.value + char
+                    search.cursor_position = len(search.value)
+                    event.stop()
+                elif event.key == "backspace" and search.value:
+                    search.focus()
+                    search.value = search.value[:-1]
+                    search.cursor_position = len(search.value)
+                    event.stop()
+            elif self.focused is search and event.key == "down":
+                table.focus()
+                event.stop()
 
         def on_data_table_row_highlighted(self, event) -> None:
             sid = str(event.row_key.value) if event.row_key else None
@@ -2810,6 +2872,11 @@ def main():
                    help="Toggle hidden state for a session")
     p.add_argument("--favorite", metavar="SESSION_ID",
                    help="Toggle favorite (★) state for a session")
+    p.add_argument("--fav-current", action="store_true",
+                   help="Mark the current Claude Code session as favorite. "
+                        "Resolves the session ID from $CLAUDE_SESSION_ID, "
+                        "falling back to the most-recently-modified JSONL "
+                        "in this project's encoded directory.")
     p.add_argument("--toggle-view", action="store_true",
                    help="Toggle saved default/show-hidden view mode (persistent).")
     p.add_argument("--toggle-tree", action="store_true",
@@ -2862,6 +2929,28 @@ def main():
         return
     if args.favorite:
         sid = _trim_sid(args.favorite)
+        now_fav = _toggle_in_set(FAVORITE_FILE, sid)
+        state = _c("* favorite", YELLOW) if now_fav else _c("not favorite", GRAY)
+        print(f"  {sid[:8]}: {state}", file=sys.stderr)
+        return
+    if args.fav_current:
+        sid = (os.environ.get("CLAUDE_SESSION_ID") or "").strip()
+        if not sid:
+            # Fall back: most-recently-modified JSONL in this project's
+            # encoded dir. That's the session being written to *now* — i.e.
+            # the one the user is in. Stable across slash-command and shell
+            # invocations where the env var isn't propagated.
+            proj = find_project_dir(Path.cwd())
+            if proj and proj.exists():
+                jsonls = sorted(proj.glob("*.jsonl"),
+                                key=lambda p: p.stat().st_mtime, reverse=True)
+                if jsonls:
+                    sid = jsonls[0].stem
+        if not sid:
+            print(_c("  no current session found "
+                     "(set CLAUDE_SESSION_ID or run inside a project)", RED),
+                  file=sys.stderr)
+            sys.exit(1)
         now_fav = _toggle_in_set(FAVORITE_FILE, sid)
         state = _c("* favorite", YELLOW) if now_fav else _c("not favorite", GRAY)
         print(f"  {sid[:8]}: {state}", file=sys.stderr)
