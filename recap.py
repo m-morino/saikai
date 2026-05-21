@@ -732,9 +732,23 @@ def _looks_like_refusal(text: str) -> bool:
     ))
 
 
+_CJK_RE = re.compile(r"[぀-ヿ一-鿿]")
+
+
+def _has_cjk(text: str) -> bool:
+    """True if the string contains Hiragana, Katakana, or CJK ideographs."""
+    return bool(_CJK_RE.search(text or ""))
+
+
 def summarize_session(s: dict) -> str:
-    """Get summary for a session: cache → AI title → LLM."""
-    if s["ai_title"]:
+    """Get summary for a session: cache → AI title → LLM.
+
+    Claude Code's `aiTitle` follows the language of the first user message,
+    so English-mode sessions produce English titles that bypass the
+    Japanese Haiku prompt below. Treat non-CJK titles as "needs Haiku"
+    and fall through; CJK titles still short-circuit for cost.
+    """
+    if s["ai_title"] and _has_cjk(s["ai_title"]):
         return s["ai_title"]
 
     # Active sessions: JSONL mtime changes every turn → cache always invalid → skip LLM
