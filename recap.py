@@ -2244,11 +2244,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
 
 def _persist_resume_id(full_id: str, target_cwd: str | None) -> Path:
-    """Save the resume ID to a TSV history + Windows clipboard so the user
-    can recover it after the wezterm/tab window closes. wezterm shortcuts
-    typically close-on-exit, so a user who needs to restart an unstable
-    claude session loses the chance to select-copy the ID from scrollback.
-    Both writes are best-effort; failures never block the resume."""
+    """Append the resume ID to a TSV history file. Long-term audit + a
+    safety net the user can reach via `tail -1` from any terminal after
+    the resumed session has crashed. Best-effort; failure never blocks
+    the resume."""
     RESUME_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().astimezone().isoformat(timespec="seconds")
     try:
@@ -2256,12 +2255,6 @@ def _persist_resume_id(full_id: str, target_cwd: str | None) -> Path:
             f.write(f"{full_id}\t{ts}\t{target_cwd or ''}\n")
     except OSError:
         pass
-    if sys.platform == "win32":
-        try:
-            subprocess.run(["clip"], input=full_id, text=True, timeout=2,
-                           creationflags=NO_WINDOW, check=False)
-        except (OSError, subprocess.SubprocessError):
-            pass
     return RESUME_HISTORY_FILE
 
 
@@ -2304,10 +2297,9 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
         auto_perm_note = _c("  [--permission-mode auto: frequent cwd]", DIM)
 
     hist_path = _persist_resume_id(full_id, target_cwd)
-    clip_hint = " (also in clipboard)" if sys.platform == "win32" else ""
     print(f"\nResuming {full_id}"
           + (f"  (cwd: {target_cwd})" if target_cwd else "")
-          + f"\n  resume ID saved → {hist_path}{clip_hint}"
+          + f"\n  resume ID logged → {hist_path}"
           + (f"\n{auto_perm_note}" if auto_perm_note else ""))
     env = os.environ.copy()
     env["RECAP_RESUME"] = "1"   # signal to teams-notify.py: suppress idle_prompt
@@ -2336,16 +2328,37 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
     _reset_terminal_modes()
     claude_bin = shutil.which("claude", path=env.get("PATH")) or "claude"
     claude_argv = [claude_bin, "--resume", full_id, *extra_args]
-    # Process replacement (execvpe) instead of subprocess.run: the python
-    # recap.py process is *replaced* by claude.exe, so there is no Python
-    # parent left blocking on subprocess.run. Prevents the leak class where
-    # a closed terminal left both recap.py and claude.exe alive for hours
-    # waiting on each other. The wrapper script's EXIT trap still fires when
-    # claude itself exits, so terminal mode resets remain covered.
+
+    # Pause-on-exit wrapper: wraps claude in `cmd.exe /c "... & pause"` (or
+    # `/bin/sh -c "...; read"` on POSIX) so the terminal window stays open
+    # after claude exits. wezterm shortcut-launched windows close the moment
+    # the foreground process dies — without pause the user loses the chance
+    # to scroll back and grab the resume ID after an unstable session.
+    # The shell is still process-replaced via execvpe so there is no python
+    # parent blocking on subprocess.run (leak prevention from the prior fix
+    # remains intact). Opt out with RECAP_NO_PAUSE_ON_EXIT=1.
+    no_pause = os.environ.get("RECAP_NO_PAUSE_ON_EXIT") == "1"
+    if no_pause:
+        exec_bin = claude_bin
+        exec_argv = claude_argv
+    elif sys.platform == "win32":
+        inner = subprocess.list2cmdline(claude_argv)
+        wrapped = (f'{inner} & echo. & echo --- claude exited '
+                   f'(scroll up to copy resume ID) --- & pause')
+        exec_bin = "cmd.exe"
+        exec_argv = ["cmd.exe", "/c", wrapped]
+    else:
+        import shlex
+        inner = " ".join(shlex.quote(a) for a in claude_argv)
+        wrapped = (f"{inner}; printf '\\n--- claude exited "
+                   f"(scroll up to copy resume ID) ---\\n'; read -r _")
+        exec_bin = "/bin/sh"
+        exec_argv = ["/bin/sh", "-c", wrapped]
+
     try:
-        os.execvpe(claude_bin, claude_argv, env)
+        os.execvpe(exec_bin, exec_argv, env)
     except FileNotFoundError:
-        print(_c("  error: claude not on PATH", RED), file=sys.stderr)
+        print(_c(f"  error: {exec_bin} not on PATH", RED), file=sys.stderr)
         _reset_terminal_modes()
         sys.exit(127)
     except OSError as e:
