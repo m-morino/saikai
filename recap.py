@@ -101,6 +101,7 @@ UI_MODE_FILE = CACHE_DIR / "ui-mode.txt"
 SORT_FILE = CACHE_DIR / "sort.json"
 GLOBAL_CLUSTERS_FILE = CACHE_DIR / "global-clusters.json"
 OPTIONS_FILE = CACHE_DIR / "options.json"
+RESUME_HISTORY_FILE = CACHE_DIR / "resume-history.tsv"
 
 # Sort columns selectable via Ctrl-1/2/3. "-" = inactive (no sort at this priority).
 SORT_COLS = ("-", "date", "last", "proj", "title", "turns", "fav", "topic")
@@ -2242,6 +2243,28 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         _resume_claude(chosen, all_sessions)
 
 
+def _persist_resume_id(full_id: str, target_cwd: str | None) -> Path:
+    """Save the resume ID to a TSV history + Windows clipboard so the user
+    can recover it after the wezterm/tab window closes. wezterm shortcuts
+    typically close-on-exit, so a user who needs to restart an unstable
+    claude session loses the chance to select-copy the ID from scrollback.
+    Both writes are best-effort; failures never block the resume."""
+    RESUME_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        with RESUME_HISTORY_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"{full_id}\t{ts}\t{target_cwd or ''}\n")
+    except OSError:
+        pass
+    if sys.platform == "win32":
+        try:
+            subprocess.run(["clip"], input=full_id, text=True, timeout=2,
+                           creationflags=NO_WINDOW, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return RESUME_HISTORY_FILE
+
+
 def _resume_claude(full_id: str, sessions: list[dict]) -> None:
     """Resume `claude --resume <full_id>` from the right cwd. Self-terminating:
     `sys.exit`s with claude's return code. Shared by every picker frontend so
@@ -2280,8 +2303,11 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
         extra_args = ["--permission-mode", "auto"]
         auto_perm_note = _c("  [--permission-mode auto: frequent cwd]", DIM)
 
-    print(f"\nResuming {full_id[:8]}"
+    hist_path = _persist_resume_id(full_id, target_cwd)
+    clip_hint = " (also in clipboard)" if sys.platform == "win32" else ""
+    print(f"\nResuming {full_id}"
           + (f"  (cwd: {target_cwd})" if target_cwd else "")
+          + f"\n  resume ID saved → {hist_path}{clip_hint}"
           + (f"\n{auto_perm_note}" if auto_perm_note else ""))
     env = os.environ.copy()
     env["RECAP_RESUME"] = "1"   # signal to teams-notify.py: suppress idle_prompt
