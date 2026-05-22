@@ -2310,19 +2310,22 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
     _reset_terminal_modes()
     claude_bin = shutil.which("claude", path=env.get("PATH")) or "claude"
     claude_argv = [claude_bin, "--resume", full_id, *extra_args]
+    # Process replacement (execvpe) instead of subprocess.run: the python
+    # recap.py process is *replaced* by claude.exe, so there is no Python
+    # parent left blocking on subprocess.run. Prevents the leak class where
+    # a closed terminal left both recap.py and claude.exe alive for hours
+    # waiting on each other. The wrapper script's EXIT trap still fires when
+    # claude itself exits, so terminal mode resets remain covered.
     try:
-        rc = subprocess.run(claude_argv, cwd=target_cwd, env=env).returncode
+        os.execvpe(claude_bin, claude_argv, env)
     except FileNotFoundError:
         print(_c("  error: claude not on PATH", RED), file=sys.stderr)
-        rc = 127
-    except KeyboardInterrupt:
-        # Ctrl-C while claude is running is a normal user exit — claude
-        # already received the signal and is winding down. Don't dump a
-        # Python traceback over its shutdown output.
-        rc = 130   # POSIX convention for SIGINT (128 + 2)
-    finally:
         _reset_terminal_modes()
-    sys.exit(rc)
+        sys.exit(127)
+    except OSError as e:
+        print(_c(f"  error: failed to launch claude ({e})", RED), file=sys.stderr)
+        _reset_terminal_modes()
+        sys.exit(1)
 
 
 # ── Project lookup ───────────────────────────────────────────────────────────
