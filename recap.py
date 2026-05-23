@@ -2329,22 +2329,31 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
     claude_bin = shutil.which("claude", path=env.get("PATH")) or "claude"
     claude_argv = [claude_bin, "--resume", full_id, *extra_args]
 
-    # Process replacement directly into claude — recap.py is replaced by
-    # claude.exe, no Python parent left to block. The pause-on-exit
-    # behavior (hold the window so the user can grab the resume ID) is
-    # handled by the wrapper script ~/.local/bin/recap, whose stdin is
-    # still attached to the outer terminal pty (it was never touched by
-    # Textual's raw-mode shenanigans).
+    # Use subprocess.run instead of execvpe so the python parent stays alive
+    # until claude exits. On Windows, execvpe replaces the process but the
+    # parent chain (uv → cmd → pwsh) sees that exit immediately and unwinds
+    # while the orphaned new claude.exe keeps running attached to the pty.
+    # That out-of-order unwind makes wezterm's "Process exited" message
+    # surface during the live claude session, which is visually broken.
+    # Subprocess keeps the call ordering correct: claude exits → python
+    # exits → chain unwinds → pwsh's trailing `exit 99` (set in wezterm
+    # launch_menu) runs *after* claude is gone, holding the pane open.
+    # Leak risk re-introduced here is mitigated by the reap-orphan-claude.py
+    # SessionStart hook, which now flags python/uv-parented claude.exe as
+    # orphan candidates.
     try:
-        os.execvpe(claude_bin, claude_argv, env)
+        rc = subprocess.run(claude_argv, env=env).returncode
     except FileNotFoundError:
         print(_c("  error: claude not on PATH", RED), file=sys.stderr)
+        rc = 127
+    except KeyboardInterrupt:
+        # Ctrl-C while claude is running is a normal user exit — claude
+        # already received the signal and is winding down. Don't dump a
+        # Python traceback over its shutdown output.
+        rc = 130
+    finally:
         _reset_terminal_modes()
-        sys.exit(127)
-    except OSError as e:
-        print(_c(f"  error: failed to launch claude ({e})", RED), file=sys.stderr)
-        _reset_terminal_modes()
-        sys.exit(1)
+    sys.exit(rc)
 
 
 # ── Project lookup ───────────────────────────────────────────────────────────
