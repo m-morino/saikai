@@ -2329,51 +2329,16 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
     claude_bin = shutil.which("claude", path=env.get("PATH")) or "claude"
     claude_argv = [claude_bin, "--resume", full_id, *extra_args]
 
-    # Pause-on-exit wrapper: holds the terminal window open after claude
-    # exits so the user can scroll back and grab the resume ID. wezterm
-    # shortcut-launched windows close the moment the foreground process
-    # dies; without pause the ID is lost.
-    #
-    # Shell preference: bash first (Git Bash on Windows / native on POSIX)
-    # because cmd.exe's `pause` exits immediately under MSYS pty — its
-    # stdin isn't a real Windows console there, so ReadConsoleInput
-    # returns end-of-input without blocking, defeating the whole point.
-    # bash's `read` blocks correctly because bash is at home in MSYS pty.
-    # Falls back to cmd.exe (Windows-only) when bash isn't available.
-    #
-    # The shell is still process-replaced via execvpe so there is no
-    # python parent blocking on subprocess.run (leak prevention from the
-    # prior fix remains intact). Opt out with RECAP_NO_PAUSE_ON_EXIT=1.
-    no_pause = os.environ.get("RECAP_NO_PAUSE_ON_EXIT") == "1"
-    bash_bin = shutil.which("bash") if not no_pause else None
-    if no_pause:
-        exec_bin = claude_bin
-        exec_argv = claude_argv
-    elif bash_bin:
-        import shlex
-        inner = " ".join(shlex.quote(a) for a in claude_argv)
-        wrapped = (f'{inner}; printf "\\n--- claude exited '
-                   f'(scroll up to copy resume ID) ---\\n"; read -r _')
-        exec_bin = bash_bin
-        exec_argv = [bash_bin, "-c", wrapped]
-    elif sys.platform == "win32":
-        inner = subprocess.list2cmdline(claude_argv)
-        wrapped = (f'{inner} & echo. & echo --- claude exited '
-                   f'(scroll up to copy resume ID) --- & pause')
-        exec_bin = "cmd.exe"
-        exec_argv = ["cmd.exe", "/c", wrapped]
-    else:
-        import shlex
-        inner = " ".join(shlex.quote(a) for a in claude_argv)
-        wrapped = (f"{inner}; printf '\\n--- claude exited "
-                   f"(scroll up to copy resume ID) ---\\n'; read -r _")
-        exec_bin = "/bin/sh"
-        exec_argv = ["/bin/sh", "-c", wrapped]
-
+    # Process replacement directly into claude — recap.py is replaced by
+    # claude.exe, no Python parent left to block. The pause-on-exit
+    # behavior (hold the window so the user can grab the resume ID) is
+    # handled by the wrapper script ~/.local/bin/recap, whose stdin is
+    # still attached to the outer terminal pty (it was never touched by
+    # Textual's raw-mode shenanigans).
     try:
-        os.execvpe(exec_bin, exec_argv, env)
+        os.execvpe(claude_bin, claude_argv, env)
     except FileNotFoundError:
-        print(_c(f"  error: {exec_bin} not on PATH", RED), file=sys.stderr)
+        print(_c("  error: claude not on PATH", RED), file=sys.stderr)
         _reset_terminal_modes()
         sys.exit(127)
     except OSError as e:
