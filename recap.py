@@ -2329,18 +2329,33 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
     claude_bin = shutil.which("claude", path=env.get("PATH")) or "claude"
     claude_argv = [claude_bin, "--resume", full_id, *extra_args]
 
-    # Pause-on-exit wrapper: wraps claude in `cmd.exe /c "... & pause"` (or
-    # `/bin/sh -c "...; read"` on POSIX) so the terminal window stays open
-    # after claude exits. wezterm shortcut-launched windows close the moment
-    # the foreground process dies — without pause the user loses the chance
-    # to scroll back and grab the resume ID after an unstable session.
-    # The shell is still process-replaced via execvpe so there is no python
-    # parent blocking on subprocess.run (leak prevention from the prior fix
-    # remains intact). Opt out with RECAP_NO_PAUSE_ON_EXIT=1.
+    # Pause-on-exit wrapper: holds the terminal window open after claude
+    # exits so the user can scroll back and grab the resume ID. wezterm
+    # shortcut-launched windows close the moment the foreground process
+    # dies; without pause the ID is lost.
+    #
+    # Shell preference: bash first (Git Bash on Windows / native on POSIX)
+    # because cmd.exe's `pause` exits immediately under MSYS pty — its
+    # stdin isn't a real Windows console there, so ReadConsoleInput
+    # returns end-of-input without blocking, defeating the whole point.
+    # bash's `read` blocks correctly because bash is at home in MSYS pty.
+    # Falls back to cmd.exe (Windows-only) when bash isn't available.
+    #
+    # The shell is still process-replaced via execvpe so there is no
+    # python parent blocking on subprocess.run (leak prevention from the
+    # prior fix remains intact). Opt out with RECAP_NO_PAUSE_ON_EXIT=1.
     no_pause = os.environ.get("RECAP_NO_PAUSE_ON_EXIT") == "1"
+    bash_bin = shutil.which("bash") if not no_pause else None
     if no_pause:
         exec_bin = claude_bin
         exec_argv = claude_argv
+    elif bash_bin:
+        import shlex
+        inner = " ".join(shlex.quote(a) for a in claude_argv)
+        wrapped = (f'{inner}; printf "\\n--- claude exited '
+                   f'(scroll up to copy resume ID) ---\\n"; read -r _')
+        exec_bin = bash_bin
+        exec_argv = [bash_bin, "-c", wrapped]
     elif sys.platform == "win32":
         inner = subprocess.list2cmdline(claude_argv)
         wrapped = (f'{inner} & echo. & echo --- claude exited '
