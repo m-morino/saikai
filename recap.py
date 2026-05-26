@@ -618,6 +618,7 @@ def _delete_session_files(session_id: str):
 
 
 _haiku_missing_warned = False  # surface "claude not on PATH" at most once per run
+_bg_summarize: dict = {}  # {"thread": Thread | None, "pending": int}
 
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
@@ -663,7 +664,12 @@ def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
     The prompt is delivered over STDIN, not as a command-line argument —
     Windows' CreateProcess caps argv at 32,767 chars total, which a
     cluster-classification prompt (170+ sessions × ~150 chars) bumps right
-    up against. Stdin has no such limit."""
+    up against. Stdin has no such limit.
+
+    Set RECAP_SUMMARIZE_BACKEND=chatagc to use chatagc-cli instead of claude -p
+    (avoids personal Haiku quota; model param is ignored for chatagc)."""
+    if os.environ.get("RECAP_SUMMARIZE_BACKEND") == "chatagc":
+        return call_chatagc(prompt, timeout=timeout, raw=raw)
     cmd = ["claude", "-p", "--model", model or SUMMARY_MODEL,
            "--setting-sources", "",
            "--strict-mcp-config",
@@ -720,6 +726,59 @@ def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
         return ""
     finally:
         _delete_session_files(session_id)
+
+
+def call_chatagc(prompt: str, timeout: int = 45, raw: bool = False) -> str:
+    """Call chatagc-cli chat as a drop-in for call_claude_haiku.
+
+    Enabled by RECAP_SUMMARIZE_BACKEND=chatagc. Uses the company ChatAGC
+    service instead of claude -p, so it doesn't consume personal Haiku quota.
+    JSON format differs: content[0].text instead of result."""
+    cmd = ["chatagc-cli", "chat", "--json"]
+    extra: dict = {}
+    if sys.platform == "win32":
+        extra["creationflags"] = NO_WINDOW
+    try:
+        with subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              **extra) as proc:
+            try:
+                raw_out, _ = proc.communicate(input=prompt.encode("utf-8"),
+                                              timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_process_tree(proc)
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
+                return ""
+        if proc.returncode != 0:
+            return ""
+        raw_text = raw_out.decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw_text)
+            text = "".join(
+                c.get("text", "") for c in payload.get("content", [])
+                if c.get("type") == "text"
+            ).strip()
+        except Exception:
+            text = raw_text.strip()
+        if raw:
+            return text
+        for line in text.split("\n"):
+            line = line.strip()
+            if line and not line.startswith("```"):
+                return line[:100]
+        return ""
+    except FileNotFoundError:
+        global _haiku_missing_warned
+        if not _haiku_missing_warned:
+            _haiku_missing_warned = True
+            print(_c("  warn: `chatagc-cli` not found — summaries will be raw user msgs",
+                     YELLOW), file=sys.stderr)
+        return ""
+    except Exception:
+        return ""
 
 
 def _looks_like_refusal(text: str) -> bool:
@@ -1859,6 +1918,27 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._refresh_table()
             self.query_one("#table", DataTable).focus()
             self._update_subtitle()
+            # If background summarization is running, start a watcher thread
+            # that refreshes the table when it finishes.
+            bg = _bg_summarize.get("thread")
+            if bg and bg.is_alive():
+                pending = _bg_summarize.get("pending", 0)
+                self.notify(
+                    f"Summarizing {pending} new sessions in background …",
+                    timeout=8,
+                )
+                import threading as _thr
+                _thr.Thread(target=self._join_bg_summarize, daemon=True).start()
+
+        def _join_bg_summarize(self) -> None:
+            """Worker thread: waits for bg summarization then refreshes table."""
+            thread = _bg_summarize.get("thread")
+            if thread:
+                thread.join()
+            self.call_from_thread(self._refresh_table)
+            self.call_from_thread(
+                lambda: self.notify("Summaries ready", severity="information", timeout=3)
+            )
 
         # Status-filter prefixes: typed alongside text in the search input.
         # `:fav python` = favorites whose searchable text matches "python".
@@ -2258,6 +2338,40 @@ def _persist_resume_id(full_id: str, target_cwd: str | None) -> Path:
     return RESUME_HISTORY_FILE
 
 
+_RECAP_SUPPRESS_PATH = Path.home() / ".claude" / "state" / "_recap_resume_oneshot.json"
+_RECAP_SUPPRESS_TTL = 3600.0  # 1h. teams-notify.py 側の RECAP_SUPPRESS_TTL と同期
+
+
+def _add_recap_suppress_session(session_id: str) -> None:
+    """teams-notify.py に「次の Notification 1 件だけ silent」 を伝える 1-shot file.
+
+    `RECAP_RESUME=1` env だけだと session lifetime 全体で Notification 抑止に
+    なる過去の事故 (2026-05-24 検出) を構造的に防ぐ。 session_id ごとに 1 件
+    だけ「最初の idle_prompt 抑止」 を予約する設計。
+
+    pid 付き tmp + os.replace で並行 recap launch race にも安全。 古い entry
+    (>1h) は ついでに prune (= claude が即 crash した stale を回収)。
+    """
+    import json as _json
+    import time as _time
+    _RECAP_SUPPRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    state: dict[str, float] = {}
+    if _RECAP_SUPPRESS_PATH.is_file():
+        try:
+            data = _json.loads(_RECAP_SUPPRESS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                state = {k: float(v) for k, v in data.items()
+                         if isinstance(v, (int, float))}
+        except (OSError, _json.JSONDecodeError, ValueError, TypeError):
+            state = {}
+    now = _time.time()
+    state = {k: v for k, v in state.items() if now - v < _RECAP_SUPPRESS_TTL}
+    state[session_id] = now
+    tmp = _RECAP_SUPPRESS_PATH.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(_json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, _RECAP_SUPPRESS_PATH)
+
+
 def _resume_claude(full_id: str, sessions: list[dict]) -> None:
     """Resume `claude --resume <full_id>` from the right cwd. Self-terminating:
     `sys.exit`s with claude's return code. Shared by every picker frontend so
@@ -2303,6 +2417,15 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
           + (f"\n{auto_perm_note}" if auto_perm_note else ""))
     env = os.environ.copy()
     env["RECAP_RESUME"] = "1"   # signal to teams-notify.py: suppress idle_prompt
+    # 1-shot 抑止 file への session_id 追加. env だけだと session 全体 lifetime で
+    # Notification 全件 silent になり、 復帰後の真の入力待ちも消える (2026-05-24
+    # 検出 bug)。 file ベースの fine-grain control で「最初の 1 件のみ silent、
+    # 以降は通常通知」 を実現する。
+    try:
+        _add_recap_suppress_session(full_id)
+    except OSError as e:
+        print(_c(f"  warn: recap suppress file write failed: {e}", YELLOW),
+              file=sys.stderr)
     # Strip uv's ephemeral VIRTUAL_ENV so the resumed session's `uv` doesn't
     # warn about a stale venv.
     leaked_venv = env.pop("VIRTUAL_ENV", None)
@@ -3147,15 +3270,27 @@ def main():
     # --list is invoked by fzf reload bindings (Ctrl-x/p/r). Reloads should be
     # instant; skip Haiku entirely and rely on whatever cache the initial run
     # already filled. Cache misses fall back to the first user message.
-    if args.no_summary or args.related or args.list:
-        for s in sessions:
-            cached = _load_cache(s["id"], s["mtime"]) if not s.get("is_open") else None
-            if cached and not _looks_like_refusal(cached):
-                s["summary"] = cached
-            else:
-                s["summary"] = s["ai_title"] or _first_msg(s)
-    else:
-        summarize_all_parallel(sessions)
+    # Phase 1 (instant): fill all sessions from cache / ai_title / first_msg.
+    # This runs synchronously in <1s so the UI starts immediately.
+    for s in sessions:
+        cached = _load_cache(s["id"], s["mtime"]) if not s.get("is_open") else None
+        s["summary"] = (cached if cached and not _looks_like_refusal(cached)
+                        else s["ai_title"] or _first_msg(s))
+
+    # Phase 2 (background): LLM-summarize sessions that had no cache hit.
+    # Skipped when --no-summary / --list / --related, or when all are cached.
+    if not (args.no_summary or args.related or args.list):
+        import threading as _thr
+        needs_llm = [s for s in sessions
+                     if not s["ai_title"] and not s.get("is_open")
+                     and _load_cache(s["id"], s["mtime"]) is None]
+        if needs_llm:
+            _t = _thr.Thread(target=summarize_all_parallel, args=(sessions,),
+                             daemon=True)
+            _t.start()
+            _bg_summarize.update(thread=_t, pending=len(needs_llm))
+        else:
+            _bg_summarize["thread"] = None
 
     if args.related:
         cmd_related(args.related, sessions)
