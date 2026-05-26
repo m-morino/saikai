@@ -316,6 +316,7 @@ def _apply_sort(sessions: list[dict], keys: list[dict]) -> None:
         if col == "turns": return s.get("n_turns") or 0
         if col == "fav":   return 1 if s["id"] in favs else 0
         if col == "topic": return s.get("primary_topic") or "~"
+        if col == "wt":    return (s.get("worktree_label") or "").lower()
         return 0
 
     for k in reversed(active):
@@ -1974,7 +1975,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     return (text in (s.get("ai_title") or "").lower()
                             or text in " ".join(s.get("real_msgs") or []).lower()
                             or text in sid
-                            or text in (s.get("project_name") or "").lower())
+                            or text in (s.get("project_name") or "").lower()
+                            or text in (s.get("worktree_label") or "").lower())
                 return True
 
             return [s for s in all_sessions if keep(s)]
@@ -2048,6 +2050,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # NOT included — the SID is already visible in the preview pane
             # and the row's RowKey carries it for resume; the user said it's
             # not useful as a sort/search target.
+            # "Wt" column: only when --here loaded sessions from >1 worktree.
+            has_worktrees = (not show_project
+                             and any(s.get("worktree_label") for s in visible))
             specs: list[tuple[str, str, int]] = [
                 ("", "_marker", 3),
                 (col_label("date", "Start"), "date", 13),
@@ -2055,6 +2060,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             ]
             if show_project:
                 specs.append((col_label("proj", "Project"), "proj", 17))
+            if has_worktrees:
+                specs.append((col_label("wt", "Wt"), "wt", 12))
             if cluster_mode:
                 specs.append((col_label("topic", "Topic"), "topic", 16))
             specs.append((col_label("title", "Title"), "title", 80))
@@ -2062,14 +2069,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 table.add_column(label, key=key, width=width)
 
             # Precompute one colour-mapping per column so a given project /
-            # topic gets the same colour everywhere it appears, and (when the
-            # unique count fits the palette) distinct values get distinct
-            # colours.
+            # topic / worktree gets the same colour everywhere it appears.
             project_color: dict[str, str] = {}
             topic_color: dict[str, str] = {}
+            wt_color: dict[str, str] = {}
             if show_project:
                 project_color = _build_color_map(
                     (project_short(s["project_name"]) for s in visible),
+                    _PROJECT_PALETTE,
+                )
+            if has_worktrees:
+                wt_color = _build_color_map(
+                    (s.get("worktree_label") or "" for s in visible
+                     if s.get("worktree_label")),
                     _PROJECT_PALETTE,
                 )
             if cluster_mode:
@@ -2097,6 +2109,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if show_project:
                     proj_txt = project_short(s["project_name"])
                     row.append(Text(proj_txt, style=project_color.get(proj_txt, "")))
+                if has_worktrees:
+                    wt = s.get("worktree_label") or ""
+                    row.append(Text(wt[:11], style=wt_color.get(wt, "") if wt else ""))
                 if cluster_mode:
                     topic_full = s.get("primary_topic") or "(none)"
                     row.append(Text(topic_full[:14], style=topic_color.get(topic_full, "")))
@@ -2500,12 +2515,10 @@ def find_project_dir(cwd: Path) -> Path | None:
 
 
 def _worktree_project_dirs(cwd: Path, projects_root: Path,
-                            exclude: Path | None) -> list[Path]:
-    """Return project dirs for all git worktrees of the repo at *cwd*,
-    excluding *exclude* (the one already loaded by the caller).
-
-    Works whether *cwd* is the main worktree or a linked worktree — git always
-    reports the full list from any checkout in the tree."""
+                            exclude: Path | None) -> list[tuple[Path, str]]:
+    """Return (project_dir, label) for all git worktrees of the repo at *cwd*,
+    excluding *exclude*. Label is the worktree basename (e.g. 'feature-x');
+    used to populate the TUI 'Wt' column."""
     try:
         r = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
@@ -2517,7 +2530,7 @@ def _worktree_project_dirs(cwd: Path, projects_root: Path,
     except Exception:
         return []
 
-    result: list[Path] = []
+    result: list[tuple[Path, str]] = []
     seen: set[Path] = {exclude} if exclude else set()
     for line in r.stdout.splitlines():
         if not line.startswith("worktree "):
@@ -2525,7 +2538,7 @@ def _worktree_project_dirs(cwd: Path, projects_root: Path,
         wt_path = Path(line[len("worktree "):].strip())
         proj = find_project_dir(wt_path)
         if proj and proj not in seen and proj.exists():
-            result.append(proj)
+            result.append((proj, wt_path.name))
             seen.add(proj)
     return result
 
@@ -3287,13 +3300,18 @@ def main():
             print("Use --project PATH (or omit --here for all projects)", file=sys.stderr)
             sys.exit(1)
         sessions = load_sessions_in_dir(target, since)
+        for s in sessions:
+            s["worktree_label"] = ""   # main checkout → blank Wt cell
         # Also include sessions from other git worktrees of the same repo.
         # `git worktree list --porcelain` works from any worktree and enumerates
         # the full tree, so --here from the main repo shows worktree sessions too
         # (and vice versa). Skip if --project was given explicitly.
         if not args.project:
-            for wt_dir in _worktree_project_dirs(cwd, projects_root, exclude=target):
+            for wt_dir, wt_label in _worktree_project_dirs(cwd, projects_root,
+                                                            exclude=target):
                 extra = load_sessions_in_dir(wt_dir, since)
+                for s in extra:
+                    s["worktree_label"] = wt_label
                 if extra:
                     sessions.extend(extra)
 
