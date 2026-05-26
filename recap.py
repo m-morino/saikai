@@ -2499,6 +2499,37 @@ def find_project_dir(cwd: Path) -> Path | None:
     return best
 
 
+def _worktree_project_dirs(cwd: Path, projects_root: Path,
+                            exclude: Path | None) -> list[Path]:
+    """Return project dirs for all git worktrees of the repo at *cwd*,
+    excluding *exclude* (the one already loaded by the caller).
+
+    Works whether *cwd* is the main worktree or a linked worktree — git always
+    reports the full list from any checkout in the tree."""
+    try:
+        r = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, cwd=cwd, timeout=5,
+            creationflags=NO_WINDOW,
+        )
+        if r.returncode != 0:
+            return []
+    except Exception:
+        return []
+
+    result: list[Path] = []
+    seen: set[Path] = {exclude} if exclude else set()
+    for line in r.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        wt_path = Path(line[len("worktree "):].strip())
+        proj = find_project_dir(wt_path)
+        if proj and proj not in seen and proj.exists():
+            result.append(proj)
+            seen.add(proj)
+    return result
+
+
 # ── Related sessions ─────────────────────────────────────────────────────────
 def _norm_cwd(s: str) -> str:
     """Normalize path so mixed separators / case differences (Windows) compare equal."""
@@ -3256,6 +3287,15 @@ def main():
             print("Use --project PATH (or omit --here for all projects)", file=sys.stderr)
             sys.exit(1)
         sessions = load_sessions_in_dir(target, since)
+        # Also include sessions from other git worktrees of the same repo.
+        # `git worktree list --porcelain` works from any worktree and enumerates
+        # the full tree, so --here from the main repo shows worktree sessions too
+        # (and vice versa). Skip if --project was given explicitly.
+        if not args.project:
+            for wt_dir in _worktree_project_dirs(cwd, projects_root, exclude=target):
+                extra = load_sessions_in_dir(wt_dir, since)
+                if extra:
+                    sessions.extend(extra)
 
     # Initial chronological sort gives _build_forest a deterministic order; the
     # user-configurable sort spec is applied AFTER forest building / clustering
