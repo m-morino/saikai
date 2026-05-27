@@ -1871,7 +1871,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     class PickerApp(App):
         TITLE = "recap"
         BINDINGS = [
-            Binding("escape", "quit", "Cancel"),
+            Binding("escape", "quit", "Quit"),
             Binding("ctrl+c", "quit", show=False),
             # Resume only on Enter. We deliberately do NOT use RowSelected, so
             # a stray mouse click on a row never triggers resume — that was
@@ -1883,18 +1883,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # into Input.Submitted and the picker never exits.
             Binding("enter", "resume", "Resume", priority=True),
             Binding("ctrl+x", "toggle_hide", "Hide"),
-            Binding("ctrl+p", "toggle_fav", "*Fav"),
-            Binding("ctrl+r", "toggle_view", "Show hidden"),
-            Binding("ctrl+t", "toggle_tree", "Tree"),
+            Binding("ctrl+p", "toggle_fav", "★"),
             Binding("ctrl+g", "toggle_cluster", "Cluster"),
-            Binding("ctrl+f", "preview_full", "Full"),
-            Binding("ctrl+s", "preview_summary", "Summary"),
-            Binding("alt+1", "cycle_sort('1')", "Sort1"),
-            Binding("alt+2", "cycle_sort('2')", "Sort2"),
-            Binding("alt+3", "cycle_sort('3')", "Sort3"),
-            Binding("alt+q", "toggle_dir('1')", "Dir1"),
-            Binding("alt+w", "toggle_dir('2')", "Dir2"),
-            Binding("alt+e", "toggle_dir('3')", "Dir3"),
+            Binding("ctrl+t", "toggle_tree", "Tree"),
+            Binding("tab", "toggle_preview", "Preview", priority=True),
         ]
         CSS = """
         Screen { layout: vertical; }
@@ -2291,6 +2283,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def action_preview_summary(self) -> None:
             self.preview_mode = "summary"
+            self._update_preview(self._cursor_sid())
+
+        def action_toggle_preview(self) -> None:
+            self.preview_mode = "summary" if self.preview_mode == "full" else "full"
             self._update_preview(self._cursor_sid())
 
         def action_cycle_sort(self, priority: str) -> None:
