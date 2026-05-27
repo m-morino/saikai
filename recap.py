@@ -1853,7 +1853,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         from textual.app import App, ComposeResult
         from textual.binding import Binding
         from textual.containers import Horizontal
-        from textual.widgets import DataTable, Footer, Input, RichLog
+        from textual.widgets import DataTable, Footer, Input, RichLog, Static
         from rich.text import Text
     except ImportError as e:
         print(_c(f"  textual not available ({e}) — falling back to fzf", YELLOW),
@@ -1899,6 +1899,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         CSS = """
         Screen { layout: vertical; }
         #search { dock: top; height: 3; border: tall $accent; }
+        #statusbar { height: 1; background: $surface; color: $warning; }
         #main { layout: horizontal; height: 1fr; }
         #table { width: 60%; }
         #preview { width: 40%; padding: 0 1; border-left: solid $accent; }
@@ -1910,6 +1911,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             yield Input(placeholder="Search title / msg / SID / proj    "
                                     "•  :fav  :hidden  :open  :active  :recent",
                         id="search")
+            yield Static("", id="statusbar")
             with Horizontal(id="main"):
                 yield DataTable(cursor_type="row", zebra_stripes=True, id="table")
                 yield RichLog(id="preview", wrap=True, highlight=False, markup=False)
@@ -2140,40 +2142,33 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def _update_subtitle(self) -> None:
             table = self.query_one("#table", DataTable)
+            n = table.row_count
+
+            # Sort: show first active sort key
+            _COL_LABEL = {
+                "date": "Start", "last": "Last", "title": "Title",
+                "proj": "Proj", "topic": "Topic", "turns": "Turns", "fav": "Fav",
+            }
             sort_keys = _load_sort()
-            parts = []
-            for i, k in enumerate(sort_keys, 1):
-                if k["col"] == "-":
-                    parts.append(f"[{i} -]")
-                else:
-                    arrow = "v" if k["dir"] == "desc" else "^"
-                    parts.append(f"[{i}{arrow}{k['col']}]")
-            view = _get_view_mode()
-
-            # Layout indicator: plain flat / tree / cluster. For cluster mode
-            # also surface the top groups + sizes so the user can see at a
-            # glance that the grouping is actually applied (the "I toggled
-            # cluster but nothing visibly changed" symptom).
-            if _get_tree_mode():
-                layout = "tree"
-            elif _get_cluster_mode():
-                # Read assignments from the global classification cache so
-                # the subtitle reflects exactly what's on screen.
-                cache = _read_json(GLOBAL_CLUSTERS_FILE, {})
-                assigns = cache.get("assignments") or {}
-                if assigns:
-                    cluster_counts = Counter(assigns.values())
-                    top = cluster_counts.most_common(3)
-                    bits = ", ".join(f"{t}({n})" for t, n in top)
-                    layout = f"cluster {bits}"
-                else:
-                    layout = "cluster (run --refresh-clusters)"
+            first = next((k for k in sort_keys if k["col"] != "-"), None)
+            if first:
+                arrow = "↓" if first["dir"] == "desc" else "↑"
+                col_display = _COL_LABEL.get(first["col"], first["col"].capitalize())
+                sort_str = f"Sort: {col_display}{arrow}"
             else:
-                layout = "flat"
+                sort_str = "Sort: default"
 
-            self.sub_title = (f"{table.row_count} sessions  "
-                              f"view:{view}  layout:{layout}  "
-                              f"sort:{' '.join(parts)}")
+            # Scope: "All projects" when --all-projects, else repo name
+            scope = "All projects" if show_project else (repo.name if repo else "All projects")
+
+            # Mode toggles with Rich markup color
+            tree_str = "[green]ON[/green]" if _get_tree_mode() else "[dim]OFF[/dim]"
+            cluster_str = "[green]ON[/green]" if _get_cluster_mode() else "[dim]OFF[/dim]"
+
+            sep = "  [dim]·[/dim]  "
+            text = (f"  {n} sessions{sep}{sort_str}{sep}"
+                    f"{scope}{sep}Tree: {tree_str}{sep}Cluster: {cluster_str}")
+            self.query_one("#statusbar", Static).update(text)
 
         def _cursor_sid(self) -> str | None:
             table = self.query_one("#table", DataTable)
