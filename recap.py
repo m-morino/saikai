@@ -1920,7 +1920,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def on_mount(self) -> None:
             self._refresh_table()
             self.query_one("#table", DataTable).focus()
-            self._update_subtitle()
             # If background summarization is running, start a watcher thread
             # that refreshes the table when it finishes.
             bg = _bg_summarize.get("thread")
