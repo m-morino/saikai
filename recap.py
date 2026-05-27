@@ -1886,7 +1886,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("ctrl+p", "toggle_fav", "★"),
             Binding("ctrl+g", "toggle_cluster", "Cluster"),
             Binding("ctrl+t", "toggle_tree", "Tree"),
-            Binding("tab", "toggle_preview", "Preview", priority=True),
+            Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
         ]
         CSS = """
         Screen { layout: vertical; }
