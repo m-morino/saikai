@@ -1891,7 +1891,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "[bold cyan]Navigation[/bold cyan]\n"
                 "  [yellow]↑[/yellow] [yellow]↓[/yellow]         Move rows\n"
                 "  [yellow]Enter[/yellow]       Resume session\n"
-                "  [yellow]Esc[/yellow]         Quit\n\n"
+                "  [yellow]Esc[/yellow]         Quit\n"
+                "  [yellow]?[/yellow]           Help (this screen)\n\n"
                 "[bold cyan]Session ops[/bold cyan]\n"
                 "  [yellow]Ctrl-X[/yellow]      Toggle hide/unhide"
                 "  ([dim]:hidden[/dim] in search to find them)\n"
@@ -1927,7 +1928,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("ctrl+g", "toggle_cluster", "Cluster"),
             Binding("ctrl+t", "toggle_tree", "Tree"),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
-            Binding("question_mark", "help", "Help"),
+            Binding("question_mark", "help", "Help", priority=True),
         ]
         CSS = """
         Screen { layout: vertical; }
