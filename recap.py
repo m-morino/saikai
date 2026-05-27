@@ -1853,6 +1853,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         from textual.app import App, ComposeResult
         from textual.binding import Binding
         from textual.containers import Horizontal
+        from textual.screen import ModalScreen
         from textual.widgets import DataTable, Footer, Input, RichLog, Static
         from rich.text import Text
     except ImportError as e:
@@ -1867,6 +1868,45 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     # Send Textual's internal logs to a file so we have a trail to inspect
     # when something goes wrong inside the framework's event loop.
     os.environ.setdefault("TEXTUAL_LOG", str(CACHE_DIR / "textual-debug.log"))
+
+    class HelpScreen(ModalScreen):
+        CSS = """
+        HelpScreen { align: center middle; }
+        #help-content {
+            background: $panel;
+            border: solid $accent;
+            padding: 1 2;
+            width: 66;
+            height: auto;
+            max-height: 28;
+        }
+        """
+        BINDINGS = [
+            Binding("escape", "dismiss", show=False),
+            Binding("question_mark", "dismiss", show=False),
+        ]
+
+        def compose(self) -> ComposeResult:
+            yield Static(
+                "[bold cyan]Navigation[/bold cyan]\n"
+                "  [yellow]↑[/yellow] [yellow]↓[/yellow]         Move rows\n"
+                "  [yellow]Enter[/yellow]       Resume session\n"
+                "  [yellow]Esc[/yellow]         Quit\n\n"
+                "[bold cyan]Session ops[/bold cyan]\n"
+                "  [yellow]Ctrl-X[/yellow]      Toggle hide/unhide"
+                "  ([dim]:hidden[/dim] in search to find them)\n"
+                "  [yellow]Ctrl-P[/yellow]      Toggle ★ favorite "
+                "  ([dim]:fav[/dim] in search to filter)\n\n"
+                "[bold cyan]Display modes[/bold cyan]\n"
+                "  [yellow]Ctrl-G[/yellow]      Cluster mode\n"
+                "  [yellow]Ctrl-T[/yellow]      Tree mode\n"
+                "  [yellow]Tab[/yellow]         Preview: full ↔ summary\n\n"
+                "[bold cyan]Sort[/bold cyan]\n"
+                "  Column header click  — sort by that column\n"
+                "  Click again          — reverse direction\n\n"
+                "[dim]Press ? or Esc to close[/dim]",
+                id="help-content",
+            )
 
     class PickerApp(App):
         TITLE = "recap"
@@ -1887,6 +1927,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("ctrl+g", "toggle_cluster", "Cluster"),
             Binding("ctrl+t", "toggle_tree", "Tree"),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
+            Binding("question_mark", "help", "Help"),
         ]
         CSS = """
         Screen { layout: vertical; }
@@ -2288,6 +2329,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def action_toggle_preview(self) -> None:
             self.preview_mode = "summary" if self.preview_mode == "full" else "full"
             self._update_preview(self._cursor_sid())
+
+        def action_help(self) -> None:
+            self.push_screen(HelpScreen())
 
         def action_cycle_sort(self, priority: str) -> None:
             _cycle_sort_col(int(priority))
