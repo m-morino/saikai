@@ -1666,6 +1666,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         """
 
         preview_mode = "summary"   # "summary" or "full"
+        _sid_index: dict = {}      # sid -> session; populated in on_mount
 
         def compose(self) -> ComposeResult:
             yield Input(placeholder="Search title / msg / SID / proj    "
@@ -1950,16 +1951,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             cache_dir = (PREVIEW_FULL_DIR if self.preview_mode == "full"
                          else PREVIEW_DIR)
             cache_file = cache_dir / f"{sid}.txt"
-            if not cache_file.exists():
-                # Warm on demand so the cache is self-sufficient: render and
-                # cache the highlighted session when it is missing.
-                s = self._sid_index.get(sid)
-                if s is not None:
-                    _write_preview_cache(s)
-            if cache_file.exists():
-                preview.write(Text.from_ansi(cache_file.read_text(encoding="utf-8")))
-            else:
-                preview.write(f"(no preview available for {sid[:8]})")
+            # Rendering runs on the UI thread; guard it like the other handlers
+            # in this class so one malformed session shows a per-row message
+            # instead of tearing down the whole picker.
+            try:
+                if not cache_file.exists():
+                    # Warm on demand so the cache is self-sufficient: render and
+                    # cache the highlighted session when it is missing.
+                    s = self._sid_index.get(sid)
+                    if s is not None:
+                        _write_preview_cache(s)
+                if cache_file.exists():
+                    preview.write(Text.from_ansi(cache_file.read_text(encoding="utf-8")))
+                else:
+                    preview.write(f"(no preview for {sid[:8]})")
+            except Exception as e:
+                preview.write(f"(preview failed for {sid[:8]}: {e})")
 
         # ── events ──────────────────────────────────────────────────────────
 

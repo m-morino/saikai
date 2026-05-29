@@ -124,7 +124,7 @@ Replace the entire `_update_subtitle` method body (lines 2141-2176) with the fol
 
 Run:
 ```
-uv run recap.py --ui textual
+uv run recap.py
 ```
 
 Expected: A yellow status bar row appears between the search box and the table:
@@ -184,7 +184,7 @@ Keep `action_preview_full`, `action_preview_summary`, `action_toggle_view`, `act
 
 Run:
 ```
-uv run recap.py --ui textual
+uv run recap.py
 ```
 
 Expected:
@@ -304,7 +304,7 @@ Add `action_help()` to `PickerApp` (insert after `action_toggle_preview`):
 
 Run:
 ```
-uv run recap.py --ui textual
+uv run recap.py
 ```
 
 Expected:
