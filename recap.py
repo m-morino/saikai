@@ -197,12 +197,12 @@ def _toggle_cluster_mode() -> bool:
 
 
 def _get_ui_mode() -> str:
-    """Picker UI: 'fzf' (default) or 'textual'."""
+    """Picker UI: 'textual' (default) or 'fzf' (legacy)."""
     try:
         v = UI_MODE_FILE.read_text(encoding="utf-8").strip()
-        return v if v in ("fzf", "textual") else "fzf"
+        return v if v in ("fzf", "textual") else "textual"
     except Exception:
-        return "fzf"
+        return "textual"
 
 
 def _set_ui_mode(mode: str) -> None:
@@ -1826,7 +1826,7 @@ def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                  flat: bool = False, cluster_mode: bool = False,
                  reload_args: list[str] | None = None) -> None:
-    """Textual-based picker (Phase 3 — adds mouse-click column sort).
+    """Textual-based picker (status bar, mouse-click column sort, ? help overlay).
 
     Layout:
       ┌─────────────────────────────────────────┐
@@ -1840,9 +1840,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     All toggles reflect in-app (no restart required):
       Enter        resume                Esc / Ctrl-C  cancel
       Ctrl-x       hide/unhide row       Ctrl-p        favorite toggle
-      Ctrl-r       toggle hidden vis     Ctrl-t        toggle tree display
-      Ctrl-g       toggle cluster        Ctrl-f / s    full / summary preview
-      Alt-1/2/3    cycle sort col N      Alt-q/w/e     toggle priority N dir
+      Ctrl-t       toggle tree display   Ctrl-g        toggle cluster
+      Tab          preview full/summary  ?             help overlay
+      (":hidden" in the search box reveals hidden rows;
+       click a column header to sort, click again to reverse)
 
     Mouse — click a column header to promote it to priority 1; click the
     same header again to flip its direction. The previous priority 1
@@ -3090,14 +3091,15 @@ def main():
     p.add_argument("--reset-options", action="store_true",
                    help="Forget saved --days/--here/--all defaults. Does NOT clear "
                         "hidden/favorite/view-mode/tree-mode/cluster-mode/sort — "
-                        "toggle those via Ctrl-x / Ctrl-p / Ctrl-r / Ctrl-t / Ctrl-g "
-                        "/ Alt-1..3 / Alt-q..e in the picker (or the matching "
+                        "toggle those via Ctrl-x / Ctrl-p / Ctrl-t / Ctrl-g in the "
+                        "picker, ':hidden' in search for hidden rows, a column-header "
+                        "click to sort (or the matching "
                         "--toggle-* / --cycle-sort / --reset-sort flags).")
     p.add_argument("--save-defaults", action="store_true",
                    help="Persist the current --days/--here/--all values as new defaults. "
                         "Without this flag, CLI args are one-shot and saved options stay untouched.")
     p.add_argument("--pick", action="store_true",
-                   help="Open the interactive fzf picker. This is the default when "
+                   help="Open the interactive picker (textual by default; --ui fzf for the legacy picker). This is the default when "
                         "no other action flag is given; --pick is kept as an explicit "
                         "no-op for clarity in shell aliases.")
     p.add_argument("--table", action="store_true",
@@ -3136,10 +3138,10 @@ def main():
                         "Mutually exclusive with tree display.")
     p.add_argument("--cycle-sort", type=int, metavar="N", choices=[1, 2, 3],
                    help="Advance the Nth sort priority to the next column. Persistent. "
-                        "Same effect as Alt-N inside the picker.")
+                        "In the picker, click a column header instead.")
     p.add_argument("--toggle-sort-dir", type=int, metavar="N", choices=[1, 2, 3],
                    help="Toggle the Nth sort priority's direction (asc/desc). Persistent. "
-                        "Same effect as Alt-q/w/e (for priority 1/2/3) inside the picker.")
+                        "In the picker, click a sorted column header again to reverse.")
     p.add_argument("--reset-sort", action="store_true",
                    help="Reset all sort priorities to defaults (date desc, then none).")
     p.add_argument("--refresh-clusters", action="store_true",
@@ -3148,10 +3150,9 @@ def main():
                         "result is cached. Run after a flurry of new sessions or when "
                         "the existing themes feel stale.")
     p.add_argument("--ui", choices=["fzf", "textual"], default=None,
-                   help="Picker UI: 'fzf' (default, fast, external binary) or "
-                        "'textual' (Python TUI with mouse support, in development). "
-                        "Persistent — sets the new default. Use without --ui to "
-                        "fall back to fzf.")
+                   help="Picker UI: 'textual' (default, Python TUI with mouse "
+                        "support) or 'fzf' (legacy, external binary). "
+                        "Persistent — sets the new default.")
     p.add_argument("--related", metavar="SESSION_ID",
                    help="Show sessions related to SESSION_ID with confidence scores and reasons")
     p.add_argument("--tree", action="store_true",
