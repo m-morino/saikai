@@ -1953,6 +1953,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             yield Footer()
 
         def on_mount(self) -> None:
+            # sid -> session map so the preview pane can warm its own cache on
+            # demand. Textual owns preview warming; previously only fzf line-
+            # building (build_fzf_lines) populated this cache.
+            self._sid_index = {s.get("id"): s for s in all_sessions}
             self._refresh_table()
             self.query_one("#table", DataTable).focus()
             # If background summarization is running, start a watcher thread
@@ -2222,10 +2226,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             cache_dir = (PREVIEW_FULL_DIR if self.preview_mode == "full"
                          else PREVIEW_DIR)
             cache_file = cache_dir / f"{sid}.txt"
+            if not cache_file.exists():
+                # Warm on demand so the cache is self-sufficient (no reliance on
+                # fzf line-building having run first).
+                s = self._sid_index.get(sid)
+                if s is not None:
+                    _write_preview_cache(s)
             if cache_file.exists():
                 preview.write(Text.from_ansi(cache_file.read_text(encoding="utf-8")))
             else:
-                preview.write(f"(no cached preview for {sid[:8]} — open the session once to populate the cache)")
+                preview.write(f"(no preview available for {sid[:8]})")
 
         # ── events ──────────────────────────────────────────────────────────
 
