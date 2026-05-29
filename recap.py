@@ -1079,12 +1079,25 @@ def _write_if_stale(path: Path, mtime: float, render) -> None:
                 return
         except Exception:
             pass
+    tmp = None
     try:
+        import tempfile
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(render(), encoding="utf-8")
+        # Atomic write: concurrent warmers (the background pre-warm thread and
+        # the UI-thread on-demand fallback) must never observe a torn file.
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent),
+                                   prefix=path.name + ".", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(render())
+        os.replace(tmp, path)
+        tmp = None
         os.utime(path, (mtime, mtime))
     except Exception:
-        pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
 
 
 def _write_preview_cache(s: dict) -> None:
@@ -1684,6 +1697,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._sid_index = {s.get("id"): s for s in all_sessions}
             self._refresh_table()
             self.query_one("#table", DataTable).focus()
+            # Pre-warm preview caches off the UI thread so scrolling stays
+            # responsive; _update_preview's on-demand warm is the fallback for
+            # rows this thread hasn't reached. Open sessions render fresh, skip.
+            import threading as _thr
+            _thr.Thread(target=self._prewarm_previews, daemon=True).start()
             # If background summarization is running, start a watcher thread
             # that refreshes the table when it finishes.
             bg = _bg_summarize.get("thread")
@@ -1695,6 +1713,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 )
                 import threading as _thr
                 _thr.Thread(target=self._join_bg_summarize, daemon=True).start()
+
+        def _prewarm_previews(self) -> None:
+            """Daemon thread: render + cache previews for all non-open sessions
+            so cursor movement doesn't trigger a synchronous render on the UI
+            thread. mtime-gated, so already-cached sessions are skipped cheaply."""
+            for s in all_sessions:
+                if not s.get("is_open"):
+                    try:
+                        _write_preview_cache(s)
+                    except Exception:
+                        pass
 
         def _join_bg_summarize(self) -> None:
             """Worker thread: waits for bg summarization then refreshes table."""
@@ -1955,12 +1984,18 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # in this class so one malformed session shows a per-row message
             # instead of tearing down the whole picker.
             try:
-                if not cache_file.exists():
-                    # Warm on demand so the cache is self-sufficient: render and
-                    # cache the highlighted session when it is missing.
-                    s = self._sid_index.get(sid)
-                    if s is not None:
-                        _write_preview_cache(s)
+                s = self._sid_index.get(sid)
+                # Open sessions grow every turn, so a cached preview goes stale.
+                # Render them fresh each time (skip the cache entirely).
+                if s is not None and s.get("is_open"):
+                    render = (_render_preview_full if self.preview_mode == "full"
+                              else _render_preview)
+                    preview.write(Text.from_ansi(render(s)))
+                    return
+                if not cache_file.exists() and s is not None:
+                    # Warm on demand (fallback for rows the background pre-warm
+                    # has not reached yet) so the cache stays self-sufficient.
+                    _write_preview_cache(s)
                 if cache_file.exists():
                     preview.write(Text.from_ansi(cache_file.read_text(encoding="utf-8")))
                 else:
