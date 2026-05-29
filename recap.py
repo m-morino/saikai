@@ -54,7 +54,7 @@ def _c(text, *codes):
 
 # ── Small shared helpers ────────────────────────────────────────────────────
 def _trim_sid(s: str) -> str:
-    """Strip fzf field padding from a session-id arg."""
+    """Strip trailing field padding from a session-id arg."""
     return s.strip().split()[0] if s and s.strip() else ""
 
 
@@ -74,7 +74,7 @@ def _read_json(path: Path, default):
 
 def _write_json(path: Path, obj) -> None:
     """Atomically write JSON to path. Uses tempfile + os.replace so concurrent
-    readers/writers (worker pool, fzf reload) cannot observe a torn write."""
+    readers/writers (worker pool, concurrent reads) cannot observe a torn write."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(obj, indent=2, ensure_ascii=False)
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
@@ -97,7 +97,6 @@ FAVORITE_FILE = CACHE_DIR / "favorite.json"
 VIEW_MODE_FILE = CACHE_DIR / "view-mode.txt"
 TREE_MODE_FILE = CACHE_DIR / "tree-mode.txt"
 CLUSTER_MODE_FILE = CACHE_DIR / "cluster-mode.txt"
-UI_MODE_FILE = CACHE_DIR / "ui-mode.txt"
 SORT_FILE = CACHE_DIR / "sort.json"
 GLOBAL_CLUSTERS_FILE = CACHE_DIR / "global-clusters.json"
 OPTIONS_FILE = CACHE_DIR / "options.json"
@@ -194,22 +193,6 @@ def _toggle_cluster_mode() -> bool:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     CLUSTER_MODE_FILE.write_text("on" if new else "off", encoding="utf-8")
     return new
-
-
-def _get_ui_mode() -> str:
-    """Picker UI: 'textual' (default) or 'fzf' (legacy)."""
-    try:
-        v = UI_MODE_FILE.read_text(encoding="utf-8").strip()
-        return v if v in ("fzf", "textual") else "textual"
-    except Exception:
-        return "textual"
-
-
-def _set_ui_mode(mode: str) -> None:
-    if mode not in ("fzf", "textual"):
-        raise ValueError(f"ui mode must be 'fzf' or 'textual', got {mode!r}")
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    UI_MODE_FILE.write_text(mode, encoding="utf-8")
 
 
 def _load_sort() -> list[dict]:
@@ -1105,7 +1088,7 @@ def _write_if_stale(path: Path, mtime: float, render) -> None:
 
 
 def _write_preview_cache(s: dict) -> None:
-    # Pre-render so fzf preview can `cat` instead of cold-starting Python (~150ms → ~5ms per cursor move).
+    # Pre-render so the preview pane can read a cached file instead of cold-starting Python (~150ms → ~5ms per cursor move).
     # Both files are mtime-gated; reloads (Ctrl-x/p/r) skip rewrites for unchanged sessions.
     sid = s["id"]
     mtime = s.get("mtime", 0.0)
@@ -1117,10 +1100,10 @@ def _preview_impl(session_id: str, cache_dir: Path, render) -> None:
     sid = _trim_sid(session_id)
     if not sid:
         # Cluster-mode group-header / separator rows carry an empty SID column.
-        # Returning silently avoids fzf spinning a "loading" indicator while
+        # Returning silently avoids the caller spinning a "loading" indicator while
         # it waits for the preview command to do nothing useful.
         return
-    # Exact cache hit (fzf passes the full UUID — fast path)
+    # Exact cache hit (full UUID — fast path)
     cache_file = cache_dir / f"{sid}.txt"
     if cache_file.exists():
         sys.stdout.write(cache_file.read_text(encoding="utf-8"))
@@ -1276,61 +1259,14 @@ def display_table(sessions: list[dict], repo: Path | None, show_project: bool,
     print()
 
 
-# ── fzf pick mode ────────────────────────────────────────────────────────────
-def build_fzf_lines(sessions: list[dict], repo: Path | None, show_project: bool,
-                    flat: bool = False) -> list[str]:
-    """Build tab-separated lines for fzf input.
-    Format:  display\tsession_id\tsearchable_text
-    --with-nth=1 displays only the first field; --nth=1,3 makes fzf search
-    against display + searchable_text. Hidden rows are wrapped in dim+gray
-    ANSI so the user can see at a glance which entries are hidden."""
-    hidden = _load_hidden()
-    favorites = _load_favorites()
-    view_mode = _get_view_mode()
-    walked: list[tuple[dict, str]] = (
-        [(s, "") for s in sessions] if flat else _tree_walk(sessions)
-    )
-    lines = []
-    for s, tree_prefix in walked:
-        is_hidden = s["id"] in hidden
-        if is_hidden and view_mode != "show-hidden":
-            continue
-        marker = f"{_activity_marker(s)}{_state_marker(s, hidden, favorites)}"
-        start = fmt_ts(s["first_ts"])
-        last = fmt_last_active(s)
-        sid8 = short_id(s["id"])
-        proj = project_short(s["project_name"]) if show_project else ""
-        prefix_w = visible_len(tree_prefix)
-        lbl = truncate_visual(label_for(s), max(20, 65 - prefix_w))
-        commits = ""
-        if repo:
-            cc = git_commits_in_range(s["first_ts"], s["last_ts"], repo)
-            if cc:
-                commits = "  " + truncate_visual(cc[0], 38)
-        if show_project:
-            body = f"{start}  [{last:>4}]  [{proj:<14}]  {sid8}  {tree_prefix}{lbl}{commits}"
-        else:
-            body = f"{start}  [{last:>4}]  {sid8}  {tree_prefix}{lbl}{commits}"
-        if is_hidden:
-            disp = f"{marker} {HIDDEN_DIM}{body}  (hidden){RESET}"
-        else:
-            disp = f"{marker} {body}"
-        # Searchable content: AI title + all user messages (capped per-session)
-        searchable = (s["ai_title"] + "  " + "  ".join(s["real_msgs"]))[:3000]
-        searchable = searchable.replace("\t", " ").replace("\n", " ").replace("\r", " ")
-        lines.append(f"{disp}\t{s['id']}\t{searchable}")
-        _write_preview_cache(s)
-    return lines
-
-
 def _reset_terminal_modes() -> None:
-    """Emit ANSI disable sequences for terminal modes fzf may have enabled.
+    """Emit ANSI disable sequences for terminal modes the picker may have enabled.
 
     Targets focus tracking (?1004), all mouse tracking variants (?1000/1002/1003/
     1006/1015), bracketed paste (?2004), and ensures the cursor is visible (?25).
     These are no-ops if the mode is already off — safe to send unconditionally.
 
-    Why this exists: on Windows, fzf occasionally exits without sending the matching
+    Why this exists: on Windows, the picker occasionally exits without sending the matching
     'l' sequence for focus / mouse SGR, so the shell receives literal '[I' (focus
     in) or stray 'm' (SGR mouse release terminator) characters."""
     try:
@@ -1614,218 +1550,8 @@ def _build_color_map(values, palette) -> dict[str, str]:
     return used
 
 
-def build_cluster_lines(sessions: list[dict], repo: Path | None,
-                        show_project: bool) -> list[str]:
-    """Build fzf lines as a flat list ordered by primary topic.
-
-    Every row is a normal selectable session row with a colored `[topic]`
-    prefix. Sessions sharing the same primary topic land next to each other
-    (sort key = -member_count, topic_name, -first_ts), so the visual effect
-    is the same as a clustered list — but without inserting non-selectable
-    header rows that confused fzf's preview pump (causing the spinner-loop
-    bug). The topic prefix is also in the searchable column, so `email` in
-    the query box still jumps straight to the email cluster."""
-    # Use the global Haiku classification (shared with the textual picker)
-    # if it's cached; otherwise fall back to the per-session primary topic.
-    if (GLOBAL_CLUSTERS_FILE.exists()
-            and _read_json(GLOBAL_CLUSTERS_FILE, {}).get("assignments")):
-        _global_cluster_assign(sessions)
-    else:
-        _assign_primary_topic(sessions)
-    topic_count: Counter = Counter(s["primary_topic"] for s in sessions)
-    # Stable two-pass sort: first by time desc (intra-cluster ordering), then
-    # by (-member_count, topic_name) (inter-cluster ordering). '' (no topic)
-    # sorts last because we map it to a high-value placeholder name.
-    sessions_sorted = sorted(sessions, key=lambda s: s["first_ts"], reverse=True)
-    # Sort key tuple:
-    #   1) "no topic" sessions go LAST (regardless of how many there are)
-    #   2) within "real topic" sessions, larger clusters first, then name asc
-    #   3) (stable from step 1's sort): time desc inside the cluster
-    sessions_sorted.sort(key=lambda s: (
-        1 if not s["primary_topic"] else 0,
-        -topic_count[s["primary_topic"]] if s["primary_topic"] else 0,
-        s["primary_topic"],
-    ))
-
-    hidden = _load_hidden()
-    favorites = _load_favorites()
-    view_mode = _get_view_mode()
-    lines: list[str] = []
-    for s in sessions_sorted:
-        is_hidden = s["id"] in hidden
-        if is_hidden and view_mode != "show-hidden":
-            continue
-        topic_label = (s["primary_topic"] or "(no topic)")
-        topic_label = topic_label[:_CLUSTER_TOPIC_W - 2].ljust(_CLUSTER_TOPIC_W - 2)
-        topic_tag = _c(f"[{topic_label}]", MAGENTA)
-        marker = f"{_activity_marker(s)}{_state_marker(s, hidden, favorites)}"
-        start = fmt_ts(s["first_ts"])
-        last = fmt_last_active(s)
-        sid8 = short_id(s["id"])
-        proj = project_short(s["project_name"]) if show_project else ""
-        lbl = truncate_visual(label_for(s), 55)
-        commits = ""
-        if repo:
-            cc = git_commits_in_range(s["first_ts"], s["last_ts"], repo)
-            if cc:
-                commits = "  " + truncate_visual(cc[0], 38)
-        if show_project:
-            body = f"{topic_tag} {start}  [{last:>4}]  [{proj:<14}]  {sid8}  {lbl}{commits}"
-        else:
-            body = f"{topic_tag} {start}  [{last:>4}]  {sid8}  {lbl}{commits}"
-        if is_hidden:
-            disp = f"{marker} {HIDDEN_DIM}{body}  (hidden){RESET}"
-        else:
-            disp = f"{marker} {body}"
-        searchable = (s["ai_title"] + "  " + "  ".join(s["real_msgs"]))[:3000]
-        searchable = searchable.replace("\t", " ").replace("\n", " ").replace("\r", " ")
-        # Topic name in searchable so `email`-typed query selects email rows.
-        lines.append(f"{disp}\t{s['id']}\t{s['primary_topic']}  {searchable}")
-        _write_preview_cache(s)
-    return lines
-
-
-def fzf_pick(sessions: list[dict], repo: Path | None, show_project: bool,
-             flat: bool = False, cluster_mode: bool = False,
-             reload_args: list[str] | None = None):
-    """Pipe session list to fzf and run claude --resume on selection.
-    Uses temp file for stdin/stdout so fzf gets a clean tty for its TUI."""
-    lines = (build_cluster_lines(sessions, repo, show_project) if cluster_mode
-             else build_fzf_lines(sessions, repo, show_project, flat=flat))
-
-    # Write to temp file (binary mode → no CRLF translation that confuses fzf).
-    # fzf needs a non-pipe stdin on Windows to start its TUI properly.
-    import tempfile
-    with tempfile.NamedTemporaryFile(
-        mode="wb", delete=False, suffix=".txt"
-    ) as tf:
-        tf.write(("\n".join(lines) + "\n").encode("utf-8"))
-        tmp_path = tf.name
-
-    out_path = tmp_path + ".out"
-    env = os.environ.copy()
-    env.setdefault("TERM", "xterm-256color")
-    result = None
-    try:
-        try:
-            with open(tmp_path, "rb") as stdin_file, open(out_path, "wb") as stdout_file:
-                # Reload re-runs recap with the session-source flags captured by main()
-                ra = reload_args or ["--list"]
-                reload_cmd = "recap " + " ".join(f'"{a}"' if " " in a else a for a in ra)
-
-                # `recap --preview` reads the pre-rendered cache; portable across cmd / bash / pwsh
-                preview_cmd      = "recap --preview {2}"
-                preview_full_cmd = "recap --preview-full {2}"
-                bindings_list = [
-                    f"ctrl-x:execute-silent(recap --hide {{2}})+reload({reload_cmd})",
-                    f"ctrl-p:execute-silent(recap --favorite {{2}})+reload({reload_cmd})",
-                    f"ctrl-r:execute-silent(recap --toggle-view)+reload({reload_cmd})",
-                    f"ctrl-t:execute-silent(recap --toggle-tree)+reload({reload_cmd})",
-                    f"ctrl-g:execute-silent(recap --toggle-cluster)+reload({reload_cmd})",
-                    f"ctrl-f:change-preview({preview_full_cmd})",
-                    f"ctrl-s:change-preview({preview_cmd})",
-                ]
-                # Sort controls. fzf in many distros doesn't recognise ctrl-1
-                # through ctrl-9 (terminal can't disambiguate the modifier), so
-                # we use the alt modifier exclusively:
-                #   Alt-1 / Alt-2 / Alt-3       cycle column at priority N
-                #   Alt-q / Alt-w / Alt-e       toggle priority N's direction
-                # Reload re-applies the saved sort spec.
-                for n, dkey in zip((1, 2, 3), ("q", "w", "e")):
-                    bindings_list.append(
-                        f"alt-{n}:execute-silent(recap --cycle-sort {n})+reload({reload_cmd})")
-                    bindings_list.append(
-                        f"alt-{dkey}:execute-silent(recap --toggle-sort-dir {n})+reload({reload_cmd})")
-                bindings = ",".join(bindings_list)
-
-                view_tag = "show-hidden" if _get_view_mode() == "show-hidden" else "default"
-                # tree/cluster are mutually exclusive in the *display*; show the
-                # active one so the user knows which keystroke does what.
-                if cluster_mode:
-                    layout_tag = "Ctrl-g:cluster(ON)"
-                else:
-                    tree_tag = "flat" if flat else "nested"
-                    layout_tag = f"Ctrl-t:tree(now:{tree_tag})  Ctrl-g:cluster(off)"
-                # Sort indicator: `[1↓date] [2↑proj] [3 -]` style. Down arrow
-                # for desc, up for asc, `-` placeholder for inactive priority.
-                # Only meaningful in flat-non-cluster mode; muted otherwise.
-                sort_active = (not cluster_mode) and flat
-                sort_tag = "  Sort:"
-                for i, k in enumerate(_load_sort(), 1):
-                    if k["col"] == "-":
-                        sort_tag += f" [{i} -]"
-                    else:
-                        arrow = "v" if k["dir"] == "desc" else "^"
-                        sort_tag += f" [{i}{arrow}{k['col']}]"
-                if not sort_active:
-                    sort_tag = _c(sort_tag + "(N/A)", DIM)
-                header = (f"Enter:resume  Ctrl-p:*fav  Ctrl-x:hide  "
-                          f"Ctrl-r:hidden(now:{view_tag})  "
-                          f"{layout_tag}  "
-                          f"Ctrl-f/s:full/summary  Ctrl-C:cancel"
-                          f"\nAlt-1/2/3:cycle sort  Alt-q/w/e:toggle dir{sort_tag}")
-                result = subprocess.run(
-                    # Layout (default fzf, preview pane below):
-                    #   top:    list pane (the session / topic selector)
-                    #   middle: prompt + header (= keybinding hints), full width
-                    #   bottom: preview pane
-                    # `--layout=default` (the fzf default) keeps the prompt at
-                    # the bottom of the list pane, which puts it just above the
-                    # preview pane → header sits in the screen middle, list
-                    # above it, preview below it.
-                    ["fzf", "--ansi", "--no-sort",
-                     "--delimiter=\t", "--with-nth=1", "--nth=1,3",
-                     "--preview", preview_cmd,
-                     "--preview-window", "down:55%:wrap",
-                     "--bind", bindings,
-                     "--header", header,
-                     "--prompt", "Search> "],
-                    stdin=stdin_file,
-                    stdout=stdout_file,
-                    stderr=None,
-                    env=env,
-                )
-        except FileNotFoundError:
-            if sys.platform == "win32":
-                hint = "winget install junegunn.fzf"
-            elif sys.platform == "darwin":
-                hint = "brew install fzf"
-            else:
-                hint = "sudo apt install fzf  # or: brew install fzf"
-            print(f"fzf not found. Install: {hint}", file=sys.stderr)
-            sys.exit(1)
-
-        try:
-            with open(out_path, "rb") as f:
-                chosen = f.read().decode("utf-8", errors="replace").strip()
-        except Exception:
-            chosen = ""
-    finally:
-        # Defensively reset terminal modes fzf may have left enabled. Observed on
-        # Windows: fzf exit (esp. via Ctrl-C / non-zero or any exception path)
-        # sometimes fails to disable focus tracking (\e[?1004h) and SGR mouse
-        # (\e[?1006h), so the shell prompt then receives stray '[I' / 'm' from
-        # focus and mouse events. Sending the disable sequences here is idempotent
-        # and safe on any VT100-compatible terminal. In `finally` so even an
-        # unexpected subprocess error doesn't leak modes back to the shell.
-        _reset_terminal_modes()
-        for p in (tmp_path, out_path):
-            try:
-                os.unlink(p)
-            except Exception:
-                pass
-
-    if result is None or result.returncode != 0 or not chosen:
-        return
-    full_id = chosen.split("\t")[1].strip()   # field 1 = UUID (0=display, 2=searchable)
-    if not full_id:
-        return
-    _resume_claude(full_id, sessions)
-
-
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
-                 flat: bool = False, cluster_mode: bool = False,
-                 reload_args: list[str] | None = None) -> None:
+                 flat: bool = False, cluster_mode: bool = False) -> None:
     """Textual-based picker (status bar, mouse-click column sort, ? help overlay).
 
     Layout:
@@ -1858,11 +1584,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         from textual.widgets import DataTable, Footer, Input, RichLog, Static
         from rich.text import Text
     except ImportError as e:
-        print(_c(f"  textual not available ({e}) — falling back to fzf", YELLOW),
-              file=sys.stderr)
-        fzf_pick(sessions, repo, show_project, flat=flat,
-                 cluster_mode=cluster_mode, reload_args=reload_args)
-        return
+        print(_c(f"  textual is required but not installed ({e}). "
+                 f"Install it with: uv tool install textual "
+                 f"(or: pip install 'textual>=0.50')", RED), file=sys.stderr)
+        sys.exit(1)
 
     all_sessions = list(sessions)
 
@@ -1954,8 +1679,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def on_mount(self) -> None:
             # sid -> session map so the preview pane can warm its own cache on
-            # demand. Textual owns preview warming; previously only fzf line-
-            # building (build_fzf_lines) populated this cache.
+            # demand: rendered and cached on a cache miss.
             self._sid_index = {s.get("id"): s for s in all_sessions}
             self._refresh_table()
             self.query_one("#table", DataTable).focus()
@@ -2227,8 +1951,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                          else PREVIEW_DIR)
             cache_file = cache_dir / f"{sid}.txt"
             if not cache_file.exists():
-                # Warm on demand so the cache is self-sufficient (no reliance on
-                # fzf line-building having run first).
+                # Warm on demand so the cache is self-sufficient: render and
+                # cache the highlighted session when it is missing.
                 s = self._sid_index.get(sid)
                 if s is not None:
                     _write_preview_cache(s)
@@ -2240,7 +1964,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         # ── events ──────────────────────────────────────────────────────────
 
         def on_key(self, event) -> None:
-            # fzf-like: typing while the table is focused redirects into the
+            # search-as-you-type: typing while the table is focused redirects into the
             # search input. Arrow keys / control bindings still route normally
             # because we only intercept printable single characters and
             # Backspace. Down arrow from the search input jumps to the table
@@ -2378,7 +2102,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         print(_c("\n  textual UI crashed:", RED), file=sys.stderr)
         traceback.print_exc()
         print(_c(f"  textual debug log: {log_path}", YELLOW), file=sys.stderr)
-        print(_c("  fall back to fzf with: recap --ui fzf", YELLOW), file=sys.stderr)
         return
     if chosen:
         _resume_claude(chosen, all_sessions)
@@ -3068,7 +2791,7 @@ def main():
                "                            on resume even when the target cwd is frequent.\n"
                "  RECAP_FREQ_CWD_MIN=N      minimum session count to flag a cwd as\n"
                "                            \"frequent\" for auto-permission (default 5).\n"
-               "  RECAP_CLUSTER_MIN_SIZE=N  (legacy, no longer used by --ui textual —\n"
+               "  RECAP_CLUSTER_MIN_SIZE=N  (legacy, no longer used by the textual picker —\n"
                "                            cluster mode is now driven by a one-shot\n"
                "                            Haiku classification cached in\n"
                "                            ~/.cache/recap/global-clusters.json; run\n"
@@ -3109,11 +2832,11 @@ def main():
                    help="Persist the current --days/--here/--all values as new defaults. "
                         "Without this flag, CLI args are one-shot and saved options stay untouched.")
     p.add_argument("--pick", action="store_true",
-                   help="Open the interactive picker (textual by default; --ui fzf for the legacy picker). This is the default when "
+                   help="Open the interactive picker. This is the default when "
                         "no other action flag is given; --pick is kept as an explicit "
                         "no-op for clarity in shell aliases.")
     p.add_argument("--table", action="store_true",
-                   help="Show static table instead of fzf picker")
+                   help="Show static table instead of the interactive picker")
     p.add_argument("--project", metavar="PATH")
     p.add_argument("--no-summary", action="store_true",
                    help="Skip Haiku summarization (use AI title or first user msg)")
@@ -3121,12 +2844,9 @@ def main():
                    help="Discard cached Haiku summaries and regenerate. Does NOT touch "
                         "parsed/topic caches; delete ~/.cache/recap/parsed/ for that.")
     p.add_argument("--preview", metavar="SESSION_ID",
-                   help="Print session content preview (used internally by --pick)")
+                   help="Print a session's content preview")
     p.add_argument("--preview-full", metavar="SESSION_ID",
-                   help="Print full conversation preview (used internally by --pick)")
-    p.add_argument("--list", action="store_true",
-                   help="Emit fzf-formatted lines (used internally by --pick reload). "
-                        "Implies --no-summary (skips Haiku).")
+                   help="Print a session's full conversation preview")
     p.add_argument("--hide", metavar="SESSION_ID",
                    help="Toggle hidden state for a session")
     p.add_argument("--favorite", metavar="SESSION_ID",
@@ -3159,10 +2879,6 @@ def main():
                         "One LLM call buckets every session into 6-10 coherent themes; "
                         "result is cached. Run after a flurry of new sessions or when "
                         "the existing themes feel stale.")
-    p.add_argument("--ui", choices=["fzf", "textual"], default=None,
-                   help="Picker UI: 'textual' (default, Python TUI with mouse "
-                        "support) or 'fzf' (legacy, external binary). "
-                        "Persistent — sets the new default.")
     p.add_argument("--related", metavar="SESSION_ID",
                    help="Show sessions related to SESSION_ID with confidence scores and reasons")
     p.add_argument("--tree", action="store_true",
@@ -3371,9 +3087,8 @@ def main():
         print(f"No sessions in {period}.")
         return
 
-    # --list is invoked by fzf reload bindings (Ctrl-x/p/r). Reloads should be
-    # instant; skip Haiku entirely and rely on whatever cache the initial run
-    # already filled. Cache misses fall back to the first user message.
+    # Skip Haiku here so the picker starts instantly: rely on whatever cache a
+    # previous run filled, falling back to the first user message on a miss.
     # Phase 1 (instant): fill all sessions from cache / ai_title / first_msg.
     # This runs synchronously in <1s so the UI starts immediately.
     for s in sessions:
@@ -3382,8 +3097,8 @@ def main():
                         else s["ai_title"] or _first_msg(s))
 
     # Phase 2 (background): LLM-summarize sessions that had no cache hit.
-    # Skipped when --no-summary / --list / --related, or when all are cached.
-    if not (args.no_summary or args.related or args.list):
+    # Skipped when --no-summary / --related, or when all are cached.
+    if not (args.no_summary or args.related):
         import threading as _thr
         needs_llm = [s for s in sessions
                      if not s["ai_title"] and not s.get("is_open")
@@ -3400,7 +3115,7 @@ def main():
         cmd_related(args.related, sessions)
         return
 
-    # Always build the cross-session forest so the fzf preview header can surface
+    # Always build the cross-session forest so the preview header can surface
     # the top-related session, even when --tree (nested display) is off. The forest
     # is O(N²) but each comparison is a cheap structural score (no Haiku); guard
     # with N <= 1000 to keep startup snappy on very large histories.
@@ -3414,8 +3129,8 @@ def main():
 
     # Display mode (flat / nested-tree / topic-cluster). Saved modes are the
     # source of truth so Ctrl-t / Ctrl-g inside the picker can toggle between
-    # them via reload. CLI --tree is a one-shot override for the initial
-    # invocation only — it is NOT carried into reload_args, so a Ctrl-* toggle
+    # them in place. CLI --tree is a one-shot override for the initial
+    # invocation only — the saved mode stays the source of truth, so a Ctrl-* toggle
     # wins. tree and cluster are mutually exclusive in display: cluster wins
     # when both happen to be on (e.g. saved cluster + CLI --tree).
     cluster_mode = _get_cluster_mode()
@@ -3426,14 +3141,6 @@ def main():
     # mode is topic-bucketed, so a free-form sort would override their layout.
     if flat and not cluster_mode:
         _apply_sort(sessions, _load_sort())
-    if args.list:
-        # Emit fzf-formatted lines without launching fzf (used by reload)
-        emitter = (build_cluster_lines(sessions, repo, args.all_projects) if cluster_mode
-                   else build_fzf_lines(sessions, repo, args.all_projects, flat=flat))
-        for line in emitter:
-            sys.stdout.write(line + "\n")
-        return
-
     if args.table:
         # Static table display (opt-in with --table)
         hidden = _load_hidden()
@@ -3444,28 +3151,9 @@ def main():
             visible = sessions
         display_table(visible, repo, args.all_projects, flat=flat)
     else:
-        # Default: interactive picker. UI choice = CLI --ui (one-shot, also
-        # persists) > saved ui-mode > 'fzf' fallback.
-        if args.ui:
-            _set_ui_mode(args.ui)
-            ui_mode = args.ui
-        else:
-            ui_mode = _get_ui_mode()
-        reload_args = ["--list", "--days", str(args.days)]
-        if args.here:
-            reload_args.append("--here")
-        if args.project:
-            reload_args += ["--project", args.project]
-        # Intentionally NOT propagating --tree into reload_args: the saved
-        # tree-mode (toggled via Ctrl-t inside the picker) is the source of
-        # truth on reload. Otherwise an initial `recap --tree` would override
-        # subsequent toggles forever.
-        if ui_mode == "textual":
-            textual_pick(sessions, repo, args.all_projects, flat=flat,
-                         cluster_mode=cluster_mode, reload_args=reload_args)
-        else:
-            fzf_pick(sessions, repo, args.all_projects, flat=flat,
-                     cluster_mode=cluster_mode, reload_args=reload_args)
+        # Default: interactive textual picker.
+        textual_pick(sessions, repo, args.all_projects, flat=flat,
+                     cluster_mode=cluster_mode)
 
 
 if __name__ == "__main__":
