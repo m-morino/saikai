@@ -410,6 +410,138 @@ def _is_pid_alive(pid: int) -> bool:
         return False
 
 
+# ── Terminal-death watchdog (Windows SIGHUP emulation) ───────────────────────
+# POSIX delivers SIGHUP to the foreground process group when the controlling
+# terminal closes, so recap and any resumed `claude --resume` child die with the
+# tab. Windows has no such cascade: closing a wezterm tab kills that tab's shell
+# (pwsh) but leaves the orphaned cmd→uv→python(recap)→claude chain running
+# forever — recap blocked in subprocess.run(claude), claude idle on a dead pty.
+# Confirmed 2026-06-05 via reaper.log: 12 such pairs survived ~24h, and
+# reap-orphan-claude.py is structurally blind to them (it excludes python/uv
+# parents after the 2026-05-23 live-session false-positive incident). This
+# watchdog restores the SIGHUP semantic: find this tab's shell, poll it, and
+# when it dies taskkill recap's OWN subtree (the claude child included). It only
+# ever targets os.getpid()'s tree, so it can never touch another session.
+_SHELL_ANCESTOR_NAMES = frozenset({
+    "pwsh.exe", "powershell.exe", "cmd.exe", "bash.exe", "sh.exe", "zsh.exe",
+})
+# Terminal emulators sit ABOVE the tab shell and survive a single-tab close, so
+# the ancestor walk stops here — the tab shell is the last shell seen before the
+# emulator (anchoring on the emulator would only fire on whole-window close).
+_TERM_EMULATOR_NAMES = frozenset({
+    "wezterm-gui.exe", "windowsterminal.exe", "openconsole.exe",
+    "alacritty.exe", "kitty.exe",
+})
+
+
+def _win_pid_index() -> dict[int, tuple[str, int]]:
+    """{pid: (image_name_lower, ppid)} from one CreateToolhelp32Snapshot call.
+    Fast (~ms, no subprocess spawn — startup stays instant). Returns {} on any
+    failure so the caller treats it as "no anchor" and the watchdog stays off."""
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID = ctypes.c_void_p(-1).value
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.Process32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32)]
+    k32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == INVALID:
+        return {}
+    out: dict[int, tuple[str, int]] = {}
+    try:
+        entry = PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        ok = k32.Process32First(snap, ctypes.byref(entry))
+        while ok:
+            name = entry.szExeFile.decode("ascii", "replace").lower()
+            out[int(entry.th32ProcessID)] = (name, int(entry.th32ParentProcessID))
+            ok = k32.Process32Next(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    return out
+
+
+def _find_terminal_anchor(pid_index: dict[int, tuple[str, int]], start_pid: int,
+                          shell_names: frozenset = _SHELL_ANCESTOR_NAMES,
+                          term_names: frozenset = _TERM_EMULATOR_NAMES) -> int:
+    """Return the PID of this tab's shell: the OUTERMOST shell ancestor below the
+    terminal emulator. That is exactly the process that dies on tab/window close
+    — an inner shim (recap.cmd's cmd.exe, the bash wrapper) merely orphans
+    alongside us, so anchoring on it would never fire. Returns 0 when no shell
+    ancestor exists (headless: test runner / scheduled task) so the watchdog
+    stays disabled. Cycle- and broken-chain-safe via the visited set."""
+    cur = start_pid
+    seen: set[int] = set()
+    anchor = 0
+    while cur and cur not in seen:
+        seen.add(cur)
+        info = pid_index.get(cur)
+        if not info:
+            break
+        name, ppid = info
+        if name in term_names:
+            break  # reached the terminal emulator; tab shell already recorded
+        if cur != start_pid and name in shell_names:
+            anchor = cur
+        cur = ppid
+    return anchor
+
+
+def _start_terminal_watchdog(poll_sec: float = 12.0) -> None:
+    """Start the Windows terminal-death watchdog. No-op on POSIX (real SIGHUP),
+    when no tab shell is found (headless), or when RECAP_NO_TERMINAL_WATCHDOG is
+    set. See the module comment above _SHELL_ANCESTOR_NAMES for the why."""
+    if sys.platform != "win32" or os.environ.get("RECAP_NO_TERMINAL_WATCHDOG"):
+        return
+    try:
+        anchor = _find_terminal_anchor(_win_pid_index(), os.getpid())
+    except Exception:
+        anchor = 0
+    if not anchor:
+        return
+    self_pid = os.getpid()
+
+    def _watch() -> None:
+        while True:
+            time.sleep(poll_sec)
+            if _is_pid_alive(anchor):
+                continue
+            # Tab/window closed → emulate SIGHUP: kill our OWN subtree (the
+            # resumed claude child included), then exit hard so a daemon thread
+            # blocked elsewhere can't keep the interpreter alive.
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(self_pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=NO_WINDOW, timeout=5)
+            except Exception:
+                pass
+            os._exit(0)
+
+    import threading as _thr
+    _thr.Thread(target=_watch, daemon=True, name="recap-terminal-watchdog").start()
+
+
 _active_sessions_cache: dict[str, str] | None = None
 
 
@@ -1601,6 +1733,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                  f"Install it with: uv tool install textual "
                  f"(or: pip install 'textual>=0.50')", RED), file=sys.stderr)
         sys.exit(1)
+
+    # Emulate POSIX SIGHUP on Windows: if this tab's shell dies (tab closed)
+    # while the picker is open or a resumed `claude` is running, take recap and
+    # its claude child down instead of orphaning the pair (see
+    # _start_terminal_watchdog). No-op on POSIX / headless.
+    _start_terminal_watchdog()
 
     all_sessions = list(sessions)
 
