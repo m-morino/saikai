@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -2958,6 +2959,136 @@ def _tree_walk(sessions: list[dict]) -> list[tuple[dict, str]]:
     return out
 
 
+# ── Claude Desktop session-list sync ─────────────────────────────────────────
+# Claude Desktop builds its session picker from
+#   %APPDATA%/Claude/claude-code-sessions/<org>/<user>/local_<uuid>.json
+# entries, each linking to a ~/.claude/projects JSONL via `cliSessionId`. Sessions
+# started in the terminal / VS Code after Desktop's one-time import have no such
+# entry, so Desktop doesn't list them. cmd_sync_desktop ADDITIVELY creates the
+# missing entries — it never touches ~/.claude/projects canonical history.
+DESKTOP_SESSIONS_ROOT = Path.home() / "AppData" / "Roaming" / "Claude" / "claude-code-sessions"
+
+
+def _desktop_index_dir() -> Path | None:
+    """The <org>/<user> dir holding Desktop's local_*.json session entries."""
+    if not DESKTOP_SESSIONS_ROOT.exists():
+        return None
+    locs = list(DESKTOP_SESSIONS_ROOT.rglob("local_*.json"))
+    if not locs:
+        return None
+    # the dir with the most entries is the active org/user
+    return Counter(p.parent for p in locs).most_common(1)[0][0]
+
+
+def _iso_to_ms(s) -> int:
+    try:
+        return int(datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def _session_surface_model(jsonl: Path) -> tuple:
+    """Read entrypoint (surface) and last assistant model from a session JSONL."""
+    ep = model = None
+    try:
+        with open(jsonl, "rb") as f:
+            for line in f:
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if ep is None and "entrypoint" in o:
+                    ep = o["entrypoint"]
+                if o.get("type") == "assistant":
+                    m = (o.get("message") or {}).get("model")
+                    if m:
+                        model = m
+    except Exception:
+        pass
+    return ep, model
+
+
+def cmd_sync_desktop() -> None:
+    """Surface Terminal/VS Code sessions in Claude Desktop's session list.
+
+    Additive (writes only new local_<uuid>.json entries into Desktop's own store)
+    and idempotent (sessions already linked by cliSessionId are skipped).
+    """
+    idx = _desktop_index_dir()
+    if idx is None:
+        print(_c("  Claude Desktop session store not found "
+                 "(is Desktop installed and has it run once?)", YELLOW), file=sys.stderr)
+        return
+    if sys.platform == "win32":
+        try:
+            # bytes (no text decode): tasklist emits the console OEM codepage
+            # (e.g. CP932 on JP Windows), which is not valid UTF-8.
+            r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Claude.exe"],
+                               capture_output=True, creationflags=NO_WINDOW)
+            if b"Claude.exe" in (r.stdout or b""):
+                print(_c("  note: Claude Desktop appears to be running — restart it "
+                         "afterwards to see the new sessions.", YELLOW), file=sys.stderr)
+        except Exception:
+            pass
+    known = set()
+    for p in idx.glob("local_*.json"):
+        c = _read_json(p, {}).get("cliSessionId")
+        if c:
+            known.add(c)
+    created = skipped = 0
+    for d in PROJECTS_ROOT.iterdir():
+        if not d.is_dir() or d.name == "memory":
+            continue
+        for s in load_sessions_in_dir(d, None):
+            sid = s["id"]
+            if sid in known:
+                skipped += 1
+                continue
+            jsonl = s.get("jsonl_path")
+            if not jsonl:
+                continue
+            surface, model = _session_surface_model(jsonl)
+            if surface not in ("cli", "claude-vscode"):
+                continue   # only Terminal / VS Code sessions
+            cwd = s.get("cwd") or s.get("origin_cwd") or str(Path.home())
+            title = (s.get("ai_title")
+                     or (s["real_msgs"][0] if s.get("real_msgs") else "")
+                     or f"({sid[:8]})")[:80]
+            created_ms = _iso_to_ms(s.get("first_ts"))
+            active_ms = _iso_to_ms(s.get("last_ts")) or created_ms
+            entry = {
+                "sessionId": "local_" + str(uuid.uuid4()),
+                "cliSessionId": sid,
+                "cwd": cwd,
+                "originCwd": s.get("origin_cwd") or cwd,
+                "createdAt": created_ms,
+                "lastActivityAt": active_ms,
+                "lastFocusedAt": active_ms,
+                "model": model or "claude-opus-4-8",
+                "effort": "max",
+                "isArchived": False,
+                "title": title,
+                "titleSource": "user",
+                "permissionMode": "default",
+                "enabledMcpTools": {},
+                "remoteMcpServersConfig": [],
+                "chromePermissionMode": "skip_all_permission_checks",
+                "completedTurns": 0,
+                "alwaysAllowedReasons": [],
+                "sessionPermissionUpdates": [],
+                "classifierSummaryEnabled": True,
+            }
+            try:
+                _write_json(idx / (entry["sessionId"] + ".json"), entry)
+                created += 1
+            except Exception as e:
+                print(_c(f"  failed writing entry for {sid[:8]}: {e}", RED), file=sys.stderr)
+    print(_c(f"  Claude Desktop sync: +{created} new, {skipped} already present.",
+             GREEN), file=sys.stderr)
+    if created:
+        print(_c("  Restart Claude Desktop to see the new sessions.", DIM), file=sys.stderr)
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     p = argparse.ArgumentParser(
@@ -3054,6 +3185,10 @@ def main():
                         "In the picker, click a sorted column header again to reverse.")
     p.add_argument("--reset-sort", action="store_true",
                    help="Reset all sort priorities to defaults (date desc, then none).")
+    p.add_argument("--sync-desktop", action="store_true",
+                   help="Create Claude Desktop session-list entries for Terminal/VS Code "
+                        "sessions missing from it. Additive + idempotent; never modifies "
+                        "~/.claude/projects. Restart Desktop afterwards to see them.")
     p.add_argument("--refresh-clusters", action="store_true",
                    help="Re-run the global Haiku classification used by cluster mode. "
                         "One LLM call buckets every session into 6-10 coherent themes; "
@@ -3155,6 +3290,9 @@ def main():
               file=sys.stderr)
         if clusters:
             print(_c("  " + ", ".join(clusters), DIM), file=sys.stderr)
+        return
+    if args.sync_desktop:
+        cmd_sync_desktop()
         return
     # --sidechain SID: in-session subagent tree. Handled here (no need to load
     # all sessions across the project — we open the target JSONL directly).
