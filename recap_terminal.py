@@ -714,26 +714,35 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         """Debounce: a new status must persist >=2 ticks (reader OR host poll)
         before it flips (spinners momentarily clear the line and would otherwise
         flicker Idle<->Busy). Busy is reported immediately (responsiveness); the
-        flip OUT of Busy is what we debounce. Guarded by self._lock because BOTH
-        the reader thread (_consume) and the UI poll (refresh_status) call it."""
+        flip OUT of Busy is what we debounce. The pending/status RMW is guarded
+        by self._lock (reader thread + UI poll both call this); the status
+        callback is marshalled OUTSIDE the lock. Calling call_from_thread (it
+        BLOCKS until the UI thread runs it) while holding the lock that
+        render_line / _current_screen also take DEADLOCKS reader vs UI."""
+        fire = None
         with self._lock:
             if new == self._status:
                 self._pending_status = None
                 self._pending_ticks = 0
-                return
-            if new == "busy":
-                self._set_status("busy")
-                return
-            # leaving busy / changing among waiting/idle: require persistence
-            if new == self._pending_status:
-                self._pending_ticks += 1
-            else:
-                self._pending_status = new
-                self._pending_ticks = 1
-            if self._pending_ticks >= 2:
-                self._set_status(new)
+            elif new == "busy":
+                self._status = "busy"          # report busy immediately
                 self._pending_status = None
                 self._pending_ticks = 0
+                fire = "busy"
+            else:
+                # leaving busy / changing among waiting/idle: require persistence
+                if new == self._pending_status:
+                    self._pending_ticks += 1
+                else:
+                    self._pending_status = new
+                    self._pending_ticks = 1
+                if self._pending_ticks >= 2:
+                    self._status = new
+                    self._pending_status = None
+                    self._pending_ticks = 0
+                    fire = new
+        if fire is not None and self._on_status and self.sid:
+            self._marshal(lambda: self._safe_status_cb(fire))   # marshal OUTSIDE the lock
 
     def _set_status(self, status: str) -> None:
         self._status = status
