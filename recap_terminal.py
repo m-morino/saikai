@@ -150,23 +150,28 @@ _WAITING_RE = re.compile(
 _MENU_RE = re.compile(r"(?:^\s*\d+\.\s+\S.*\n){2,}", re.MULTILINE)
 
 
-def classify_pty_status(recent_text: str) -> str:
-    """Classify the tail of decoded PTY output into ``"busy"`` / ``"waiting"`` /
-    ``"idle"``.
+def classify_pty_status(screen_text: str, title: str = "") -> str:
+    """Classify into ``"busy"`` / ``"waiting"`` / ``"idle"``.
 
-    Priority: Busy > Waiting > Idle. ANSI is stripped first (the footer is
-    heavily colored) and only the last ~2 KB is inspected (scrollback holds
-    stale prompts). recap debounces flips and cross-checks the file-based
-    registry status — this is a refinement signal, not the sole source.
+    The most reliable, real-time signal is claude's OWN OSC-0 title (the same
+    thing WezTerm surfaces): a leading braille-spinner glyph (U+2800–U+28FF)
+    means it's working; "✳" means ready/idle. We use the title for busy/idle and
+    the on-screen text for a permission/forced-choice prompt (waiting).
+    Priority: Waiting (a visible prompt) > Busy > Idle. `screen_text` should be
+    the CURRENT screen (pyte .display), not a rolling byte tail.
     """
-    t = _ANSI_RE.sub("", recent_text or "")[-2000:]
-    if not t.strip():
-        return "idle"
+    t = _ANSI_RE.sub("", screen_text or "")[-2000:]
+    # A visible permission / forced-choice prompt is the strongest "needs you".
+    if _WAITING_RE.search(t) or _MENU_RE.search(t):
+        return "waiting"
+    # claude's title spinner = actively working (reliable; survives scrollback).
+    g = (title or "")[:1]
+    if g and 0x2800 <= ord(g) <= 0x28FF:
+        return "busy"
+    # Corroborating body markers in case the title was missed this tick.
     last_line = t.splitlines()[-1] if t.splitlines() else ""
     if _BUSY_RE.search(t) or _SPINNER_RE.search(last_line):
         return "busy"
-    if _WAITING_RE.search(t) or _MENU_RE.search(t):
-        return "waiting"
     return "idle"
 
 
@@ -663,29 +668,35 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
                 if added > 0:
                     self._scroll = min(self._scroll + added,
                                        len(self._screen.history.top))
-        # Classify from the CURRENT screen (what's visible now), not a rolling
-        # byte tail: a tail keeps stale "esc to interrupt" / already-answered
-        # prompts that scrolled up and would misclassify a now-idle pane.
-        self._update_status(classify_pty_status(self._current_screen_text()))
+        # Classify from the CURRENT screen + claude's OSC-0 title (its own state
+        # glyph), not a rolling byte tail: a tail keeps stale "esc to interrupt"
+        # / answered prompts that scrolled up and would misclassify an idle pane.
+        _txt, _title = self._current_screen()
+        self._update_status(classify_pty_status(_txt, _title))
 
-    def _current_screen_text(self) -> str:
-        """Visible screen as plain text (pyte .display) for status classification
-        — reflects what is on screen NOW, not scrolled-off bytes."""
+    def _current_screen(self) -> tuple:
+        """(visible text, title) under the lock. `title` is claude's OSC-0 title
+        — its leading glyph (braille spinner = working, ✳ = ready) is the
+        reliable state signal; pyte tracks it via set_title."""
         with self._lock:
             if self._screen is None:
-                return ""
+                return "", ""
             try:
-                return "\n".join(self._screen.display)
+                txt = "\n".join(self._screen.display)
             except Exception:
-                return ""
+                txt = ""
+            title = getattr(self._screen, "title", "") or ""
+        return txt, title
 
     def refresh_status(self) -> None:
-        """Re-classify from the current screen. The host calls this periodically
-        so a pane that went idle WITHOUT new output (no reader tick to re-run
-        _consume) still flips out of 'busy' and the debounce gets its 2nd tick."""
+        """Re-classify from the current screen + title. The host calls this
+        periodically so a pane that went idle WITHOUT new output (no reader tick
+        to re-run _consume) still flips out of 'busy', and the debounce gets its
+        second tick on the timer cadence."""
         if self._screen is None or self.is_dead:
             return
-        self._update_status(classify_pty_status(self._current_screen_text()))
+        txt, title = self._current_screen()
+        self._update_status(classify_pty_status(txt, title))
 
     def _update_status(self, new: str) -> None:
         """Debounce: a new status must persist >=2 ticks (reader OR host poll)
