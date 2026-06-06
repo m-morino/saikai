@@ -1394,7 +1394,7 @@ def _render_preview(s: dict) -> str:
         lines.append(f"\033[36m── Last user message  (#{len(s['real_msgs'])}) ──\033[0m")
         lines.append(s["real_msgs"][-1][:1500])
     lines.append("")
-    lines.append("\033[2mCtrl-f: full conversation  |  Ctrl-s: this summary view\033[0m")
+    lines.append("\033[2mTab: full/summary  ·  Ctrl-d: changes (transcript diff)\033[0m")
     return "\n".join(lines)
 
 
@@ -1429,7 +1429,83 @@ def _render_preview_full(s: dict) -> str:
     except Exception:
         pass
     lines.append("")
-    lines.append("\033[2mCtrl-s: condensed summary  |  Ctrl-f: this full view\033[0m")
+    lines.append("\033[2mTab: full/summary  ·  Ctrl-d: changes (transcript diff)\033[0m")
+    return "\n".join(lines)
+
+
+def _extract_session_changes(jsonl_path, max_ops: int = 40):
+    """Reconstruct what a session changed from its OWN transcript: Edit /
+    MultiEdit / Write / NotebookEdit tool calls record old_string / new_string /
+    content. Returns an ordered list of (file_path, kind, old, new) — reliable
+    for a session of any age, no git/worktree needed. Best-effort."""
+    ops = []
+    try:
+        with open(jsonl_path, "rb") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") != "assistant":
+                    continue
+                content = obj.get("message", {}).get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for b in content:
+                    if not (isinstance(b, dict) and b.get("type") == "tool_use"):
+                        continue
+                    name = b.get("name", "")
+                    inp = b.get("input") or {}
+                    if name == "Edit":
+                        ops.append((inp.get("file_path", ""), "edit",
+                                    inp.get("old_string", ""), inp.get("new_string", "")))
+                    elif name == "MultiEdit":
+                        fp = inp.get("file_path", "")
+                        for e in (inp.get("edits") or []):
+                            if isinstance(e, dict):
+                                ops.append((fp, "edit", e.get("old_string", ""),
+                                            e.get("new_string", "")))
+                    elif name == "Write":
+                        ops.append((inp.get("file_path", ""), "write", "",
+                                    inp.get("content", "")))
+                    elif name == "NotebookEdit":
+                        ops.append((inp.get("notebook_path", ""), "edit",
+                                    inp.get("old_source", ""), inp.get("new_source", "")))
+                    if len(ops) >= max_ops:
+                        return ops
+    except Exception:
+        return ops
+    return ops
+
+
+def _render_preview_changes(s: dict) -> str:
+    """Preview mode (Ctrl-d): a diff-like view of what THIS session changed,
+    reconstructed from the transcript's own Edit/Write records."""
+    lines = _render_header(s)
+    lines.append("\033[36m── Changes this session made (from transcript) ──\033[0m")
+    ops = _extract_session_changes(s["jsonl_path"])
+    if not ops:
+        lines.append("(no file edits recorded in this session)")
+    else:
+        cur = None
+        for fp, kind, old, new in ops:
+            base = os.path.basename(fp) or fp or "(unknown)"
+            if base != cur:
+                lines.append("")
+                lines.append(f"\033[1m{base}\033[0m")
+                cur = base
+            if kind == "write":
+                nl = (new.count("\n") + 1) if new else 0
+                lines.append(f"  \033[32m+ new / overwrite, {nl} lines\033[0m")
+                for ln in new.splitlines()[:6]:
+                    lines.append(f"  \033[32m+\033[0m {ln[:100]}")
+            else:
+                for ln in (old.splitlines()[:4] if old else []):
+                    lines.append(f"  \033[31m-\033[0m {ln[:100]}")
+                for ln in (new.splitlines()[:4] if new else []):
+                    lines.append(f"  \033[32m+\033[0m {ln[:100]}")
+    lines.append("")
+    lines.append("\033[2mTab: full/summary  ·  Ctrl-d: changes (this view)\033[0m")
     return "\n".join(lines)
 
 
@@ -2032,7 +2108,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Ctrl-P[/yellow]      Toggle ★ favorite "
                 "  ([dim]:fav[/dim] in search to filter)\n"
                 "  [yellow]Ctrl-R[/yellow]      Refresh list  (auto: RECAP_AUTO_REFRESH=secs)\n"
-                "  [yellow]Ctrl-Y[/yellow]      Copy this session's opening prompt\n\n"
+                "  [yellow]Ctrl-Y[/yellow]      Copy this session's opening prompt\n"
+                "  [yellow]Ctrl-D[/yellow]      Show what this session changed (transcript diff)\n\n"
                 "[bold cyan]Display modes[/bold cyan]\n"
                 "  [yellow]Ctrl-G[/yellow]      Cluster (topic) mode\n"
                 "  [yellow]Ctrl-T[/yellow]      Tree (parent/child) mode\n"
@@ -2075,6 +2152,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("ctrl+o", "cycle_group", "Group"),
             Binding("ctrl+r", "refresh", "Refresh"),
             Binding("ctrl+y", "copy_prompt", "Copy prompt"),
+            Binding("ctrl+d", "preview_changes", "Changes"),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
             Binding("question_mark", "help", "Help", priority=True),
             # Split-live: open/attach a live claude as a tab; navigate tabs; and
@@ -2593,6 +2671,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # instead of tearing down the whole picker.
             try:
                 s = self._sid_index.get(sid)
+                if self.preview_mode == "changes" and s is not None:
+                    # Transcript-reconstructed diff; render on demand (no cache).
+                    preview.write(Text.from_ansi(_render_preview_changes(s)))
+                    return
                 # Open sessions grow every turn, so a cached preview goes stale.
                 # Render them fresh each time (skip the cache entirely).
                 if s is not None and s.get("is_open"):
@@ -3114,6 +3196,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def action_preview_summary(self) -> None:
             self.preview_mode = "summary"
+            self._update_preview(self._cursor_sid())
+
+        def action_preview_changes(self) -> None:
+            # Ctrl-D: show what this session changed (reconstructed from the
+            # transcript's Edit/Write records — no git, works for any age).
+            self.preview_mode = "changes"
             self._update_preview(self._cursor_sid())
 
         def action_quit(self) -> None:
