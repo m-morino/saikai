@@ -663,15 +663,35 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
                 if added > 0:
                     self._scroll = min(self._scroll + added,
                                        len(self._screen.history.top))
-        # status tail (ANSI kept; classify strips it). Bound the buffer.
-        self._tail = (self._tail + chunk)[-4000:]
-        self._update_status(classify_pty_status(self._tail))
+        # Classify from the CURRENT screen (what's visible now), not a rolling
+        # byte tail: a tail keeps stale "esc to interrupt" / already-answered
+        # prompts that scrolled up and would misclassify a now-idle pane.
+        self._update_status(classify_pty_status(self._current_screen_text()))
+
+    def _current_screen_text(self) -> str:
+        """Visible screen as plain text (pyte .display) for status classification
+        — reflects what is on screen NOW, not scrolled-off bytes."""
+        with self._lock:
+            if self._screen is None:
+                return ""
+            try:
+                return "\n".join(self._screen.display)
+            except Exception:
+                return ""
+
+    def refresh_status(self) -> None:
+        """Re-classify from the current screen. The host calls this periodically
+        so a pane that went idle WITHOUT new output (no reader tick to re-run
+        _consume) still flips out of 'busy' and the debounce gets its 2nd tick."""
+        if self._screen is None or self.is_dead:
+            return
+        self._update_status(classify_pty_status(self._current_screen_text()))
 
     def _update_status(self, new: str) -> None:
-        """Debounce: a new status must persist >=2 reader ticks before it
-        flips (spinners momentarily clear the line and would otherwise flicker
-        Idle<->Busy). Busy is reported immediately (responsiveness), the flip
-        OUT of Busy is what we debounce."""
+        """Debounce: a new status must persist >=2 ticks (reader OR host poll)
+        before it flips (spinners momentarily clear the line and would otherwise
+        flicker Idle<->Busy). Busy is reported immediately (responsiveness); the
+        flip OUT of Busy is what we debounce."""
         if new == self._status:
             self._pending_status = None
             self._pending_ticks = 0
