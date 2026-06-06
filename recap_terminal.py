@@ -679,14 +679,14 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
     def on_unmount(self) -> None:
         self.kill()
 
-    def kill(self) -> None:
-        """Stop the reader and kill the child PROCESS TREE.
+    def kill(self):
+        """Stop the reader and kill the child PROCESS TREE. Returns the daemon
+        thread reaping the grandchildren (or None) so a caller that must not exit
+        before the reap completes (kill_all on quit) can join it.
 
-        Order matters: close()/terminate() calls cancel_io(), which UNBLOCKS the
-        blocked reader read() fast (taskkill alone takes ~2s to EOF it). THEN
-        taskkill /T reaps grandchildren (claude's node workers) that terminate()
-        alone would orphan — the SIGHUP-emulation concern from commit 0fd9fcf.
-        Idempotent."""
+        The FAST part (close() → cancel_io() → reader unblocks) runs inline; the
+        SLOW part (taskkill /T, ~hundreds ms–seconds) runs OFF the UI thread so
+        closing one pane — or many in parallel — never freezes recap. Idempotent."""
         self._stop.set()
         pty, pid = self._pty, self._pid
         self._pty = None
@@ -699,15 +699,25 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
                 except Exception:
                     pass
         if sys.platform == "win32" and pid:
-            try:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    timeout=5,
-                )
-            except Exception:
-                pass
+            t = threading.Thread(target=self._reap_tree, args=(pid,),
+                                 name=f"reap-{pid}", daemon=True)
+            t.start()
+            return t
+        return None
+
+    @staticmethod
+    def _reap_tree(pid) -> None:
+        # taskkill /T reaps grandchildren (claude's node workers) that a plain
+        # terminate() would orphan — the SIGHUP-emulation concern, commit 0fd9fcf.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=10,
+            )
+        except Exception:
+            pass
 
     # ── messages ────────────────────────────────────────────────────────────────
     if events is not None:  # only define when textual present
@@ -744,6 +754,7 @@ class LiveSessionManager:
         self.max_live = max_live
         self._terms: dict[str, "ClaudeTerminal"] = {}     # sid -> widget
         self._status: dict[str, str] = {}                 # sid -> status
+        self._reaps: list = []                            # in-flight taskkill threads
 
     @staticmethod
     def pane_id(sid: str) -> str:
@@ -784,14 +795,36 @@ class LiveSessionManager:
     def all_terms(self) -> list["ClaudeTerminal"]:
         return list(self._terms.values())
 
-    def kill_all(self) -> None:
+    def note_reap(self, thread) -> None:
+        """Track an in-flight reap thread (from a single-pane close) so a later
+        quit can join it and not orphan the grandchildren."""
+        if thread is not None:
+            self._reaps.append(thread)
+
+    def join_reaps(self, total_timeout: float = 3.0) -> None:
+        """Wait (bounded) for all in-flight reaps so process exit doesn't orphan
+        node workers — bounded so quit stays snappy even if a taskkill hangs."""
+        import time
+        deadline = time.monotonic() + total_timeout
+        for t in self._reaps:
+            try:
+                t.join(timeout=max(0.0, deadline - time.monotonic()))
+            except Exception:
+                pass
+        self._reaps = [t for t in self._reaps if t.is_alive()]
+
+    def kill_all(self, wait: bool = False) -> None:
+        # Start every kill FIRST so the taskkills run IN PARALLEL, then
+        # (optionally) join — closing N panes costs ~one taskkill, not N.
         for term in list(self._terms.values()):
             try:
-                term.kill()
+                self.note_reap(term.kill())
             except Exception:
                 pass
         self._terms.clear()
         self._status.clear()
+        if wait:
+            self.join_reaps()
 
 
 # Status → a compact glyph for the DataTable marker / tab label. Loud on

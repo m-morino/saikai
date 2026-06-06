@@ -2152,7 +2152,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]F2/F3[/yellow]       Prev / next live tab\n"
                 "  [yellow]F4[/yellow]          Hide / show the session list\n"
                 "  [yellow]Ctrl-B[/yellow]      Release focus claude → list\n"
-                "  [yellow]Ctrl-W[/yellow]      Close live tab   [yellow]Ctrl-C[/yellow] force-quit\n\n"
+                "  [yellow]Ctrl-W[/yellow]      Close tab  ·  [yellow]Ctrl-K[/yellow] close all  ·  [yellow]Ctrl-C[/yellow] quit-all\n\n"
                 "[bold cyan]Filter / Group / Sort (top-right dropdowns, Desktop-style)[/bold cyan]\n"
                 "  Group by  Date / Project / State / None   (Ctrl-O cycles)\n"
                 "  Sort by   Recency / Created time / Alphabetically\n"
@@ -2192,6 +2192,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # focus to the list when a terminal is focused instead of quitting.
             # ctrl+enter keeps the legacy full-takeover resume as a fallback.
             Binding("ctrl+w", "close_live", "Close tab", show=False),
+            Binding("ctrl+k", "close_all_live", "Close all", show=False),
             Binding("f2", "prev_tab", "◀Tab", priority=True),
             Binding("f3", "next_tab", "Tab▶", priority=True),
             Binding("f4", "toggle_list", "Hide list", priority=True),
@@ -2945,7 +2946,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             t = self._live.get(sid)
             if t is not None:
                 try:
-                    t.kill()
+                    self._live.note_reap(t.kill())   # reap off-thread; UI stays snappy
                 except Exception:
                     pass
             self._live.forget(sid)
@@ -2967,6 +2968,27 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 pass
             self.query_one("#table", DataTable).focus()
             self._refresh_table()
+
+        def action_close_all_live(self) -> None:
+            # Ctrl-K: close ALL live panes at once (parallel kill) but STAY in
+            # recap — unlike Ctrl-C (also quits) or Esc (one at a time).
+            if self._live is None or self._live.count == 0:
+                return
+            n = self._live.count
+            tabs = self.query_one("#right", TabbedContent)
+            for s in list(self._live.statuses().keys()):
+                try:
+                    tabs.remove_pane(self._live.pane_id(s))
+                except Exception:
+                    pass
+            self._live.kill_all()      # parallel, non-blocking (recap stays up)
+            try:
+                tabs.active = "tab-preview"
+            except Exception:
+                pass
+            self.query_one("#table", DataTable).focus()
+            self._refresh_table()
+            self.notify(f"closed {n} live session(s)", timeout=3)
 
         def action_close_live(self) -> None:
             """Ctrl-W: kill + remove the focused (or active) live tab."""
@@ -3272,12 +3294,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if sid is not None:
                     self._close_live_sid(sid)
                     return
+            if self._live is not None:
+                self._live.join_reaps()   # don't orphan the last pane's reap
             self.exit(None)
 
         def action_quit_all(self) -> None:
-            # Ctrl-C: force quit — kill every live claude pane and exit now.
+            # Ctrl-C: force quit — kill every live claude pane (in PARALLEL) and
+            # exit; wait=True joins the reaps so no node worker is orphaned.
             if self._live is not None:
-                self._live.kill_all()
+                self._live.kill_all(wait=True)
             self.exit(None)
 
         def action_toggle_preview(self) -> None:
