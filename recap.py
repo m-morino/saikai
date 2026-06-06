@@ -2191,6 +2191,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # apply the Claude-Desktop-style grouping (Pinned + date/project).
             grouping = "none" if (cluster_mode or tree_mode) else group_by
             show_proj_col = show_project or (grouping == "project")
+            # The split-live list pane is narrow (~34%): use a Desktop-style
+            # minimal column set (status + relative-Last + title) and convey the
+            # project by tinting the title instead of a wide Project column.
+            narrow = _LIVE_TERM is not None
             tree_prefixes: dict[str, str] = {}
 
             if grouping != "none":
@@ -2237,20 +2241,30 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # and the row's RowKey carries it for resume; the user said it's
             # not useful as a sort/search target.
             # "Wt" column: only when --here loaded sessions from >1 worktree.
-            has_worktrees = (not show_project
-                             and any(s.get("worktree_label") for s in visible))
-            specs: list[tuple[str, str, int]] = [
-                ("", "_marker", 3),
-                (col_label("date", "Start"), "date", 13),
-                (col_label("last", "Last"), "last", 7),
-            ]
-            if show_proj_col:
-                specs.append((col_label("proj", "Project"), "proj", 17))
-            if has_worktrees:
-                specs.append((col_label("wt", "Wt"), "wt", 12))
-            if cluster_mode:
-                specs.append((col_label("topic", "Topic"), "topic", 16))
-            specs.append((col_label("title", "Title"), "title", 80))
+            if narrow:
+                # Minimal list for the split pane: status + relative-Last + title.
+                has_worktrees = False
+                specs: list[tuple[str, str, int]] = [
+                    ("", "_marker", 3),
+                    (col_label("last", "Last"), "last", 6),
+                    (col_label("title", "Title"), "title", 80),
+                ]
+            else:
+                # "Wt" column: only when --here loaded sessions from >1 worktree.
+                has_worktrees = (not show_project
+                                 and any(s.get("worktree_label") for s in visible))
+                specs = [
+                    ("", "_marker", 3),
+                    (col_label("date", "Start"), "date", 13),
+                    (col_label("last", "Last"), "last", 7),
+                ]
+                if show_proj_col:
+                    specs.append((col_label("proj", "Project"), "proj", 17))
+                if has_worktrees:
+                    specs.append((col_label("wt", "Wt"), "wt", 12))
+                if cluster_mode:
+                    specs.append((col_label("topic", "Topic"), "topic", 16))
+                specs.append((col_label("title", "Title"), "title", 80))
             for label, key, width in specs:
                 table.add_column(label, key=key, width=width)
 
@@ -2259,7 +2273,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             project_color: dict[str, str] = {}
             topic_color: dict[str, str] = {}
             wt_color: dict[str, str] = {}
-            if show_proj_col:
+            if show_proj_col or narrow:
                 project_color = _build_color_map(
                     (project_short(s["project_name"]) for s in visible),
                     _PROJECT_PALETTE,
@@ -2310,7 +2324,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # Emit a section-header row just before its first member.
                 if s["id"] in header_before:
                     hdr_cells = ["" for _ in specs]
-                    hdr_cells[1] = Text(header_before[s["id"]], style="bold #7aa2f7")
+                    # Put the section label where there's room: the Title column
+                    # in the narrow pane, else the (wider) Start column.
+                    hdr_idx = (len(specs) - 1) if narrow else 1
+                    hdr_cells[hdr_idx] = Text(header_before[s["id"]],
+                                              style="bold #7aa2f7")
                     table.add_row(*hdr_cells, key=f"__hdr__{n}")
                     n += 1
                 is_hidden = s["id"] in hidden
@@ -2334,6 +2352,25 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 marker_s = ("*" if s["id"] in favorites
                             else "x" if is_hidden else " ")
                 marker = f"{marker_a}{marker_s}"
+                # Plain title; collapse any newline/tab so a multi-line ai_title
+                # doesn't push the row to multiple terminal lines.
+                raw_title = (s.get("ai_title") or _first_msg(s) or "")[:80]
+                raw_title = (raw_title.replace("\n", " ")
+                                       .replace("\r", " ")
+                                       .replace("\t", " "))
+                if tree_mode and tree_prefixes.get(s["id"]):
+                    # Strip ANSI from the tree prefix so the cell stays a plain
+                    # str of consistent width.
+                    raw_title = _ANSI_RE.sub("", tree_prefixes[s["id"]]) + raw_title
+                if narrow:
+                    # marker · relative-Last · title (title tinted by project).
+                    proj_txt = project_short(s.get("project_name") or "")
+                    row = [marker, fmt_last_active(s),
+                           Text(raw_title, style=project_color.get(proj_txt, ""))]
+                    table.add_row(*row, key=s["id"])
+                    n += 1
+                    n_sessions += 1
+                    continue
                 row = [marker, fmt_ts(s["first_ts"]), fmt_last_active(s)]
                 if show_proj_col:
                     proj_txt = project_short(s["project_name"])
@@ -2344,20 +2381,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if cluster_mode:
                     topic_full = s.get("primary_topic") or "(none)"
                     row.append(Text(topic_full[:14], style=topic_color.get(topic_full, "")))
-                # Plain title cell; collapse any newline/tab so a multi-line
-                # ai_title doesn't push the row to multiple terminal lines.
-                raw_title = (s.get("ai_title") or _first_msg(s) or "")[:80]
-                raw_title = (raw_title.replace("\n", " ")
-                                       .replace("\r", " ")
-                                       .replace("\t", " "))
-                if tree_mode and tree_prefixes.get(s["id"]):
-                    # Strip ANSI from the tree prefix so the cell stays a plain
-                    # str of consistent width.
-                    prefix = _ANSI_RE.sub("", tree_prefixes[s["id"]])
-                    title_cell = f"{prefix}{raw_title}"
-                else:
-                    title_cell = raw_title
-                row.append(title_cell)
+                row.append(raw_title)
                 table.add_row(*row, key=s["id"])
                 n += 1
                 n_sessions += 1
