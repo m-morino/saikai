@@ -2248,6 +2248,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def on_data_table_row_highlighted(self, event) -> None:
             sid = str(event.row_key.value) if event.row_key else None
+            # Claude-Desktop-like: highlighting a row shows its content on the
+            # right — a LIVE session switches to its terminal tab, a non-live one
+            # shows the static preview. Focus stays on the list so arrow-browsing
+            # stays smooth; Enter is what focuses a live pane to type into it.
+            if _LIVE_TERM is not None and self._live is not None and sid and self._live.has(sid):
+                try:
+                    self.query_one("#right", TabbedContent).active = self._live.pane_id(sid)
+                    self.query_one("#table", DataTable).focus()
+                    return
+                except Exception:
+                    pass
+            if _LIVE_TERM is not None:
+                try:
+                    self.query_one("#right", TabbedContent).active = "tab-preview"
+                except Exception:
+                    pass
             self._update_preview(sid)
 
         def action_resume(self) -> None:
