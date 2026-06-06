@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["textual>=0.50"]
+# dependencies = [
+#   "textual>=0.50",
+#   "pyte>=0.8",                          # PTY byte-stream -> screen grid (split-live)
+#   "pywinpty>=2.0 ; sys_platform == 'win32'",   # Windows ConPTY backend
+#   "ptyprocess>=0.7 ; sys_platform != 'win32'", # POSIX PTY backend
+# ]
 # ///
 """
 recap — Claude Code session history viewer with LLM summarization
@@ -1724,16 +1729,41 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     """
     try:
         from textual.app import App, ComposeResult
+        from textual.actions import SkipAction
         from textual.binding import Binding
         from textual.containers import Horizontal
         from textual.screen import ModalScreen
-        from textual.widgets import DataTable, Footer, Input, RichLog, Static
+        from textual.widgets import (DataTable, Footer, Input, RichLog, Static,
+                                     TabbedContent, TabPane)
         from rich.text import Text
     except ImportError as e:
         print(_c(f"  textual is required but not installed ({e}). "
                  f"Install it with: uv tool install textual "
                  f"(or: pip install 'textual>=0.50')", RED), file=sys.stderr)
         sys.exit(1)
+
+    # Live split-terminal support is OPTIONAL and degrades gracefully: if
+    # recap_terminal or its PTY/pyte deps are missing, _LIVE_TERM stays None and
+    # the picker behaves exactly as before (static preview, Enter = full-takeover
+    # resume). The import lives beside recap.py (single-file script's sibling).
+    _LIVE_TERM = None
+    _LIVE_TERM_REASON = "recap_terminal module not found"
+    try:
+        import recap_terminal as _LIVE_TERM  # type: ignore
+        if not _LIVE_TERM.TERMINAL_AVAILABLE:
+            _LIVE_TERM_REASON = _LIVE_TERM.unavailable_reason() or "unavailable"
+            _LIVE_TERM = None
+    except Exception as _lte:  # pragma: no cover - missing sibling / dep
+        _LIVE_TERM_REASON = repr(_lte)
+        _LIVE_TERM = None
+    # Split-live is OPT-IN while it stabilises: the live render + keystroke path
+    # into a running claude is unproven without an interactive TTY, and the
+    # rendering of claude's full alt-screen UI via pyte is known-imperfect. So
+    # the DEFAULT stays the proven legacy path (static preview + Enter =
+    # full-takeover resume); set RECAP_SPLIT_LIVE=1 to try the live split pane.
+    if _LIVE_TERM is not None and not os.environ.get("RECAP_SPLIT_LIVE"):
+        _LIVE_TERM = None
+        _LIVE_TERM_REASON = "split-live is opt-in (set RECAP_SPLIT_LIVE=1 to enable)"
 
     # Emulate POSIX SIGHUP on Windows: if this tab's shell dies (tab closed)
     # while the picker is open or a resumed `claude` is running, take recap and
@@ -1807,14 +1837,27 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("ctrl+t", "toggle_tree", "Tree"),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
             Binding("question_mark", "help", "Help", priority=True),
+            # Split-live: open/attach a live claude as a tab; navigate tabs; and
+            # a context-sensitive Escape (handled in action_quit) that returns
+            # focus to the list when a terminal is focused instead of quitting.
+            # ctrl+enter keeps the legacy full-takeover resume as a fallback.
+            Binding("ctrl+w", "close_live", "Close tab", show=False),
+            Binding("f2", "prev_tab", "◀tab", show=False),
+            Binding("f3", "next_tab", "tab▶", show=False),
+            Binding("ctrl+l", "focus_list", "List", show=False),
         ]
+        # Cap on concurrent live claude children (each is a full node process
+        # tree). Override with RECAP_MAX_LIVE.
+        MAX_LIVE = int(os.environ.get("RECAP_MAX_LIVE", "4") or "4")
         CSS = """
         Screen { layout: vertical; }
         #search { dock: top; height: 3; border: tall $accent; }
         #statusbar { height: 1; background: $surface; color: $warning; }
         #main { layout: horizontal; height: 1fr; }
         #table { width: 60%; }
-        #preview { width: 40%; padding: 0 1; border-left: solid $accent; }
+        #right, .right { width: 40%; border-left: solid $accent; }
+        #preview { padding: 0 1; height: 1fr; }
+        ClaudeTerminal { width: 1fr; height: 1fr; }
         """
 
         preview_mode = "summary"   # "summary" or "full"
@@ -1827,13 +1870,30 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             yield Static("", id="statusbar")
             with Horizontal(id="main"):
                 yield DataTable(cursor_type="row", zebra_stripes=True, id="table")
-                yield RichLog(id="preview", wrap=True, highlight=False, markup=False)
+                if _LIVE_TERM is not None:
+                    # Split-live: the preview becomes the first tab; live claude
+                    # panes are appended as TabPanes on Enter.
+                    with TabbedContent(id="right", initial="tab-preview"):
+                        with TabPane("Preview", id="tab-preview"):
+                            yield RichLog(id="preview", wrap=True,
+                                          highlight=False, markup=False)
+                else:
+                    # Legacy / graceful-fallback layout: bare preview pane.
+                    # The RichLog keeps id="preview" (so _update_preview's
+                    # query is identical in both layouts) and ALSO carries the
+                    # #right sizing class so the 40% width rule applies.
+                    yield RichLog(id="preview", classes="right", wrap=True,
+                                  highlight=False, markup=False)
             yield Footer()
 
         def on_mount(self) -> None:
             # sid -> session map so the preview pane can warm its own cache on
             # demand: rendered and cached on a cache miss.
             self._sid_index = {s.get("id"): s for s in all_sessions}
+            # Live-terminal bookkeeping (None-safe: only used when _LIVE_TERM is
+            # available). Pure data structure; the TabbedContent is the UI.
+            self._live = (_LIVE_TERM.LiveSessionManager(max_live=self.MAX_LIVE)
+                          if _LIVE_TERM is not None else None)
             self._refresh_table()
             self.query_one("#table", DataTable).focus()
             # Pre-warm preview caches off the UI thread so scrolling stays
@@ -2033,8 +2093,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 is_hidden = s["id"] in hidden
                 if is_hidden and not show_hidden:
                     continue
-                marker_a = ("@" if s.get("is_open") else "+" if s.get("is_active")
-                            else "." if s.get("is_recent") else " ")
+                # A live (recap-hosted) pane's status takes precedence in the
+                # marker so a backgrounded session needing input is loud in the
+                # list: ? = waiting, ~ = busy, = = idle-but-live. Falls back to
+                # the file-registry open/active/recent markers otherwise.
+                live_status = (self._live.status(s["id"])
+                               if self._live is not None else "")
+                if live_status == "waiting":
+                    marker_a = "?"
+                elif live_status == "busy":
+                    marker_a = "~"
+                elif live_status == "idle":
+                    marker_a = "="
+                else:
+                    marker_a = ("@" if s.get("is_open") else "+" if s.get("is_active")
+                                else "." if s.get("is_recent") else " ")
                 marker_s = ("*" if s["id"] in favorites
                             else "x" if is_hidden else " ")
                 marker = f"{marker_a}{marker_s}"
@@ -2176,9 +2249,200 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._update_preview(sid)
 
         def action_resume(self) -> None:
+            # When split-live is unavailable, keep the original behavior: exit
+            # the picker and hand the bare terminal to a single blocking claude.
+            if _LIVE_TERM is None:
+                sid = self._cursor_sid()
+                if sid:
+                    self.exit(sid)
+                return
+            # Split-live: if a terminal is focused, Enter belongs to claude.
+            # A plain `return` still counts as "handled", so the priority binding
+            # would SWALLOW the key; raise SkipAction so Textual forwards it to
+            # the focused ClaudeTerminal (whose on_key writes \r to the PTY).
+            if self._focused_terminal() is not None:
+                raise SkipAction()
             sid = self._cursor_sid()
             if sid:
+                self._open_or_attach_live(sid)
+
+        def action_resume_detached(self) -> None:
+            """Legacy full-takeover: exit the picker and run claude in the bare
+            terminal (alternate screen handed off). Kept as an escape hatch for
+            users who want a full-screen claude instead of the split pane."""
+            sid = self._cursor_sid()
+            if sid:
+                # Tear down any live panes first so their PTYs don't outlive the
+                # picker as orphans once we exit into the foreground claude.
+                if self._live is not None:
+                    self._live.kill_all()
                 self.exit(sid)
+
+        # ── split-live helpers ────────────────────────────────────────────────
+        def _focused_terminal(self):
+            """Return the focused ClaudeTerminal, or None."""
+            if _LIVE_TERM is None:
+                return None
+            foc = self.focused
+            return foc if isinstance(foc, _LIVE_TERM.ClaudeTerminal) else None
+
+        def _open_or_attach_live(self, sid: str) -> None:
+            assert _LIVE_TERM is not None and self._live is not None
+            tabs = self.query_one("#right", TabbedContent)
+            pane_id = self._live.pane_id(sid)
+            if self._live.has(sid):                  # already running → switch
+                tabs.active = pane_id
+                term = self._live.get(sid)
+                if term is not None:
+                    term.focus()
+                return
+            if self._live.at_capacity():
+                self.notify(
+                    f"Max {self._live.max_live} live sessions; close one (Ctrl-W)",
+                    severity="warning", timeout=5)
+                return
+            s = self._sid_index.get(sid)
+            try:
+                argv, cwd, env = _build_resume_invocation(sid, all_sessions)
+            except Exception as e:
+                self.notify(f"could not build resume command: {e!r}",
+                            severity="error", timeout=8)
+                return
+            title = (s.get("ai_title") if s else None) or sid[:8]
+            term = _LIVE_TERM.ClaudeTerminal(
+                argv, cwd=cwd, env=env, sid=sid, title=title,
+                on_status=self._on_live_status, on_exit=self._on_live_exit,
+            )
+            pane = TabPane(_LIVE_TERM.tab_label(title, "idle"), term, id=pane_id)
+            try:
+                tabs.add_pane(pane)
+            except Exception as e:
+                self.notify(f"could not open tab: {e!r}", severity="error",
+                            timeout=8)
+                return
+            self._live.register(sid, term)
+            tabs.active = pane_id
+            term.focus()
+            # Reuse the resume side effects: 1-shot teams-notify suppression so
+            # the first idle_prompt after launch doesn't ping (mirrors
+            # _resume_claude). Best-effort.
+            try:
+                _add_recap_suppress_session(sid)
+            except Exception:
+                pass
+            # Refresh the table so the marker column shows this row is now live.
+            self._refresh_table()
+
+        def _on_live_status(self, sid: str, status: str) -> None:
+            """Called on the UI thread (terminal marshals it) when a pane's
+            Busy/Waiting/Idle/dead status changes."""
+            if self._live is None:
+                return
+            self._live.set_status(sid, status)
+            # Update the tab label.
+            try:
+                tabs = self.query_one("#right", TabbedContent)
+                s = self._sid_index.get(sid)
+                title = (s.get("ai_title") if s else None) or sid[:8]
+                pane = tabs.get_pane(self._live.pane_id(sid))
+                if pane is not None:
+                    pane.label = _LIVE_TERM.tab_label(title, status)
+            except Exception:
+                pass
+            # Mirror onto the DataTable marker so a backgrounded waiting session
+            # is loud even when its tab isn't focused.
+            self._refresh_table()
+
+        def _on_live_exit(self, sid: str) -> None:
+            """Called on the UI thread when a pane's child exits. Keep the tab
+            (so the user sees the final frame) but re-title it; drop it from the
+            active set so a later Enter re-launches instead of attaching to a
+            dead PTY."""
+            if self._live is None:
+                return
+            try:
+                tabs = self.query_one("#right", TabbedContent)
+                s = self._sid_index.get(sid)
+                title = (s.get("ai_title") if s else None) or sid[:8]
+                pane = tabs.get_pane(self._live.pane_id(sid))
+                if pane is not None:
+                    pane.label = _LIVE_TERM.tab_label(title, "dead")
+            except Exception:
+                pass
+            self._live.forget(sid)
+            self._refresh_table()
+
+        def on_claude_terminal_focus_released(self, event) -> None:
+            """The terminal's Ctrl-F1 escape hatch: return focus to the list."""
+            self.query_one("#table", DataTable).focus()
+            try:
+                event.stop()
+            except Exception:
+                pass
+
+        def action_close_live(self) -> None:
+            """Ctrl-W: kill + remove the focused (or active) live tab."""
+            if _LIVE_TERM is None or self._live is None:
+                return
+            term = self._focused_terminal()
+            sid = term.sid if term is not None else None
+            tabs = self.query_one("#right", TabbedContent)
+            if sid is None:
+                # No terminal focused: act on the active tab if it's a live one.
+                active = tabs.active or ""
+                for s in list(self._live.statuses().keys()):
+                    if self._live.pane_id(s) == active:
+                        sid = s
+                        break
+            if sid is None:
+                return
+            t = self._live.get(sid)
+            if t is not None:
+                try:
+                    t.kill()
+                except Exception:
+                    pass
+            self._live.forget(sid)
+            try:
+                tabs.remove_pane(self._live.pane_id(sid))
+            except Exception:
+                pass
+            tabs.active = "tab-preview"
+            self.query_one("#table", DataTable).focus()
+            self._refresh_table()
+
+        def action_next_tab(self) -> None:
+            self._cycle_tab(+1)
+
+        def action_prev_tab(self) -> None:
+            self._cycle_tab(-1)
+
+        def _cycle_tab(self, step: int) -> None:
+            if _LIVE_TERM is None:
+                return
+            try:
+                tabs = self.query_one("#right", TabbedContent)
+                ids = [p.id for p in tabs.query(TabPane)]
+                if not ids:
+                    return
+                cur = tabs.active or ids[0]
+                i = (ids.index(cur) + step) % len(ids) if cur in ids else 0
+                tabs.active = ids[i]
+                # Focus the terminal if the new tab hosts one, else the list.
+                if self._live is not None:
+                    for sid in self._live.statuses():
+                        if self._live.pane_id(sid) == ids[i]:
+                            t = self._live.get(sid)
+                            if t is not None:
+                                t.focus()
+                            return
+                self.query_one("#table", DataTable).focus()
+            except Exception:
+                pass
+
+        def action_focus_list(self) -> None:
+            """Ctrl-L: jump focus back to the session list from a terminal."""
+            self.query_one("#table", DataTable).focus()
 
         def on_data_table_header_selected(self, event) -> None:
             # Excel-like: click a sortable column → 3-state cycle
@@ -2243,11 +2507,34 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.preview_mode = "summary"
             self._update_preview(self._cursor_sid())
 
+        def action_quit(self) -> None:
+            # Context-sensitive Escape: when a live terminal is focused, Esc is
+            # claude's (and also our "give me the list back" gesture) — return
+            # focus to the table instead of quitting the whole picker. Quit only
+            # when focus is on the list / search. On real quit, kill every live
+            # pane so no claude child is orphaned.
+            if self._focused_terminal() is not None:
+                self.query_one("#table", DataTable).focus()
+                return
+            if self._live is not None:
+                self._live.kill_all()
+            self.exit(None)
+
         def action_toggle_preview(self) -> None:
+            # Tab is a priority binding (overrides focus-cycling). When a live
+            # terminal is focused, Tab belongs to claude — SkipAction so the key
+            # is forwarded to the terminal (a plain return would eat it).
+            if self._focused_terminal() is not None:
+                raise SkipAction()
             self.preview_mode = "summary" if self.preview_mode == "full" else "full"
             self._update_preview(self._cursor_sid())
 
         def action_help(self) -> None:
+            # '?' is a priority binding; don't pop the help modal over a focused
+            # terminal (the user is typing into claude). SkipAction forwards the
+            # key to the terminal rather than eating it.
+            if self._focused_terminal() is not None:
+                raise SkipAction()
             self.push_screen(HelpScreen())
 
         def action_cycle_sort(self, priority: str) -> None:
@@ -2337,17 +2624,20 @@ def _add_recap_suppress_session(session_id: str) -> None:
     os.replace(tmp, _RECAP_SUPPRESS_PATH)
 
 
-def _resume_claude(full_id: str, sessions: list[dict]) -> None:
-    """Resume `claude --resume <full_id>` from the right cwd. Self-terminating:
-    `sys.exit`s with claude's return code. Shared by every picker frontend so
-    cwd resolution / auto-permission / venv strip / terminal reset stay in
-    exactly one place."""
-    # Try origin_cwd first (where Claude originally indexed the session — required
-    # for --resume to find it). Fall back to last cwd, then to an existing user
-    # directory whose path-key matches the JSONL's project dir name (handles
-    # sessions whose original cwd was deleted but a sibling/parent still exists).
+def _resolve_resume_cwd(full_id: str, sessions: list[dict]) -> str | None:
+    """origin_cwd-first cwd resolution for `claude --resume`.
+
+    Try origin_cwd first (where Claude originally indexed the session — required
+    for --resume to find it on disk). Fall back to last cwd, then to an existing
+    sibling directory under the same projects/<key>/ dir (handles sessions whose
+    original cwd was deleted but a sibling/parent still exists). Returns an
+    existing directory path, or None.
+
+    This is load-bearing: resuming from the wrong cwd yields
+    "No conversation found" for worktree-moved sessions.
+    """
     selected = next((s for s in sessions if s["id"] == full_id), None)
-    candidates = []
+    candidates: list[str] = []
     if selected:
         for k in ("origin_cwd", "cwd"):
             v = selected.get(k)
@@ -2361,36 +2651,34 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
                     if v and Path(v).is_dir():
                         candidates.append(v)
                         break
-    target_cwd = candidates[0] if candidates else None
-    if not target_cwd:
-        print(_c(f"  warn: session's recorded cwd no longer exists — running from current dir", YELLOW),
-              file=sys.stderr)
+    return candidates[0] if candidates else None
+
+
+def _build_resume_invocation(
+    full_id: str, sessions: list[dict]
+) -> tuple[list[str], str | None, dict]:
+    """Single source of truth for HOW to launch a resumed `claude`.
+
+    Returns ``(argv, cwd, env)`` where argv = ``[claude_bin, --resume, <id>,
+    *auto_perm]``, cwd = the resolved target dir (or None), and env = a prepared
+    copy of os.environ (RECAP_RESUME set, ephemeral VIRTUAL_ENV stripped from
+    both the var and PATH). Performs NO side effects beyond reading state — no
+    chdir, no terminal reset, no printing, no subprocess. Used by BOTH the
+    legacy full-takeover path (_resume_claude) and the embedded split-live pane
+    (recap_terminal.ClaudeTerminal) so cwd / auto-permission / venv-strip logic
+    can never drift between them.
+    """
+    target_cwd = _resolve_resume_cwd(full_id, sessions)
 
     # Auto --permission-mode auto for frequent (= trusted) workspaces.
     extra_args: list[str] = []
-    auto_perm_note = ""
     if (target_cwd
             and not os.environ.get("RECAP_NO_AUTO_PERMISSION")
             and _canonical_workspace(target_cwd) in _frequent_cwds(sessions)):
         extra_args = ["--permission-mode", "auto"]
-        auto_perm_note = _c("  [--permission-mode auto: frequent cwd]", DIM)
 
-    hist_path = _persist_resume_id(full_id, target_cwd)
-    print(f"\nResuming {full_id}"
-          + (f"  (cwd: {target_cwd})" if target_cwd else "")
-          + f"\n  resume ID logged → {hist_path}"
-          + (f"\n{auto_perm_note}" if auto_perm_note else ""))
     env = os.environ.copy()
     env["RECAP_RESUME"] = "1"   # signal to teams-notify.py: suppress idle_prompt
-    # 1-shot 抑止 file への session_id 追加. env だけだと session 全体 lifetime で
-    # Notification 全件 silent になり、 復帰後の真の入力待ちも消える (2026-05-24
-    # 検出 bug)。 file ベースの fine-grain control で「最初の 1 件のみ silent、
-    # 以降は通常通知」 を実現する。
-    try:
-        _add_recap_suppress_session(full_id)
-    except OSError as e:
-        print(_c(f"  warn: recap suppress file write failed: {e}", YELLOW),
-              file=sys.stderr)
     # Strip uv's ephemeral VIRTUAL_ENV so the resumed session's `uv` doesn't
     # warn about a stale venv.
     leaked_venv = env.pop("VIRTUAL_ENV", None)
@@ -2402,6 +2690,32 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
         parts = [p for p in env.get("PATH", "").split(os.pathsep) if cmp(p) != cmp(venv_bin)]
         env["PATH"] = os.pathsep.join(parts)
 
+    claude_bin = shutil.which("claude", path=env.get("PATH")) or "claude"
+    argv = [claude_bin, "--resume", full_id, *extra_args]
+    return argv, target_cwd, env
+
+
+def _resume_claude(full_id: str, sessions: list[dict]) -> None:
+    """Resume `claude --resume <full_id>` from the right cwd. Self-terminating:
+    `sys.exit`s with claude's return code. Shared by every picker frontend so
+    cwd resolution / auto-permission / venv strip / terminal reset stay in
+    exactly one place (now via _build_resume_invocation)."""
+    claude_argv, target_cwd, env = _build_resume_invocation(full_id, sessions)
+    if not target_cwd:
+        print(_c(f"  warn: session's recorded cwd no longer exists — running from current dir", YELLOW),
+              file=sys.stderr)
+    auto_perm_note = (_c("  [--permission-mode auto: frequent cwd]", DIM)
+                      if "--permission-mode" in claude_argv else "")
+
+    hist_path = _persist_resume_id(full_id, target_cwd)
+    print(f"\nResuming {full_id}"
+          + (f"  (cwd: {target_cwd})" if target_cwd else "")
+          + f"\n  resume ID logged → {hist_path}"
+          + (f"\n{auto_perm_note}" if auto_perm_note else ""))
+    # 1-shot 抑止 file への session_id 追加. env だけだと session 全体 lifetime で
+    # Notification 全件 silent になり、 復帰後の真の入力待ちも消える (2026-05-24
+    # 検出 bug)。 file ベースの fine-grain control で「最初の 1 件のみ silent、
+    # 以降は通常通知」 を実現する。
     if target_cwd:
         # TOCTOU: directory passed `is_dir()` earlier but could vanish before chdir.
         try:
@@ -2414,8 +2728,6 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
     sys.stderr.write(_c("  Loading claude session ...", DIM) + "\n")
     sys.stderr.flush()
     _reset_terminal_modes()
-    claude_bin = shutil.which("claude", path=env.get("PATH")) or "claude"
-    claude_argv = [claude_bin, "--resume", full_id, *extra_args]
 
     # Use subprocess.run instead of execvpe so the python parent stays alive
     # until claude exits. On Windows, execvpe replaces the process but the
