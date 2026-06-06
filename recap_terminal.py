@@ -45,11 +45,49 @@ error line — it never tears down the host app.
 """
 from __future__ import annotations
 
+import atexit
 import re
 import subprocess
 import sys
 import threading
 from typing import Callable, Optional
+
+
+# ── global reap-thread registry ───────────────────────────────────────────────
+# Every kill() spawns a daemon thread running `taskkill /F /T` to reap the
+# child's grandchildren (claude's node workers). If recap exits before that
+# taskkill finishes the daemon dies and the workers orphan (the 0fd9fcf hazard).
+# on_unmount-driven teardown and exceptions don't route through the App's
+# join_reaps, so track EVERY reap here and join them at interpreter exit.
+_REAP_THREADS: list = []
+_REAP_LOCK = threading.Lock()
+
+
+def _track_reap(t) -> None:
+    if t is None:
+        return
+    with _REAP_LOCK:
+        _REAP_THREADS[:] = [x for x in _REAP_THREADS if x.is_alive()]
+        _REAP_THREADS.append(t)
+
+
+def join_all_reaps(timeout: float = 3.0) -> None:
+    """Bounded-join every tracked reap so process exit doesn't orphan node
+    workers. Safe to call repeatedly; prunes finished threads."""
+    import time
+    deadline = time.monotonic() + timeout
+    with _REAP_LOCK:
+        threads = list(_REAP_THREADS)
+    for t in threads:
+        try:
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:
+            pass
+    with _REAP_LOCK:
+        _REAP_THREADS[:] = [x for x in _REAP_THREADS if x.is_alive()]
+
+
+atexit.register(join_all_reaps)
 
 # ── Soft imports ─────────────────────────────────────────────────────────────
 # The widget is only constructed when these are present (recap probes
@@ -817,6 +855,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             t = threading.Thread(target=self._reap_tree, args=(pid,),
                                  name=f"reap-{pid}", daemon=True)
             t.start()
+            _track_reap(t)   # joined at interpreter exit (atexit) on every exit path
             return t
         return None
 

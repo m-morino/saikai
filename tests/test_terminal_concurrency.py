@@ -56,6 +56,29 @@ def test_update_status_marshals_outside_lock():
     assert ct._status == "busy"
 
 
+def test_kill_tracks_reap_for_atexit_join():
+    """kill() must register its taskkill reap in the module registry so
+    join_all_reaps (wired to atexit) can wait on it on EVERY exit path — not
+    just the App's two quit actions. Otherwise on_unmount-driven teardown leaks
+    the reap and orphans claude's node workers (the 0fd9fcf hazard)."""
+    if sys.platform != "win32":
+        return  # the reap thread is win32-only
+    ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    ct._stop = threading.Event()
+    ct._pty = None              # skip the pty.close() branch
+    ct._pid = 999999999         # nonexistent pid -> taskkill returns fast
+    with rt._REAP_LOCK:
+        rt._REAP_THREADS.clear()
+    t = ct.kill()
+    assert t is not None, "kill() should return a reap thread on win32"
+    with rt._REAP_LOCK:
+        assert any(x is t for x in rt._REAP_THREADS), "reap not tracked in registry"
+    rt.join_all_reaps(timeout=5)
+    assert not t.is_alive(), "reap not joined by join_all_reaps"
+
+
 if __name__ == "__main__":
     test_update_status_marshals_outside_lock()
     print("PASS test_update_status_marshals_outside_lock")
+    test_kill_tracks_reap_for_atexit_join()
+    print("PASS test_kill_tracks_reap_for_atexit_join")

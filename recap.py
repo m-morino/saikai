@@ -2916,6 +2916,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             try:
                 tabs.add_pane(pane)
             except Exception as e:
+                # add_pane may have already mounted the widget (on_mount spawned
+                # the pty); kill it so a half-opened claude isn't orphaned
+                # untracked (it was never register()ed).
+                try:
+                    self._live.note_reap(term.kill())
+                except Exception:
+                    pass
                 self.notify(f"could not open tab: {e!r}", severity="error",
                             timeout=8)
                 return
