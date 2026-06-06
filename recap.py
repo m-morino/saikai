@@ -2165,6 +2165,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
     class PickerApp(App):
         TITLE = "recap"
+        # Textual's built-in command palette also binds Ctrl+P, which SHADOWS our
+        # Ctrl+P = toggle-favorite (the palette opened instead of toggling). recap
+        # doesn't use the palette, so disable it to free Ctrl+P.
+        ENABLE_COMMAND_PALETTE = False
         BINDINGS = [
             Binding("escape", "quit", "Quit"),
             Binding("ctrl+c", "quit_all", show=False),
