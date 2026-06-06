@@ -2001,6 +2001,38 @@ def _build_color_map(values, palette) -> dict[str, str]:
     return used
 
 
+def _avail_ram_mb():
+    """Best-effort available physical RAM in MB (None if unknown). Memory — not
+    CPU/core count — is what limits how many live `claude` node process trees a
+    machine can host, so this gates opening more split-live panes."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = _MS()
+            ms.dwLength = ctypes.sizeof(_MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return ms.ullAvailPhys / (1024 * 1024)
+        else:
+            with open("/proc/meminfo", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) / 1024
+    except Exception:
+        return None
+    return None
+
+
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                  flat: bool = False, cluster_mode: bool = False,
                  reload_fn=None) -> None:
@@ -2165,9 +2197,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("f4", "toggle_list", "Hide list", priority=True),
             Binding("ctrl+l", "focus_list", "List", show=False),
         ]
-        # Cap on concurrent live claude children (each is a full node process
-        # tree). Override with RECAP_MAX_LIVE.
-        MAX_LIVE = int(os.environ.get("RECAP_MAX_LIVE", "4") or "4")
+        # The practical limit on concurrent live claude panes is MEMORY — each
+        # is a full node process tree that sits CPU-idle waiting for input — so
+        # the real gate is a free-RAM check at spawn time (see
+        # _open_or_attach_live), NOT a fixed count or core count. MAX_LIVE is
+        # only a runaway backstop; set RECAP_MAX_LIVE for a stricter hard cap.
+        MAX_LIVE = int(os.environ.get("RECAP_MAX_LIVE", "64") or "64")
         CSS = """
         Screen { layout: vertical; }
         #searchrow { dock: top; height: 3; }
@@ -2809,9 +2844,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             if self._live.at_capacity():
                 self.notify(
-                    f"Max {self._live.max_live} live sessions; close one (Ctrl-W)",
-                    severity="warning", timeout=5)
+                    f"hit the {self._live.max_live}-pane backstop; close one "
+                    f"(Ctrl-W) or raise RECAP_MAX_LIVE",
+                    severity="warning", timeout=6)
                 return
+            # The real limit is memory (each live pane is a node process tree);
+            # warn — but still open — when physical RAM is running low.
+            _avail = _avail_ram_mb()
+            _floor = float(os.environ.get("RECAP_MIN_FREE_MB", "1536") or "1536")
+            if _avail is not None and _avail < _floor:
+                self.notify(
+                    f"low memory: {_avail:.0f} MB free — each live claude is "
+                    f"RAM-heavy; close panes (Ctrl-W) if it slows down",
+                    severity="warning", timeout=7)
             s = self._sid_index.get(sid)
             try:
                 argv, cwd, env = _build_resume_invocation(sid, all_sessions)
