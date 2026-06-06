@@ -174,15 +174,42 @@ def classify_pty_status(recent_text: str) -> str:
 _HEX6 = re.compile(r"\A[0-9a-fA-F]{6}\Z")
 
 
+# pyte uses a few color NAMES that rich does not accept verbatim: ANSI-3 is
+# "brown" (rich wants "yellow") and the bright set is "bright<name>" (rich wants
+# "bright_<name>"). Map those; anything still unparseable degrades to the
+# default color instead of crashing the whole UI (the original 'brown' crash).
+_PYTE_TO_RICH = {
+    "brown": "yellow", "brightbrown": "bright_yellow",
+    "brightblack": "bright_black", "brightred": "bright_red",
+    "brightgreen": "bright_green", "brightblue": "bright_blue",
+    "brightmagenta": "bright_magenta", "brightcyan": "bright_cyan",
+    "brightwhite": "bright_white",
+}
+_COLOR_CACHE: dict = {}
+
+
 def _pyte_color(color: Optional[str]) -> Optional[str]:
-    """Map a pyte color (name string like 'red', 6-hex without '#', or
-    'default') to a value rich.Style accepts, or None for the terminal
-    default."""
+    """Map a pyte color (name like 'red'/'brown', 6-hex without '#', or
+    'default') to a value rich.Style accepts, or None for the terminal default.
+    Validated against rich once per name and cached; an unknown/unparseable
+    color degrades to default rather than raising — a single bad color must
+    never tear down the pane."""
     if not color or color == "default":
         return None
+    if color in _COLOR_CACHE:
+        return _COLOR_CACHE[color]
     if _HEX6.match(color):
-        return "#" + color
-    return color  # named color: 'red', 'brightblue', …
+        val: Optional[str] = "#" + color
+    else:
+        name = _PYTE_TO_RICH.get(color, color)
+        try:
+            from rich.color import Color as _RichColor
+            _RichColor.parse(name)
+            val = name
+        except Exception:
+            val = None
+    _COLOR_CACHE[color] = val
+    return val
 
 
 def _cell_style(ch):  # -> rich.Style; only reached from render_line (textual present)
