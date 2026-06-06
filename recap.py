@@ -2736,6 +2736,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         # ── events ──────────────────────────────────────────────────────────
 
         def on_key(self, event) -> None:
+            # Ctrl+C / Ctrl+Q reaching the App means the LIST or search box is
+            # focused (a focused live terminal consumes Ctrl+C first, to interrupt
+            # claude). Route it to our force-quit (kill-all + join) so Textual's
+            # built-in quit can't exit WITHOUT reaping the claude trees — the
+            # Screen's default ctrl+c=quit would otherwise shadow our binding.
+            if event.key in ("ctrl+c", "ctrl+q"):
+                event.stop()
+                self.action_quit_all()
+                return
             # search-as-you-type: typing while the table is focused redirects into the
             # search input. Arrow keys / control bindings still route normally
             # because we only intercept printable single characters and
