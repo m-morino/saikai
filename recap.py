@@ -2953,6 +2953,23 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Refresh the table so the marker column shows this row is now live.
             self._refresh_table()
 
+        def _request_refresh(self) -> None:
+            """Coalesce frequent table-refresh requests (live status flips, the
+            1.5s poll) into ~one rebuild per frame, so a streaming claude can't
+            trigger a full-DataTable-rebuild storm on the UI thread."""
+            if getattr(self, "_refresh_req_pending", False):
+                return
+            self._refresh_req_pending = True
+            try:
+                self.call_after_refresh(self._do_req_refresh)
+            except Exception:
+                self._refresh_req_pending = False
+                self._refresh_table()
+
+        def _do_req_refresh(self) -> None:
+            self._refresh_req_pending = False
+            self._refresh_table()
+
         def _on_live_status(self, sid: str, status: str) -> None:
             """Called on the UI thread (terminal marshals it) when a pane's
             Busy/Waiting/Idle/dead status changes."""
@@ -2970,8 +2987,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
             # Mirror onto the DataTable marker so a backgrounded waiting session
-            # is loud even when its tab isn't focused.
-            self._refresh_table()
+            # is loud even when its tab isn't focused. Coalesced: a streaming
+            # claude flips status many times/sec and each full rebuild is costly.
+            self._request_refresh()
 
         def _on_live_exit(self, sid: str) -> None:
             """Called on the UI thread when a pane's child exits. Keep the tab
@@ -3284,7 +3302,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             changed = (cur != prev)
             self._last_status = cur
             if changed:
-                self._refresh_table()
+                self._request_refresh()
 
         def action_copy_prompt(self) -> None:
             # Ctrl-Y: copy the selected session's opening user prompt to the

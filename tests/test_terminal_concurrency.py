@@ -77,8 +77,26 @@ def test_kill_tracks_reap_for_atexit_join():
     assert not t.is_alive(), "reap not joined by join_all_reaps"
 
 
+def test_pane_refresh_coalesces():
+    """_schedule_pane_refresh queues at most ONE repaint until the UI paints it
+    (then re-queues), so a burst of PTY chunks can't flood call_from_thread."""
+    ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    queued = []
+    ct._marshal = lambda fn: queued.append(fn)   # simulate the UI queue (don't run)
+    ct.refresh = lambda: None
+    ct._schedule_pane_refresh()
+    ct._schedule_pane_refresh()
+    ct._schedule_pane_refresh()
+    assert len(queued) == 1, f"not coalesced: {len(queued)} marshals"
+    queued[0]()                                   # simulate UI running _do_pane_refresh
+    ct._schedule_pane_refresh()
+    assert len(queued) == 2, "should re-queue a repaint after the UI painted"
+
+
 if __name__ == "__main__":
     test_update_status_marshals_outside_lock()
     print("PASS test_update_status_marshals_outside_lock")
     test_kill_tracks_reap_for_atexit_join()
     print("PASS test_kill_tracks_reap_for_atexit_join")
+    test_pane_refresh_coalesces()
+    print("PASS test_pane_refresh_coalesces")
