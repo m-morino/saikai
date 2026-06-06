@@ -1865,7 +1865,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         TITLE = "recap"
         BINDINGS = [
             Binding("escape", "quit", "Quit"),
-            Binding("ctrl+c", "quit", show=False),
+            Binding("ctrl+c", "quit_all", show=False),
             # Resume only on Enter. We deliberately do NOT use RowSelected, so
             # a stray mouse click on a row never triggers resume — that was
             # the "screen disappears when I click around" symptom: the click
@@ -2449,21 +2449,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
 
-        def action_close_live(self) -> None:
-            """Ctrl-W: kill + remove the focused (or active) live tab."""
-            if _LIVE_TERM is None or self._live is None:
-                return
-            term = self._focused_terminal()
-            sid = term.sid if term is not None else None
-            tabs = self.query_one("#right", TabbedContent)
-            if sid is None:
-                # No terminal focused: act on the active tab if it's a live one.
-                active = tabs.active or ""
-                for s in list(self._live.statuses().keys()):
-                    if self._live.pane_id(s) == active:
-                        sid = s
-                        break
-            if sid is None:
+        def _close_live_sid(self, sid) -> None:
+            """Kill + remove one live session's tab. Afterwards show the next
+            remaining live pane (so Esc steps through them) or the preview, and
+            return focus to the list."""
+            if self._live is None or sid is None:
                 return
             t = self._live.get(sid)
             if t is not None:
@@ -2472,13 +2462,40 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
             self._live.forget(sid)
+            tabs = self.query_one("#right", TabbedContent)
             try:
                 tabs.remove_pane(self._live.pane_id(sid))
             except Exception:
                 pass
-            tabs.active = "tab-preview"
+            remaining = list(self._live.statuses().keys())
+            try:
+                tabs.active = (self._live.pane_id(remaining[-1])
+                               if remaining else "tab-preview")
+            except Exception:
+                pass
+            try:
+                self.notify(f"closed live session — {len(remaining)} still running",
+                            timeout=2)
+            except Exception:
+                pass
             self.query_one("#table", DataTable).focus()
             self._refresh_table()
+
+        def action_close_live(self) -> None:
+            """Ctrl-W: kill + remove the focused (or active) live tab."""
+            if _LIVE_TERM is None or self._live is None:
+                return
+            term = self._focused_terminal()
+            sid = term.sid if term is not None else None
+            if sid is None:
+                # No terminal focused: act on the active tab if it's a live one.
+                active = self.query_one("#right", TabbedContent).active or ""
+                for s in list(self._live.statuses().keys()):
+                    if self._live.pane_id(s) == active:
+                        sid = s
+                        break
+            if sid is not None:
+                self._close_live_sid(sid)
 
         def action_next_tab(self) -> None:
             self._cycle_tab(+1)
@@ -2593,14 +2610,32 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._update_preview(self._cursor_sid())
 
         def action_quit(self) -> None:
-            # Context-sensitive Escape: when a live terminal is focused, Esc is
-            # claude's (and also our "give me the list back" gesture) — return
-            # focus to the table instead of quitting the whole picker. Quit only
-            # when focus is on the list / search. On real quit, kill every live
-            # pane so no claude child is orphaned.
+            # Esc, on the list, closes live claude sessions ONE AT A TIME so an
+            # accidental Esc can't nuke everything; recap quits only once none
+            # remain. (Ctrl-C is the force-quit: kill all + exit.) When a
+            # terminal is focused Esc belongs to claude — this branch just
+            # returns focus to the list (the terminal usually eats Esc first).
             if self._focused_terminal() is not None:
                 self.query_one("#table", DataTable).focus()
                 return
+            if self._live is not None and self._live.count > 0:
+                tabs = self.query_one("#right", TabbedContent)
+                active = tabs.active or ""
+                sid = None
+                for s in list(self._live.statuses().keys()):
+                    if self._live.pane_id(s) == active:
+                        sid = s
+                        break
+                if sid is None:
+                    live_sids = list(self._live.statuses().keys())
+                    sid = live_sids[-1] if live_sids else None
+                if sid is not None:
+                    self._close_live_sid(sid)
+                    return
+            self.exit(None)
+
+        def action_quit_all(self) -> None:
+            # Ctrl-C: force quit — kill every live claude pane and exit now.
             if self._live is not None:
                 self._live.kill_all()
             self.exit(None)
