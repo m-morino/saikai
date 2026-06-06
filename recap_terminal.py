@@ -185,6 +185,21 @@ def _pyte_color(color: Optional[str]) -> Optional[str]:
     return color  # named color: 'red', 'brightblue', …
 
 
+def _cell_style(ch):  # -> rich.Style; only reached from render_line (textual present)
+    """Map a pyte Char's attributes (fg/bg + bold/italic/underline/reverse/…)
+    to a rich.Style for a single cell."""
+    return Style(
+        color=_pyte_color(getattr(ch, "fg", None)),
+        bgcolor=_pyte_color(getattr(ch, "bg", None)),
+        bold=bool(getattr(ch, "bold", False)),
+        italic=bool(getattr(ch, "italics", False)),
+        underline=bool(getattr(ch, "underscore", False)),
+        strike=bool(getattr(ch, "strikethrough", False)),
+        reverse=bool(getattr(ch, "reverse", False)),
+        blink=bool(getattr(ch, "blink", False)),
+    )
+
+
 # ── Key encoding ──────────────────────────────────────────────────────────────
 # event.key -> exact bytes/escape the PTY child expects. We start from the
 # textual-terminal reference table, then add the control bytes it leaves to
