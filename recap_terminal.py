@@ -284,14 +284,12 @@ def encode_key(key: str, character: Optional[str]) -> Optional[str]:
 
 # ── alt-screen tracking (pyte gap, see pyte spike) ────────────────────────────
 # pyte records the ?1049h/?1049l mode bit but has only ONE buffer: it does NOT
-# swap/save/restore, and ignores ?47/?1047 entirely. claude is a full-screen
-# TUI that lives on the alt screen. We can't give pyte a second buffer, but a
-# single pyte buffer rendering the alt-screen content is exactly what an
-# embedded terminal wants (claude owns the pane for its whole lifetime). We
-# still detect the boundary so the host can RESET the pyte screen on each
-# transition — that mirrors a real terminal's buffer swap and prevents the
-# pre-alt prompt from bleeding under claude's UI, and prevents claude's last
-# frame from lingering after it exits back to a shell.
+# swap/save/restore, and ignores ?47/?1047 entirely. NOTE: current claude
+# renders to the NORMAL buffer (probe 2026-06: no ?1049h alt-screen, no mouse
+# reporting) — which is why the HistoryScreen scrollback above works. The
+# alt-reset below is now a dormant SAFETY NET: if some tool DOES swap buffers,
+# resetting pyte's single buffer at the boundary keeps a pre-alt prompt from
+# bleeding under its UI and stops the last frame lingering after it exits.
 _ALT_ENTER_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)h")
 _ALT_LEAVE_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)l")
 _ALT_ANY_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)[hl]")
@@ -302,6 +300,13 @@ _ALT_ANY_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)[hl]")
 # underlined. Strip them before feeding pyte (keyboard-protocol negotiation,
 # irrelevant to the display grid).
 _PRIVATE_SGR_RE = re.compile(r"\x1b\[[<>=][0-9;:]*m")
+
+
+def _scroll_row_index(hist_len: int, scroll: int, y: int) -> int:
+    """Absolute index into (history.top + live buffer) for visible row y at a
+    given scroll offset (0 = live bottom). idx < hist_len -> a history line;
+    idx >= hist_len -> live buffer row (idx - hist_len)."""
+    return hist_len - scroll + y
 
 
 class AltScreenTracker:
@@ -381,6 +386,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         self._screen = None          # pyte.Screen
         self._stream = None          # pyte.Stream (feeds str)
         self._alt = AltScreenTracker()
+        self._scroll = 0             # lines scrolled back (0 = live bottom)
         self._reader: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._lock = threading.Lock()   # guards pyte feed vs render_line read
@@ -405,7 +411,10 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
     def on_mount(self) -> None:
         rows, cols = self._dims()
         try:
-            self._screen = pyte.Screen(cols, rows)          # (cols, rows)!
+            # HistoryScreen keeps scrolled-off lines in .history.top so the pane
+            # can scroll back (claude renders to the NORMAL buffer — verified by
+            # probe: no ?1049h alt-screen — so terminal-side scrollback applies).
+            self._screen = pyte.HistoryScreen(cols, rows, history=5000)   # (cols, rows)!
             self._stream = pyte.Stream(self._screen)        # feed str; pywinpty already decodes
         except Exception as e:  # pragma: no cover
             self._fail(f"pyte init failed: {e!r}")
@@ -458,13 +467,31 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             return Strip.blank(width)
 
         with self._lock:
-            buf = screen.buffer[y]              # defaultdict[x] -> Char (safe)
+            cols = screen.columns
             cursor_x = screen.cursor.x
             cursor_y = screen.cursor.y
-            cols = screen.columns
-            cells = [buf[x] for x in range(cols)]
+            s = self._scroll
+            if s > 0:
+                # Scrolled back: window into history.top + live buffer, shifted
+                # up by `s` (read-only — we never call pyte prev_page/next_page,
+                # so live state is untouched and s==0 is the unchanged fast path).
+                hist = screen.history.top
+                idx = _scroll_row_index(len(hist), s, y)
+                if idx < 0:
+                    buf = None
+                elif idx < len(hist):
+                    buf = hist[idx]
+                else:
+                    buf = screen.buffer[idx - len(hist)]
+            else:
+                buf = screen.buffer[y]          # live: defaultdict[x] -> Char
+            cells = [buf[x] for x in range(cols)] if buf is not None else None
 
-        show_cursor = self.has_focus and y == cursor_y and not self.is_dead
+        if cells is None:
+            return Strip.blank(width)
+        # Cursor only in the live view (it lives at the bottom, not in history).
+        show_cursor = (s == 0 and self.has_focus and y == cursor_y
+                       and not self.is_dead)
         segments = []
         run_chars: list[str] = []
         run_style = None
@@ -531,12 +558,35 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
                 pass
             event.stop()
 
+    # ── mouse wheel -> scroll back through history.top ─────────────────────────
+    def on_mouse_scroll_up(self, event) -> None:    # events.MouseScrollUp
+        if self._screen is None:
+            return
+        with self._lock:
+            maxs = len(self._screen.history.top)
+        self._scroll = min(self._scroll + 3, maxs)
+        try:
+            event.stop()
+        except Exception:
+            pass
+        self.refresh()
+
+    def on_mouse_scroll_down(self, event) -> None:  # events.MouseScrollDown
+        if self._scroll:
+            self._scroll = max(0, self._scroll - 3)
+            self.refresh()
+        try:
+            event.stop()
+        except Exception:
+            pass
+
     # ── (3) widget resize -> pyte + PTY ────────────────────────────────────────
     def on_resize(self, event) -> None:  # events.Resize
         if self._screen is None:
             return
         rows, cols = self._dims()
         with self._lock:
+            self._scroll = 0     # geometry changed; drop any scrollback offset
             try:
                 self._screen.resize(rows, cols)     # pyte: (rows, cols)!
             except Exception:
@@ -585,6 +635,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         if not chunk:
             return
         with self._lock:
+            top_before = len(self._screen.history.top)
             try:
                 pos = 0
                 for m in _ALT_ANY_RE.finditer(chunk):
@@ -595,6 +646,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
                     if entering != self._alt.in_alt:
                         self._alt.in_alt = entering
                         self._screen.reset()
+                        self._scroll = 0
                     self._stream.feed(m.group())
                     pos = m.end()
                 rest = chunk[pos:]
@@ -603,6 +655,14 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             except Exception:
                 # A malformed sequence must not kill the reader; drop rather than crash.
                 pass
+            # If the user is scrolled back, advance the offset by however many
+            # lines just scrolled into history so their view stays pinned to the
+            # same content instead of being dragged by new output.
+            if self._scroll > 0:
+                added = len(self._screen.history.top) - top_before
+                if added > 0:
+                    self._scroll = min(self._scroll + added,
+                                       len(self._screen.history.top))
         # status tail (ANSI kept; classify strips it). Bound the buffer.
         self._tail = (self._tail + chunk)[-4000:]
         self._update_status(classify_pty_status(self._tail))
