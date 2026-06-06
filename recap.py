@@ -1842,8 +1842,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # focus to the list when a terminal is focused instead of quitting.
             # ctrl+enter keeps the legacy full-takeover resume as a fallback.
             Binding("ctrl+w", "close_live", "Close tab", show=False),
-            Binding("f2", "prev_tab", "◀tab", show=False),
-            Binding("f3", "next_tab", "tab▶", show=False),
+            Binding("f2", "prev_tab", "◀Tab", priority=True),
+            Binding("f3", "next_tab", "Tab▶", priority=True),
             Binding("ctrl+l", "focus_list", "List", show=False),
         ]
         # Cap on concurrent live claude children (each is a full node process
@@ -1855,7 +1855,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         #statusbar { height: 1; background: $surface; color: $warning; }
         #main { layout: horizontal; height: 1fr; }
         #table { width: 60%; }
-        #right, .right { width: 40%; border-left: solid $accent; }
+        #main.split #table { width: 34%; }   /* split-live: give the live pane the room */
+        #right { width: 66%; border-left: solid $accent; }
+        .right { width: 40%; border-left: solid $accent; }
         #preview { padding: 0 1; height: 1fr; }
         ClaudeTerminal { width: 1fr; height: 1fr; }
         """
@@ -1868,7 +1870,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                     "•  :fav  :hidden  :open  :active  :recent",
                         id="search")
             yield Static("", id="statusbar")
-            with Horizontal(id="main"):
+            with Horizontal(id="main", classes=("split" if _LIVE_TERM is not None else "")):
                 yield DataTable(cursor_type="row", zebra_stripes=True, id="table")
                 if _LIVE_TERM is not None:
                     # Split-live: the preview becomes the first tab; live claude
