@@ -2338,7 +2338,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             """Daemon thread: render + cache previews for all non-open sessions
             so cursor movement doesn't trigger a synchronous render on the UI
             thread. mtime-gated, so already-cached sessions are skipped cheaply."""
-            for s in all_sessions:
+            # Cap the cold-start burst to the most-recent N (all_sessions is
+            # sorted recent-first); the rest warm on demand via _update_preview.
+            # Bail if the app stopped, so we don't churn disk after quit.
+            for s in all_sessions[:200]:
+                if not getattr(self, "is_running", True):
+                    break
                 if not s.get("is_open"):
                     try:
                         _write_preview_cache(s)
