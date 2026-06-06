@@ -103,6 +103,7 @@ FAVORITE_FILE = CACHE_DIR / "favorite.json"
 VIEW_MODE_FILE = CACHE_DIR / "view-mode.txt"
 TREE_MODE_FILE = CACHE_DIR / "tree-mode.txt"
 CLUSTER_MODE_FILE = CACHE_DIR / "cluster-mode.txt"
+DESKTOP_MODE_FILE = CACHE_DIR / "desktop-mode.txt"
 SORT_FILE = CACHE_DIR / "sort.json"
 GLOBAL_CLUSTERS_FILE = CACHE_DIR / "global-clusters.json"
 OPTIONS_FILE = CACHE_DIR / "options.json"
@@ -199,6 +200,49 @@ def _toggle_cluster_mode() -> bool:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     CLUSTER_MODE_FILE.write_text("on" if new else "off", encoding="utf-8")
     return new
+
+
+def _get_desktop_mode() -> bool:
+    """Saved Claude-Desktop-like view: group by project, Last desc, active pinned."""
+    try:
+        return DESKTOP_MODE_FILE.read_text(encoding="utf-8").strip() == "on"
+    except Exception:
+        return False
+
+
+def _toggle_desktop_mode() -> bool:
+    new = not _get_desktop_mode()
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    DESKTOP_MODE_FILE.write_text("on" if new else "off", encoding="utf-8")
+    return new
+
+
+def _desktop_group_sort(sessions: list[dict]) -> None:
+    """Reorder `sessions` in place to mimic Claude Desktop's sidebar: group by
+    project, projects ordered by their most-recent activity, and within each
+    project the running/open sessions pinned on top then by last-activity desc.
+
+    Confirmed against Claude Desktop's app.asar: it sorts sessions by
+    `lastActivityAt` descending and groups the sidebar by project."""
+    def proj(s):
+        return project_short(s.get("project_name") or "")
+    def last(s):
+        return s.get("last_ts") or ""
+    # 1) most-recent first (stable base; preserved within groups by step 3)
+    sessions.sort(key=last, reverse=True)
+    # 2) rank projects by their most-recent activity (recent projects first)
+    proj_recent: dict = {}
+    for s in sessions:
+        p = proj(s)
+        if last(s) > proj_recent.get(p, ""):
+            proj_recent[p] = last(s)
+    rank = {p: i for i, p in enumerate(
+        sorted(proj_recent, key=lambda p: proj_recent[p], reverse=True))}
+    # 3) stable group: project (recent first), running/open pinned atop each
+    sessions.sort(key=lambda s: (
+        rank.get(proj(s), 1 << 30),
+        0 if (s.get("is_open") or s.get("is_active")) else 1,
+    ))
 
 
 def _load_sort() -> list[dict]:
@@ -1835,6 +1879,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("ctrl+p", "toggle_fav", "★"),
             Binding("ctrl+g", "toggle_cluster", "Cluster"),
             Binding("ctrl+t", "toggle_tree", "Tree"),
+            Binding("ctrl+o", "toggle_desktop", "Proj"),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
             Binding("question_mark", "help", "Help", priority=True),
             # Split-live: open/attach a live claude as a tab; navigate tabs; and
@@ -2004,9 +2049,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             view_mode = _get_view_mode()
             tree_mode = _get_tree_mode() and len(all_sessions) <= 1000
             cluster_mode = _get_cluster_mode()
+            desktop_mode = _get_desktop_mode()
+            show_proj_col = show_project or desktop_mode
             tree_prefixes: dict[str, str] = {}
 
-            if cluster_mode:
+            if desktop_mode:
+                # Claude-Desktop-like: group by project, recency-sorted, active atop.
+                _desktop_group_sort(visible)
+            elif cluster_mode:
                 # Apply the user sort first so cluster members keep that order
                 # inside each group (stable sort below preserves it).
                 _apply_sort(visible, _load_sort())
@@ -2053,7 +2103,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 (col_label("date", "Start"), "date", 13),
                 (col_label("last", "Last"), "last", 7),
             ]
-            if show_project:
+            if show_proj_col:
                 specs.append((col_label("proj", "Project"), "proj", 17))
             if has_worktrees:
                 specs.append((col_label("wt", "Wt"), "wt", 12))
@@ -2068,7 +2118,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             project_color: dict[str, str] = {}
             topic_color: dict[str, str] = {}
             wt_color: dict[str, str] = {}
-            if show_project:
+            if show_proj_col:
                 project_color = _build_color_map(
                     (project_short(s["project_name"]) for s in visible),
                     _PROJECT_PALETTE,
@@ -2114,7 +2164,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                             else "x" if is_hidden else " ")
                 marker = f"{marker_a}{marker_s}"
                 row = [marker, fmt_ts(s["first_ts"]), fmt_last_active(s)]
-                if show_project:
+                if show_proj_col:
                     proj_txt = project_short(s["project_name"])
                     row.append(Text(proj_txt, style=project_color.get(proj_txt, "")))
                 if has_worktrees:
@@ -2170,10 +2220,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Mode toggles with Rich markup color
             tree_str = "[green]ON[/green]" if _get_tree_mode() else "[dim]OFF[/dim]"
             cluster_str = "[green]ON[/green]" if _get_cluster_mode() else "[dim]OFF[/dim]"
+            desktop_str = "[green]ON[/green]" if _get_desktop_mode() else "[dim]OFF[/dim]"
 
             sep = "  [dim]·[/dim]  "
             text = (f"  {n} sessions{sep}{sort_str}{sep}"
-                    f"{scope}{sep}Tree: {tree_str}{sep}Cluster: {cluster_str}")
+                    f"{scope}{sep}Tree: {tree_str}{sep}Cluster: {cluster_str}{sep}Proj: {desktop_str}")
             self.query_one("#statusbar", Static).update(text)
 
         def _cursor_sid(self) -> str | None:
@@ -2505,16 +2556,32 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def action_toggle_tree(self) -> None:
             new_on = _toggle_tree_mode()
-            # Tree and cluster are mutually exclusive in display — turn off the
-            # other to keep the saved state consistent.
-            if new_on and _get_cluster_mode():
-                _toggle_cluster_mode()
+            # Tree / cluster / desktop are mutually exclusive display modes —
+            # turn the others off to keep the saved state consistent.
+            if new_on:
+                if _get_cluster_mode():
+                    _toggle_cluster_mode()
+                if _get_desktop_mode():
+                    _toggle_desktop_mode()
             self._refresh_table()
 
         def action_toggle_cluster(self) -> None:
             new_on = _toggle_cluster_mode()
-            if new_on and _get_tree_mode():
-                _toggle_tree_mode()
+            if new_on:
+                if _get_tree_mode():
+                    _toggle_tree_mode()
+                if _get_desktop_mode():
+                    _toggle_desktop_mode()
+            self._refresh_table()
+
+        def action_toggle_desktop(self) -> None:
+            # Claude-Desktop-like view: group by project, Last desc, active pinned.
+            new_on = _toggle_desktop_mode()
+            if new_on:
+                if _get_tree_mode():
+                    _toggle_tree_mode()
+                if _get_cluster_mode():
+                    _toggle_cluster_mode()
             self._refresh_table()
 
         def action_preview_full(self) -> None:
