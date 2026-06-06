@@ -253,26 +253,28 @@ def _set_lastact_days(days: int) -> None:
 
 
 def _iso_dt(ts_iso: str):
-    """Parse an ISO timestamp to a naive (local) datetime, tolerantly."""
+    """Parse an ISO timestamp to a naive LOCAL datetime. Transcripts are UTC
+    ('…Z'); converting to local makes Age-window and date-bucket comparisons —
+    both against datetime.now() (local) — correct in non-UTC timezones."""
     if not ts_iso:
         return None
     try:
-        return datetime.fromisoformat(ts_iso[:19])
+        dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
     except Exception:
-        return None
+        try:
+            dt = datetime.fromisoformat(ts_iso[:19])
+        except Exception:
+            return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)   # -> local wall-clock, naive
+    return dt
 
 
 def _iso_date(ts_iso: str):
-    """Parse an ISO timestamp to a (local) date, tolerantly. None on failure."""
-    if not ts_iso:
-        return None
-    try:
-        return datetime.fromisoformat(ts_iso.replace("Z", "+00:00")).date()
-    except Exception:
-        try:
-            return datetime.fromisoformat(ts_iso[:19]).date()
-        except Exception:
-            return None
+    """Local calendar date of an ISO timestamp (see _iso_dt re: UTC→local — the
+    old UTC-date version mis-bucketed near-midnight sessions by the TZ offset)."""
+    dt = _iso_dt(ts_iso)
+    return dt.date() if dt is not None else None
 
 
 def _date_bucket(ts_iso: str, now) -> str:
@@ -353,7 +355,7 @@ def _read_last_jsonl_record(path):
         with open(path, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
-            f.seek(max(0, size - 8192))
+            f.seek(max(0, size - 65536))   # large enough to hold a big final record
             tail = f.read().decode("utf-8", "replace")
         for line in reversed(tail.splitlines()):
             line = line.strip()
@@ -380,7 +382,15 @@ def _needs_attention(s: dict, cache: dict) -> bool:
         rec = _read_last_jsonl_record(path)
         if rec is not None:
             role = rec.get("type") or (rec.get("message") or {}).get("role")
-            val = (role == "user")
+            val = role == "user"
+            if val:
+                # Claude Code writes tool_result turns as type:"user" too; those
+                # are auto-generated, not a human prompt pending — don't flag.
+                content = (rec.get("message") or {}).get("content")
+                if isinstance(content, list) and any(
+                        isinstance(b, dict) and b.get("type") == "tool_result"
+                        for b in content):
+                    val = False
     cache[sid] = (mt, val)
     return val
 
@@ -2195,8 +2205,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # a context-sensitive Escape (handled in action_quit) that returns
             # focus to the list when a terminal is focused instead of quitting.
             # ctrl+enter keeps the legacy full-takeover resume as a fallback.
-            Binding("ctrl+w", "close_live", "Close tab", show=False),
-            Binding("ctrl+k", "close_all_live", "Close all", show=False),
+            Binding("ctrl+w", "close_live", "Close tab", show=False, priority=True),
+            Binding("ctrl+k", "close_all_live", "Close all", show=False, priority=True),
             Binding("f2", "prev_tab", "◀Tab", priority=True),
             Binding("f3", "next_tab", "Tab▶", priority=True),
             Binding("f4", "toggle_list", "Hide list", priority=True),
@@ -2397,12 +2407,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def _do_refresh_table(self) -> None:
             table = self.query_one("#table", DataTable)
             saved_cursor = table.cursor_row
+            saved_sid = self._cursor_sid()   # restore by SESSION, not row index (headers/grouping shift it)
             table.clear(columns=True)
 
             # Read state first; layout mode decides whether the Topic column
             # is added, so we need to know it before defining columns.
             query = self.query_one("#search", Input).value
-            visible = self._filter(query)
+            visible = list(self._filter(query))   # copy: _filter may return the shared all_sessions; we sort/tag it in place
             # Claude-Desktop 'Last activity' window: drop rows older than N days.
             _lastact = _get_lastact_days()
             if _lastact:
@@ -2635,7 +2646,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 n += 1
                 n_sessions += 1
             self._n_sessions = n_sessions
-            if n and 0 <= saved_cursor < n:
+            # Restore the cursor onto the SAME session (its row index shifts when
+            # grouping/filtering/headers change); fall back to the old clamp.
+            restored = False
+            if saved_sid:
+                try:
+                    table.move_cursor(row=table.get_row_index(saved_sid))
+                    restored = True
+                except Exception:
+                    restored = False
+            if not restored and n and 0 <= saved_cursor < n:
                 try:
                     table.move_cursor(row=saved_cursor)
                 except Exception:
@@ -2773,6 +2793,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def on_data_table_row_highlighted(self, event) -> None:
             sid = str(event.row_key.value) if event.row_key else None
+            # If a live pane is focused, ignore highlight events from background
+            # refreshes ENTIRELY (incl. header rows) — never switch the right pane
+            # or steal focus while the user is interacting with claude.
+            if self._focused_terminal() is not None:
+                return
             if sid and sid.startswith("__hdr__"):
                 # Section-header row: not a session — clear the preview (don't
                 # leave a stale one) and show which group this is.
@@ -2789,14 +2814,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     pv.write(Text("  group header — no session selected", style="dim"))
                 except Exception:
                     pass
-                return
-            # While the user is interacting with a focused live pane, IGNORE
-            # highlight events fired by background refreshes (status poll / status
-            # change re-render the table and re-emit this for the cursor row).
-            # Switching the tab or calling table.focus() here would yank focus to
-            # the list — which is why arrow keys typed into claude were jumping
-            # recap's session tabs.
-            if self._focused_terminal() is not None:
                 return
             # Claude-Desktop-like: highlighting a row shows its content on the
             # right — a LIVE session switches to its terminal tab, a non-live one
@@ -2817,6 +2834,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._update_preview(sid)
 
         def action_resume(self) -> None:
+            # Enter on a focused dropdown (Group/Sort/Status/Age) belongs to the
+            # Select (open/confirm its overlay), not resume — forward it.
+            if isinstance(self.focused, Select):
+                raise SkipAction()
             # When split-live is unavailable, keep the original behavior: exit
             # the picker and hand the bare terminal to a single blocking claude.
             if _LIVE_TERM is None:
@@ -2961,6 +2982,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
 
+        def _live_pane_ids(self) -> list:
+            """All mounted live-pane ids (excludes the preview tab). Includes
+            panes whose claude already EXITED (kept for the final frame), which
+            are no longer in self._live.statuses() — so close paths can still
+            target them instead of leaving them unclosable."""
+            try:
+                return [p.id for p in self.query_one("#right", TabbedContent).query(TabPane)
+                        if p.id and p.id != "tab-preview"]
+            except Exception:
+                return []
+
         def _close_live_sid(self, sid) -> None:
             """Kill + remove one live session's tab. Afterwards show the next
             remaining live pane (so Esc steps through them) or the preview, and
@@ -2995,40 +3027,59 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def action_close_all_live(self) -> None:
             # Ctrl-K: close ALL live panes at once (parallel kill) but STAY in
-            # recap — unlike Ctrl-C (also quits) or Esc (one at a time).
-            if self._live is None or self._live.count == 0:
+            # recap — unlike Ctrl-C (also quits) or Esc (one at a time). Removes
+            # mounted panes incl. dead/exited ones (not just live statuses).
+            if self._live is None:
                 return
-            n = self._live.count
             tabs = self.query_one("#right", TabbedContent)
-            for s in list(self._live.statuses().keys()):
+            ids = self._live_pane_ids()
+            if not ids:
+                return
+            n = len(ids)
+            for pid in ids:
                 try:
-                    tabs.remove_pane(self._live.pane_id(s))
+                    tabs.remove_pane(pid)
                 except Exception:
                     pass
-            self._live.kill_all()      # parallel, non-blocking (recap stays up)
+            self._live.kill_all()      # kill any still-live terms (parallel, non-blocking)
             try:
                 tabs.active = "tab-preview"
             except Exception:
                 pass
             self.query_one("#table", DataTable).focus()
             self._refresh_table()
-            self.notify(f"closed {n} live session(s)", timeout=3)
+            self.notify(f"closed {n} live tab(s)", timeout=3)
 
         def action_close_live(self) -> None:
             """Ctrl-W: kill + remove the focused (or active) live tab."""
             if _LIVE_TERM is None or self._live is None:
                 return
+            tabs = self.query_one("#right", TabbedContent)
+            active = tabs.active or ""
             term = self._focused_terminal()
             sid = term.sid if term is not None else None
             if sid is None:
                 # No terminal focused: act on the active tab if it's a live one.
-                active = self.query_one("#right", TabbedContent).active or ""
                 for s in list(self._live.statuses().keys()):
                     if self._live.pane_id(s) == active:
                         sid = s
                         break
             if sid is not None:
                 self._close_live_sid(sid)
+                return
+            # A dead/forgotten pane (claude exited) is still mounted but absent
+            # from statuses(); remove it directly so it isn't unclosable.
+            if active and active != "tab-preview":
+                try:
+                    tabs.remove_pane(active)
+                except Exception:
+                    pass
+                try:
+                    tabs.active = "tab-preview"
+                except Exception:
+                    pass
+                self.query_one("#table", DataTable).focus()
+                self._refresh_table()
 
         def action_next_tab(self) -> None:
             self._cycle_tab(+1)
@@ -3117,6 +3168,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             v = getattr(event, "value", None)
             if sel_id == "groupsel":
                 if v in ("none", "date", "project", "state"):
+                    if v == _get_group_by():
+                        return   # already applied (e.g. action_cycle_group set .value) — no 2nd rebuild
                     if v != "none":   # grouping needs the flat display modes off
                         if _get_tree_mode():
                             _toggle_tree_mode()
@@ -3239,6 +3292,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     return
             self.notify(f"copied opening prompt ({len(text)} chars)", timeout=3)
 
+        def _apply_fresh_sessions(self, fresh) -> None:
+            # Reassign the session list after a re-scan, but KEEP any live pane
+            # whose sid fell out of the fresh scan (filter / --days window) so a
+            # running pane doesn't vanish from the list or lose its title.
+            if self._live is not None:
+                have = {s.get("id") for s in fresh}
+                for sid in list(self._live.statuses().keys()):
+                    if sid not in have:
+                        old = self._sid_index.get(sid)
+                        if old is not None:
+                            fresh.append(old)
+            nonlocal all_sessions
+            all_sessions = fresh
+            self._sid_index = {s.get("id"): s for s in fresh}
+
         def _auto_tick(self) -> None:
             # Quiet periodic re-scan (RECAP_AUTO_REFRESH). Skips while a live pane
             # is focused so it doesn't disrupt typing into claude.
@@ -3248,9 +3316,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 fresh = reload_fn()
             except Exception:
                 return
-            nonlocal all_sessions
-            all_sessions = fresh
-            self._sid_index = {s["id"]: s for s in fresh}
+            self._apply_fresh_sessions(fresh)
             self._refresh_table()
 
         def action_refresh(self) -> None:
@@ -3266,9 +3332,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.notify(f"refresh failed: {e!r}", severity="error",
                             title="recap", timeout=6)
                 return
-            nonlocal all_sessions
-            all_sessions = fresh
-            self._sid_index = {s["id"]: s for s in fresh}
+            self._apply_fresh_sessions(fresh)
             self._refresh_table()
             self.notify(f"refreshed — {len(fresh)} sessions", timeout=3)
 
@@ -3338,9 +3402,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.exit(None)
 
         def action_toggle_preview(self) -> None:
-            # Tab is a priority binding (overrides focus-cycling). When a live
-            # terminal is focused, Tab belongs to claude — SkipAction so the key
-            # is forwarded to the terminal (a plain return would eat it).
+            # Tab is a priority binding (overrides focus-cycling). On a focused
+            # dropdown or the search box, Tab belongs to that widget (move/navigate
+            # focus); on a focused live terminal it belongs to claude. SkipAction
+            # forwards the key (a plain return would eat it).
+            if isinstance(self.focused, (Select, Input)):
+                raise SkipAction()
             if self._focused_terminal() is not None:
                 raise SkipAction()
             self.preview_mode = "summary" if self.preview_mode == "full" else "full"
