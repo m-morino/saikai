@@ -665,8 +665,9 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
                     time.sleep(0.01)
                     continue
                 self._consume(chunk)
-                # NEVER touch the UI from this thread — marshal the repaint.
-                self._marshal(self.refresh)
+                # NEVER touch the UI from this thread — marshal a COALESCED
+                # repaint so a fast stream of small chunks can't flood the UI.
+                self._schedule_pane_refresh()
         finally:
             self._finalize()
 
@@ -812,6 +813,20 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             self._on_exit(self.sid)  # type: ignore[arg-type]
         except Exception:
             pass
+
+    def _schedule_pane_refresh(self) -> None:
+        """Coalesce per-chunk repaints: queue at most ONE refresh on the UI
+        thread at a time. claude streams many small chunks/sec and one
+        call_from_thread per chunk floods the UI; the next chunk re-queues only
+        after the UI painted (flag cleared in _do_pane_refresh)."""
+        if getattr(self, "_refresh_pending", False):
+            return
+        self._refresh_pending = True
+        self._marshal(self._do_pane_refresh)
+
+    def _do_pane_refresh(self) -> None:   # runs on the UI thread
+        self._refresh_pending = False
+        self.refresh()
 
     # ── thread → UI marshaling (defensive) ─────────────────────────────────────
     def _marshal(self, fn: Callable) -> None:
