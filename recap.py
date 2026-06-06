@@ -1313,6 +1313,40 @@ def _find_session_jsonl(sid_prefix: str) -> Path | None:
     return None
 
 
+def _extract_edited_files(jsonl_path, limit: int = 8) -> list[str]:
+    """Scan a transcript for files the assistant edited/created (Edit / Write /
+    MultiEdit / NotebookEdit tool calls). Returns up to `limit` unique basenames
+    in first-seen order. Best-effort; [] on any error."""
+    seen: list[str] = []
+    try:
+        with open(jsonl_path, "rb") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") != "assistant":
+                    continue
+                content = obj.get("message", {}).get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for b in content:
+                    if not (isinstance(b, dict) and b.get("type") == "tool_use"):
+                        continue
+                    if b.get("name") not in ("Edit", "Write", "MultiEdit",
+                                             "NotebookEdit"):
+                        continue
+                    inp = b.get("input") or {}
+                    fp = inp.get("file_path") or inp.get("notebook_path")
+                    if fp:
+                        base = os.path.basename(str(fp))
+                        if base and base not in seen:
+                            seen.append(base)
+    except Exception:
+        pass
+    return seen[:limit]
+
+
 def _render_header(s: dict) -> list[str]:
     found = s["jsonl_path"]
     hidden_tag = "  [HIDDEN]" if s["id"] in _load_hidden() else ""
@@ -1330,14 +1364,20 @@ def _render_header(s: dict) -> list[str]:
         marker = _confidence_marker(score)
         rs = "  ·  ".join(reasons) if reasons else ""
         lines.append(f"  parent:   {marker} {pid[:8]}  [score {score:.2f}]  {_c(rs, GRAY)}")
+    lines.append(f"  project:  {found.parent.name}")
+    branch = s.get("git_branch") or ""
+    if branch:
+        lines.append(f"  branch:   {branch}")
     lines.extend([
-        f"  project:  {found.parent.name}",
         f"  cwd:      {s.get('cwd','')}",
         f"  start:    {fmt_ts(s['first_ts'])}",
         f"  last:     {fmt_last_active(s)} ago  ({fmt_ts(s['last_ts'])})",
         f"  turns:    {s['n_turns']}",
-        "",
     ])
+    edited = _extract_edited_files(found)
+    if edited:
+        lines.append(f"  edited:   {_c(', '.join(edited), GRAY)}")
+    lines.append("")
     return lines
 
 
@@ -2073,6 +2113,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         preview_mode = "summary"   # "summary" or "full"
         _sid_index: dict = {}      # sid -> session; populated in on_mount
         _na_cache: dict = {}       # sid -> (mtime, needs_attention); Group-by-State
+        _last_status: dict = {}    # sid -> last live status; for waiting toasts
 
         def compose(self) -> ComposeResult:
             with Horizontal(id="searchrow"):
@@ -2137,6 +2178,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         self.set_interval(_secs, self._auto_tick)
                 except Exception:
                     pass
+            # Poll live-pane status so a backgrounded pane that starts WAITING
+            # for input raises a toast, and the list markers stay live.
+            if self._live is not None:
+                self.set_interval(1.5, self._poll_live_status)
             # Pre-warm preview caches off the UI thread so scrolling stays
             # responsive; _update_preview's on-demand warm is the fallback for
             # rows this thread hasn't reached. Open sessions render fresh, skip.
@@ -2960,6 +3005,32 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _toggle_tree_mode()
                 _set_group_by("none")
             self._refresh_table()
+
+        def _poll_live_status(self) -> None:
+            # Detect background live panes transitioning into "waiting" (needs
+            # input) and toast once per transition; keep the list markers live.
+            if self._live is None:
+                return
+            try:
+                cur = dict(self._live.statuses())
+            except Exception:
+                return
+            prev = self._last_status
+            try:
+                active = self.query_one("#right", TabbedContent).active or ""
+            except Exception:
+                active = ""
+            for sid, st in cur.items():
+                if st == "waiting" and prev.get(sid) != "waiting" \
+                        and self._live.pane_id(sid) != active:
+                    sess = self._sid_index.get(sid) or {}
+                    title = (sess.get("ai_title") or _first_msg(sess)
+                             or sid[:8])[:50]
+                    self.notify(f"needs input: {title}", title="recap", timeout=8)
+            changed = (cur != prev)
+            self._last_status = cur
+            if changed:
+                self._refresh_table()
 
         def _auto_tick(self) -> None:
             # Quiet periodic re-scan (RECAP_AUTO_REFRESH). Skips while a live pane
