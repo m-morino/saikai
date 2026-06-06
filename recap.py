@@ -2790,6 +2790,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
                 return
+            # While the user is interacting with a focused live pane, IGNORE
+            # highlight events fired by background refreshes (status poll / status
+            # change re-render the table and re-emit this for the cursor row).
+            # Switching the tab or calling table.focus() here would yank focus to
+            # the list — which is why arrow keys typed into claude were jumping
+            # recap's session tabs.
+            if self._focused_terminal() is not None:
+                return
             # Claude-Desktop-like: highlighting a row shows its content on the
             # right — a LIVE session switches to its terminal tab, a non-live one
             # shows the static preview. Focus stays on the list so arrow-browsing
@@ -2892,7 +2900,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             self._live.register(sid, term)
             tabs.active = pane_id
-            term.focus()
+            # add_pane mounts asynchronously and _refresh_table (below) re-emits a
+            # row-highlight; focus the terminal AFTER the refresh settles so focus
+            # lands on the pane and stays there (not back on the list).
+            self.call_after_refresh(term.focus)
             # Reuse the resume side effects: 1-shot teams-notify suppression so
             # the first idle_prompt after launch doesn't ping (mirrors
             # _resume_claude). Best-effort.
