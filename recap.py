@@ -2031,7 +2031,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  ([dim]:hidden[/dim] in search to find them)\n"
                 "  [yellow]Ctrl-P[/yellow]      Toggle ★ favorite "
                 "  ([dim]:fav[/dim] in search to filter)\n"
-                "  [yellow]Ctrl-R[/yellow]      Refresh list  (auto: RECAP_AUTO_REFRESH=secs)\n\n"
+                "  [yellow]Ctrl-R[/yellow]      Refresh list  (auto: RECAP_AUTO_REFRESH=secs)\n"
+                "  [yellow]Ctrl-Y[/yellow]      Copy this session's opening prompt\n\n"
                 "[bold cyan]Display modes[/bold cyan]\n"
                 "  [yellow]Ctrl-G[/yellow]      Cluster (topic) mode\n"
                 "  [yellow]Ctrl-T[/yellow]      Tree (parent/child) mode\n"
@@ -2073,6 +2074,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("ctrl+t", "toggle_tree", "Tree"),
             Binding("ctrl+o", "cycle_group", "Group"),
             Binding("ctrl+r", "refresh", "Refresh"),
+            Binding("ctrl+y", "copy_prompt", "Copy prompt"),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
             Binding("question_mark", "help", "Help", priority=True),
             # Split-live: open/attach a live claude as a tab; navigate tabs; and
@@ -3031,6 +3033,30 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._last_status = cur
             if changed:
                 self._refresh_table()
+
+        def action_copy_prompt(self) -> None:
+            # Ctrl-Y: copy the selected session's opening user prompt to the
+            # clipboard so it can be reused to start a similar task (Crystal-style
+            # prompt reuse). OSC-52 first (works over SSH), `clip` as fallback.
+            sid = self._cursor_sid()
+            if not sid:
+                return
+            msgs = (self._sid_index.get(sid) or {}).get("real_msgs") or []
+            if not msgs:
+                self.notify("no user prompt to copy", timeout=3)
+                return
+            text = msgs[0]
+            try:
+                self.copy_to_clipboard(text)
+            except Exception:
+                try:
+                    import subprocess
+                    subprocess.run("clip", input=text.encode("utf-16-le"),
+                                   shell=True, check=False)
+                except Exception as e:
+                    self.notify(f"copy failed: {e!r}", severity="error", timeout=4)
+                    return
+            self.notify(f"copied opening prompt ({len(text)} chars)", timeout=3)
 
         def _auto_tick(self) -> None:
             # Quiet periodic re-scan (RECAP_AUTO_REFRESH). Skips while a live pane
