@@ -50,6 +50,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from typing import Callable, Optional
 
 
@@ -658,9 +659,10 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
                     break
                 if not chunk:
                     # Defensive: some backends may yield "" transiently. Avoid a
-                    # busy-spin; re-check isalive and continue.
+                    # busy-spin; re-check isalive and back off before continuing.
                     if not _safe_isalive(pty):
                         break
+                    time.sleep(0.01)
                     continue
                 self._consume(chunk)
                 # NEVER touch the UI from this thread — marshal the repaint.

@@ -392,6 +392,11 @@ def _needs_attention(s: dict, cache: dict) -> bool:
                         for b in content):
                     val = False
     cache[sid] = (mt, val)
+    if len(cache) > 4096:        # bound memory: drop oldest (dict is insertion-ordered)
+        try:
+            del cache[next(iter(cache))]
+        except (StopIteration, KeyError):
+            pass
     return val
 
 
@@ -2550,10 +2555,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         _s["_state"] = "Archived"
                     elif _live == "busy":
                         _s["_state"] = "Running"
-                    elif _live == "waiting" or _needs_attention(_s, self._na_cache):
+                    elif _live == "waiting":
                         _s["_state"] = "Needs input"
                     elif _s.get("is_open") or _live == "idle":
+                        # Running now (live pane / open elsewhere): state is known
+                        # and its JSONL is GROWING — skip the needs-attention
+                        # tail-read, which would defeat the mtime cache every
+                        # refresh (resource #6).
                         _s["_state"] = "Open"
+                    elif _needs_attention(_s, self._na_cache):
+                        _s["_state"] = "Needs input"   # idle session: stable mtime -> cached
                     elif _s.get("is_active") or _s.get("is_recent"):
                         _s["_state"] = "Recent"
                     else:
@@ -3511,8 +3522,14 @@ def _add_recap_suppress_session(session_id: str) -> None:
     state = {k: v for k, v in state.items() if now - v < _RECAP_SUPPRESS_TTL}
     state[session_id] = now
     tmp = _RECAP_SUPPRESS_PATH.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(_json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, _RECAP_SUPPRESS_PATH)
+    try:
+        tmp.write_text(_json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, _RECAP_SUPPRESS_PATH)
+    except Exception:
+        try:                       # don't leave a .<pid>.tmp behind on failure
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def _resolve_resume_cwd(full_id: str, sessions: list[dict]) -> str | None:
