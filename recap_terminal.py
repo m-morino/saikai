@@ -295,6 +295,13 @@ def encode_key(key: str, character: Optional[str]) -> Optional[str]:
 _ALT_ENTER_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)h")
 _ALT_LEAVE_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)l")
 _ALT_ANY_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)[hl]")
+# Private-intro CSI sequences that END in 'm' but are NOT SGR: XTMODKEYS
+# (\x1b[>4;2m = modifyOtherKeys) and friends. pyte ignores the >/</= private
+# marker and misapplies the params as SGR — '>4;2m' becomes underline(4)+faint(2),
+# and since claude never sends a matching reset, EVERY following cell renders
+# underlined. Strip them before feeding pyte (keyboard-protocol negotiation,
+# irrelevant to the display grid).
+_PRIVATE_SGR_RE = re.compile(r"\x1b\[[<>=][0-9;:]*m")
 
 
 class AltScreenTracker:
@@ -574,6 +581,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         # reset()-ing pyte's single buffer there (it has no second buffer) so a
         # pre-alt shell prompt and claude's frames never share one buffer.
         chunk = chunk.replace("0011Ignore", "")
+        chunk = _PRIVATE_SGR_RE.sub("", chunk)   # drop XTMODKEYS \x1b[>4;2m etc. (pyte misreads as SGR-4 underline)
         if not chunk:
             return
         with self._lock:
