@@ -210,13 +210,13 @@ def _get_group_by() -> str:
     'none' to keep the plain list unless the user opts in)."""
     try:
         v = GROUP_BY_FILE.read_text(encoding="utf-8").strip()
-        return v if v in ("none", "date", "project") else "none"
+        return v if v in ("none", "date", "project", "state") else "none"
     except Exception:
         return "none"
 
 
 def _set_group_by(value: str) -> None:
-    if value not in ("none", "date", "project"):
+    if value not in ("none", "date", "project", "state"):
         value = "none"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     GROUP_BY_FILE.write_text(value, encoding="utf-8")
@@ -325,6 +325,15 @@ def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
             order.append("—")
         for l in order:
             groups.append((l, buckets[l]))
+    elif group_by == "state":
+        # Sessions are pre-tagged with s["_state"] by the caller (needs live /
+        # transcript info). Emit a fixed, attention-first section order.
+        buckets = {}
+        for s in rest:
+            buckets.setdefault(s.get("_state") or "Idle", []).append(s)
+        for l in ("Needs input", "Running", "Open", "Recent", "Idle", "Archived"):
+            if buckets.get(l):
+                groups.append((l, buckets[l]))
     else:  # project
         buckets = {}
         for s in rest:
@@ -335,6 +344,45 @@ def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
                         reverse=True):
             groups.append((l, buckets[l]))
     return groups
+
+
+def _read_last_jsonl_record(path):
+    """Cheaply read the last JSON record of a transcript (tail seek, no full
+    parse). None on any error."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 8192))
+            tail = f.read().decode("utf-8", "replace")
+        for line in reversed(tail.splitlines()):
+            line = line.strip()
+            if line:
+                return json.loads(line)
+    except Exception:
+        return None
+    return None
+
+
+def _needs_attention(s: dict, cache: dict) -> bool:
+    """Heuristic 'this session needs you': the transcript's last record is a
+    user turn — the assistant didn't get the last word, so the session was
+    interrupted / left unanswered and is worth resuming. Cached by mtime so a
+    file is tail-read at most once per change."""
+    sid = s.get("id")
+    mt = s.get("mtime", 0)
+    hit = cache.get(sid)
+    if hit is not None and hit[0] == mt:
+        return hit[1]
+    val = False
+    path = s.get("jsonl_path")
+    if path:
+        rec = _read_last_jsonl_record(path)
+        if rec is not None:
+            role = rec.get("type") or (rec.get("message") or {}).get("role")
+            val = (role == "user")
+    cache[sid] = (mt, val)
+    return val
 
 
 def _load_sort() -> list[dict]:
@@ -1956,7 +2004,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Ctrl-B[/yellow]      Release focus claude → list\n"
                 "  [yellow]Ctrl-W[/yellow]      Close live tab   [yellow]Ctrl-C[/yellow] force-quit\n\n"
                 "[bold cyan]Filter / Group / Sort (top-right dropdowns, Desktop-style)[/bold cyan]\n"
-                "  Group by  Date / Project / None   (or Ctrl-O)\n"
+                "  Group by  Date / Project / State / None   (Ctrl-O cycles)\n"
                 "  Sort by   Recency / Created time / Alphabetically\n"
                 "  Status    Active / Archived / All\n"
                 "  Age       last 1d / 3d / 7d / 30d / All time\n"
@@ -2024,6 +2072,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         preview_mode = "summary"   # "summary" or "full"
         _sid_index: dict = {}      # sid -> session; populated in on_mount
+        _na_cache: dict = {}       # sid -> (mtime, needs_attention); Group-by-State
 
         def compose(self) -> ComposeResult:
             with Horizontal(id="searchrow"):
@@ -2031,7 +2080,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                         "•  :fav  :hidden  :open  :active  :recent",
                             id="search")
                 yield Select(
-                    [("Date", "date"), ("Project", "project"), ("None", "none")],
+                    [("Date", "date"), ("Project", "project"),
+                     ("State", "state"), ("None", "none")],
                     prompt="Group", id="groupsel",
                 )
                 yield Select(
@@ -2303,9 +2353,28 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if _status in ("archived", "all"):
                 show_hidden = True
 
+            # Group-by-State needs a per-session state tag (live status +
+            # needs-attention heuristic + open/active flags); compute it here
+            # where self._live and the transcript are reachable.
+            if grouping == "state":
+                for _s in visible:
+                    _live = (self._live.status(_s["id"])
+                             if self._live is not None else "")
+                    if _s["id"] in hidden:
+                        _s["_state"] = "Archived"
+                    elif _live == "busy":
+                        _s["_state"] = "Running"
+                    elif _live == "waiting" or _needs_attention(_s, self._na_cache):
+                        _s["_state"] = "Needs input"
+                    elif _s.get("is_open") or _live == "idle":
+                        _s["_state"] = "Open"
+                    elif _s.get("is_active") or _s.get("is_recent"):
+                        _s["_state"] = "Recent"
+                    else:
+                        _s["_state"] = "Idle"
             # Claude-Desktop-style sections: partition the (already sorted) rows
-            # into Pinned + date/project groups, then remember which row each
-            # section header should precede. grouping='none' -> no headers.
+            # into Pinned + date/project/state groups, then remember which row
+            # each section header should precede. grouping='none' -> no headers.
             groups = (_build_groups(visible, grouping, set(favorites), datetime.now())
                       if grouping != "none" else [(None, visible)])
             header_before: dict[str, str] = {}
@@ -2317,7 +2386,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if not _vis:
                     continue
                 if _hdr is not None:
-                    header_before[_vis[0]["id"]] = _hdr
+                    header_before[_vis[0]["id"]] = f"{_hdr} ({len(_vis)})"
                 flat.extend(_vis)
             visible = flat
 
@@ -2424,7 +2493,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             tree_str = "[green]ON[/green]" if _get_tree_mode() else "[dim]OFF[/dim]"
             cluster_str = "[green]ON[/green]" if _get_cluster_mode() else "[dim]OFF[/dim]"
             _GROUP_LABEL = {"none": "[dim]off[/dim]", "date": "[green]Date[/green]",
-                            "project": "[green]Project[/green]"}
+                            "project": "[green]Project[/green]",
+                            "state": "[green]State[/green]"}
             group_str = _GROUP_LABEL.get(_get_group_by(), "[dim]off[/dim]")
 
             sep = "  [dim]·[/dim]  "
@@ -2816,7 +2886,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             sel_id = getattr(sel, "id", None)
             v = getattr(event, "value", None)
             if sel_id == "groupsel":
-                if v in ("none", "date", "project"):
+                if v in ("none", "date", "project", "state"):
                     if v != "none":   # grouping needs the flat display modes off
                         if _get_tree_mode():
                             _toggle_tree_mode()
@@ -2903,8 +2973,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def action_cycle_group(self) -> None:
             # Ctrl-O cycles the Claude-Desktop-style grouping: none -> Date ->
             # Project -> none. (The "Group" dropdown sets it explicitly too.)
-            new = {"none": "date", "date": "project",
-                   "project": "none"}.get(_get_group_by(), "date")
+            new = {"none": "date", "date": "project", "project": "state",
+                   "state": "none"}.get(_get_group_by(), "date")
             if new != "none":
                 if _get_tree_mode():
                     _toggle_tree_mode()
