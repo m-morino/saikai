@@ -3162,6 +3162,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # input) and toast once per transition; keep the list markers live.
             if self._live is None:
                 return
+            # Re-classify each pane from its CURRENT screen first, so a pane that
+            # went idle WITHOUT new output still flips out of "busy" (and the
+            # debounce gets its second tick on this timer cadence).
+            for term in self._live.all_terms():
+                try:
+                    term.refresh_status()
+                except Exception:
+                    pass
             try:
                 cur = dict(self._live.statuses())
             except Exception:
