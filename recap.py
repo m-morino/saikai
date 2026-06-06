@@ -1991,7 +1991,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  ([dim]:hidden[/dim] in search to find them)\n"
                 "  [yellow]Ctrl-P[/yellow]      Toggle ★ favorite "
                 "  ([dim]:fav[/dim] in search to filter)\n"
-                "  [yellow]Ctrl-R[/yellow]      Refresh list (re-scan for new sessions)\n\n"
+                "  [yellow]Ctrl-R[/yellow]      Refresh list  (auto: RECAP_AUTO_REFRESH=secs)\n\n"
                 "[bold cyan]Display modes[/bold cyan]\n"
                 "  [yellow]Ctrl-G[/yellow]      Cluster (topic) mode\n"
                 "  [yellow]Ctrl-T[/yellow]      Tree (parent/child) mode\n"
@@ -2127,6 +2127,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                           if _LIVE_TERM is not None else None)
             self._refresh_table()
             self.query_one("#table", DataTable).focus()
+            # Optional auto-refresh: RECAP_AUTO_REFRESH=<seconds> re-scans disk on
+            # an interval so sessions started elsewhere appear without Ctrl-R.
+            _ar = os.environ.get("RECAP_AUTO_REFRESH")
+            if _ar:
+                try:
+                    _secs = float(_ar)
+                    if _secs >= 2:
+                        self.set_interval(_secs, self._auto_tick)
+                except Exception:
+                    pass
             # Pre-warm preview caches off the UI thread so scrolling stays
             # responsive; _update_preview's on-demand warm is the fallback for
             # rows this thread hasn't reached. Open sessions render fresh, skip.
@@ -2949,6 +2959,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if _get_tree_mode():
                     _toggle_tree_mode()
                 _set_group_by("none")
+            self._refresh_table()
+
+        def _auto_tick(self) -> None:
+            # Quiet periodic re-scan (RECAP_AUTO_REFRESH). Skips while a live pane
+            # is focused so it doesn't disrupt typing into claude.
+            if reload_fn is None or self._focused_terminal() is not None:
+                return
+            try:
+                fresh = reload_fn()
+            except Exception:
+                return
+            nonlocal all_sessions
+            all_sessions = fresh
+            self._sid_index = {s["id"]: s for s in fresh}
             self._refresh_table()
 
         def action_refresh(self) -> None:
