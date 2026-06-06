@@ -1838,7 +1838,8 @@ def _build_color_map(values, palette) -> dict[str, str]:
 
 
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
-                 flat: bool = False, cluster_mode: bool = False) -> None:
+                 flat: bool = False, cluster_mode: bool = False,
+                 reload_fn=None) -> None:
     """Textual-based picker (status bar, mouse-click column sort, ? help overlay).
 
     Layout:
@@ -1941,7 +1942,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Ctrl-X[/yellow]      Toggle hide/unhide"
                 "  ([dim]:hidden[/dim] in search to find them)\n"
                 "  [yellow]Ctrl-P[/yellow]      Toggle ★ favorite "
-                "  ([dim]:fav[/dim] in search to filter)\n\n"
+                "  ([dim]:fav[/dim] in search to filter)\n"
+                "  [yellow]Ctrl-R[/yellow]      Refresh list (re-scan for new sessions)\n\n"
                 "[bold cyan]Display modes[/bold cyan]\n"
                 "  [yellow]Ctrl-G[/yellow]      Cluster (topic) mode\n"
                 "  [yellow]Ctrl-T[/yellow]      Tree (parent/child) mode\n"
@@ -1982,6 +1984,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("ctrl+g", "toggle_cluster", "Cluster"),
             Binding("ctrl+t", "toggle_tree", "Tree"),
             Binding("ctrl+o", "cycle_group", "Group"),
+            Binding("ctrl+r", "refresh", "Refresh"),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
             Binding("question_mark", "help", "Help", priority=True),
             # Split-live: open/attach a live claude as a tab; navigate tabs; and
@@ -2320,6 +2323,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
             n = 0
             n_sessions = 0
+            self._header_labels = {}
             for s in visible:
                 # Emit a section-header row just before its first member.
                 if s["id"] in header_before:
@@ -2329,6 +2333,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     hdr_idx = (len(specs) - 1) if narrow else 1
                     hdr_cells[hdr_idx] = Text(header_before[s["id"]],
                                               style="bold #7aa2f7")
+                    self._header_labels[f"__hdr__{n}"] = header_before[s["id"]]
                     table.add_row(*hdr_cells, key=f"__hdr__{n}")
                     n += 1
                 is_hidden = s["id"] in hidden
@@ -2511,7 +2516,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def on_data_table_row_highlighted(self, event) -> None:
             sid = str(event.row_key.value) if event.row_key else None
             if sid and sid.startswith("__hdr__"):
-                return   # section-header row — nothing to preview / resume
+                # Section-header row: not a session — clear the preview (don't
+                # leave a stale one) and show which group this is.
+                if _LIVE_TERM is not None:
+                    try:
+                        self.query_one("#right", TabbedContent).active = "tab-preview"
+                    except Exception:
+                        pass
+                try:
+                    label = getattr(self, "_header_labels", {}).get(sid, "")
+                    pv = self.query_one("#preview", RichLog)
+                    pv.clear()
+                    pv.write(Text(f"\n  ── {label} ──", style="bold #7aa2f7"))
+                    pv.write(Text("  group header — no session selected", style="dim"))
+                except Exception:
+                    pass
+                return
             # Claude-Desktop-like: highlighting a row shows its content on the
             # right — a LIVE session switches to its terminal tab, a non-live one
             # shows the static preview. Focus stays on the list so arrow-browsing
@@ -2860,6 +2880,25 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _toggle_tree_mode()
                 _set_group_by("none")
             self._refresh_table()
+
+        def action_refresh(self) -> None:
+            # Ctrl-R: re-scan ~/.claude/projects for new / updated sessions
+            # (recap loads once at startup; this picks up sessions started
+            # elsewhere while the picker is open).
+            if reload_fn is None:
+                self._refresh_table()
+                return
+            try:
+                fresh = reload_fn()
+            except Exception as e:
+                self.notify(f"refresh failed: {e!r}", severity="error",
+                            title="recap", timeout=6)
+                return
+            nonlocal all_sessions
+            all_sessions = fresh
+            self._sid_index = {s["id"]: s for s in fresh}
+            self._refresh_table()
+            self.notify(f"refreshed — {len(fresh)} sessions", timeout=3)
 
         def action_cycle_group(self) -> None:
             # Ctrl-O cycles the Claude-Desktop-style grouping: none -> Date ->
@@ -4178,9 +4217,46 @@ def main():
             visible = sessions
         display_table(visible, repo, args.all_projects, flat=flat)
     else:
-        # Default: interactive textual picker.
+        # Default: interactive textual picker. Hand it a reload closure so the
+        # in-app refresh (Ctrl-R) can re-scan ~/.claude/projects for new/updated
+        # sessions without restarting.
+        def _reload():
+            fresh = []
+            if args.all_projects:
+                for d in projects_root.iterdir():
+                    if d.is_dir() and d.name != "memory":
+                        fresh.extend(load_sessions_in_dir(d, since))
+            else:
+                tgt = Path(args.project) if args.project else find_project_dir(cwd)
+                if tgt and tgt.exists():
+                    fresh = load_sessions_in_dir(tgt, since)
+                    for s in fresh:
+                        s["worktree_label"] = ""
+                    if not args.project:
+                        for wt_dir, wt_label in _worktree_project_dirs(
+                                cwd, projects_root, exclude=tgt):
+                            extra = load_sessions_in_dir(wt_dir, since)
+                            for s in extra:
+                                s["worktree_label"] = wt_label
+                            if extra:
+                                fresh.extend(extra)
+            fresh.sort(key=lambda s: s["first_ts"], reverse=True)
+            for s in fresh:
+                cached = (_load_cache(s["id"], s["mtime"])
+                          if not s.get("is_open") else None)
+                s["summary"] = (cached if cached and not _looks_like_refusal(cached)
+                                else s["ai_title"] or _first_msg(s))
+            if len(fresh) <= 1000:
+                _build_forest(fresh)
+            else:
+                for s in fresh:
+                    s["parent_id"] = None
+                    s["parent_score"] = 0.0
+                    s["parent_reasons"] = []
+            return fresh
+
         textual_pick(sessions, repo, args.all_projects, flat=flat,
-                     cluster_mode=cluster_mode)
+                     cluster_mode=cluster_mode, reload_fn=_reload)
 
 
 if __name__ == "__main__":
