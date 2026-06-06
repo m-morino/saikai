@@ -1851,9 +1851,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Ctrl-P[/yellow]      Toggle ★ favorite "
                 "  ([dim]:fav[/dim] in search to filter)\n\n"
                 "[bold cyan]Display modes[/bold cyan]\n"
-                "  [yellow]Ctrl-G[/yellow]      Cluster mode\n"
-                "  [yellow]Ctrl-T[/yellow]      Tree mode\n"
+                "  [yellow]Ctrl-G[/yellow]      Cluster (topic) mode\n"
+                "  [yellow]Ctrl-T[/yellow]      Tree (parent/child) mode\n"
+                "  [yellow]Ctrl-O[/yellow]      Project groups (Desktop-like)\n"
                 "  [yellow]Tab[/yellow]         Preview: full ↔ summary\n\n"
+                "[bold cyan]Split-live (RECAP_SPLIT_LIVE=1)[/bold cyan]\n"
+                "  [yellow]Enter[/yellow]       Open / focus the live claude pane\n"
+                "  [yellow]F2/F3[/yellow]       Prev / next live tab\n"
+                "  [yellow]F4[/yellow]          Hide / show the session list\n"
+                "  [yellow]Ctrl-B[/yellow]      Release focus claude → list\n"
+                "  [yellow]Ctrl-W[/yellow]      Close live tab   [yellow]Ctrl-C[/yellow] force-quit\n\n"
                 "[bold cyan]Sort[/bold cyan]\n"
                 "  Column header click  — sort by that column\n"
                 "  Click again          — reverse direction\n\n"
@@ -1889,6 +1896,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("ctrl+w", "close_live", "Close tab", show=False),
             Binding("f2", "prev_tab", "◀Tab", priority=True),
             Binding("f3", "next_tab", "Tab▶", priority=True),
+            Binding("f4", "toggle_list", "Hide list", priority=True),
             Binding("ctrl+l", "focus_list", "List", show=False),
         ]
         # Cap on concurrent live claude children (each is a full node process
@@ -1903,6 +1911,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         #main.split #table { width: 34%; }   /* split-live: give the live pane the room */
         #right { width: 66%; border-left: solid $accent; }
         .right { width: 40%; border-left: solid $accent; }
+        /* F4 hides the session list so the live pane (or preview) is full-width */
+        #main.nolist #table { display: none; }
+        #main.nolist #right { width: 100%; }
+        #main.nolist .right { width: 100%; }
         #preview { padding: 0 1; height: 1fr; }
         ClaudeTerminal { width: 1fr; height: 1fr; }
         """
@@ -2529,6 +2541,31 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def action_focus_list(self) -> None:
             """Ctrl-L: jump focus back to the session list from a terminal."""
             self.query_one("#table", DataTable).focus()
+
+        def action_toggle_list(self) -> None:
+            """F4: hide/show the left session list. Hidden -> the live pane (or
+            preview) is full-width and the active live terminal takes focus so
+            you can type; shown -> focus returns to the list."""
+            main = self.query_one("#main")
+            main.toggle_class("nolist")
+            if main.has_class("nolist"):
+                term = self._focused_terminal()
+                if term is None and self._live is not None:
+                    try:
+                        active = self.query_one("#right", TabbedContent).active or ""
+                        for s in self._live.statuses():
+                            if self._live.pane_id(s) == active:
+                                term = self._live.get(s)
+                                break
+                    except Exception:
+                        term = None
+                if term is not None:
+                    try:
+                        term.focus()
+                    except Exception:
+                        pass
+            else:
+                self.query_one("#table", DataTable).focus()
 
         def on_data_table_header_selected(self, event) -> None:
             # Excel-like: click a sortable column → 3-state cycle

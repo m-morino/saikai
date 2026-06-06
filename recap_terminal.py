@@ -263,7 +263,7 @@ RELEASE_FOCUS_KEY = "ctrl+b"
 _KEYMAP.pop(RELEASE_FOCUS_KEY, None)
 # F2/F3 are reserved by recap for prev/next tab (priority bindings); never
 # forward them to the child, so tab-switching works even while a pane is focused.
-for _rk in ("f2", "f3"):
+for _rk in ("f2", "f3", "f4"):
     _KEYMAP.pop(_rk, None)
 
 
