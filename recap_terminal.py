@@ -261,6 +261,10 @@ _KEYMAP.update({
 #: forwarded to the child.
 RELEASE_FOCUS_KEY = "ctrl+b"
 _KEYMAP.pop(RELEASE_FOCUS_KEY, None)
+# F2/F3 are reserved by recap for prev/next tab (priority bindings); never
+# forward them to the child, so tab-switching works even while a pane is focused.
+for _rk in ("f2", "f3"):
+    _KEYMAP.pop(_rk, None)
 
 
 def encode_key(key: str, character: Optional[str]) -> Optional[str]:
