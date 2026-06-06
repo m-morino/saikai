@@ -104,6 +104,8 @@ VIEW_MODE_FILE = CACHE_DIR / "view-mode.txt"
 TREE_MODE_FILE = CACHE_DIR / "tree-mode.txt"
 CLUSTER_MODE_FILE = CACHE_DIR / "cluster-mode.txt"
 GROUP_BY_FILE = CACHE_DIR / "group-by.txt"
+STATUS_FILTER_FILE = CACHE_DIR / "status-filter.txt"
+LASTACT_FILTER_FILE = CACHE_DIR / "lastact-filter.txt"
 SORT_FILE = CACHE_DIR / "sort.json"
 GLOBAL_CLUSTERS_FILE = CACHE_DIR / "global-clusters.json"
 OPTIONS_FILE = CACHE_DIR / "options.json"
@@ -218,6 +220,46 @@ def _set_group_by(value: str) -> None:
         value = "none"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     GROUP_BY_FILE.write_text(value, encoding="utf-8")
+
+
+def _get_status_filter() -> str:
+    """Claude-Desktop 'Status' filter: 'active' (non-archived, default) |
+    'archived' (only hidden/archived) | 'all'."""
+    try:
+        v = STATUS_FILTER_FILE.read_text(encoding="utf-8").strip()
+        return v if v in ("active", "archived", "all") else "active"
+    except Exception:
+        return "active"
+
+
+def _set_status_filter(value: str) -> None:
+    if value not in ("active", "archived", "all"):
+        value = "active"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    STATUS_FILTER_FILE.write_text(value, encoding="utf-8")
+
+
+def _get_lastact_days() -> int:
+    """Claude-Desktop 'Last activity' window in days (0 = All time, default)."""
+    try:
+        return int(LASTACT_FILTER_FILE.read_text(encoding="utf-8").strip())
+    except Exception:
+        return 0
+
+
+def _set_lastact_days(days: int) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    LASTACT_FILTER_FILE.write_text(str(int(days)), encoding="utf-8")
+
+
+def _iso_dt(ts_iso: str):
+    """Parse an ISO timestamp to a naive (local) datetime, tolerantly."""
+    if not ts_iso:
+        return None
+    try:
+        return datetime.fromisoformat(ts_iso[:19])
+    except Exception:
+        return None
 
 
 def _iso_date(ts_iso: str):
@@ -1911,9 +1953,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]F4[/yellow]          Hide / show the session list\n"
                 "  [yellow]Ctrl-B[/yellow]      Release focus claude → list\n"
                 "  [yellow]Ctrl-W[/yellow]      Close live tab   [yellow]Ctrl-C[/yellow] force-quit\n\n"
-                "[bold cyan]Group / Sort (top-right dropdowns, Desktop-style)[/bold cyan]\n"
+                "[bold cyan]Filter / Group / Sort (top-right dropdowns, Desktop-style)[/bold cyan]\n"
                 "  Group by  Date / Project / None   (or Ctrl-O)\n"
                 "  Sort by   Recency / Created time / Alphabetically\n"
+                "  Status    Active / Archived / All\n"
+                "  Age       last 1d / 3d / 7d / 30d / All time\n"
                 "  (clicking a column header still sorts too)\n\n"
                 "[dim]Press ? or Esc to close[/dim]",
                 id="help-content",
@@ -1957,8 +2001,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         Screen { layout: vertical; }
         #searchrow { dock: top; height: 3; }
         #search { width: 1fr; border: tall $accent; }
-        #groupsel { width: 16; }
-        #sortsel { width: 20; }
+        #groupsel { width: 15; }
+        #sortsel { width: 17; }
+        #statussel { width: 14; }
+        #lastsel { width: 12; }
         #statusbar { height: 1; background: $surface; color: $warning; }
         #main { layout: horizontal; height: 1fr; }
         #table { width: 60%; }
@@ -1989,6 +2035,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     [("Recency", "last"), ("Created time", "date"),
                      ("Alphabetically", "title")],
                     prompt="Sort", id="sortsel",
+                )
+                yield Select(
+                    [("Active", "active"), ("Archived", "archived"), ("All", "all")],
+                    prompt="Status", id="statussel",
+                )
+                yield Select(
+                    [("All time", "0"), ("1d", "1"), ("3d", "3"),
+                     ("7d", "7"), ("30d", "30")],
+                    prompt="Age", id="lastsel",
                 )
             yield Static("", id="statusbar")
             with Horizontal(id="main", classes=("split" if _LIVE_TERM is not None else "")):
@@ -2120,6 +2175,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # is added, so we need to know it before defining columns.
             query = self.query_one("#search", Input).value
             visible = self._filter(query)
+            # Claude-Desktop 'Last activity' window: drop rows older than N days.
+            _lastact = _get_lastact_days()
+            if _lastact:
+                _cut = datetime.now() - timedelta(days=_lastact)
+                visible = [s for s in visible
+                           if (_iso_dt(s.get("last_ts")) or datetime.min) >= _cut]
             hidden = _load_hidden()
             favorites = _load_favorites()
             view_mode = _get_view_mode()
@@ -2220,6 +2281,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # would match them but the renderer would drop every one.
             show_hidden = (view_mode == "show-hidden"
                            or ":hidden" in self._parse_query(query)[0])
+            # Claude-Desktop 'Status' filter: archived/all reveal hidden rows.
+            _status = _get_status_filter()
+            if _status in ("archived", "all"):
+                show_hidden = True
 
             # Claude-Desktop-style sections: partition the (already sorted) rows
             # into Pinned + date/project groups, then remember which row each
@@ -2230,7 +2295,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             flat: list[dict] = []
             for _hdr, _members in groups:
                 _vis = [m for m in _members
-                        if not (m["id"] in hidden and not show_hidden)]
+                        if not (m["id"] in hidden and not show_hidden)
+                        and not (_status == "archived" and m["id"] not in hidden)]
                 if not _vis:
                     continue
                 if _hdr is not None:
@@ -2333,8 +2399,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             group_str = _GROUP_LABEL.get(_get_group_by(), "[dim]off[/dim]")
 
             sep = "  [dim]·[/dim]  "
+            # Active Desktop-style filters (only shown when non-default).
+            _filt = []
+            if _get_status_filter() != "active":
+                _filt.append(_get_status_filter().capitalize())
+            _la = _get_lastact_days()
+            if _la:
+                _filt.append(f"{_la}d")
+            filt_str = (f"{sep}Filter: [yellow]" + "+".join(_filt) + "[/yellow]") if _filt else ""
             text = (f"  {n} sessions{sep}{sort_str}{sep}"
-                    f"{scope}{sep}Group: {group_str}{sep}Tree: {tree_str}{sep}Cluster: {cluster_str}")
+                    f"{scope}{sep}Group: {group_str}{filt_str}{sep}Tree: {tree_str}{sep}Cluster: {cluster_str}")
             self.query_one("#statusbar", Static).update(text)
 
         def _cursor_sid(self) -> str | None:
@@ -2714,6 +2788,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _save_sort([{"col": col, "dir": direction},
                                 {"col": "-", "dir": "desc"},
                                 {"col": "-", "dir": "desc"}])
+                    self._refresh_table()
+            elif sel_id == "statussel":
+                if v in ("active", "archived", "all"):
+                    _set_status_filter(v)
+                    self._refresh_table()
+            elif sel_id == "lastsel":
+                if v in ("0", "1", "3", "7", "30"):
+                    _set_lastact_days(int(v))
                     self._refresh_table()
 
         def on_input_changed(self, event) -> None:
