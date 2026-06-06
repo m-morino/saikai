@@ -1777,8 +1777,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         from textual.binding import Binding
         from textual.containers import Horizontal
         from textual.screen import ModalScreen
-        from textual.widgets import (DataTable, Footer, Input, RichLog, Static,
-                                     TabbedContent, TabPane)
+        from textual.widgets import (DataTable, Footer, Input, RichLog, Select,
+                                     Static, TabbedContent, TabPane)
         from rich.text import Text
     except ImportError as e:
         print(_c(f"  textual is required but not installed ({e}). "
@@ -1904,7 +1904,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         MAX_LIVE = int(os.environ.get("RECAP_MAX_LIVE", "4") or "4")
         CSS = """
         Screen { layout: vertical; }
-        #search { dock: top; height: 3; border: tall $accent; }
+        #searchrow { dock: top; height: 3; }
+        #search { width: 1fr; border: tall $accent; }
+        #sortsel { width: 30; }
         #statusbar { height: 1; background: $surface; color: $warning; }
         #main { layout: horizontal; height: 1fr; }
         #table { width: 60%; }
@@ -1923,9 +1925,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         _sid_index: dict = {}      # sid -> session; populated in on_mount
 
         def compose(self) -> ComposeResult:
-            yield Input(placeholder="Search title / msg / SID / proj    "
-                                    "•  :fav  :hidden  :open  :active  :recent",
-                        id="search")
+            with Horizontal(id="searchrow"):
+                yield Input(placeholder="Search title / msg / SID / proj    "
+                                        "•  :fav  :hidden  :open  :active  :recent",
+                            id="search")
+                yield Select(
+                    [("Last activity", "last"), ("Started (newest)", "date"),
+                     ("Title A-Z", "title"), ("Project groups", "project")],
+                    prompt="Sort", id="sortsel",
+                )
             yield Static("", id="statusbar")
             with Horizontal(id="main", classes=("split" if _LIVE_TERM is not None else "")):
                 yield DataTable(cursor_type="row", zebra_stripes=True, id="table")
@@ -2586,6 +2594,31 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"sort failed: {e!r}\n{traceback.format_exc()[-400:]}",
                     severity="error", title="recap", timeout=15,
                 )
+
+        def on_select_changed(self, event) -> None:
+            # Claude-Desktop-like sort dropdown (the list is too narrow to sort
+            # by clicking column headers). Each option is a flat sort preset or
+            # the project-grouping view; picking one clears the other modes.
+            v = getattr(event, "value", None)
+            if v not in ("last", "date", "title", "project"):
+                return   # ignore the blank prompt / any other Select
+            if _get_tree_mode():
+                _toggle_tree_mode()
+            if _get_cluster_mode():
+                _toggle_cluster_mode()
+            if v == "project":
+                if not _get_desktop_mode():
+                    _toggle_desktop_mode()
+            else:
+                if _get_desktop_mode():
+                    _toggle_desktop_mode()
+                col, direction = {"last": ("last", "desc"),
+                                  "date": ("date", "desc"),
+                                  "title": ("title", "asc")}[v]
+                _save_sort([{"col": col, "dir": direction},
+                            {"col": "-", "dir": "desc"},
+                            {"col": "-", "dir": "desc"}])
+            self._refresh_table()
 
         def on_input_changed(self, event) -> None:
             self._refresh_table()
