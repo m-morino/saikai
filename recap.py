@@ -103,7 +103,7 @@ FAVORITE_FILE = CACHE_DIR / "favorite.json"
 VIEW_MODE_FILE = CACHE_DIR / "view-mode.txt"
 TREE_MODE_FILE = CACHE_DIR / "tree-mode.txt"
 CLUSTER_MODE_FILE = CACHE_DIR / "cluster-mode.txt"
-DESKTOP_MODE_FILE = CACHE_DIR / "desktop-mode.txt"
+GROUP_BY_FILE = CACHE_DIR / "group-by.txt"
 SORT_FILE = CACHE_DIR / "sort.json"
 GLOBAL_CLUSTERS_FILE = CACHE_DIR / "global-clusters.json"
 OPTIONS_FILE = CACHE_DIR / "options.json"
@@ -202,47 +202,97 @@ def _toggle_cluster_mode() -> bool:
     return new
 
 
-def _get_desktop_mode() -> bool:
-    """Saved Claude-Desktop-like view: group by project, Last desc, active pinned."""
+def _get_group_by() -> str:
+    """Saved grouping axis: 'none' | 'date' | 'project'. Mirrors Claude
+    Desktop's 'Group by' menu (Desktop defaults to Date; recap defaults to
+    'none' to keep the plain list unless the user opts in)."""
     try:
-        return DESKTOP_MODE_FILE.read_text(encoding="utf-8").strip() == "on"
+        v = GROUP_BY_FILE.read_text(encoding="utf-8").strip()
+        return v if v in ("none", "date", "project") else "none"
     except Exception:
-        return False
+        return "none"
 
 
-def _toggle_desktop_mode() -> bool:
-    new = not _get_desktop_mode()
+def _set_group_by(value: str) -> None:
+    if value not in ("none", "date", "project"):
+        value = "none"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    DESKTOP_MODE_FILE.write_text("on" if new else "off", encoding="utf-8")
-    return new
+    GROUP_BY_FILE.write_text(value, encoding="utf-8")
 
 
-def _desktop_group_sort(sessions: list[dict]) -> None:
-    """Reorder `sessions` in place to mimic Claude Desktop's sidebar: group by
-    project, projects ordered by their most-recent activity, and within each
-    project the running/open sessions pinned on top then by last-activity desc.
+def _iso_date(ts_iso: str):
+    """Parse an ISO timestamp to a (local) date, tolerantly. None on failure."""
+    if not ts_iso:
+        return None
+    try:
+        return datetime.fromisoformat(ts_iso.replace("Z", "+00:00")).date()
+    except Exception:
+        try:
+            return datetime.fromisoformat(ts_iso[:19]).date()
+        except Exception:
+            return None
 
-    Confirmed against Claude Desktop's app.asar: it sorts sessions by
-    `lastActivityAt` descending and groups the sidebar by project."""
-    def proj(s):
-        return project_short(s.get("project_name") or "")
-    def last(s):
-        return s.get("last_ts") or ""
-    # 1) most-recent first (stable base; preserved within groups by step 3)
-    sessions.sort(key=last, reverse=True)
-    # 2) rank projects by their most-recent activity (recent projects first)
-    proj_recent: dict = {}
-    for s in sessions:
-        p = proj(s)
-        if last(s) > proj_recent.get(p, ""):
-            proj_recent[p] = last(s)
-    rank = {p: i for i, p in enumerate(
-        sorted(proj_recent, key=lambda p: proj_recent[p], reverse=True))}
-    # 3) stable group: project (recent first), running/open pinned atop each
-    sessions.sort(key=lambda s: (
-        rank.get(proj(s), 1 << 30),
-        0 if (s.get("is_open") or s.get("is_active")) else 1,
-    ))
+
+def _date_bucket(ts_iso: str, now) -> str:
+    """Claude-Desktop-style date-section label for a session's last activity:
+    Today / Yesterday / 'M月D日' (this year) / 'YYYY/M/D' (older)."""
+    d = _iso_date(ts_iso)
+    if d is None:
+        return "—"
+    today = now.date()
+    if d == today:
+        return "Today"
+    if (today - d).days == 1:
+        return "Yesterday"
+    if d.year == today.year:
+        return f"{d.month}月{d.day}日"
+    return f"{d.year}/{d.month}/{d.day}"
+
+
+def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
+    """Partition already-sorted `sessions` into Claude-Desktop-like sections.
+    Returns an ordered list of (header_label | None, members); members keep
+    their incoming order so the active Sort spec decides within-group order.
+
+    - group_by='none'  -> one unlabelled group (plain list, no Pinned header).
+    - otherwise        -> a 'Pinned' section first (favorites), then date
+      buckets (Today, Yesterday, dates desc) or project buckets (projects
+      ordered by most-recent activity)."""
+    if group_by == "none":
+        return [(None, list(sessions))]
+    groups: list = []
+    rest = list(sessions)
+    pinned = [s for s in rest if s["id"] in favorites]
+    if pinned:
+        groups.append(("Pinned", pinned))
+        rest = [s for s in rest if s["id"] not in favorites]
+    if group_by == "date":
+        buckets: dict = {}
+        for s in rest:
+            buckets.setdefault(_date_bucket(s.get("last_ts") or "", now), []).append(s)
+        order = []
+        if "Today" in buckets:
+            order.append("Today")
+        if "Yesterday" in buckets:
+            order.append("Yesterday")
+        dated = [l for l in buckets if l not in ("Today", "Yesterday", "—")]
+        dated.sort(key=lambda l: max((m.get("last_ts") or "") for m in buckets[l]),
+                   reverse=True)
+        order += dated
+        if "—" in buckets:
+            order.append("—")
+        for l in order:
+            groups.append((l, buckets[l]))
+    else:  # project
+        buckets = {}
+        for s in rest:
+            key = project_short(s.get("project_name") or "") or "(none)"
+            buckets.setdefault(key, []).append(s)
+        for l in sorted(buckets,
+                        key=lambda l: max((m.get("last_ts") or "") for m in buckets[l]),
+                        reverse=True):
+            groups.append((l, buckets[l]))
+    return groups
 
 
 def _load_sort() -> list[dict]:
@@ -1853,7 +1903,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "[bold cyan]Display modes[/bold cyan]\n"
                 "  [yellow]Ctrl-G[/yellow]      Cluster (topic) mode\n"
                 "  [yellow]Ctrl-T[/yellow]      Tree (parent/child) mode\n"
-                "  [yellow]Ctrl-O[/yellow]      Project groups (Desktop-like)\n"
+                "  [yellow]Ctrl-O[/yellow]      Cycle grouping: none / Date / Project\n"
                 "  [yellow]Tab[/yellow]         Preview: full ↔ summary\n\n"
                 "[bold cyan]Split-live (RECAP_SPLIT_LIVE=1)[/bold cyan]\n"
                 "  [yellow]Enter[/yellow]       Open / focus the live claude pane\n"
@@ -1861,9 +1911,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]F4[/yellow]          Hide / show the session list\n"
                 "  [yellow]Ctrl-B[/yellow]      Release focus claude → list\n"
                 "  [yellow]Ctrl-W[/yellow]      Close live tab   [yellow]Ctrl-C[/yellow] force-quit\n\n"
-                "[bold cyan]Sort[/bold cyan]\n"
-                "  Column header click  — sort by that column\n"
-                "  Click again          — reverse direction\n\n"
+                "[bold cyan]Group / Sort (top-right dropdowns, Desktop-style)[/bold cyan]\n"
+                "  Group by  Date / Project / None   (or Ctrl-O)\n"
+                "  Sort by   Recency / Created time / Alphabetically\n"
+                "  (clicking a column header still sorts too)\n\n"
                 "[dim]Press ? or Esc to close[/dim]",
                 id="help-content",
             )
@@ -1886,7 +1937,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("ctrl+p", "toggle_fav", "★"),
             Binding("ctrl+g", "toggle_cluster", "Cluster"),
             Binding("ctrl+t", "toggle_tree", "Tree"),
-            Binding("ctrl+o", "toggle_desktop", "Proj"),
+            Binding("ctrl+o", "cycle_group", "Group"),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
             Binding("question_mark", "help", "Help", priority=True),
             # Split-live: open/attach a live claude as a tab; navigate tabs; and
@@ -1906,7 +1957,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         Screen { layout: vertical; }
         #searchrow { dock: top; height: 3; }
         #search { width: 1fr; border: tall $accent; }
-        #sortsel { width: 30; }
+        #groupsel { width: 16; }
+        #sortsel { width: 20; }
         #statusbar { height: 1; background: $surface; color: $warning; }
         #main { layout: horizontal; height: 1fr; }
         #table { width: 60%; }
@@ -1930,8 +1982,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                         "•  :fav  :hidden  :open  :active  :recent",
                             id="search")
                 yield Select(
-                    [("Last activity", "last"), ("Started (newest)", "date"),
-                     ("Title A-Z", "title"), ("Project groups", "project")],
+                    [("Date", "date"), ("Project", "project"), ("None", "none")],
+                    prompt="Group", id="groupsel",
+                )
+                yield Select(
+                    [("Recency", "last"), ("Created time", "date"),
+                     ("Alphabetically", "title")],
                     prompt="Sort", id="sortsel",
                 )
             yield Static("", id="statusbar")
@@ -2069,14 +2125,18 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             view_mode = _get_view_mode()
             tree_mode = _get_tree_mode() and len(all_sessions) <= 1000
             cluster_mode = _get_cluster_mode()
-            desktop_mode = _get_desktop_mode()
-            show_proj_col = show_project or desktop_mode
+            group_by = _get_group_by()
+            # Cluster / tree are their own layouts and take precedence; otherwise
+            # apply the Claude-Desktop-style grouping (Pinned + date/project).
+            grouping = "none" if (cluster_mode or tree_mode) else group_by
+            show_proj_col = show_project or (grouping == "project")
             tree_prefixes: dict[str, str] = {}
 
-            if desktop_mode:
-                # Claude-Desktop-like: group by project, recency-sorted, active atop.
-                _desktop_group_sort(visible)
-            elif cluster_mode:
+            if grouping != "none":
+                # Order by the current Sort spec; _build_groups only partitions,
+                # preserving this within-group order.
+                _apply_sort(visible, _load_sort())
+            if cluster_mode:
                 # Apply the user sort first so cluster members keep that order
                 # inside each group (stable sort below preserves it).
                 _apply_sort(visible, _load_sort())
@@ -2160,8 +2220,33 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # would match them but the renderer would drop every one.
             show_hidden = (view_mode == "show-hidden"
                            or ":hidden" in self._parse_query(query)[0])
+
+            # Claude-Desktop-style sections: partition the (already sorted) rows
+            # into Pinned + date/project groups, then remember which row each
+            # section header should precede. grouping='none' -> no headers.
+            groups = (_build_groups(visible, grouping, set(favorites), datetime.now())
+                      if grouping != "none" else [(None, visible)])
+            header_before: dict[str, str] = {}
+            flat: list[dict] = []
+            for _hdr, _members in groups:
+                _vis = [m for m in _members
+                        if not (m["id"] in hidden and not show_hidden)]
+                if not _vis:
+                    continue
+                if _hdr is not None:
+                    header_before[_vis[0]["id"]] = _hdr
+                flat.extend(_vis)
+            visible = flat
+
             n = 0
+            n_sessions = 0
             for s in visible:
+                # Emit a section-header row just before its first member.
+                if s["id"] in header_before:
+                    hdr_cells = ["" for _ in specs]
+                    hdr_cells[1] = Text(header_before[s["id"]], style="bold #7aa2f7")
+                    table.add_row(*hdr_cells, key=f"__hdr__{n}")
+                    n += 1
                 is_hidden = s["id"] in hidden
                 if is_hidden and not show_hidden:
                     continue
@@ -2209,6 +2294,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 row.append(title_cell)
                 table.add_row(*row, key=s["id"])
                 n += 1
+                n_sessions += 1
+            self._n_sessions = n_sessions
             if n and 0 <= saved_cursor < n:
                 try:
                     table.move_cursor(row=saved_cursor)
@@ -2218,7 +2305,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def _update_subtitle(self) -> None:
             table = self.query_one("#table", DataTable)
-            n = table.row_count
+            # Section-header rows inflate row_count; use the tracked session count.
+            n = getattr(self, "_n_sessions", table.row_count)
 
             # Sort: show first active sort key
             _COL_LABEL = {
@@ -2240,11 +2328,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Mode toggles with Rich markup color
             tree_str = "[green]ON[/green]" if _get_tree_mode() else "[dim]OFF[/dim]"
             cluster_str = "[green]ON[/green]" if _get_cluster_mode() else "[dim]OFF[/dim]"
-            desktop_str = "[green]ON[/green]" if _get_desktop_mode() else "[dim]OFF[/dim]"
+            _GROUP_LABEL = {"none": "[dim]off[/dim]", "date": "[green]Date[/green]",
+                            "project": "[green]Project[/green]"}
+            group_str = _GROUP_LABEL.get(_get_group_by(), "[dim]off[/dim]")
 
             sep = "  [dim]·[/dim]  "
             text = (f"  {n} sessions{sep}{sort_str}{sep}"
-                    f"{scope}{sep}Tree: {tree_str}{sep}Cluster: {cluster_str}{sep}Proj: {desktop_str}")
+                    f"{scope}{sep}Group: {group_str}{sep}Tree: {tree_str}{sep}Cluster: {cluster_str}")
             self.query_one("#statusbar", Static).update(text)
 
         def _cursor_sid(self) -> str | None:
@@ -2253,7 +2343,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return None
             try:
                 row_key, _ = table.coordinate_to_cell_key((table.cursor_row, 0))
-                return str(row_key.value) if row_key else None
+                if not row_key:
+                    return None
+                val = str(row_key.value)
+                return None if val.startswith("__hdr__") else val
             except Exception:
                 return None
 
@@ -2319,6 +2412,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def on_data_table_row_highlighted(self, event) -> None:
             sid = str(event.row_key.value) if event.row_key else None
+            if sid and sid.startswith("__hdr__"):
+                return   # section-header row — nothing to preview / resume
             # Claude-Desktop-like: highlighting a row shows its content on the
             # right — a LIVE session switches to its terminal tab, a non-live one
             # shows the static preview. Focus stays on the list so arrow-browsing
@@ -2596,29 +2691,30 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 )
 
         def on_select_changed(self, event) -> None:
-            # Claude-Desktop-like sort dropdown (the list is too narrow to sort
-            # by clicking column headers). Each option is a flat sort preset or
-            # the project-grouping view; picking one clears the other modes.
+            # Two Claude-Desktop-like dropdowns (top-right): "Group" (grouping
+            # axis) and "Sort" (within-group order). The list is too narrow to
+            # sort by clicking column headers, so these drive it.
+            sel = getattr(event, "select", None) or getattr(event, "control", None)
+            sel_id = getattr(sel, "id", None)
             v = getattr(event, "value", None)
-            if v not in ("last", "date", "title", "project"):
-                return   # ignore the blank prompt / any other Select
-            if _get_tree_mode():
-                _toggle_tree_mode()
-            if _get_cluster_mode():
-                _toggle_cluster_mode()
-            if v == "project":
-                if not _get_desktop_mode():
-                    _toggle_desktop_mode()
-            else:
-                if _get_desktop_mode():
-                    _toggle_desktop_mode()
-                col, direction = {"last": ("last", "desc"),
-                                  "date": ("date", "desc"),
-                                  "title": ("title", "asc")}[v]
-                _save_sort([{"col": col, "dir": direction},
-                            {"col": "-", "dir": "desc"},
-                            {"col": "-", "dir": "desc"}])
-            self._refresh_table()
+            if sel_id == "groupsel":
+                if v in ("none", "date", "project"):
+                    if v != "none":   # grouping needs the flat display modes off
+                        if _get_tree_mode():
+                            _toggle_tree_mode()
+                        if _get_cluster_mode():
+                            _toggle_cluster_mode()
+                    _set_group_by(v)
+                    self._refresh_table()
+            elif sel_id == "sortsel":
+                if v in ("last", "date", "title"):
+                    col, direction = {"last": ("last", "desc"),
+                                      "date": ("date", "desc"),
+                                      "title": ("title", "asc")}[v]
+                    _save_sort([{"col": col, "dir": direction},
+                                {"col": "-", "dir": "desc"},
+                                {"col": "-", "dir": "desc"}])
+                    self._refresh_table()
 
         def on_input_changed(self, event) -> None:
             self._refresh_table()
@@ -2643,13 +2739,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def action_toggle_tree(self) -> None:
             new_on = _toggle_tree_mode()
-            # Tree / cluster / desktop are mutually exclusive display modes —
-            # turn the others off to keep the saved state consistent.
+            # Tree / cluster / grouping are mutually exclusive layouts — turn
+            # the others off to keep the saved state consistent.
             if new_on:
                 if _get_cluster_mode():
                     _toggle_cluster_mode()
-                if _get_desktop_mode():
-                    _toggle_desktop_mode()
+                _set_group_by("none")
             self._refresh_table()
 
         def action_toggle_cluster(self) -> None:
@@ -2657,18 +2752,24 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if new_on:
                 if _get_tree_mode():
                     _toggle_tree_mode()
-                if _get_desktop_mode():
-                    _toggle_desktop_mode()
+                _set_group_by("none")
             self._refresh_table()
 
-        def action_toggle_desktop(self) -> None:
-            # Claude-Desktop-like view: group by project, Last desc, active pinned.
-            new_on = _toggle_desktop_mode()
-            if new_on:
+        def action_cycle_group(self) -> None:
+            # Ctrl-O cycles the Claude-Desktop-style grouping: none -> Date ->
+            # Project -> none. (The "Group" dropdown sets it explicitly too.)
+            new = {"none": "date", "date": "project",
+                   "project": "none"}.get(_get_group_by(), "date")
+            if new != "none":
                 if _get_tree_mode():
                     _toggle_tree_mode()
                 if _get_cluster_mode():
                     _toggle_cluster_mode()
+            _set_group_by(new)
+            try:   # keep the dropdown's shown value in sync
+                self.query_one("#groupsel").value = new
+            except Exception:
+                pass
             self._refresh_table()
 
         def action_preview_full(self) -> None:
