@@ -147,7 +147,7 @@ _WAITING_RE = re.compile(
     re.IGNORECASE,
 )
 # A multi-line numbered menu (>=2 "N. text" lines) is also a forced choice.
-_MENU_RE = re.compile(r"(?:^\s*\d+\.\s+\S.*\n){2,}", re.MULTILINE)
+_MENU_RE = re.compile(r"(?:^\s*\d+\.\s+\S.*$\n?){2,}", re.MULTILINE)
 
 
 def classify_pty_status(screen_text: str, title: str = "") -> str:
@@ -392,6 +392,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         self._stream = None          # pyte.Stream (feeds str)
         self._alt = AltScreenTracker()
         self._scroll = 0             # lines scrolled back (0 = live bottom)
+        self._esc_carry = ""         # trailing partial escape held across read()s
         self._reader: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._lock = threading.Lock()   # guards pyte feed vs render_line read
@@ -567,9 +568,8 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
     def on_mouse_scroll_up(self, event) -> None:    # events.MouseScrollUp
         if self._screen is None:
             return
-        with self._lock:
-            maxs = len(self._screen.history.top)
-        self._scroll = min(self._scroll + 3, maxs)
+        with self._lock:   # same lock the reader uses to bump _scroll in _consume
+            self._scroll = min(self._scroll + 3, len(self._screen.history.top))
         try:
             event.stop()
         except Exception:
@@ -577,8 +577,11 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         self.refresh()
 
     def on_mouse_scroll_down(self, event) -> None:  # events.MouseScrollDown
-        if self._scroll:
-            self._scroll = max(0, self._scroll - 3)
+        with self._lock:
+            moved = self._scroll > 0
+            if moved:
+                self._scroll = max(0, self._scroll - 3)
+        if moved:
             self.refresh()
         try:
             event.stop()
@@ -635,6 +638,15 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         # sentinel, then split the feed at each alt-screen enter/leave boundary,
         # reset()-ing pyte's single buffer there (it has no second buffer) so a
         # pre-alt shell prompt and claude's frames never share one buffer.
+        # Reassemble an escape sequence cut at the read() boundary: the pre-pyte
+        # scrubs below are stateless, so a split \x1b[>4;2m / \x1b[?1049h would
+        # slip through. Hold a SHORT trailing partial-escape for the next chunk.
+        chunk = self._esc_carry + chunk
+        self._esc_carry = ""
+        _m = re.search(r"\x1b(?:[\[\]][0-9;:<>=?]*)?$", chunk)
+        if _m is not None and (len(chunk) - _m.start()) < 32:
+            self._esc_carry = chunk[_m.start():]
+            chunk = chunk[:_m.start()]
         chunk = chunk.replace("0011Ignore", "")
         chunk = _PRIVATE_SGR_RE.sub("", chunk)   # drop XTMODKEYS \x1b[>4;2m etc. (pyte misreads as SGR-4 underline)
         if not chunk:
@@ -702,24 +714,26 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         """Debounce: a new status must persist >=2 ticks (reader OR host poll)
         before it flips (spinners momentarily clear the line and would otherwise
         flicker Idle<->Busy). Busy is reported immediately (responsiveness); the
-        flip OUT of Busy is what we debounce."""
-        if new == self._status:
-            self._pending_status = None
-            self._pending_ticks = 0
-            return
-        if new == "busy":
-            self._set_status("busy")
-            return
-        # leaving busy / changing among waiting/idle: require persistence
-        if new == self._pending_status:
-            self._pending_ticks += 1
-        else:
-            self._pending_status = new
-            self._pending_ticks = 1
-        if self._pending_ticks >= 2:
-            self._set_status(new)
-            self._pending_status = None
-            self._pending_ticks = 0
+        flip OUT of Busy is what we debounce. Guarded by self._lock because BOTH
+        the reader thread (_consume) and the UI poll (refresh_status) call it."""
+        with self._lock:
+            if new == self._status:
+                self._pending_status = None
+                self._pending_ticks = 0
+                return
+            if new == "busy":
+                self._set_status("busy")
+                return
+            # leaving busy / changing among waiting/idle: require persistence
+            if new == self._pending_status:
+                self._pending_ticks += 1
+            else:
+                self._pending_status = new
+                self._pending_ticks = 1
+            if self._pending_ticks >= 2:
+                self._set_status(new)
+                self._pending_status = None
+                self._pending_ticks = 0
 
     def _set_status(self, status: str) -> None:
         self._status = status
@@ -781,6 +795,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         self._stop.set()
         pty, pid = self._pty, self._pid
         self._pty = None
+        self._pid = None        # idempotent: a 2nd kill() must not re-taskkill a (recycled) PID
         if pty is not None:
             try:
                 pty.close(force=True)   # → terminate() → cancel_io(): unblock reader fast
