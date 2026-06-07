@@ -199,7 +199,10 @@ def classify_pty_status(screen_text: str, title: str = "") -> str:
     Priority: Waiting (a visible prompt) > Busy > Idle. `screen_text` should be
     the CURRENT screen (pyte .display), not a rolling byte tail.
     """
-    t = _ANSI_RE.sub("", screen_text or "")[-2000:]
+    # Slice to the tail BEFORE the ANSI-strip: pyte's .display is already
+    # escape-free and the classifier only needs the last ~2000 chars, so scrubbing
+    # the whole (possibly huge) screen on every chunk is wasted work.
+    t = _ANSI_RE.sub("", (screen_text or "")[-2000:])
     # A visible permission / forced-choice prompt is the strongest "needs you".
     if _WAITING_RE.search(t) or _MENU_RE.search(t):
         return "waiting"
@@ -208,7 +211,8 @@ def classify_pty_status(screen_text: str, title: str = "") -> str:
     if g and 0x2800 <= ord(g) <= 0x28FF:
         return "busy"
     # Corroborating body markers in case the title was missed this tick.
-    last_line = t.splitlines()[-1] if t.splitlines() else ""
+    _lines = t.splitlines()
+    last_line = _lines[-1] if _lines else ""
     if _BUSY_RE.search(t) or _SPINNER_RE.search(last_line):
         return "busy"
     return "idle"
