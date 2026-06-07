@@ -319,16 +319,31 @@ for _i, _ch in enumerate("abcdefghijklmnopqrstuvwxyz", 1):
 # A few extra control combos readline / claude use.
 _KEYMAP.update({
     "ctrl+@": "\x00", "ctrl+space": "\x00",
-    "ctrl+backslash": "\x1c", "ctrl+]": "\x1d",
-    "ctrl+^": "\x1e", "ctrl+underscore": "\x1f",
+    "ctrl+backslash": "\x1c", "ctrl+right_square_bracket": "\x1d",
+    "ctrl+circumflex_accent": "\x1e", "ctrl+underscore": "\x1f",
 })
 
-#: The key that releases focus back to the session list (the escape hatch).
-#: A focused terminal swallows every key, so without this the user is trapped.
-#: ctrl+f1 is NOT reliably delivered by Windows ConPTY; ctrl+b (tmux-style
-#: prefix) is, and claude rarely needs it. Popped from _KEYMAP so it is never
-#: forwarded to the child.
-RELEASE_FOCUS_KEY = "ctrl+b"
+
+def _normalize_key(spec: str) -> str:
+    """Map a human key spec (e.g. 'ctrl+]') to Textual's key name
+    ('ctrl+right_square_bracket') so RECAP_RELEASE_KEY accepts either form."""
+    s = (spec or "").strip().lower()
+    repl = {"]": "right_square_bracket", "[": "left_square_bracket",
+            "\\": "backslash", "_": "underscore", "^": "circumflex_accent"}
+    if "+" in s:
+        head, _, tail = s.rpartition("+")
+        return f"{head}+{repl.get(tail, tail)}"
+    return repl.get(s, s)
+
+#: The key that releases focus back to the session list (the escape hatch). A
+#: focused terminal swallows every key, so without this the user is trapped. Esc
+#: goes to claude (interrupt) and the readline editing keys (Ctrl+A/B/E/W/K/…) are
+#: forwarded, so the default is Ctrl+] — a control char ConPTY delivers reliably,
+#: rarely needed in claude (readline char-search). Override with RECAP_RELEASE_KEY
+#: (human form like 'ctrl+]' or a Textual name). Popped from _KEYMAP so it is
+#: never forwarded to the child. NOTE: Textual names ']' as right_square_bracket,
+#: so the literal 'ctrl+]' string would never match — _normalize_key fixes that.
+RELEASE_FOCUS_KEY = _normalize_key(os.environ.get("RECAP_RELEASE_KEY") or "ctrl+]")
 _KEYMAP.pop(RELEASE_FOCUS_KEY, None)
 # F2/F3 are reserved by recap for prev/next tab (priority bindings); never
 # forward them to the child, so tab-switching works even while a pane is focused.
@@ -345,6 +360,15 @@ def encode_key(key: str, character: Optional[str]) -> Optional[str]:
     mapped = _KEYMAP.get(key)
     if mapped is not None:
         return mapped
+    # Meta / Alt = ESC prefix — readline word ops (alt+b/f/d backward/forward/
+    # kill-word, alt+. , alt+backspace = backward-kill-word) must reach claude too.
+    if key.startswith("alt+"):
+        rest = key[4:]
+        if rest == "backspace":
+            return "\x1b\x7f"
+        if len(rest) == 1:
+            return "\x1b" + rest
+        return None   # alt+<named> (arrows etc.) aren't readline word ops
     # Printable single char (letters, digits, punctuation, space, IME unicode).
     if character and character.isprintable():
         return character
