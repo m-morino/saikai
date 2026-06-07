@@ -439,6 +439,13 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         self._reader: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._lock = threading.Lock()   # guards pyte feed vs render_line read
+        # _scr_ver bumps on every pyte mutation (feed/reset) under _lock so
+        # _current_screen can skip re-joining an unchanged screen, and the host
+        # poll can skip re-classifying a stable (non-busy) pane with no new output.
+        self._scr_ver = 0
+        self._cached_ver = -1
+        self._cached_screen: tuple = ("", "")
+        self._last_poll_ver = -1
 
         # status detection
         self._tail = ""                  # rolling decoded tail for classify
@@ -725,6 +732,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
                 if added > 0:
                     self._scroll = min(self._scroll + added,
                                        len(self._screen.history.top))
+            self._scr_ver += 1   # screen mutated → invalidates the _current_screen cache
         # Classify from the CURRENT screen + claude's OSC-0 title (its own state
         # glyph), not a rolling byte tail: a tail keeps stale "esc to interrupt"
         # / answered prompts that scrolled up and would misclassify an idle pane.
@@ -738,12 +746,18 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         with self._lock:
             if self._screen is None:
                 return "", ""
+            # Reuse the last join when the screen hasn't changed since (the host
+            # poll and render path both call this between feeds).
+            if self._scr_ver == self._cached_ver:
+                return self._cached_screen
             try:
                 txt = "\n".join(self._screen.display)
             except Exception:
                 txt = ""
             title = getattr(self._screen, "title", "") or ""
-        return txt, title
+            self._cached_ver = self._scr_ver
+            self._cached_screen = (txt, title)
+            return txt, title
 
     def refresh_status(self) -> None:
         """Re-classify from the current screen + title. The host calls this
@@ -752,6 +766,13 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         second tick on the timer cadence."""
         if self._screen is None or self.is_dead:
             return
+        # Skip the screen-join + classify for a STABLE pane that produced no
+        # output since the last poll — UNLESS it is still 'busy', which must keep
+        # being re-checked so it can flip to idle (the debounce's 2nd tick) when
+        # claude stops without emitting anything further.
+        if self._scr_ver == self._last_poll_ver and self._status != "busy":
+            return
+        self._last_poll_ver = self._scr_ver
         txt, title = self._current_screen()
         self._update_status(classify_pty_status(txt, title))
 
