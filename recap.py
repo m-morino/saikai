@@ -1342,6 +1342,7 @@ def summarize_all_parallel(sessions: list[dict], max_workers: int = 5):
           file=sys.stderr)
 
     done = 0
+    ok = 0
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(summarize_session, s): s for s in pending}
         for fut in as_completed(futures):
@@ -1350,9 +1351,16 @@ def summarize_all_parallel(sessions: list[dict], max_workers: int = 5):
                 s["summary"] = fut.result()
             except Exception:
                 s["summary"] = _first_msg(s)
+            # A real Haiku summary is cached by summarize_session; a fall-back to
+            # the first message is NOT. Re-read the cache to count honest wins so
+            # the UI can say "showing first messages" instead of falsely "ready".
+            if _load_cache(s["id"], s["mtime"], s.get("last_ts", "")):
+                ok += 1
             done += 1
             print(f"\r  [{done}/{len(pending)}] ", end="", file=sys.stderr, flush=True)
     print(file=sys.stderr)
+    _bg_summarize["succeeded"] = ok
+    _bg_summarize["attempted"] = len(pending)
 
     for s in sessions:
         if "summary" not in s:
@@ -2596,16 +2604,27 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         pass
 
         def _join_bg_summarize(self) -> None:
-            """Worker thread: waits for bg summarization then refreshes table."""
+            """Worker thread: waits for bg summarization, refreshes the table, and
+            reports HONESTLY — if Haiku/network failed, every session quietly fell
+            back to its first message, so don't claim "ready"."""
             thread = _bg_summarize.get("thread")
             if thread:
                 thread.join()
             if not getattr(self, "is_running", True):
                 return   # app quit while summarizing — don't marshal into a dead App
+            ok = _bg_summarize.get("succeeded", 0)
+            attempted = _bg_summarize.get("attempted", _bg_summarize.get("pending", 0))
+            if attempted and ok == 0:
+                msg, sev = (f"summaries unavailable ({attempted}) — Haiku/network "
+                            "error; showing first messages", "warning")
+            elif attempted:
+                msg, sev = (f"summaries ready ({ok}/{attempted})", "information")
+            else:
+                msg, sev = ("summaries ready", "information")
             try:
                 self.call_from_thread(self._refresh_table)
                 self.call_from_thread(
-                    lambda: self.notify("Summaries ready", severity="information", timeout=3)
+                    lambda: self.notify(msg, severity=sev, timeout=4)
                 )
             except Exception:
                 pass
@@ -3209,6 +3228,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if _LIVE_TERM is None:
                 sid = self._cursor_sid()
                 if sid:
+                    # Probe BEFORE tearing down the picker: here resume runs only
+                    # AFTER self.exit() leaves the alt-screen, so a "claude not on
+                    # PATH" error would print into a half-restored terminal and
+                    # scroll away — the user just sees recap vanish. Surface it now.
+                    if shutil.which("claude") is None:
+                        self.notify("claude not found on PATH — cannot resume",
+                                    severity="error", title="recap", timeout=8)
+                        return
                     self.exit(sid)
                 return
             # Split-live: if a terminal is focused, Enter belongs to claude.
@@ -3800,7 +3827,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def action_copy_prompt(self) -> None:
             # F9: copy the selected session's opening user prompt to the
             # clipboard so it can be reused to start a similar task (Crystal-style
-            # prompt reuse). OSC-52 first (works over SSH), `clip` as fallback.
+            # prompt reuse). On Windows use `clip` (reliable); OSC-52 elsewhere
+            # (works over SSH).
             sid = self._cursor_sid()
             if not sid:
                 return
@@ -3809,13 +3837,23 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.notify("no user prompt to copy", timeout=3)
                 return
             text = msgs[0]
-            try:
-                self.copy_to_clipboard(text)
-            except Exception:
+            copied = False
+            if sys.platform == "win32":
+                # Textual's copy_to_clipboard is OSC-52, which many Windows console
+                # hosts silently DROP while never raising — so the old code always
+                # claimed success and the `clip` fallback was dead code. Use `clip`
+                # (deterministic) first; DEVNULL so it can't bleed bytes into the
+                # Textual screen.
                 try:
-                    import subprocess
-                    subprocess.run("clip", input=text.encode("utf-16-le"),
-                                   shell=True, check=False)
+                    subprocess.run(["clip"], input=text.encode("utf-16-le"),
+                                   check=True, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                    copied = True
+                except Exception:
+                    copied = False
+            if not copied:
+                try:
+                    self.copy_to_clipboard(text)   # OSC-52: SSH / non-Windows
                 except Exception as e:
                     self.notify(f"copy failed: {e!r}", severity="error", timeout=4)
                     return
@@ -3852,18 +3890,45 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def _auto_tick(self) -> None:
             # Quiet periodic re-scan (RECAP_AUTO_REFRESH). Skips while a live pane
-            # is focused so it doesn't disrupt typing into claude.
+            # is focused so it doesn't disrupt typing into claude. The scan itself
+            # — disk walk + parse + O(N^2) _build_forest — runs OFF the UI thread:
+            # set_interval fires ON the UI thread, so doing it inline froze the
+            # list every interval while the user read. Mirror _build_forest_bg —
+            # reload_fn() builds a FRESH local list and touches no shared state, so
+            # it's safe off-thread; only the swap (_apply_fresh_sessions mutates
+            # all_sessions + repaint) is marshalled back. No PTY/terminal lock is
+            # involved, so call_from_thread here can't deadlock. _auto_busy stops
+            # overlapping scans if an interval is shorter than a scan.
             if reload_fn is None or self._focused_terminal() is not None:
                 return
-            _invalidate_active_sessions()   # re-read the live registry, not the launch snapshot
-            try:
-                fresh = reload_fn()
-            except Exception as e:
-                _log(f"auto-reload failed: {e!r}")
+            if getattr(self, "_auto_busy", False):
                 return
-            _log(f"auto-reload: {len(fresh)} sessions")
-            self._apply_fresh_sessions(fresh)
-            self._refresh_table()
+            self._auto_busy = True
+            _invalidate_active_sessions()   # re-read the live registry, not the launch snapshot
+            import threading as _thr
+
+            def _work():
+                try:
+                    fresh = reload_fn()
+                except Exception as e:
+                    _log(f"auto-reload failed: {e!r}")
+                    fresh = None
+
+                def _apply():
+                    self._auto_busy = False
+                    if fresh is not None:
+                        _log(f"auto-reload: {len(fresh)} sessions")
+                        self._apply_fresh_sessions(fresh)
+                        self._refresh_table()
+                try:
+                    if getattr(self, "is_running", True):
+                        self.call_from_thread(_apply)
+                    else:
+                        self._auto_busy = False
+                except Exception:
+                    self._auto_busy = False
+
+            _thr.Thread(target=_work, daemon=True).start()
 
         def action_refresh(self) -> None:
             # F5: re-scan ~/.claude/projects for new / updated sessions
