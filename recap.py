@@ -2427,6 +2427,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # rows this thread hasn't reached. Open sessions render fresh, skip.
             import threading as _thr
             _thr.Thread(target=self._prewarm_previews, daemon=True).start()
+            # Build the cross-session forest OFF the pre-paint path (it only feeds
+            # tree display + the related-header). parent_id was pre-set to None so
+            # the flat list is correct meanwhile; this repaints once when done.
+            if len(all_sessions) <= 1000 and not getattr(self, "_forest_built", False):
+                _thr.Thread(target=self._build_forest_bg, daemon=True).start()
             # If background summarization is running, start a watcher thread
             # that refreshes the table when it finishes.
             bg = _bg_summarize.get("thread")
@@ -2438,6 +2443,24 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 )
                 import threading as _thr
                 _thr.Thread(target=self._join_bg_summarize, daemon=True).start()
+
+        def _build_forest_bg(self) -> None:
+            """Daemon: compute the cross-session forest off the pre-paint path,
+            then repaint once. Pure CPU (no subprocess / pty / lock), so an
+            abandoned run at exit leaks nothing. parent_id was pre-initialised to
+            None, so tree display + the related-header just fill in when this
+            lands; reads of a half-assigned forest are GIL-atomic (None or a valid
+            id), never torn."""
+            try:
+                _build_forest(all_sessions)
+                self._forest_built = True
+            except Exception:
+                return
+            try:
+                if getattr(self, "is_running", True):
+                    self.call_from_thread(self._refresh_table)
+            except Exception:
+                pass
 
         def _prewarm_previews(self) -> None:
             """Daemon thread: render + cache previews for all non-open sessions
@@ -4814,6 +4837,7 @@ def main():
     for s in sessions:
         cached = (_load_cache(s["id"], s["mtime"], s.get("last_ts", ""))
                   if not s.get("is_open") else None)
+        s["_cache_hit"] = cached      # reused by the Phase-2 needs_llm probe (avoid a 2nd read)
         s["summary"] = (cached if cached and not _looks_like_refusal(cached)
                         else s["ai_title"] or _first_msg(s))
 
@@ -4823,7 +4847,7 @@ def main():
         import threading as _thr
         needs_llm = [s for s in sessions
                      if not s["ai_title"] and not s.get("is_open")
-                     and _load_cache(s["id"], s["mtime"], s.get("last_ts", "")) is None]
+                     and s.get("_cache_hit") is None]
         if needs_llm:
             _t = _thr.Thread(target=summarize_all_parallel, args=(sessions,),
                              daemon=True)
@@ -4840,7 +4864,11 @@ def main():
     # the top-related session, even when --tree (nested display) is off. The forest
     # is O(N²) but each comparison is a cheap structural score (no Haiku); guard
     # with N <= 1000 to keep startup snappy on very large histories.
-    if len(sessions) <= 1000:
+    # parent_id feeds tree display + the related-header, NOT first paint. The
+    # static --table path needs it now; the interactive picker initialises it
+    # cheaply here and builds the real forest in the background after mount (see
+    # on_mount / _build_forest_bg), so a large history doesn't gate the first frame.
+    if args.table and len(sessions) <= 1000:
         _build_forest(sessions)
     else:
         for s in sessions:
