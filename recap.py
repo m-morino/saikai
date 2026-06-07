@@ -2953,10 +2953,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 return
             if self.focused is table:
-                if event.key == "space":
-                    # Space toggles a batch-launch mark on the cursor row. (A
-                    # leading space in the search box was useless anyway; to
-                    # search, type a letter first — space then works in the box.)
+                if event.key == "space" and _LIVE_TERM is not None:
+                    # Space toggles a batch-launch mark (split-live only — batch
+                    # launch opens one live pane per mark). In the default launcher
+                    # mode space falls through to search (there's no batch there).
                     self.action_toggle_mark()
                     event.stop()
                     return
@@ -3096,7 +3096,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         f"backstop — close some (Ctrl-W) or raise RECAP_MAX_LIVE",
                         severity="warning", timeout=6)
                     break
-                self._open_or_attach_live(sid)
+                self._open_or_attach_live(sid, refresh=False)   # repaint once below
                 opened += 1
             self._refresh_table()
 
@@ -3122,7 +3122,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
 
-        def _open_or_attach_live(self, sid: str) -> None:
+        def _open_or_attach_live(self, sid: str, refresh: bool = True) -> None:
             assert _LIVE_TERM is not None and self._live is not None
             tabs = self.query_one("#right", TabbedContent)
             pane_id = self._live.pane_id(sid)
@@ -3189,7 +3189,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
             # Refresh the table so the marker column shows this row is now live.
-            self._refresh_table()
+            # Batch launch passes refresh=False and repaints ONCE after all opens —
+            # N synchronous full rebuilds here serialised the opens and slowed
+            # multi-launch (the claude spawns couldn't start back-to-back).
+            if refresh:
+                self._refresh_table()
 
         def _request_refresh(self) -> None:
             """Coalesce frequent table-refresh requests (live status flips, the
