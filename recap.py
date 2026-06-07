@@ -2693,6 +2693,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
             n = 0
             n_sessions = 0
+            first_session_row = None   # row index of the first real session (cursor-off-header)
             self._header_labels = {}
             for s in visible:
                 # Emit a section-header row just before its first member.
@@ -2743,6 +2744,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     row = [marker, fmt_last_active(s),
                            Text(raw_title, style=project_color.get(proj_txt, ""))]
                     table.add_row(*row, key=s["id"])
+                    if first_session_row is None:
+                        first_session_row = n
                     n += 1
                     n_sessions += 1
                     continue
@@ -2758,6 +2761,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     row.append(Text(topic_full[:14], style=topic_color.get(topic_full, "")))
                 row.append(raw_title)
                 table.add_row(*row, key=s["id"])
+                if first_session_row is None:
+                    first_session_row = n
                 n += 1
                 n_sessions += 1
             self._n_sessions = n_sessions
@@ -2773,6 +2778,24 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if not restored and n and 0 <= saved_cursor < n:
                 try:
                     table.move_cursor(row=saved_cursor)
+                except Exception:
+                    pass
+            if n_sessions and first_session_row is not None and self._cursor_sid() is None:
+                # The restore (or the default row 0) landed on a section-header
+                # row, which has no session → preview/Enter would act on nothing.
+                # Nudge down to the first real session.
+                try:
+                    table.move_cursor(row=first_session_row)
+                except Exception:
+                    pass
+            elif n_sessions == 0:
+                # No session rows → no row-highlight fires → _update_preview never
+                # runs, so the preview pane would keep the last session's content
+                # and imply it matched. Clear it and say so.
+                try:
+                    pv = self.query_one("#preview", RichLog)
+                    pv.clear()
+                    pv.write("No sessions match the current search / filters.")
                 except Exception:
                     pass
             self._update_subtitle()
