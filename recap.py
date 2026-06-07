@@ -2878,8 +2878,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if _la:
                 _filt.append(f"{_la}d")
             filt_str = (f"{sep}Filter: [yellow]" + "+".join(_filt) + "[/yellow]") if _filt else ""
+            # Live-pane capacity (split-live only): how many more claude panes can
+            # still be spawned before the MAX_LIVE backstop. Green while slots
+            # remain, red at the cap.
+            live_str = ""
+            if self._live is not None:
+                cnt, mx = self._live.count, self._live.max_live
+                free = max(0, mx - cnt)
+                _col = "green" if free > 0 else "red"
+                live_str = f"{sep}Live: [{_col}]{cnt}/{mx}[/{_col}] ({free} free)"
             text = (f"  {n} sessions{sep}{sort_str}{sep}"
-                    f"{scope}{sep}Group: {group_str}{filt_str}{sep}Tree: {tree_str}{sep}Cluster: {cluster_str}")
+                    f"{scope}{sep}Group: {group_str}{filt_str}{sep}Tree: {tree_str}{sep}Cluster: {cluster_str}{live_str}")
             self.query_one("#statusbar", Static).update(text)
 
         def _cursor_sid(self) -> str | None:
