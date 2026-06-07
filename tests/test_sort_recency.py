@@ -163,6 +163,32 @@ def test_summary_cache_keys_on_last_ts():
         recap._read_json = orig
 
 
+def test_build_groups_date_order_recent_first():
+    """Single-pass bucket-max must keep Today first and older date buckets after
+    (the ordering the old double-pass max() produced)."""
+    now = datetime.now()
+    today = {"id": "t", "mtime": time.time(), "last_ts": _iso_ago(0)}
+    old = {"id": "o", "mtime": time.time() - 5 * 86400, "last_ts": _iso_ago(5)}
+    groups = recap._build_groups([old, today], "date", set(), now)
+    labels = [g[0] for g in groups]
+    assert labels[0] == "Today", labels
+    assert labels[1] != "Today" and len(labels) == 2, labels
+
+
+def test_build_groups_project_order_by_recency():
+    """Project buckets ordered by most-recent activity (single-pass bucket-max)."""
+    now = datetime.now()
+    a = {"id": "a", "mtime": time.time() - 5 * 86400, "last_ts": _iso_ago(5),
+         "project_name": "old-proj"}
+    b = {"id": "b", "mtime": time.time(), "last_ts": _iso_ago(0),
+         "project_name": "new-proj"}
+    groups = recap._build_groups([a, b], "project", set(), now)
+    labels = [g[0] for g in groups]
+    new_lbl = recap.project_short("new-proj") or "(none)"
+    old_lbl = recap.project_short("old-proj") or "(none)"
+    assert labels.index(new_lbl) < labels.index(old_lbl), labels
+
+
 def test_missing_both_is_none_not_crash():
     s = {"id": "empty"}
     assert recap._last_active_dt(s) is None
@@ -195,6 +221,10 @@ if __name__ == "__main__":
     print("PASS test_enrich_stamps_last_active_dt")
     test_summary_cache_keys_on_last_ts()
     print("PASS test_summary_cache_keys_on_last_ts")
+    test_build_groups_date_order_recent_first()
+    print("PASS test_build_groups_date_order_recent_first")
+    test_build_groups_project_order_by_recency()
+    print("PASS test_build_groups_project_order_by_recency")
     test_missing_both_is_none_not_crash()
     print("PASS test_missing_both_is_none_not_crash")
     print("ALL PASS")
