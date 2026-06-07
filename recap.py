@@ -3742,11 +3742,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     return
             if self._live is not None:
                 self._live.join_reaps()   # don't orphan the last pane's reap
+            _log("quit: Esc (no live panes left)")
             self.exit(None)
 
         def action_quit_all(self) -> None:
             # Ctrl-C: force quit — kill every live claude pane (in PARALLEL) and
             # exit; wait=True joins the reaps so no node worker is orphaned.
+            _log(f"quit: force (Ctrl-C), live={self._live.count if self._live else 0}")
             if self._live is not None:
                 self._live.kill_all(wait=True)
             self.exit(None)

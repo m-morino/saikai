@@ -46,12 +46,33 @@ error line — it never tears down the host app.
 from __future__ import annotations
 
 import atexit
+import os
 import re
 import subprocess
 import sys
 import threading
 import time
 from typing import Callable, Optional
+
+
+def _log(msg: str) -> None:
+    """Best-effort append to the shared recap.log (same file recap.py's _log
+    writes; standalone here so this module keeps no recap import). Size-bounded,
+    never raises. `[term]` tags lines from the split-live PTY layer so a
+    post-mortem can tell the process lifecycle from the list-side events."""
+    try:
+        d = os.path.join(os.path.expanduser("~"), ".cache", "recap")
+        os.makedirs(d, exist_ok=True)
+        lf = os.path.join(d, "recap.log")
+        try:
+            if os.path.getsize(lf) > 1_000_000:
+                os.replace(lf, lf + ".1")
+        except OSError:
+            pass
+        with open(lf, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  [term] {msg}\n")
+    except Exception:
+        pass
 
 
 # ── global reap-thread registry ───────────────────────────────────────────────
@@ -495,8 +516,10 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         # argv MUST be a list (pywinpty spike gotcha #3).
         self._pty = PtyProcess.spawn(self._argv, **kwargs)
         self._pid = getattr(self._pty, "pid", None)
+        _log(f"spawn: sid={(getattr(self, 'sid', None) or '?')[:8]} pid={self._pid}")
 
     def _fail(self, msg: str) -> None:
+        _log(f"spawn FAIL: sid={(getattr(self, 'sid', None) or '?')[:8]} — {msg}")
         self._spawn_error = msg
         self.is_dead = True
         try:
@@ -824,6 +847,8 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
     def _finalize(self) -> None:
         """Reader-thread teardown: mark dead, notify the host (on the UI
         thread), repaint once more so the final frame is shown."""
+        if not self.is_dead:
+            _log(f"exit: sid={(getattr(self, 'sid', None) or '?')[:8]} (claude ended)")
         self.is_dead = True
         if self._status != "dead":
             self._status = "dead"
@@ -885,6 +910,8 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         pty, pid = self._pty, self._pid
         self._pty = None
         self._pid = None        # idempotent: a 2nd kill() must not re-taskkill a (recycled) PID
+        if pid:
+            _log(f"kill: sid={(getattr(self, 'sid', None) or '?')[:8]} pid={pid}")
         if pty is not None:
             try:
                 pty.close(force=True)   # → terminate() → cancel_io(): unblock reader fast
