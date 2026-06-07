@@ -584,21 +584,29 @@ def _apply_sort(sessions: list[dict], keys: list[dict]) -> None:
         sessions.sort(key=lambda s, c=k["col"]: keyfn(s, c),
                       reverse=(k["dir"] == "desc"))
 
-def _load_cache(sid: str, mtime: float) -> str | None:
+def _load_cache(sid: str, mtime: float, last_ts: str = "") -> str | None:
     d = _read_json(CACHE_DIR / f"{sid}.json", None)
     if d is None:
         return None
-    # Cache is valid if file mtime matches (session not updated)
-    if abs(d.get("mtime", 0) - mtime) < 1.0:
-        return d.get("summary", "") or None
-    return None
+    # Validity keys on last_ts (the last *content* timestamp), not mtime. Untimed
+    # metadata appends (ai-title / permission-mode / last-prompt) bump the file
+    # mtime but NOT last_ts, so an mtime key needlessly re-summarises (Haiku cost)
+    # on those; last_ts also closes the sub-second staleness window the old mtime
+    # tolerance left. Legacy caches (no stored last_ts) fall back to the mtime
+    # tolerance so they stay valid without a one-time re-summarise of everything.
+    if "last_ts" in d:
+        valid = d.get("last_ts") == (last_ts or "")
+    else:
+        valid = abs(d.get("mtime", 0) - mtime) < 1.0
+    return (d.get("summary", "") or None) if valid else None
 
 
-def _save_cache(sid: str, mtime: float, summary: str):
+def _save_cache(sid: str, mtime: float, summary: str, last_ts: str = ""):
     _write_json(CACHE_DIR / f"{sid}.json", {
         "session_id": sid,
         "summary": summary,
         "mtime": mtime,
+        "last_ts": last_ts or "",
         "model": SUMMARY_MODEL,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -1213,13 +1221,13 @@ def summarize_session(s: dict) -> str:
         return _first_msg(s)
 
     mtime = s["mtime"]
-    cached = _load_cache(s["id"], mtime)
+    cached = _load_cache(s["id"], mtime, s.get("last_ts", ""))
     if cached is not None and not _looks_like_refusal(cached):
         return cached
 
     if not s["real_msgs"]:
         # No content to summarize — cache empty so we don't retry next time
-        _save_cache(s["id"], mtime, "")
+        _save_cache(s["id"], mtime, "", s.get("last_ts", ""))
         return ""
 
     sample = "\n---\n".join(s["real_msgs"][:5])[:3000]
@@ -1233,7 +1241,7 @@ def summarize_session(s: dict) -> str:
 
     summary = call_claude_haiku(prompt)
     if summary and not _looks_like_refusal(summary):
-        _save_cache(s["id"], mtime, summary)
+        _save_cache(s["id"], mtime, summary, s.get("last_ts", ""))
         return summary
     return _first_msg(s)
 
@@ -1242,7 +1250,7 @@ def summarize_all_parallel(sessions: list[dict], max_workers: int = 5):
     """Summarize all sessions in parallel, showing progress."""
     pending = [s for s in sessions if not s["ai_title"]
                and not s.get("is_open")   # active JSONL mtime changes → cache always stale
-               and _load_cache(s["id"], s["mtime"]) is None]
+               and _load_cache(s["id"], s["mtime"], s.get("last_ts", "")) is None]
     if not pending:
         for s in sessions:
             s["summary"] = summarize_session(s)  # cache hit / ai_title
@@ -4786,7 +4794,8 @@ def main():
     # Phase 1 (instant): fill all sessions from cache / ai_title / first_msg.
     # This runs synchronously in <1s so the UI starts immediately.
     for s in sessions:
-        cached = _load_cache(s["id"], s["mtime"]) if not s.get("is_open") else None
+        cached = (_load_cache(s["id"], s["mtime"], s.get("last_ts", ""))
+                  if not s.get("is_open") else None)
         s["summary"] = (cached if cached and not _looks_like_refusal(cached)
                         else s["ai_title"] or _first_msg(s))
 
@@ -4796,7 +4805,7 @@ def main():
         import threading as _thr
         needs_llm = [s for s in sessions
                      if not s["ai_title"] and not s.get("is_open")
-                     and _load_cache(s["id"], s["mtime"]) is None]
+                     and _load_cache(s["id"], s["mtime"], s.get("last_ts", "")) is None]
         if needs_llm:
             _t = _thr.Thread(target=summarize_all_parallel, args=(sessions,),
                              daemon=True)
@@ -4870,7 +4879,7 @@ def main():
                                 fresh.extend(extra)
             fresh.sort(key=lambda s: s["first_ts"], reverse=True)
             for s in fresh:
-                cached = (_load_cache(s["id"], s["mtime"])
+                cached = (_load_cache(s["id"], s["mtime"], s.get("last_ts", ""))
                           if not s.get("is_open") else None)
                 s["summary"] = (cached if cached and not _looks_like_refusal(cached)
                                 else s["ai_title"] or _first_msg(s))
