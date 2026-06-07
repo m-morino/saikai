@@ -301,7 +301,11 @@ def _iso_dt(ts_iso: str):
         dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
     except Exception:
         try:
-            dt = datetime.fromisoformat(ts_iso[:19])
+            # Fallback for an odd/truncated form: the leading 19 chars are UTC
+            # (transcripts are UTC). Tag UTC so the astimezone() below converts —
+            # without it the value was returned naive and mistaken for LOCAL,
+            # off by the full TZ offset (mis-bucketing near-midnight sessions).
+            dt = datetime.fromisoformat(ts_iso[:19]).replace(tzinfo=timezone.utc)
         except Exception:
             return None
     if dt.tzinfo is not None:
@@ -1000,7 +1004,7 @@ def parse_session(jsonl_path: Path) -> dict | None:
                 if t == "ai-title":
                     ai_title = obj.get("aiTitle", "") or ai_title
                 if t == "user":
-                    text = _extract_text(obj.get("message", {}).get("content", ""))
+                    text = _extract_text((obj.get("message") or {}).get("content", ""))
                     if _is_real_user_msg(text):
                         real_msgs.append(text[:800].replace("\n", " "))
     except Exception:
@@ -1025,6 +1029,16 @@ def parse_session(jsonl_path: Path) -> dict | None:
     }
     if prior_topics:
         parsed["topics"] = prior_topics
+    else:
+        # Defensive: a transient miss of `cached` (its read raced a concurrent
+        # _save_topics_to_cache) must not drop topics already on disk — re-read
+        # just before writing and preserve any we find (topics are Haiku-derived).
+        try:
+            _existing = _read_json(cache_file, None)
+            if isinstance(_existing, dict) and _existing.get("topics"):
+                parsed["topics"] = _existing["topics"]
+        except Exception:
+            pass
     try:
         _write_json(cache_file, parsed)
     except Exception:
@@ -1261,7 +1275,7 @@ def summarize_session(s: dict) -> str:
     Japanese Haiku prompt below. Treat non-CJK titles as "needs Haiku"
     and fall through; CJK titles still short-circuit for cost.
     """
-    if s["ai_title"] and _has_cjk(s["ai_title"]):
+    if s["ai_title"] and _has_cjk(s["ai_title"]) and not _looks_like_refusal(s["ai_title"]):
         return s["ai_title"]
 
     # Active sessions: JSONL mtime changes every turn → cache always invalid → skip LLM
@@ -1474,7 +1488,7 @@ def _extract_edited_files(jsonl_path, limit: int = 8) -> list[str]:
                     continue
                 if obj.get("type") != "assistant":
                     continue
-                content = obj.get("message", {}).get("content", [])
+                content = (obj.get("message") or {}).get("content", [])
                 if not isinstance(content, list):
                     continue
                 for b in content:
@@ -1573,12 +1587,12 @@ def _render_preview_full(s: dict) -> str:
                     continue
                 t = obj.get("type", "")
                 if t == "user":
-                    text = _extract_text(obj.get("message", {}).get("content", ""))
+                    text = _extract_text((obj.get("message") or {}).get("content", ""))
                     if _is_real_user_msg(text):
                         n += 1
                         lines.append(f"\033[36m▶ user [{n}]:\033[0m {text[:1200]}")
                 elif t == "assistant":
-                    content = obj.get("message", {}).get("content", [])
+                    content = (obj.get("message") or {}).get("content", [])
                     if isinstance(content, list):
                         for b in content:
                             if isinstance(b, dict) and b.get("type") == "text":
@@ -1608,7 +1622,7 @@ def _extract_session_changes(jsonl_path, max_ops: int = 40):
                     continue
                 if obj.get("type") != "assistant":
                     continue
-                content = obj.get("message", {}).get("content", [])
+                content = (obj.get("message") or {}).get("content", [])
                 if not isinstance(content, list):
                     continue
                 for b in content:
@@ -1625,6 +1639,8 @@ def _extract_session_changes(jsonl_path, max_ops: int = 40):
                             if isinstance(e, dict):
                                 ops.append((fp, "edit", e.get("old_string", ""),
                                             e.get("new_string", "")))
+                                if len(ops) >= max_ops:   # cap INSIDE the inner loop too
+                                    return ops
                     elif name == "Write":
                         ops.append((inp.get("file_path", ""), "write", "",
                                     inp.get("content", "")))
@@ -2084,16 +2100,22 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
     if valid_parsed:
         new_clusters = parsed.get("clusters") or list(set(parsed["assignments"].values()))
         new_assigns = {}
-        # Map back 8-char SIDs the LLM returned to full SIDs.
-        sid_lookup = {s["id"][:8]: s["id"] for s in sessions}
+        # Map back 8-char SIDs the LLM returned to full SIDs — over `targets` ONLY
+        # (the sessions actually classified this round), so an over-eager reply
+        # that echoes a sid OUTSIDE its task set can't overwrite a good assignment.
+        sid_lookup = {s["id"][:8]: s["id"] for s in targets}
         for short, theme in parsed["assignments"].items():
             full = sid_lookup.get(short)
             if full and isinstance(theme, str):
                 new_assigns[full] = theme.lower().strip()
 
         if force_refresh or not cache.get("assignments"):
-            assignments = new_assigns
-            cache = {"clusters": [c.lower() for c in new_clusters], "assignments": assignments}
+            # Merge over any prior assignments even on a full refresh: a partial
+            # Haiku reply (it omitted some sids — common at scale) then keeps the
+            # clusters it didn't re-mention instead of dropping them to "". new wins.
+            assignments = {**(cache.get("assignments") or {}), **new_assigns}
+            cluster_set = {c.lower() for c in new_clusters} | set(assignments.values())
+            cache = {"clusters": sorted(cluster_set), "assignments": assignments}
         else:
             assignments.update(new_assigns)
             cluster_set = set(cache.get("clusters") or []) | {c.lower() for c in new_clusters}
@@ -2105,6 +2127,9 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
               file=sys.stderr)
 
     # Apply assignments; sessions still missing fall back to per-session topic.
+    # Populate primary_topic first (it was otherwise never set, so the fallback
+    # was always "" on a Haiku miss despite the message promising a per-session topic).
+    _assign_primary_topic(sessions)
     fallback = {s["id"]: s.get("primary_topic", "") for s in sessions}
     for s in sessions:
         s["primary_topic"] = assignments.get(s["id"], fallback.get(s["id"], ""))
@@ -4413,7 +4438,7 @@ def _read_subagent_summary(agent_file: Path) -> dict:
                 if ts:
                     summary["last_ts"] = ts
                 t = obj.get("type", "")
-                text = _extract_text(obj.get("message", {}).get("content", "")) or ""
+                text = _extract_text((obj.get("message") or {}).get("content", "")) or ""
                 text = " ".join(text.split())
                 if t == "user" and not summary["first_user"]:
                     summary["first_user"] = text
@@ -4572,9 +4597,18 @@ def _tree_walk(sessions: list[dict]) -> list[tuple[dict, str]]:
             cont = "   " if is_last else "|  "
             walk(kid, prefix + cont, i == len(kids) - 1)
 
-    roots.sort(key=newest_in_tree, reverse=True)
-    for i, root in enumerate(roots):
-        walk(root, "", i == len(roots) - 1)
+    # newest_in_tree / walk recurse once per tree DEPTH; a long single-project
+    # parent chain can be ~len(sessions) deep and overflow Python's default 1000
+    # limit (RecursionError → CLI crash in --table --tree, empty tree + toast in
+    # the picker). Raise the limit for the build (gated at N<=1000, so bounded).
+    _old_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(_old_limit, len(sessions) + 200))
+    try:
+        roots.sort(key=newest_in_tree, reverse=True)
+        for i, root in enumerate(roots):
+            walk(root, "", i == len(roots) - 1)
+    finally:
+        sys.setrecursionlimit(_old_limit)
     return out
 
 
