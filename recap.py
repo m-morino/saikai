@@ -369,18 +369,21 @@ def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
         rest = [s for s in rest if s["id"] not in favorites]
     if group_by == "date":
         buckets: dict = {}
+        bmax: dict = {}     # newest activity per bucket, tracked in the assign pass
         for s in rest:
             _la = _last_active_dt(s)
-            buckets.setdefault(_date_label(_la.date() if _la else None, now), []).append(s)
+            lbl = _date_label(_la.date() if _la else None, now)
+            buckets.setdefault(lbl, []).append(s)
+            _k = _la or datetime.min
+            if _k > bmax.get(lbl, datetime.min):
+                bmax[lbl] = _k
         order = []
         if "Today" in buckets:
             order.append("Today")
         if "Yesterday" in buckets:
             order.append("Yesterday")
         dated = [l for l in buckets if l not in ("Today", "Yesterday", "—")]
-        dated.sort(key=lambda l: max((_last_active_dt(m) or datetime.min)
-                                     for m in buckets[l]),
-                   reverse=True)
+        dated.sort(key=lambda l: bmax[l], reverse=True)   # no second member re-scan
         order += dated
         if "—" in buckets:
             order.append("—")
@@ -397,13 +400,14 @@ def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
                 groups.append((l, buckets[l]))
     else:  # project
         buckets = {}
+        bmax = {}
         for s in rest:
             key = project_short(s.get("project_name") or "") or "(none)"
             buckets.setdefault(key, []).append(s)
-        for l in sorted(buckets,
-                        key=lambda l: max((_last_active_dt(m) or datetime.min)
-                                          for m in buckets[l]),
-                        reverse=True):
+            _k = _last_active_dt(s) or datetime.min
+            if _k > bmax.get(key, datetime.min):
+                bmax[key] = _k
+        for l in sorted(buckets, key=lambda l: bmax[l], reverse=True):
             groups.append((l, buckets[l]))
     return groups
 
@@ -3373,7 +3377,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self._refresh_table()
 
         def on_input_changed(self, event) -> None:
-            self._refresh_table()
+            # Coalesce keystrokes: a burst of typing collapses to ~one rebuild per
+            # frame instead of a full filter+sort+group+render over all sessions
+            # PER keystroke. Reuses the proven poll-path coalescer.
+            self._request_refresh()
 
         # ── actions ─────────────────────────────────────────────────────────
 

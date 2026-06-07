@@ -968,8 +968,12 @@ class LiveSessionManager:
 
     def note_reap(self, thread) -> None:
         """Track an in-flight reap thread (from a single-pane close) so a later
-        quit can join it and not orphan the grandchildren."""
+        quit can join it and not orphan the grandchildren. Prune already-finished
+        reaps first so the list can't grow unbounded over open/close churn — dead
+        reaps need no join, and the module-level _REAP_THREADS (atexit join) still
+        guarantees every reap is awaited at process exit."""
         if thread is not None:
+            self._reaps[:] = [t for t in self._reaps if t.is_alive()]
             self._reaps.append(thread)
 
     def join_reaps(self, total_timeout: float = 3.0) -> None:

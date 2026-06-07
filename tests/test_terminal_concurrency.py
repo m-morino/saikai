@@ -93,6 +93,28 @@ def test_pane_refresh_coalesces():
     assert len(queued) == 2, "should re-queue a repaint after the UI painted"
 
 
+def test_note_reap_prunes_finished_threads():
+    """note_reap drops already-finished reaps so _reaps can't grow unbounded over
+    open/close pane churn — while still tracking in-flight ones. This does NOT
+    weaken reaping: join_reaps only needs to wait on STILL-RUNNING reaps, and the
+    module-level _REAP_THREADS (atexit) awaits every reap at process exit."""
+    mgr = rt.LiveSessionManager.__new__(rt.LiveSessionManager)
+    mgr._reaps = []
+    for _ in range(3):                       # three already-finished reaps
+        d = threading.Thread(target=lambda: None)
+        d.start(); d.join()
+        mgr.note_reap(d)
+    # each append prunes the prior finished ones -> at most 1 dead thread retained
+    assert len([t for t in mgr._reaps if not t.is_alive()]) <= 1, mgr._reaps
+    ev = threading.Event()
+    live = threading.Thread(target=ev.wait)
+    live.start()
+    mgr.note_reap(live)                      # prunes the dead, keeps the live one
+    assert live in mgr._reaps
+    assert all(t is live or not t.is_alive() for t in mgr._reaps)
+    ev.set(); live.join()
+
+
 if __name__ == "__main__":
     test_update_status_marshals_outside_lock()
     print("PASS test_update_status_marshals_outside_lock")
@@ -100,3 +122,5 @@ if __name__ == "__main__":
     print("PASS test_kill_tracks_reap_for_atexit_join")
     test_pane_refresh_coalesces()
     print("PASS test_pane_refresh_coalesces")
+    test_note_reap_prunes_finished_threads()
+    print("PASS test_note_reap_prunes_finished_threads")
