@@ -2504,14 +2504,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             narrow = _LIVE_TERM is not None
             tree_prefixes: dict[str, str] = {}
 
-            if grouping != "none":
-                # Order by the current Sort spec; _build_groups only partitions,
-                # preserving this within-group order.
+            if not tree_mode:
+                # Flat, grouped and cluster layouts all honour the live Sort spec
+                # (tree is structural and walks itself). visible is a COPY, so this
+                # never mutates all_sessions; _build_groups and the cluster pass
+                # below only partition, preserving this order via a stable sort.
+                # (Flat previously relied on main()'s one-time sort, so changing the
+                # Sort dropdown re-ordered nothing until the next launch.)
                 _apply_sort(visible, _load_sort())
             if cluster_mode:
-                # Apply the user sort first so cluster members keep that order
-                # inside each group (stable sort below preserves it).
-                _apply_sort(visible, _load_sort())
                 # Global Haiku-based clustering: every session gets assigned
                 # to one of ~5-9 themes by a single one-shot LLM call. Cached
                 # in ~/.cache/recap/global-clusters.json so the LLM only runs
@@ -2530,7 +2531,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 walked = _tree_walk(visible)
                 tree_prefixes = {s["id"]: p for s, p in walked}
                 visible = [s for s, _ in walked]
-            # else: keep main()'s sort order (date desc + user sort spec)
+            # else (flat): already ordered by _apply_sort above.
 
             # Column labels carry a sort indicator (priority + direction arrow)
             # so a glance at the header tells the user the current sort spec.
