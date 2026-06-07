@@ -2951,13 +2951,27 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
             elif n_sessions == 0:
-                # No session rows → no row-highlight fires → _update_preview never
-                # runs, so the preview pane would keep the last session's content
-                # and imply it matched. Clear it and say so.
+                # No session rows. A blank TABLE reads as "recap broke", so add a
+                # non-selectable placeholder ROW (keyed __hdr__ → _cursor_sid /
+                # Enter / highlight all skip it) explaining WHY it's empty, and
+                # clear the preview (which would otherwise keep the last session's
+                # content and imply a match). Distinguish "filtered to zero" from
+                # "no sessions exist at all".
+                if all_sessions:
+                    msg = "No sessions match — press Esc to clear the search, or widen Status / Age"
+                else:
+                    msg = "No sessions found under ~/.claude/projects"
+                try:
+                    ph = ["" for _ in specs]
+                    ph[(len(specs) - 1) if narrow else 1] = Text(msg, style="dim italic")
+                    self._header_labels["__hdr__empty"] = msg
+                    table.add_row(*ph, key="__hdr__empty")
+                except Exception:
+                    pass
                 try:
                     pv = self.query_one("#preview", RichLog)
                     pv.clear()
-                    pv.write("No sessions match the current search / filters.")
+                    pv.write(msg)
                 except Exception:
                     pass
             self._update_subtitle()
@@ -3095,10 +3109,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 return
             if self.focused is table:
-                if event.key == "space" and _LIVE_TERM is not None:
+                if (event.key == "space" and _LIVE_TERM is not None
+                        and not search.value):
                     # Space toggles a batch-launch mark (split-live only — batch
-                    # launch opens one live pane per mark). In the default launcher
-                    # mode space falls through to search (there's no batch there).
+                    # launch opens one live pane per mark). Only when no query is
+                    # in progress: once the user has started typing, Space must
+                    # reach the search box so multi-word queries (":fav python")
+                    # work instead of silently marking a row.
                     self.action_toggle_mark()
                     event.stop()
                     return
@@ -3113,9 +3130,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     search.value = search.value[:-1]
                     search.cursor_position = len(search.value)
                     event.stop()
-            elif self.focused is search and event.key == "down":
-                table.focus()
-                event.stop()
+            elif self.focused is search:
+                if event.key == "escape":
+                    # Esc in the search box = clear the query (the conventional
+                    # reflex), and only when it's already empty does it leave the
+                    # field for the list. WITHOUT this, Esc bubbles to action_quit
+                    # and EXITS recap mid-search (there was no clear-search key).
+                    if search.value:
+                        search.value = ""
+                        search.cursor_position = 0
+                    else:
+                        table.focus()
+                    event.stop()
+                elif event.key == "down":
+                    table.focus()
+                    event.stop()
 
         def on_data_table_row_highlighted(self, event) -> None:
             sid = str(event.row_key.value) if event.row_key else None
@@ -3244,11 +3273,18 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         # ── split-live helpers ────────────────────────────────────────────────
         def _focused_terminal(self):
-            """Return the focused ClaudeTerminal, or None."""
+            """Return the focused LIVE ClaudeTerminal, or None.
+
+            A DEAD pane (claude exited) deliberately counts as None: otherwise
+            Enter/Esc/Tab/? all SkipAction into a corpse and the user can neither
+            relaunch nor leave. Treating it as not-focused lets Enter fall through
+            to relaunch and Esc/F10 close the ✓ tab."""
             if _LIVE_TERM is None:
                 return None
             foc = self.focused
-            return foc if isinstance(foc, _LIVE_TERM.ClaudeTerminal) else None
+            if isinstance(foc, _LIVE_TERM.ClaudeTerminal) and not getattr(foc, "is_dead", False):
+                return foc
+            return None
 
         def _focus_live_pane(self, sid: str) -> None:
             """Focus a live pane's terminal (deferred from open) so cursor keys go
@@ -3463,18 +3499,28 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self._live.note_reap(t.kill())   # reap off-thread; UI stays snappy
                 except Exception:
                     pass
-            self._live.forget(sid)
             tabs = self.query_one("#right", TabbedContent)
+            pane_id = self._live.pane_id(sid)
+            # Land on the ADJACENT pane (DOM order), not the last-registered one,
+            # so closing C in [A,B,C,D] goes to its neighbour, not whatever opened
+            # last. _live_pane_ids() is DOM order and includes dead ✓ panes.
+            ids_before = self._live_pane_ids()
             try:
-                tabs.remove_pane(self._live.pane_id(sid))
+                idx = ids_before.index(pane_id)
+            except ValueError:
+                idx = len(ids_before)
+            self._live.forget(sid)
+            try:
+                tabs.remove_pane(pane_id)
+            except Exception:
+                pass
+            ids_after = [p for p in ids_before if p != pane_id]
+            try:
+                tabs.active = (ids_after[min(idx, len(ids_after) - 1)]
+                               if ids_after else "tab-preview")
             except Exception:
                 pass
             remaining = list(self._live.statuses().keys())
-            try:
-                tabs.active = (self._live.pane_id(remaining[-1])
-                               if remaining else "tab-preview")
-            except Exception:
-                pass
             try:
                 self.notify(f"closed live session — {len(remaining)} still running",
                             timeout=2)
@@ -3590,9 +3636,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                 break
                     except Exception:
                         term = None
-                if term is not None:
+                if term is not None and not getattr(term, "is_dead", False):
                     try:
-                        term.focus()
+                        term.focus()        # never focus a dead ✓ pane (keys would vanish)
                     except Exception:
                         pass
             else:

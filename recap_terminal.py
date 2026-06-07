@@ -568,6 +568,13 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             return Strip.blank(width)
         if screen is None or y >= screen.lines:
             return Strip.blank(width)
+        if self.is_dead and self._scroll == 0 and y == screen.lines - 1:
+            # claude exited: overlay a one-line hint on the bottom row so a dead
+            # pane isn't just a frozen frame with no cue on how to act. Reads only
+            # atomic int/bool (no lock); live view only (s==0) so scrolled-back
+            # history stays clean for copy/read. _finalize already repaints once.
+            msg = " ⏎ claude exited — Enter relaunches · F10 closes this tab "
+            return Strip([Segment(msg[:width] if width else msg, Style(reverse=True))])
 
         with self._lock:
             cols = screen.columns
