@@ -3467,6 +3467,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # mounted panes incl. dead/exited ones (not just live statuses).
             if self._live is None:
                 return
+            if isinstance(self.focused, Input):
+                raise SkipAction()   # search box: Ctrl+K = kill-line, let it through
             _ft = self._focused_terminal()
             if _ft is not None and not getattr(_ft, "is_dead", False):
                 raise SkipAction()   # live claude: Ctrl+K = kill-line, forward it
@@ -3496,6 +3498,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             where Ctrl+W / Esc then closes)."""
             if _LIVE_TERM is None or self._live is None:
                 return
+            if isinstance(self.focused, Input):
+                raise SkipAction()   # search box: Ctrl+W = word-delete, let it through
             _ft = self._focused_terminal()
             if _ft is not None and not getattr(_ft, "is_dead", False):
                 raise SkipAction()   # live claude: Ctrl+W = word-delete, forward it
@@ -3906,9 +3910,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def action_help(self) -> None:
             # '?' is a priority binding; don't pop the help modal over a focused
-            # terminal (the user is typing into claude). SkipAction forwards the
-            # key to the terminal rather than eating it.
-            if self._focused_terminal() is not None:
+            # terminal (typing into claude) or the search box (typing a '?' query).
+            # SkipAction forwards the key to that widget rather than eating it.
+            if self._focused_terminal() is not None or isinstance(self.focused, Input):
                 raise SkipAction()
             self.push_screen(HelpScreen())
 
