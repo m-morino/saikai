@@ -110,6 +110,7 @@ SORT_FILE = CACHE_DIR / "sort.json"
 GLOBAL_CLUSTERS_FILE = CACHE_DIR / "global-clusters.json"
 OPTIONS_FILE = CACHE_DIR / "options.json"
 RESUME_HISTORY_FILE = CACHE_DIR / "resume-history.tsv"
+LOG_FILE = CACHE_DIR / "recap.log"
 
 # Sort columns selectable via Ctrl-1/2/3. "-" = inactive (no sort at this priority).
 SORT_COLS = ("-", "date", "last", "proj", "title", "turns", "fav", "topic")
@@ -121,6 +122,25 @@ SORT_DEFAULT = [
 PARSED_DIR = CACHE_DIR / "parsed"
 PREVIEW_DIR = CACHE_DIR / "preview"
 PREVIEW_FULL_DIR = CACHE_DIR / "preview-full"
+
+
+def _log(msg: str) -> None:
+    """Append a timestamped line to CACHE_DIR/recap.log. TUI-safe (a FILE, never
+    stdout — that would corrupt the Textual display), best-effort, and size-bounded
+    (rotates at ~1 MB, one backup) so it can neither fail recap nor grow without
+    limit. Always on, so the trail is already there when something like 'all
+    sessions vanished' happens unexpectedly."""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            if LOG_FILE.stat().st_size > 1_000_000:
+                os.replace(LOG_FILE, LOG_FILE.with_name(LOG_FILE.name + ".1"))
+        except OSError:
+            pass
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+    except Exception:
+        pass
 
 
 def _load_options() -> dict:
@@ -2539,6 +2559,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             try:
                 self._do_refresh_table()
             except Exception as e:
+                _log(f"refresh error: {e!r}")
                 import traceback
                 self.notify(
                     f"refresh failed: {e!r}\n{traceback.format_exc()[-400:]}",
@@ -3182,6 +3203,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                             timeout=8)
                 return
             self._live.register(sid, term)
+            _log(f"live open: {sid[:8]}  ({self._live.count}/{self._live.max_live})")
             tabs.active = pane_id
             # Focus the new pane so cursor keys go straight to claude. The
             # post-open _refresh_table re-emits a row-highlight that races this
@@ -3286,6 +3308,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             return focus to the list."""
             if self._live is None or sid is None:
                 return
+            _log(f"live close: {sid[:8]}")
             t = self._live.get(sid)
             if t is not None:
                 try:
@@ -3596,6 +3619,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # deleting everything. Refuse to clobber a populated list with an empty
             # scan; that was the "all sessions suddenly vanished" bug.
             if not fresh and all_sessions:
+                _log(f"reload: 0 sessions returned — KEPT current {len(all_sessions)} (transient?)")
                 try:
                     self.notify("re-scan returned 0 sessions — kept the current "
                                 "list (likely transient; Ctrl-R to retry)",
@@ -3623,8 +3647,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             try:
                 fresh = reload_fn()
-            except Exception:
+            except Exception as e:
+                _log(f"auto-reload failed: {e!r}")
                 return
+            _log(f"auto-reload: {len(fresh)} sessions")
             self._apply_fresh_sessions(fresh)
             self._refresh_table()
 
@@ -3638,9 +3664,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             try:
                 fresh = reload_fn()
             except Exception as e:
+                _log(f"Ctrl-R reload failed: {e!r}")
                 self.notify(f"refresh failed: {e!r}", severity="error",
                             title="recap", timeout=6)
                 return
+            _log(f"Ctrl-R reload: {len(fresh)} sessions")
             self._apply_fresh_sessions(fresh)
             self._refresh_table()
             self.notify(f"refreshed — {len(fresh)} sessions", timeout=3)
@@ -4926,6 +4954,8 @@ def main():
     # user-configurable sort spec is applied AFTER forest building / clustering
     # so it controls only the displayed order.
     sessions.sort(key=lambda s: s["first_ts"], reverse=True)
+    _log(f"start: loaded {len(sessions)} sessions "
+         f"(all_projects={args.all_projects}, project={args.project}, days={args.days})")
 
     if not sessions:
         period = "all history" if args.days == 0 else f"last {args.days} days"
