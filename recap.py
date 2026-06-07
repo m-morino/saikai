@@ -1588,7 +1588,7 @@ def _render_preview(s: dict) -> str:
         lines.append(f"\033[36m── Last user message  (#{len(s['real_msgs'])}) ──\033[0m")
         lines.append(s["real_msgs"][-1][:1500])
     lines.append("")
-    lines.append("\033[2mTab: full/summary  ·  Ctrl-d: changes (transcript diff)\033[0m")
+    lines.append("\033[2mTab: full/summary  ·  F8: changes (transcript diff)\033[0m")
     return "\n".join(lines)
 
 
@@ -1623,7 +1623,7 @@ def _render_preview_full(s: dict) -> str:
     except Exception:
         pass
     lines.append("")
-    lines.append("\033[2mTab: full/summary  ·  Ctrl-d: changes (transcript diff)\033[0m")
+    lines.append("\033[2mTab: full/summary  ·  F8: changes (transcript diff)\033[0m")
     return "\n".join(lines)
 
 
@@ -1675,7 +1675,7 @@ def _extract_session_changes(jsonl_path, max_ops: int = 40):
 
 
 def _render_preview_changes(s: dict) -> str:
-    """Preview mode (Ctrl-d): a diff-like view of what THIS session changed,
+    """Preview mode (F8): a diff-like view of what THIS session changed,
     reconstructed from the transcript's own Edit/Write records."""
     lines = _render_header(s)
     lines.append("\033[36m── Changes this session made (from transcript) ──\033[0m")
@@ -1701,7 +1701,7 @@ def _render_preview_changes(s: dict) -> str:
                 for ln in (new.splitlines()[:4] if new else []):
                     lines.append(f"  \033[32m+\033[0m {ln[:100]}")
     lines.append("")
-    lines.append("\033[2mTab: full/summary  ·  Ctrl-d: changes (this view)\033[0m")
+    lines.append("\033[2mTab: full/summary  ·  F8: changes (this view)\033[0m")
     return "\n".join(lines)
 
 
@@ -1736,7 +1736,7 @@ def _write_if_stale(path: Path, mtime: float, render) -> None:
 
 def _write_preview_cache(s: dict) -> None:
     # Pre-render so the preview pane can read a cached file instead of cold-starting Python (~150ms → ~5ms per cursor move).
-    # Both files are mtime-gated; reloads (Ctrl-x/p/r) skip rewrites for unchanged sessions.
+    # Both files are mtime-gated; reloads (F5/F6/F7) skip rewrites for unchanged sessions.
     sid = s["id"]
     mtime = s.get("mtime", 0.0)
     _write_if_stale(PREVIEW_DIR / f"{sid}.txt", mtime, lambda: _render_preview(s))
@@ -2254,9 +2254,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
     All toggles reflect in-app (no restart required):
       Enter        resume                Esc / Ctrl-C  cancel
-      Ctrl-x       hide/unhide row       Ctrl-p        favorite toggle
-      Ctrl-t       toggle tree display   Ctrl-g        toggle cluster
+      F7           hide/unhide row       F6            favorite toggle
+      Shift-F5     toggle tree display   Shift-F6      toggle cluster
       Tab          preview full/summary  ?             help overlay
+      (recap uses FUNCTION keys only — every Ctrl+letter is left to the
+       search box / live claude, e.g. Ctrl-W word-delete, Ctrl-R history)
       (":hidden" in the search box reveals hidden rows;
        click a column header to sort, click again to reverse)
 
@@ -2339,29 +2341,30 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Enter[/yellow]       Resume session\n"
                 "  [yellow]Esc[/yellow]         Quit\n"
                 "  [yellow]?[/yellow]           Help (this screen)\n\n"
-                "[bold cyan]Session ops[/bold cyan]\n"
-                "  [yellow]Ctrl-X[/yellow]      Toggle hide/unhide"
+                "[bold cyan]Session ops[/bold cyan]  [dim](function keys — every Ctrl+letter stays with the search box / claude)[/dim]\n"
+                "  [yellow]F7[/yellow]          Toggle hide/unhide"
                 "  ([dim]:hidden[/dim] in search to find them)\n"
-                "  [yellow]Ctrl-P[/yellow]      Toggle ★ favorite "
+                "  [yellow]F6[/yellow]          Toggle ★ favorite "
                 "  ([dim]:fav[/dim] in search to filter)\n"
-                "  [yellow]Ctrl-R[/yellow]      Refresh list  (auto: RECAP_AUTO_REFRESH=secs)\n"
-                "  [yellow]Ctrl-Y[/yellow]      Copy this session's opening prompt\n"
-                "  [yellow]Ctrl-D[/yellow]      Show what this session changed (transcript diff)\n\n"
+                "  [yellow]F5[/yellow]          Refresh list  (auto: RECAP_AUTO_REFRESH=secs)\n"
+                "  [yellow]F9[/yellow]          Copy this session's opening prompt\n"
+                "  [yellow]F8[/yellow]          Show what this session changed (transcript diff)\n\n"
                 "[bold cyan]Display modes[/bold cyan]\n"
-                "  [yellow]Ctrl-G[/yellow]      Cluster (topic) mode\n"
-                "  [yellow]Ctrl-T[/yellow]      Tree (parent/child) mode\n"
-                "  [yellow]Ctrl-O[/yellow]      Cycle grouping: none / Date / Project\n"
+                "  [yellow]Shift-F6[/yellow]    Cluster (topic) mode\n"
+                "  [yellow]Shift-F5[/yellow]    Tree (parent/child) mode\n"
+                "  [yellow]Shift-F7[/yellow]    Cycle grouping: none / Date / Project\n"
                 "  [yellow]Tab[/yellow]         Preview: full ↔ summary\n\n"
                 "[bold cyan]Split-live (RECAP_SPLIT_LIVE=1)[/bold cyan]\n"
                 "  [yellow]Enter[/yellow]       Open / focus the live claude pane\n"
                 "  [yellow]F2/F3[/yellow]       Prev / next live tab\n"
                 "  [yellow]F4[/yellow]          Hide / show the session list\n"
                 "  [yellow]Ctrl-][/yellow]      Return focus: pane → list  (RECAP_RELEASE_KEY to change)\n"
-                "  [yellow]Ctrl-W[/yellow]/[yellow]Ctrl-K[/yellow]  Close tab / all (from the list — in a pane they go to claude)  ·  [yellow]Ctrl-C[/yellow] quit-all\n"
+                "  [yellow]F10[/yellow]         Close the active tab   ·   [yellow]Shift-F10[/yellow]  Close ALL tabs\n"
+                "  [yellow]Esc[/yellow]         Close / return one pane at a time   ·   [yellow]Ctrl-C[/yellow]  quit-all\n"
                 "  [yellow]Scroll up[/yellow]   Freeze the pane (copy mode): Shift+drag to select while a\n"
                 "              streaming claude keeps running; scroll to the bottom to resume live\n\n"
                 "[bold cyan]Filter / Group / Sort (top-right dropdowns, Desktop-style)[/bold cyan]\n"
-                "  Group by  Date / Project / State / None   (Ctrl-O cycles)\n"
+                "  Group by  Date / Project / State / None   (Shift-F7 cycles)\n"
                 "  Sort by   Recency / Created time / Alphabetically\n"
                 "  Status    Active / Archived / All\n"
                 "  Age       last 1d / 3d / 7d / 30d / All time\n"
@@ -2372,9 +2375,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
     class PickerApp(App):
         TITLE = "recap"
-        # Textual's built-in command palette also binds Ctrl+P, which SHADOWS our
-        # Ctrl+P = toggle-favorite (the palette opened instead of toggling). recap
-        # doesn't use the palette, so disable it to free Ctrl+P.
+        # Textual's built-in command palette binds Ctrl+P. recap deliberately
+        # leaves every Ctrl+letter to the search box / live claude (Ctrl+P =
+        # readline previous-history), so disable the palette to keep Ctrl+P free.
         ENABLE_COMMAND_PALETTE = False
         BINDINGS = [
             Binding("escape", "quit", "Quit"),
@@ -2388,26 +2391,33 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # focus — without it, focus on the Search Input swallows Enter
             # into Input.Submitted and the picker never exits.
             Binding("enter", "resume", "Resume", priority=True),
-            Binding("ctrl+x", "toggle_hide", "Hide"),
-            Binding("ctrl+p", "toggle_fav", "★"),
-            Binding("ctrl+g", "toggle_cluster", "Cluster"),
-            Binding("ctrl+t", "toggle_tree", "Tree"),
-            Binding("ctrl+o", "cycle_group", "Group"),
-            Binding("ctrl+r", "refresh", "Refresh"),
-            Binding("ctrl+y", "copy_prompt", "Copy prompt"),
-            Binding("ctrl+d", "preview_changes", "Changes"),
+            # App shortcuts live on FUNCTION KEYS, never readline Ctrl+letters.
+            # Ctrl+W/K/R/D/Y/P/G/T/O/L/X are all readline editing keys the user
+            # types constantly — and claude itself binds Ctrl+R (history search),
+            # Ctrl+T (todos), Ctrl+L (clear). Stealing them broke editing in the
+            # search box and inside live panes, and Ctrl+K once nuked every pane.
+            # Claude Code binds NO F-keys (verified), so F5-F10 / Shift+F5-7 are
+            # safe to capture (priority) even while a claude pane is focused; the
+            # freed Ctrl+letters now pass straight through to the Input / claude.
+            Binding("f5", "refresh", "Refresh", priority=True),
+            Binding("f6", "toggle_fav", "★", priority=True),
+            Binding("f7", "toggle_hide", "Hide", priority=True),
+            Binding("f8", "preview_changes", "Changes", priority=True),
+            Binding("f9", "copy_prompt", "Copy", priority=True),
+            Binding("shift+f5", "toggle_tree", "Tree", priority=True),
+            Binding("shift+f6", "toggle_cluster", "Cluster", priority=True),
+            Binding("shift+f7", "cycle_group", "Group", priority=True),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
             Binding("question_mark", "help", "Help", priority=True),
-            # Split-live: open/attach a live claude as a tab; navigate tabs; and
-            # a context-sensitive Escape (handled in action_quit) that returns
-            # focus to the list when a terminal is focused instead of quitting.
-            # ctrl+enter keeps the legacy full-takeover resume as a fallback.
-            Binding("ctrl+w", "close_live", "Close tab", show=False, priority=True),
-            Binding("ctrl+k", "close_all_live", "Close all", show=False, priority=True),
+            # Split-live tab management (opt-in). F10 closes the ACTIVE tab;
+            # Shift+F10 closes ALL — two keys apart so a single stray press can't
+            # wipe every pane (that was the accidental "全件終了"). Esc also closes
+            # /returns one pane at a time; Ctrl+] returns focus pane → list.
+            Binding("f10", "close_live", "Close tab", show=False, priority=True),
+            Binding("shift+f10", "close_all_live", "Close all", show=False, priority=True),
             Binding("f2", "prev_tab", "◀Tab", priority=True),
             Binding("f3", "next_tab", "Tab▶", priority=True),
             Binding("f4", "toggle_list", "Hide list", priority=True),
-            Binding("ctrl+l", "focus_list", "List", show=False),
         ]
         # The practical limit on concurrent live claude panes is MEMORY — each
         # is a full node process tree that sits CPU-idle waiting for input — so
@@ -2516,7 +2526,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._refresh_table()
             self.query_one("#table", DataTable).focus()
             # Optional auto-refresh: RECAP_AUTO_REFRESH=<seconds> re-scans disk on
-            # an interval so sessions started elsewhere appear without Ctrl-R.
+            # an interval so sessions started elsewhere appear without F5.
             _ar = os.environ.get("RECAP_AUTO_REFRESH")
             if _ar:
                 try:
@@ -3225,7 +3235,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if self._live.at_capacity() and not self._live.has(sid):
                     self.notify(
                         f"opened {opened}; hit the {self._live.max_live}-pane "
-                        f"backstop — close some (Ctrl-W) or raise RECAP_MAX_LIVE",
+                        f"backstop — close some (F10) or raise RECAP_MAX_LIVE",
                         severity="warning", timeout=6)
                     break
                 self._open_or_attach_live(sid, refresh=False)   # repaint once below
@@ -3266,7 +3276,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if self._live.at_capacity():
                 self.notify(
                     f"hit the {self._live.max_live}-pane backstop; close one "
-                    f"(Ctrl-W) or raise RECAP_MAX_LIVE",
+                    f"(F10) or raise RECAP_MAX_LIVE",
                     severity="warning", timeout=6)
                 return
             # The real limit is memory (each live pane is a node process tree);
@@ -3276,7 +3286,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if _avail is not None and _avail < _floor:
                 self.notify(
                     f"low memory: {_avail:.0f} MB free — each live claude is "
-                    f"RAM-heavy; close panes (Ctrl-W) if it slows down",
+                    f"RAM-heavy; close panes (F10) if it slows down",
                     severity="warning", timeout=7)
             s = self._sid_index.get(sid)
             try:
@@ -3422,7 +3432,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._refresh_table()
 
         def on_claude_terminal_focus_released(self, event) -> None:
-            """The terminal's Ctrl-F1 escape hatch: return focus to the list."""
+            """The terminal's Ctrl+] (RECAP_RELEASE_KEY) escape hatch: refocus the list."""
             self.query_one("#table", DataTable).focus()
             try:
                 event.stop()
@@ -3474,16 +3484,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._refresh_table()
 
         def action_close_all_live(self) -> None:
-            # Ctrl-K: close ALL live panes at once (parallel kill) but STAY in
+            # Shift+F10: close ALL live panes at once (parallel kill) but STAY in
             # recap — unlike Ctrl-C (also quits) or Esc (one at a time). Removes
-            # mounted panes incl. dead/exited ones (not just live statuses).
+            # mounted panes incl. dead/exited ones (not just live statuses). It's
+            # on a function key (not a readline key), so it fires from any focus —
+            # no SkipAction forwarding needed, and a single stray press can't reach
+            # it (Shift+F10 is deliberate), which is why all-panes-vanished is gone.
             if self._live is None:
                 return
-            if isinstance(self.focused, Input):
-                raise SkipAction()   # search box: Ctrl+K = kill-line, let it through
-            _ft = self._focused_terminal()
-            if _ft is not None and not getattr(_ft, "is_dead", False):
-                raise SkipAction()   # live claude: Ctrl+K = kill-line, forward it
             tabs = self.query_one("#right", TabbedContent)
             ids = self._live_pane_ids()
             if not ids:
@@ -3504,17 +3512,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.notify(f"closed {n} live tab(s)", timeout=3)
 
         def action_close_live(self) -> None:
-            """Ctrl-W: close the active live tab — but ONLY from the list. In a
-            focused claude pane Ctrl+W is readline word-delete, so forward it to
-            claude instead of closing the tab (Esc returns focus to the list,
-            where Ctrl+W / Esc then closes)."""
+            """F10: close the active live tab. On a focused claude pane it closes
+            THAT pane; from the list it closes the active tab. F10 is not a
+            readline key, so unlike the old Ctrl+W it never needs to forward."""
             if _LIVE_TERM is None or self._live is None:
                 return
-            if isinstance(self.focused, Input):
-                raise SkipAction()   # search box: Ctrl+W = word-delete, let it through
-            _ft = self._focused_terminal()
-            if _ft is not None and not getattr(_ft, "is_dead", False):
-                raise SkipAction()   # live claude: Ctrl+W = word-delete, forward it
             tabs = self.query_one("#right", TabbedContent)
             active = tabs.active or ""
             term = self._focused_terminal()
@@ -3570,10 +3572,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.query_one("#table", DataTable).focus()
             except Exception:
                 pass
-
-        def action_focus_list(self) -> None:
-            """Ctrl-L: jump focus back to the session list from a terminal."""
-            self.query_one("#table", DataTable).focus()
 
         def action_toggle_list(self) -> None:
             """F4: hide/show the left session list. Hidden -> the live pane (or
@@ -3754,7 +3752,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self._request_refresh()
 
         def action_copy_prompt(self) -> None:
-            # Ctrl-Y: copy the selected session's opening user prompt to the
+            # F9: copy the selected session's opening user prompt to the
             # clipboard so it can be reused to start a similar task (Crystal-style
             # prompt reuse). OSC-52 first (works over SSH), `clip` as fallback.
             sid = self._cursor_sid()
@@ -3788,7 +3786,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _log(f"reload: 0 sessions returned — KEPT current {len(all_sessions)} (transient?)")
                 try:
                     self.notify("re-scan returned 0 sessions — kept the current "
-                                "list (likely transient; Ctrl-R to retry)",
+                                "list (likely transient; F5 to retry)",
                                 severity="warning", timeout=6)
                 except Exception:
                     pass
@@ -3822,7 +3820,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._refresh_table()
 
         def action_refresh(self) -> None:
-            # Ctrl-R: re-scan ~/.claude/projects for new / updated sessions
+            # F5: re-scan ~/.claude/projects for new / updated sessions
             # (recap loads once at startup; this picks up sessions started
             # elsewhere while the picker is open).
             if reload_fn is None:
@@ -3832,17 +3830,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             try:
                 fresh = reload_fn()
             except Exception as e:
-                _log(f"Ctrl-R reload failed: {e!r}")
+                _log(f"refresh reload failed: {e!r}")
                 self.notify(f"refresh failed: {e!r}", severity="error",
                             title="recap", timeout=6)
                 return
-            _log(f"Ctrl-R reload: {len(fresh)} sessions")
+            _log(f"refresh reload: {len(fresh)} sessions")
             self._apply_fresh_sessions(fresh)
             self._refresh_table()
             self.notify(f"refreshed — {len(fresh)} sessions", timeout=3)
 
         def action_cycle_group(self) -> None:
-            # Ctrl-O cycles the Claude-Desktop-style grouping: none -> Date ->
+            # Shift-F7 cycles the Claude-Desktop-style grouping: none -> Date ->
             # Project -> none. (The "Group" dropdown sets it explicitly too.)
             new = {"none": "date", "date": "project", "project": "state",
                    "state": "none"}.get(_get_group_by(), "date")
@@ -3867,7 +3865,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._update_preview(self._cursor_sid())
 
         def action_preview_changes(self) -> None:
-            # Ctrl-D: show what this session changed (reconstructed from the
+            # F8: show what this session changed (reconstructed from the
             # transcript's Edit/Write records — no git, works for any age).
             self.preview_mode = "changes"
             self._update_preview(self._cursor_sid())
@@ -4875,7 +4873,7 @@ def main():
     p.add_argument("--reset-options", action="store_true",
                    help="Forget saved --days/--here/--all defaults. Does NOT clear "
                         "hidden/favorite/view-mode/tree-mode/cluster-mode/sort — "
-                        "toggle those via Ctrl-x / Ctrl-p / Ctrl-t / Ctrl-g in the "
+                        "toggle those via F7 / F6 / Shift-F5 / Shift-F6 in the "
                         "picker, ':hidden' in search for hidden rows, a column-header "
                         "click to sort (or the matching "
                         "--toggle-* / --cycle-sort / --reset-sort flags).")
@@ -4911,11 +4909,11 @@ def main():
                    help="Toggle saved default/show-hidden view mode (persistent).")
     p.add_argument("--toggle-tree", action="store_true",
                    help="Toggle saved flat/nested tree-display mode (persistent). "
-                        "Same effect as Ctrl-t inside the picker.")
+                        "Same effect as Shift-F5 inside the picker.")
     p.add_argument("--toggle-cluster", action="store_true",
                    help="Toggle saved topic-cluster view (persistent). When on, "
                         "sessions are grouped by their most widely-shared cached "
-                        "topic keyword. Same effect as Ctrl-g inside the picker. "
+                        "topic keyword. Same effect as Shift-F6 inside the picker. "
                         "Mutually exclusive with tree display.")
     p.add_argument("--cycle-sort", type=int, metavar="N", choices=[1, 2, 3],
                    help="Advance the Nth sort priority to the next column. Persistent. "
@@ -5194,7 +5192,7 @@ def main():
             s["parent_reasons"] = []
 
     # Display mode (flat / nested-tree / topic-cluster). Saved modes are the
-    # source of truth so Ctrl-t / Ctrl-g inside the picker can toggle between
+    # source of truth so Shift-F5 / Shift-F6 inside the picker can toggle between
     # them in place. CLI --tree is a one-shot override for the initial
     # invocation only — the saved mode stays the source of truth, so a Ctrl-* toggle
     # wins. tree and cluster are mutually exclusive in display: cluster wins
@@ -5218,7 +5216,7 @@ def main():
         display_table(visible, repo, args.all_projects, flat=flat)
     else:
         # Default: interactive textual picker. Hand it a reload closure so the
-        # in-app refresh (Ctrl-R) can re-scan ~/.claude/projects for new/updated
+        # in-app refresh (F5) can re-scan ~/.claude/projects for new/updated
         # sessions without restarting.
         def _reload():
             fresh = []
