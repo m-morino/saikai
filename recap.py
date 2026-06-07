@@ -4271,10 +4271,21 @@ def _build_forest(sessions: list[dict], floor: float = 0.20) -> None:
     so the forest still builds on cwd/branch/title. Run --related <sid> to get
     topic-aware scoring on demand."""
     by_time = sorted(sessions, key=lambda s: s["first_ts"])
+    max_struct = _W_CWD + _W_BRANCH + _W_TITLE + _W_TOPIC   # ceiling of `structural`
     for i, s in enumerate(by_time):
         best_score, best_parent, best_reasons = floor, None, []
         for j in range(i):
             p = by_time[j]
+            # Exact prune: score = structural * time_factor, and structural is
+            # bounded by max_struct, so if the time-damped ceiling can't beat the
+            # current best there is no point paying for the cwd/title/topic
+            # scoring. gap uses the memoised _interval_dts so this check is O(1);
+            # it never drops a pair that could actually win (>, not >=).
+            gap = _interval_gap_minutes(s, p)
+            tf = 0.10 + 0.90 * (math.exp(-gap / _TIME_TAU_MIN)
+                                if gap != float("inf") else 0.0)
+            if max_struct * tf <= best_score:
+                continue
             score, reasons = _score_relation(s, p)
             if score > best_score:
                 best_score, best_parent, best_reasons = score, p, reasons
