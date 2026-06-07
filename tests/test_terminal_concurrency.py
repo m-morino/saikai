@@ -93,6 +93,17 @@ def test_pane_refresh_coalesces():
     assert len(queued) == 2, "should re-queue a repaint after the UI painted"
 
 
+def test_classify_pty_status_basics():
+    """Guard the busy/waiting/idle classifier (and the slice-before-strip tail
+    handling) so the per-chunk perf trim didn't change its verdicts."""
+    assert rt.classify_pty_status("", "⠀ working") == "busy"      # braille spinner title
+    assert rt.classify_pty_status("Do you want to proceed? (y/n)", "") == "waiting"
+    assert rt.classify_pty_status("1. one\n2. two\n", "") == "waiting"  # numbered menu
+    assert rt.classify_pty_status("just some output", "✳ ready") == "idle"
+    # a prompt in the last 2000 chars is still found after slicing the tail first
+    assert rt.classify_pty_status("x" * 5000 + "\n(y/n)", "") == "waiting"
+
+
 def test_note_reap_prunes_finished_threads():
     """note_reap drops already-finished reaps so _reaps can't grow unbounded over
     open/close pane churn — while still tracking in-flight ones. This does NOT
@@ -122,5 +133,7 @@ if __name__ == "__main__":
     print("PASS test_kill_tracks_reap_for_atexit_join")
     test_pane_refresh_coalesces()
     print("PASS test_pane_refresh_coalesces")
+    test_classify_pty_status_basics()
+    print("PASS test_classify_pty_status_basics")
     test_note_reap_prunes_finished_threads()
     print("PASS test_note_reap_prunes_finished_threads")
