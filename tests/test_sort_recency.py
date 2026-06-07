@@ -309,6 +309,24 @@ def test_no_app_binding_steals_a_readline_ctrl_key():
         assert must in keys, f"expected F-key binding {must!r} missing: {keys}"
 
 
+def test_build_new_invocation_starts_fresh_session_with_id():
+    """New-session launch must pass --session-id (NOT --resume) so claude starts a
+    fresh session keyed to that uuid, with the chosen cwd and RECAP_RESUME env."""
+    import tempfile
+    import shutil as _sh
+    d = tempfile.mkdtemp()
+    try:
+        argv, cwd, env = recap._build_new_invocation(
+            d, "11111111-2222-3333-4444-555555555555", [])
+        assert "--session-id" in argv, argv
+        assert "11111111-2222-3333-4444-555555555555" in argv, argv
+        assert "--resume" not in argv, argv
+        assert cwd == d
+        assert env.get("RECAP_RESUME") == "1"
+    finally:
+        _sh.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_last_active_prefers_mtime_over_stale_last_ts()
     print("PASS test_last_active_prefers_mtime_over_stale_last_ts")
@@ -350,4 +368,6 @@ if __name__ == "__main__":
     print("PASS test_missing_both_is_none_not_crash")
     test_no_app_binding_steals_a_readline_ctrl_key()
     print("PASS test_no_app_binding_steals_a_readline_ctrl_key")
+    test_build_new_invocation_starts_fresh_session_with_id()
+    print("PASS test_build_new_invocation_starts_fresh_session_with_id")
     print("ALL PASS")

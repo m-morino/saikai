@@ -2279,10 +2279,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         from textual.app import App, ComposeResult
         from textual.actions import SkipAction
         from textual.binding import Binding
-        from textual.containers import Horizontal
+        from textual.containers import Horizontal, Vertical
         from textual.screen import ModalScreen
-        from textual.widgets import (DataTable, Footer, Input, RichLog, Select,
-                                     Static, TabbedContent, TabPane)
+        from textual.widgets import (DataTable, Footer, Input, OptionList, RichLog,
+                                     Select, Static, TabbedContent, TabPane)
+        from textual.widgets.option_list import Option
         from rich.text import Text
     except ImportError as e:
         print(_c(f"  textual is required but not installed ({e}). "
@@ -2365,6 +2366,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Tab[/yellow]         Preview: full ↔ summary\n\n"
                 "[bold cyan]Split-live (RECAP_SPLIT_LIVE=1)[/bold cyan]\n"
                 "  [yellow]Enter[/yellow]       Open / focus the live claude pane\n"
+                "  [yellow]Shift-F8[/yellow]    New claude session in a folder / git worktree\n"
                 "  [yellow]F2/F3[/yellow]       Prev / next live tab\n"
                 "  [yellow]F4[/yellow]          Hide / show the session list\n"
                 "  [yellow]Ctrl-][/yellow]      Return focus: pane → list  (RECAP_RELEASE_KEY to change)\n"
@@ -2384,6 +2386,53 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "[dim]Press ? or Esc to close[/dim]",
                 id="help-content",
             )
+
+    class NewSessionScreen(ModalScreen):
+        """Pick a folder / git worktree, then start a FRESH claude session there.
+        Type a path + Enter to launch it, or pick a worktree / recent dir from the
+        list; Esc cancels. Returns the chosen path (or None) via dismiss()."""
+        CSS = """
+        NewSessionScreen { align: center middle; }
+        #new-box { background: $panel; border: solid $accent; padding: 1 2;
+                   width: 84; height: auto; max-height: 28; }
+        #new-path { margin: 1 0; border: tall $accent; }
+        #new-dirs { height: auto; max-height: 16; }
+        """
+        BINDINGS = [Binding("escape", "cancel", show=False)]
+
+        def __init__(self, base_dir, candidates):
+            super().__init__()
+            self._base_dir = base_dir
+            self._candidates = candidates           # list[(label, path)]
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="new-box"):
+                yield Static("[bold cyan]New claude session[/bold cyan]   "
+                             "[dim]type a folder + Enter, or pick a worktree / "
+                             "recent dir below · Esc cancels[/dim]")
+                yield Input(value=self._base_dir, placeholder="folder path",
+                            id="new-path")
+                if self._candidates:
+                    yield OptionList(*[Option(lbl) for lbl, _p in self._candidates],
+                                     id="new-dirs")
+
+        def on_mount(self) -> None:
+            try:
+                self.query_one("#new-path", Input).focus()
+            except Exception:
+                pass
+
+        def action_cancel(self) -> None:
+            self.dismiss(None)
+
+        def on_input_submitted(self, event) -> None:
+            self.dismiss((event.value or "").strip() or None)
+
+        def on_option_list_option_selected(self, event) -> None:
+            try:
+                self.dismiss(self._candidates[event.option_index][1])
+            except Exception:
+                self.dismiss(None)
 
     class PickerApp(App):
         TITLE = "recap"
@@ -2419,6 +2468,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("shift+f5", "toggle_tree", "Tree", priority=True),
             Binding("shift+f6", "toggle_cluster", "Cluster", priority=True),
             Binding("shift+f7", "cycle_group", "Group", priority=True),
+            Binding("shift+f8", "new_session", "New", priority=True),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
             Binding("question_mark", "help", "Help", priority=True),
             # Split-live tab management (opt-in). F10 closes the ACTIVE tab;
@@ -3385,20 +3435,63 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     pass
 
         def _open_or_attach_live(self, sid: str, refresh: bool = True) -> None:
+            """Resume an existing session as a live pane (or switch to it if it's
+            already running)."""
             assert _LIVE_TERM is not None and self._live is not None
-            tabs = self.query_one("#right", TabbedContent)
-            pane_id = self._live.pane_id(sid)
             if self._live.has(sid):                  # already running → switch
-                tabs.active = pane_id
+                tabs = self.query_one("#right", TabbedContent)
+                tabs.active = self._live.pane_id(sid)
                 self._opening_live_sid = sid
                 self.call_after_refresh(lambda: self._focus_live_pane(sid))
                 return
+            s = self._sid_index.get(sid)
+            try:
+                argv, cwd, env = _build_resume_invocation(sid, all_sessions)
+            except Exception as e:
+                self.notify(f"could not build resume command: {e!r}",
+                            severity="error", timeout=8)
+                return
+            title = (s.get("ai_title") if s else None) or sid[:8]
+            self._spawn_live_pane(sid, argv, cwd, env, title, refresh=refresh)
+
+        def _open_new_live(self, target_cwd: str) -> None:
+            """Start a FRESH claude session in target_cwd as a live pane. A
+            pre-generated --session-id keys the pane so the new session links to
+            its list row once claude writes the JSONL (appears on the next scan)."""
+            if _LIVE_TERM is None or self._live is None:
+                return
+            try:
+                d = Path(target_cwd).expanduser()
+                if not d.is_dir():
+                    self.notify(f"not a directory: {target_cwd}",
+                                severity="error", timeout=6)
+                    return
+            except Exception as e:
+                self.notify(f"bad path: {e!r}", severity="error", timeout=6)
+                return
+            sid = str(uuid.uuid4())
+            try:
+                argv, cwd, env = _build_new_invocation(str(d), sid, all_sessions)
+            except Exception as e:
+                self.notify(f"could not build new-session command: {e!r}",
+                            severity="error", timeout=8)
+                return
+            if self._spawn_live_pane(sid, argv, cwd, env, d.name or str(d), refresh=True):
+                self.notify(f"new claude session in {d}", timeout=4)
+
+        def _spawn_live_pane(self, sid, argv, cwd, env, title, refresh=True) -> bool:
+            """Capacity/RAM-gate, mount, register and focus a live pane for an
+            already-built (argv, cwd, env). Shared by resume + new-session; returns
+            True if it opened. Does NOT weaken the kill/reap lifecycle."""
+            assert _LIVE_TERM is not None and self._live is not None
+            tabs = self.query_one("#right", TabbedContent)
+            pane_id = self._live.pane_id(sid)
             if self._live.at_capacity():
                 self.notify(
                     f"hit the {self._live.max_live}-pane backstop; close one "
                     f"(F10) or raise RECAP_MAX_LIVE",
                     severity="warning", timeout=6)
-                return
+                return False
             # The real limit is memory (each live pane is a node process tree).
             # Default: warn but still open (don't surprise existing users).
             # RECAP_HARD_RAM_GATE=1 turns the floor into a hard stop. Predictive —
@@ -3414,20 +3507,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         f"would drop below RECAP_MIN_FREE_MB ({_floor:.0f}). Close a "
                         f"pane (F10) or lower RECAP_CLAUDE_MB / RECAP_MIN_FREE_MB.",
                         severity="error", timeout=9)
-                    return
+                    return False
                 self.notify(
                     f"low memory: {_avail:.0f} MB free — each live claude is "
                     f"RAM-heavy (~{_per:.0f} MB); close panes (F10) if it slows. "
                     f"RECAP_HARD_RAM_GATE=1 to block instead.",
                     severity="warning", timeout=7)
-            s = self._sid_index.get(sid)
-            try:
-                argv, cwd, env = _build_resume_invocation(sid, all_sessions)
-            except Exception as e:
-                self.notify(f"could not build resume command: {e!r}",
-                            severity="error", timeout=8)
-                return
-            title = (s.get("ai_title") if s else None) or sid[:8]
             term = _LIVE_TERM.ClaudeTerminal(
                 argv, cwd=cwd, env=env, sid=sid, title=title,
                 on_status=self._on_live_status, on_exit=self._on_live_exit,
@@ -3453,7 +3538,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     pass
                 self.notify(f"could not open tab: {e!r}", severity="error",
                             timeout=8)
-                return
+                return False
             self._live.register(sid, term)
             _log(f"live open: {sid[:8]}  ({self._live.count}/{self._live.max_live})")
             tabs.active = pane_id
@@ -3464,19 +3549,58 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # (and the _focused_terminal guard then keeps it there).
             self._opening_live_sid = sid
             self.call_after_refresh(lambda: self._focus_live_pane(sid))
-            # Reuse the resume side effects: 1-shot teams-notify suppression so
-            # the first idle_prompt after launch doesn't ping (mirrors
-            # _resume_claude). Best-effort.
+            # 1-shot teams-notify suppression so the first idle_prompt after launch
+            # doesn't ping (mirrors _resume_claude). Best-effort.
             try:
                 _add_recap_suppress_session(sid)
             except Exception:
                 pass
             # Refresh the table so the marker column shows this row is now live.
-            # Batch launch passes refresh=False and repaints ONCE after all opens —
-            # N synchronous full rebuilds here serialised the opens and slowed
-            # multi-launch (the claude spawns couldn't start back-to-back).
+            # Batch launch passes refresh=False and repaints ONCE after all opens.
             if refresh:
                 self._refresh_table()
+            return True
+
+        def action_new_session(self) -> None:
+            """Shift+F8: pick a folder / git worktree and start a FRESH claude
+            session there as a live pane (split-live only)."""
+            if _LIVE_TERM is None or self._live is None:
+                self.notify("new session needs split-live (RECAP_SPLIT_LIVE=1)",
+                            severity="warning", timeout=6)
+                return
+            base = str(repo) if repo else str(Path.cwd())
+            cands = self._new_session_candidates()
+
+            def _go(path):
+                if path:
+                    self._open_new_live(path)
+            self.push_screen(NewSessionScreen(base, cands), _go)
+
+        def _new_session_candidates(self):
+            """(label, path) rows for the new-session picker: git worktrees of the
+            current repo first, then distinct recent session dirs. Existing only."""
+            out, seen = [], set()
+            try:
+                r = subprocess.run(
+                    ["git", "worktree", "list", "--porcelain"],
+                    cwd=(str(repo) if repo else None),
+                    capture_output=True, text=True, timeout=5)
+                for line in r.stdout.splitlines():
+                    if line.startswith("worktree "):
+                        p = line[9:].strip()
+                        if p and p not in seen and Path(p).is_dir():
+                            seen.add(p)
+                            out.append((f"worktree   {p}", p))
+            except Exception:
+                pass
+            for s in all_sessions:
+                p = s.get("origin_cwd") or s.get("cwd")
+                if p and p not in seen and Path(p).is_dir():
+                    seen.add(p)
+                    out.append((f"recent     {p}", p))
+                if len(out) >= 40:
+                    break
+            return out
 
         def _request_refresh(self) -> None:
             """Coalesce frequent table-refresh requests (live status flips, the
@@ -4234,22 +4358,19 @@ def _resolve_resume_cwd(full_id: str, sessions: list[dict]) -> str | None:
     return candidates[0] if candidates else None
 
 
-def _build_resume_invocation(
-    full_id: str, sessions: list[dict]
+def _build_claude_invocation(
+    session_args: list[str], target_cwd: str | None, sessions: list[dict]
 ) -> tuple[list[str], str | None, dict]:
-    """Single source of truth for HOW to launch a resumed `claude`.
+    """Single source of truth for HOW to launch `claude` — resume OR new.
 
-    Returns ``(argv, cwd, env)`` where argv = ``[claude_bin, --resume, <id>,
-    *auto_perm]``, cwd = the resolved target dir (or None), and env = a prepared
-    copy of os.environ (RECAP_RESUME set, ephemeral VIRTUAL_ENV stripped from
-    both the var and PATH). Performs NO side effects beyond reading state — no
-    chdir, no terminal reset, no printing, no subprocess. Used by BOTH the
-    legacy full-takeover path (_resume_claude) and the embedded split-live pane
-    (recap_terminal.ClaudeTerminal) so cwd / auto-permission / venv-strip logic
-    can never drift between them.
+    ``session_args`` is the session selector, e.g. ``['--resume', sid]`` or
+    ``['--session-id', uuid]``. Returns ``(argv, cwd, env)``: argv =
+    ``[claude_bin, *session_args, *auto_perm]``, cwd = target dir (or None), env =
+    a prepared os.environ copy (RECAP_RESUME set, ephemeral VIRTUAL_ENV stripped
+    from both the var and PATH). NO side effects — no chdir / print / subprocess.
+    Shared by resume (_build_resume_invocation) and new (_build_new_invocation) so
+    cwd / auto-permission / venv-strip logic can never drift between them.
     """
-    target_cwd = _resolve_resume_cwd(full_id, sessions)
-
     # Auto --permission-mode auto for frequent (= trusted) workspaces.
     extra_args: list[str] = []
     if (target_cwd
@@ -4258,8 +4379,8 @@ def _build_resume_invocation(
         extra_args = ["--permission-mode", "auto"]
 
     env = os.environ.copy()
-    env["RECAP_RESUME"] = "1"   # signal to teams-notify.py: suppress idle_prompt
-    # Strip uv's ephemeral VIRTUAL_ENV so the resumed session's `uv` doesn't
+    env["RECAP_RESUME"] = "1"   # signal to teams-notify.py: suppress the first idle_prompt
+    # Strip uv's ephemeral VIRTUAL_ENV so the launched session's `uv` doesn't
     # warn about a stale venv.
     leaked_venv = env.pop("VIRTUAL_ENV", None)
     env.pop("VIRTUAL_ENV_PROMPT", None)
@@ -4271,8 +4392,26 @@ def _build_resume_invocation(
         env["PATH"] = os.pathsep.join(parts)
 
     claude_bin = shutil.which("claude", path=env.get("PATH")) or "claude"
-    argv = [claude_bin, "--resume", full_id, *extra_args]
+    argv = [claude_bin, *session_args, *extra_args]
     return argv, target_cwd, env
+
+
+def _build_resume_invocation(
+    full_id: str, sessions: list[dict]
+) -> tuple[list[str], str | None, dict]:
+    """Launch a RESUMED `claude --resume <id>` from its origin cwd. Used by both
+    the legacy full-takeover path (_resume_claude) and the split-live pane."""
+    target_cwd = _resolve_resume_cwd(full_id, sessions)
+    return _build_claude_invocation(["--resume", full_id], target_cwd, sessions)
+
+
+def _build_new_invocation(
+    target_cwd: str, session_id: str, sessions: list[dict]
+) -> tuple[list[str], str | None, dict]:
+    """Launch a FRESH `claude` in ``target_cwd`` with a pre-assigned
+    ``--session-id``, so recap can key the live pane by that uuid and the new
+    session links to its list row once claude writes the JSONL (next scan)."""
+    return _build_claude_invocation(["--session-id", session_id], target_cwd, sessions)
 
 
 def _resume_claude(full_id: str, sessions: list[dict]) -> None:
