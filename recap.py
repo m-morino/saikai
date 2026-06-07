@@ -2402,6 +2402,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # sid -> session map so the preview pane can warm its own cache on
             # demand: rendered and cached on a cache miss.
             self._sid_index = {s.get("id"): s for s in all_sessions}
+            self._marked: set = set()        # sids selected for batch launch (Space)
+            self._opening_live_sid = None     # sid whose pane should grab focus on open
             # Live-terminal bookkeeping (None-safe: only used when _LIVE_TERM is
             # available). Pure data structure; the TabbedContent is the UI.
             self._live = (_LIVE_TERM.LiveSessionManager(max_live=self.MAX_LIVE)
@@ -2773,6 +2775,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # Strip ANSI from the tree prefix so the cell stays a plain
                     # str of consistent width.
                     raw_title = _ANSI_RE.sub("", tree_prefixes[s["id"]]) + raw_title
+                if s["id"] in getattr(self, "_marked", ()):
+                    raw_title = "▣ " + raw_title       # batch-launch selection (Space)
                 if narrow:
                     # marker · relative-Last · title (title tinted by project).
                     proj_txt = project_short(s.get("project_name") or "")
@@ -2949,6 +2953,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 return
             if self.focused is table:
+                if event.key == "space":
+                    # Space toggles a batch-launch mark on the cursor row. (A
+                    # leading space in the search box was useless anyway; to
+                    # search, type a letter first — space then works in the box.)
+                    self.action_toggle_mark()
+                    event.stop()
+                    return
                 char = event.character
                 if char and len(char) == 1 and char.isprintable():
                     search.focus()
@@ -2966,6 +2977,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def on_data_table_row_highlighted(self, event) -> None:
             sid = str(event.row_key.value) if event.row_key else None
+            # A row just opened via Enter wants focus on its PANE (cursor keys go
+            # to claude), not the list — consume that marker one-shot here.
+            just_opened = (sid is not None
+                           and sid == getattr(self, "_opening_live_sid", None))
+            if just_opened:
+                self._opening_live_sid = None
             # If a live pane is focused, ignore highlight events from background
             # refreshes ENTIRELY (incl. header rows) — never switch the right pane
             # or steal focus while the user is interacting with claude.
@@ -2995,7 +3012,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if _LIVE_TERM is not None and self._live is not None and sid and self._live.has(sid):
                 try:
                     self.query_one("#right", TabbedContent).active = self._live.pane_id(sid)
-                    self.query_one("#table", DataTable).focus()
+                    if just_opened:
+                        term = self._live.get(sid)
+                        if term is not None:
+                            term.focus()        # Enter-opened → cursor keys to claude
+                    else:
+                        self.query_one("#table", DataTable).focus()   # browsing → stay on list
                     return
                 except Exception:
                     pass
@@ -3024,6 +3046,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # the focused ClaudeTerminal (whose on_key writes \r to the PTY).
             if self._focused_terminal() is not None:
                 raise SkipAction()
+            # Batch launch: if rows are marked (Space), open a pane for each.
+            if self._marked:
+                self._open_marked_live()
+                return
             sid = self._cursor_sid()
             if sid:
                 self._open_or_attach_live(sid)
@@ -3040,6 +3066,40 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self._live.kill_all()
                 self.exit(sid)
 
+        def action_toggle_mark(self) -> None:
+            """Toggle the cursor row's batch-launch selection (Space). Split-live
+            only: batch launch opens one live pane per marked session."""
+            if _LIVE_TERM is None:
+                return
+            sid = self._cursor_sid()
+            if not sid:
+                return
+            if sid in self._marked:
+                self._marked.discard(sid)
+            else:
+                self._marked.add(sid)
+            self._request_refresh()   # repaint the ▣ marker (coalesced)
+
+        def _open_marked_live(self) -> None:
+            """Open a live pane for each marked session (in display order),
+            honoring the pane cap, then clear the marks. The last one opened
+            keeps focus (each open sets _opening_live_sid)."""
+            if _LIVE_TERM is None or self._live is None:
+                return
+            order = [s["id"] for s in all_sessions if s["id"] in self._marked]
+            self._marked.clear()
+            opened = 0
+            for sid in order:
+                if self._live.at_capacity() and not self._live.has(sid):
+                    self.notify(
+                        f"opened {opened}; hit the {self._live.max_live}-pane "
+                        f"backstop — close some (Ctrl-W) or raise RECAP_MAX_LIVE",
+                        severity="warning", timeout=6)
+                    break
+                self._open_or_attach_live(sid)
+                opened += 1
+            self._refresh_table()
+
         # ── split-live helpers ────────────────────────────────────────────────
         def _focused_terminal(self):
             """Return the focused ClaudeTerminal, or None."""
@@ -3048,15 +3108,28 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             foc = self.focused
             return foc if isinstance(foc, _LIVE_TERM.ClaudeTerminal) else None
 
+        def _focus_live_pane(self, sid: str) -> None:
+            """Focus a live pane's terminal (deferred from open) so cursor keys go
+            to claude; consume the just-opened marker."""
+            if getattr(self, "_opening_live_sid", None) == sid:
+                self._opening_live_sid = None
+            if self._live is None:
+                return
+            term = self._live.get(sid)
+            if term is not None:
+                try:
+                    term.focus()
+                except Exception:
+                    pass
+
         def _open_or_attach_live(self, sid: str) -> None:
             assert _LIVE_TERM is not None and self._live is not None
             tabs = self.query_one("#right", TabbedContent)
             pane_id = self._live.pane_id(sid)
             if self._live.has(sid):                  # already running → switch
                 tabs.active = pane_id
-                term = self._live.get(sid)
-                if term is not None:
-                    term.focus()
+                self._opening_live_sid = sid
+                self.call_after_refresh(lambda: self._focus_live_pane(sid))
                 return
             if self._live.at_capacity():
                 self.notify(
@@ -3101,10 +3174,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             self._live.register(sid, term)
             tabs.active = pane_id
-            # add_pane mounts asynchronously and _refresh_table (below) re-emits a
-            # row-highlight; focus the terminal AFTER the refresh settles so focus
-            # lands on the pane and stays there (not back on the list).
-            self.call_after_refresh(term.focus)
+            # Focus the new pane so cursor keys go straight to claude. The
+            # post-open _refresh_table re-emits a row-highlight that races this
+            # deferred focus; mark the sid "just opened" so the highlight handler
+            # focuses the PANE too — whichever runs first, focus lands on claude
+            # (and the _focused_terminal guard then keeps it there).
+            self._opening_live_sid = sid
+            self.call_after_refresh(lambda: self._focus_live_pane(sid))
             # Reuse the resume side effects: 1-shot teams-notify suppression so
             # the first idle_prompt after launch doesn't ping (mirrors
             # _resume_claude). Best-effort.
