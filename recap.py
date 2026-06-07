@@ -3436,6 +3436,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # mounted panes incl. dead/exited ones (not just live statuses).
             if self._live is None:
                 return
+            _ft = self._focused_terminal()
+            if _ft is not None and not getattr(_ft, "is_dead", False):
+                raise SkipAction()   # live claude: Ctrl+K = kill-line, forward it
             tabs = self.query_one("#right", TabbedContent)
             ids = self._live_pane_ids()
             if not ids:
@@ -3456,9 +3459,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.notify(f"closed {n} live tab(s)", timeout=3)
 
         def action_close_live(self) -> None:
-            """Ctrl-W: kill + remove the focused (or active) live tab."""
+            """Ctrl-W: close the active live tab — but ONLY from the list. In a
+            focused claude pane Ctrl+W is readline word-delete, so forward it to
+            claude instead of closing the tab (Esc returns focus to the list,
+            where Ctrl+W / Esc then closes)."""
             if _LIVE_TERM is None or self._live is None:
                 return
+            _ft = self._focused_terminal()
+            if _ft is not None and not getattr(_ft, "is_dead", False):
+                raise SkipAction()   # live claude: Ctrl+W = word-delete, forward it
             tabs = self.query_one("#right", TabbedContent)
             active = tabs.active or ""
             term = self._focused_terminal()
