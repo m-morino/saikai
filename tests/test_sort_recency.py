@@ -147,6 +147,22 @@ def test_enrich_stamps_last_active_dt():
     assert recap._last_active_dt(r) is r["last_active_dt"]   # reads the stamp
 
 
+def test_summary_cache_keys_on_last_ts():
+    """Summary cache validity keys on last_ts (content), not mtime: metadata-only
+    mtime drift keeps the cache (no needless Haiku re-summarise), a last_ts change
+    invalidates it. Legacy caches without last_ts fall back to the mtime window."""
+    orig = recap._read_json
+    try:
+        recap._read_json = lambda *a, **k: {"summary": "S", "last_ts": "T1", "mtime": 100.0}
+        assert recap._load_cache("sid", 999.0, "T1") == "S"     # mtime drifted, last_ts matches → hit
+        assert recap._load_cache("sid", 100.0, "T2") is None    # last_ts changed → miss
+        recap._read_json = lambda *a, **k: {"summary": "L", "mtime": 100.0}  # legacy, no last_ts
+        assert recap._load_cache("sid", 100.4, "x") == "L"      # within mtime tolerance → hit
+        assert recap._load_cache("sid", 200.0, "x") is None     # outside tolerance → miss
+    finally:
+        recap._read_json = orig
+
+
 def test_missing_both_is_none_not_crash():
     s = {"id": "empty"}
     assert recap._last_active_dt(s) is None
@@ -177,6 +193,8 @@ if __name__ == "__main__":
     print("PASS test_recency_flags_use_current_time")
     test_enrich_stamps_last_active_dt()
     print("PASS test_enrich_stamps_last_active_dt")
+    test_summary_cache_keys_on_last_ts()
+    print("PASS test_summary_cache_keys_on_last_ts")
     test_missing_both_is_none_not_crash()
     print("PASS test_missing_both_is_none_not_crash")
     print("ALL PASS")
