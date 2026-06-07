@@ -50,9 +50,23 @@ that feeds pyte under `self._lock`; the **UI thread** also takes `self._lock`
 - **Timezone:** transcript timestamps are UTC (`…Z`). `_iso_dt` / `_iso_date`
   convert to LOCAL before any comparison against `datetime.now()` (Age filter,
   Date grouping) — using the UTC value mis-buckets near-midnight sessions.
+- **"Last activity" = `_last_active_dt(s) = max(mtime, last_ts)`, never raw
+  `last_ts`.** last_ts freezes at the last *timestamped* JSONL record, but claude
+  appends untimed metadata (ai-title / permission-mode / last-prompt) that still
+  bumps the file mtime. The Last column, Recency sort, Age filter and Date/Project
+  grouping ALL key off `_last_active_dt` so they agree — keying any one off raw
+  last_ts makes a freshly-touched session sort/bucket as old while the column
+  shows "now" (2026-06, session 6019b00c). Regression: `tests/test_sort_recency.py`.
 - **Textual default bindings shadow ours:** Ctrl+P (command palette — disabled
   via `ENABLE_COMMAND_PALETTE=False`), Screen's Ctrl+C (routed via `on_key`).
   Check `App`/`Screen`/`DataTable`/`Input` defaults before adding a binding.
+- **`Select.BLANK` is literally `False` in Textual 8.2.7** — passing it as
+  `Select(value=…)` raises `InvalidSelectValueError` on mount (would crash
+  launch). To start a Select with no selection, OMIT `value=` entirely. The
+  Group/Sort/Status/Age boxes are initialised from persisted state
+  (`_sort_select_value` etc.) so they show the remembered choice; a Select built
+  WITH a value also fires `Changed` on mount, so `on_select_changed` guards
+  against re-applying / rebuilding for the value it already has.
 - **`status` comes from claude's OSC-0 title** (leading braille spinner = busy,
   `✳` = idle), NOT from scraping the screen body. Verified via probe; claude
   emits no OSC 9;4 / OSC 133.
