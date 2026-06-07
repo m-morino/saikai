@@ -2347,7 +2347,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "[bold cyan]Navigation[/bold cyan]\n"
                 "  [yellow]↑[/yellow] [yellow]↓[/yellow]         Move rows\n"
                 "  [yellow]Enter[/yellow]       Resume session\n"
-                "  [yellow]Esc[/yellow]         Quit\n"
+                "  [yellow]/[/yellow]           Open search & filter (or just start typing)\n"
+                "  [yellow]Esc[/yellow]         Close the search bar if open · else quit\n"
                 "  [yellow]?[/yellow]           Help (this screen)\n\n"
                 "[bold cyan]Session ops[/bold cyan]  [dim](function keys — every Ctrl+letter stays with the search box / claude)[/dim]\n"
                 "  [yellow]F7[/yellow]          Toggle hide/unhide"
@@ -2376,7 +2377,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  Sort by   Recency / Created time / Alphabetically\n"
                 "  Status    Active / Archived / All\n"
                 "  Age       last 1d / 3d / 7d / 30d / All time\n"
-                "  Search    type to filter; tokens AND with text + each other —\n"
+                "  Search    [yellow]/[/yellow] or type to open the bar; tokens AND with text + each other —\n"
                 "            :fav  :hidden  :open  :active  :recent   (Esc clears)\n"
                 "  Markers   @ open · + active · . recent · live ~ busy · ? waiting · ! unread · = viewed · * fav · x hidden\n"
                 "  (clicking a column header still sorts too)\n\n"
@@ -2438,7 +2439,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         MAX_LIVE = int(os.environ.get("RECAP_MAX_LIVE", "64") or "64")
         CSS = """
         Screen { layout: vertical; }
-        #searchrow { dock: top; height: 3; }
+        #searchrow { dock: top; height: 3; display: none; }   /* on-demand: shown by '/' or typing, hidden by Esc */
         #search { width: 1fr; border: tall $accent; }
         #groupsel { width: 15; }
         #sortsel { width: 17; }
@@ -3071,7 +3072,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _col = "green" if fit > 0 else "red"
                     live_str = (f"{sep}Live: {cnt}  [{_col}]~{fit} fit[/{_col}]"
                                 f"  ({avail / 1024:.1f}GB free)")
-            text = (f"  {n} sessions{sep}{sort_str}{sep}"
+            # Search: when the on-demand bar is hidden, surface the active text
+            # query (so a filtered list isn't mistaken for "sessions missing");
+            # otherwise hint how to open it.
+            search_str = ""
+            if not self._search_visible():
+                try:
+                    _q = self.query_one("#search", Input).value.strip()
+                except Exception:
+                    _q = ""
+                if _q:
+                    _qd = _q if len(_q) <= 30 else _q[:29] + "…"
+                    search_str = f"{sep}[yellow]search: {_qd!r}[/yellow]"
+                else:
+                    search_str = f"{sep}[dim]/ search[/dim]"
+            text = (f"  {n} sessions{search_str}{sep}{sort_str}{sep}"
                     f"{scope}{sep}Group: {group_str}{filt_str}{sep}Tree: {tree_str}{sep}Cluster: {cluster_str}{live_str}")
             self.query_one("#statusbar", Static).update(text)
 
@@ -3125,6 +3140,38 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         # ── events ──────────────────────────────────────────────────────────
 
+        def _search_visible(self) -> bool:
+            try:
+                return bool(self.query_one("#searchrow").display)
+            except Exception:
+                return False
+
+        def _open_search(self, prefill: str | None = None) -> None:
+            """Show the on-demand search/filter bar (docked top) and focus the box.
+            prefill appends a just-typed char (search-as-you-type)."""
+            try:
+                self.query_one("#searchrow").display = True
+                search = self.query_one("#search", Input)
+            except Exception:
+                return
+            search.focus()
+            if prefill:
+                search.value = search.value + prefill
+                search.cursor_position = len(search.value)
+
+        def _hide_search(self) -> None:
+            """Hide the bar so the table reclaims the rows. The query is KEPT (the
+            list stays filtered; the statusbar shows it), so Esc dismisses the
+            chrome, not the filter."""
+            try:
+                self.query_one("#searchrow").display = False
+            except Exception:
+                pass
+            try:
+                self.query_one("#table", DataTable).focus()
+            except Exception:
+                pass
+
         def on_key(self, event) -> None:
             # Ctrl+C / Ctrl+Q reaching the App means the LIST or search box is
             # focused (a focused live terminal consumes Ctrl+C first, to interrupt
@@ -3148,40 +3195,32 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if self.focused is table:
                 if (event.key == "space" and _LIVE_TERM is not None
                         and not search.value):
-                    # Space toggles a batch-launch mark (split-live only — batch
-                    # launch opens one live pane per mark). Only when no query is
-                    # in progress: once the user has started typing, Space must
-                    # reach the search box so multi-word queries (":fav python")
-                    # work instead of silently marking a row.
+                    # Space toggles a batch-launch mark (split-live only). Only when
+                    # no query is in progress: once typing has started, Space must
+                    # reach the search box so multi-word queries work.
                     self.action_toggle_mark()
+                    event.stop()
+                    return
+                if event.key == "slash":
+                    # '/' opens the on-demand search/filter bar EMPTY (vim-style;
+                    # not a readline key). Other printable chars open it AND type
+                    # in (search-as-you-type), so a leading '/' is the only char you
+                    # can't search literally from the list (rare — type it after).
+                    self._open_search()
                     event.stop()
                     return
                 char = event.character
                 if char and len(char) == 1 and char.isprintable():
-                    search.focus()
-                    search.value = search.value + char
-                    search.cursor_position = len(search.value)
+                    self._open_search(char)
                     event.stop()
                 elif event.key == "backspace" and search.value:
-                    search.focus()
+                    self._open_search()
                     search.value = search.value[:-1]
                     search.cursor_position = len(search.value)
                     event.stop()
-            elif self.focused is search:
-                if event.key == "escape":
-                    # Esc in the search box = clear the query (the conventional
-                    # reflex), and only when it's already empty does it leave the
-                    # field for the list. WITHOUT this, Esc bubbles to action_quit
-                    # and EXITS recap mid-search (there was no clear-search key).
-                    if search.value:
-                        search.value = ""
-                        search.cursor_position = 0
-                    else:
-                        table.focus()
-                    event.stop()
-                elif event.key == "down":
-                    table.focus()
-                    event.stop()
+            elif self.focused is search and event.key == "down":
+                table.focus()
+                event.stop()
 
         def on_data_table_row_highlighted(self, event) -> None:
             sid = str(event.row_key.value) if event.row_key else None
@@ -4017,6 +4056,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # remain. (Ctrl-C is the force-quit: kill all + exit.) When a
             # terminal is focused Esc belongs to claude — this branch just
             # returns focus to the list (the terminal usually eats Esc first).
+            # First: if the on-demand search bar is open, Esc just dismisses it
+            # (keeping the filter, shown in the statusbar) — never quits mid-search.
+            if self._search_visible():
+                self._hide_search()
+                return
             if self._focused_terminal() is not None:
                 self.query_one("#table", DataTable).focus()
                 return
