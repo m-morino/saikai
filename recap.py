@@ -277,10 +277,9 @@ def _iso_date(ts_iso: str):
     return dt.date() if dt is not None else None
 
 
-def _date_bucket(ts_iso: str, now) -> str:
-    """Claude-Desktop-style date-section label for a session's last activity:
+def _date_label(d, now) -> str:
+    """Claude-Desktop-style date-section label from a local date (None -> '—'):
     Today / Yesterday / 'M月D日' (this year) / 'YYYY/M/D' (older)."""
-    d = _iso_date(ts_iso)
     if d is None:
         return "—"
     today = now.date()
@@ -291,6 +290,34 @@ def _date_bucket(ts_iso: str, now) -> str:
     if d.year == today.year:
         return f"{d.month}月{d.day}日"
     return f"{d.year}/{d.month}/{d.day}"
+
+
+def _date_bucket(ts_iso: str, now) -> str:
+    return _date_label(_iso_date(ts_iso), now)
+
+
+def _last_active_dt(s: dict):
+    """Unified 'last activity' as a naive LOCAL datetime: the LATER of the file
+    mtime and the last message timestamp.
+
+    The Last column, Recency sort, Age filter and Date grouping ALL key off this
+    so they never disagree. last_ts freezes at the last *timestamped* record, but
+    Claude appends untimed metadata (ai-title / permission-mode / last-prompt)
+    that still bumps the file mtime — so a freshly-touched session whose tail is
+    metadata-only must sort/bucket by mtime (what the Last column already shows),
+    not by its stale last-message ts. max() also guards a restored backup whose
+    mtime predates its newest message."""
+    cands = []
+    mt = s.get("mtime") or 0.0
+    if mt:
+        try:
+            cands.append(datetime.fromtimestamp(mt))   # local naive
+        except (OverflowError, OSError, ValueError):
+            pass
+    lt = _iso_dt(s.get("last_ts"))                      # local naive or None
+    if lt is not None:
+        cands.append(lt)
+    return max(cands) if cands else None
 
 
 def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
@@ -313,14 +340,16 @@ def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
     if group_by == "date":
         buckets: dict = {}
         for s in rest:
-            buckets.setdefault(_date_bucket(s.get("last_ts") or "", now), []).append(s)
+            _la = _last_active_dt(s)
+            buckets.setdefault(_date_label(_la.date() if _la else None, now), []).append(s)
         order = []
         if "Today" in buckets:
             order.append("Today")
         if "Yesterday" in buckets:
             order.append("Yesterday")
         dated = [l for l in buckets if l not in ("Today", "Yesterday", "—")]
-        dated.sort(key=lambda l: max((m.get("last_ts") or "") for m in buckets[l]),
+        dated.sort(key=lambda l: max((_last_active_dt(m) or datetime.min)
+                                     for m in buckets[l]),
                    reverse=True)
         order += dated
         if "—" in buckets:
@@ -342,7 +371,8 @@ def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
             key = project_short(s.get("project_name") or "") or "(none)"
             buckets.setdefault(key, []).append(s)
         for l in sorted(buckets,
-                        key=lambda l: max((m.get("last_ts") or "") for m in buckets[l]),
+                        key=lambda l: max((_last_active_dt(m) or datetime.min)
+                                          for m in buckets[l]),
                         reverse=True):
             groups.append((l, buckets[l]))
     return groups
@@ -498,7 +528,7 @@ def _apply_sort(sessions: list[dict], keys: list[dict]) -> None:
         # raises TypeError on mixed None/str even when a session is missing
         # a timestamp or other field.
         if col == "date":  return s.get("first_ts") or ""
-        if col == "last":  return s.get("last_ts") or ""
+        if col == "last":  return _last_active_dt(s) or datetime.min
         if col == "proj":  return (s.get("project_name") or "").lower()
         if col == "title": return (s.get("ai_title") or _first_msg(s) or "").lower()
         if col == "turns": return s.get("n_turns") or 0
@@ -1634,8 +1664,12 @@ def _state_marker(s: dict, hidden: set, favorites: set) -> str:
 
 
 def fmt_last_active(s: dict) -> str:
-    """Human-friendly 'last activity' column: '5m', '2h', '3d', '04/22'."""
-    age = time.time() - s.get("mtime", 0.0)
+    """Human-friendly 'last activity' column: '5m', '2h', '3d', '04/22'.
+    Keyed on _last_active_dt so the column matches the Recency sort exactly."""
+    dt = _last_active_dt(s)
+    if dt is None:
+        return ""
+    age = max(0.0, (datetime.now() - dt).total_seconds())
     if age < 60:
         return "now"
     if age < 3600:
@@ -1644,11 +1678,7 @@ def fmt_last_active(s: dict) -> str:
         return f"{int(age/3600)}h"
     if age < 86400 * 7:
         return f"{int(age/86400)}d"
-    try:
-        dt = datetime.fromisoformat(s["last_ts"].replace("Z", "+00:00"))
-        return dt.astimezone().strftime("%m/%d")
-    except Exception:
-        return ""
+    return dt.strftime("%m/%d")
 
 
 def display_table(sessions: list[dict], repo: Path | None, show_project: bool,
@@ -2429,7 +2459,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if _lastact:
                 _cut = datetime.now() - timedelta(days=_lastact)
                 visible = [s for s in visible
-                           if (_iso_dt(s.get("last_ts")) or datetime.min) >= _cut]
+                           if (_last_active_dt(s) or datetime.min) >= _cut]
             hidden = _load_hidden()
             favorites = _load_favorites()
             view_mode = _get_view_mode()
@@ -4298,7 +4328,12 @@ def cmd_sync_desktop() -> None:
                      or (s["real_msgs"][0] if s.get("real_msgs") else "")
                      or f"({sid[:8]})")[:80]
             created_ms = _iso_to_ms(s.get("first_ts"))
-            active_ms = _iso_to_ms(s.get("last_ts")) or created_ms
+            # last activity = the later of last-message ts and file mtime, matching
+            # recap's Recency column (untimed ai-title/permission-mode appends bump
+            # mtime but not last_ts) so Desktop orders these sessions the same way.
+            active_ms = (max(_iso_to_ms(s.get("last_ts")),
+                             int((s.get("mtime") or 0) * 1000))
+                         or created_ms)
             entry = {
                 "sessionId": "local_" + str(uuid.uuid4()),
                 "cliSessionId": sid,
