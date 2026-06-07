@@ -447,6 +447,17 @@ def _load_sort() -> list[dict]:
     return out
 
 
+def _sort_select_value():
+    """Primary sort column as a #sortsel option ('last'|'date'|'title'), or None
+    if the saved sort leads with a column the dropdown can't show (e.g. a
+    header-click sort by turns/fav). Lets the Sort box display the remembered
+    choice on launch instead of the generic 'Sort' prompt."""
+    for k in _load_sort():
+        if k.get("col") in ("last", "date", "title"):
+            return k["col"]
+    return None
+
+
 def _save_sort(keys: list[dict]) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     _write_json(SORT_FILE, keys[:3])
@@ -2285,24 +2296,41 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 yield Input(placeholder="Search title / msg / SID / proj    "
                                         "•  :fav  :hidden  :open  :active  :recent",
                             id="search")
+                # Initialise each dropdown to the persisted selection so the box
+                # shows what is actually applied (the choices ARE remembered on
+                # disk + applied at startup; without value= the box just showed
+                # the generic prompt, which read as "not remembered"). OMIT value=
+                # when there is no representable selection — Select.BLANK is
+                # literally `False` in Textual 8.2.7 and passing it raises
+                # InvalidSelectValueError on mount (would crash launch whenever the
+                # saved sort leads with a non-dropdown column, e.g. a header-click
+                # sort by turns). Group/Status getters are always valid options.
                 yield Select(
                     [("Date", "date"), ("Project", "project"),
                      ("State", "state"), ("None", "none")],
-                    prompt="Group", id="groupsel",
+                    prompt="Group", id="groupsel", value=_get_group_by(),
                 )
+                _sort_kw = {"prompt": "Sort", "id": "sortsel"}
+                _sv = _sort_select_value()
+                if _sv is not None:
+                    _sort_kw["value"] = _sv
                 yield Select(
                     [("Recency", "last"), ("Created time", "date"),
                      ("Alphabetically", "title")],
-                    prompt="Sort", id="sortsel",
+                    **_sort_kw,
                 )
                 yield Select(
                     [("Active", "active"), ("Archived", "archived"), ("All", "all")],
-                    prompt="Status", id="statussel",
+                    prompt="Status", id="statussel", value=_get_status_filter(),
                 )
+                _last_kw = {"prompt": "Age", "id": "lastsel"}
+                _lv = str(_get_lastact_days())
+                if _lv in ("0", "1", "3", "7", "30"):
+                    _last_kw["value"] = _lv
                 yield Select(
                     [("All time", "0"), ("1d", "1"), ("3d", "3"),
                      ("7d", "7"), ("30d", "30")],
-                    prompt="Age", id="lastsel",
+                    **_last_kw,
                 )
             yield Static("", id="statusbar")
             with Horizontal(id="main", classes=("split" if _LIVE_TERM is not None else "")):
@@ -3250,6 +3278,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self._refresh_table()
             elif sel_id == "sortsel":
                 if v in ("last", "date", "title"):
+                    if v == _sort_select_value():
+                        return   # mount echo / re-pick of current primary — no rebuild
                     col, direction = {"last": ("last", "desc"),
                                       "date": ("date", "desc"),
                                       "title": ("title", "asc")}[v]
@@ -3259,10 +3289,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self._refresh_table()
             elif sel_id == "statussel":
                 if v in ("active", "archived", "all"):
+                    if v == _get_status_filter():
+                        return
                     _set_status_filter(v)
                     self._refresh_table()
             elif sel_id == "lastsel":
                 if v in ("0", "1", "3", "7", "30"):
+                    if int(v) == _get_lastact_days():
+                        return
                     _set_lastact_days(int(v))
                     self._refresh_table()
 

@@ -66,6 +66,29 @@ def test_date_bucket_uses_mtime():
     assert recap._date_label(la.date() if la else None, now) == "Today"
 
 
+def test_sort_select_value_reflects_primary_or_none():
+    """The Sort dropdown shows the remembered primary; for a primary the dropdown
+    can't represent (header-click sort by turns/fav) it returns None so compose
+    OMITS value= — passing Select.BLANK (== False in Textual 8.2.7) would crash
+    launch with InvalidSelectValueError."""
+    orig = recap._load_sort
+
+    def _spec(col):
+        return [{"col": col, "dir": "desc"},
+                {"col": "-", "dir": "desc"}, {"col": "-", "dir": "desc"}]
+    try:
+        recap._load_sort = lambda: _spec("last")
+        assert recap._sort_select_value() == "last"
+        recap._load_sort = lambda: _spec("title")
+        assert recap._sort_select_value() == "title"
+        recap._load_sort = lambda: _spec("date")
+        assert recap._sort_select_value() == "date"
+        recap._load_sort = lambda: _spec("turns")     # not a dropdown option
+        assert recap._sort_select_value() is None
+    finally:
+        recap._load_sort = orig
+
+
 def test_missing_both_is_none_not_crash():
     s = {"id": "empty"}
     assert recap._last_active_dt(s) is None
@@ -86,6 +109,8 @@ if __name__ == "__main__":
     print("PASS test_age_filter_keeps_freshly_touched")
     test_date_bucket_uses_mtime()
     print("PASS test_date_bucket_uses_mtime")
+    test_sort_select_value_reflects_primary_or_none()
+    print("PASS test_sort_select_value_reflects_primary_or_none")
     test_missing_both_is_none_not_crash()
     print("PASS test_missing_both_is_none_not_crash")
     print("ALL PASS")
