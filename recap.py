@@ -883,18 +883,28 @@ def _load_active_sessions() -> dict[str, str]:
         return _active_sessions_cache
     out: dict[str, str] = {}
     sessions_dir = Path.home() / ".claude" / "sessions"
-    if sessions_dir.exists():
-        for f in sessions_dir.glob("*.json"):
-            try:
-                d = json.loads(f.read_text(encoding="utf-8"))
-                pid = d.get("pid")
-                sid = d.get("sessionId")
-                status = d.get("status", "")
-                if pid and sid and _is_pid_alive(int(pid)):
-                    out[sid] = status
-            except Exception:
-                continue
-    _active_sessions_cache = out
+    scanned_ok = False
+    try:
+        if sessions_dir.exists():
+            for f in sessions_dir.glob("*.json"):
+                try:
+                    d = json.loads(f.read_text(encoding="utf-8"))
+                    pid = d.get("pid")
+                    sid = d.get("sessionId")
+                    status = d.get("status", "")
+                    if pid and sid and _is_pid_alive(int(pid)):
+                        out[sid] = status
+                except Exception:
+                    continue
+            scanned_ok = True
+    except Exception:
+        scanned_ok = False   # glob/exists itself failed (transient FS hiccup)
+    # Only memoise a CLEAN scan. A transient failure (dir momentarily absent on a
+    # roaming/OneDrive profile, glob error) yields an empty/partial registry; if
+    # cached, EVERY session freezes as is_open=False for the whole process and
+    # live panes render as dead. Leave the cache unset so the next call retries.
+    if scanned_ok:
+        _active_sessions_cache = out
     return out
 
 
@@ -1008,7 +1018,11 @@ def parse_session(jsonl_path: Path) -> dict | None:
                     if _is_real_user_msg(text):
                         real_msgs.append(text[:800].replace("\n", " "))
     except Exception:
-        return None
+        # A late/mid read error (locked tail, half-written multibyte line while
+        # claude appends) must NOT drop a session we already parsed valid records
+        # from — keep the partial parse; the first_ts guard below still drops a
+        # genuinely empty read.
+        pass
 
     if first_ts is None:
         return None
@@ -1077,11 +1091,17 @@ def _delete_session_files(session_id: str):
     """Remove any JSONL created by an ephemeral claude -p call."""
     if not session_id or not _UUID_RE.fullmatch(session_id):
         return
-    for jsonl in PROJECTS_ROOT.rglob(f"{session_id}.jsonl"):
-        try:
-            jsonl.unlink()
-        except Exception:
-            pass
+    matches = list(PROJECTS_ROOT.rglob(f"{session_id}.jsonl"))
+    # A `claude -p` call creates exactly ONE transcript. More than one match means
+    # this UUID also names a real user session in another project — refuse to
+    # touch anything rather than risk deleting their history on a (vanishingly
+    # rare) id collision.
+    if len(matches) != 1:
+        return
+    try:
+        matches[0].unlink()
+    except Exception:
+        pass
 
 
 _haiku_missing_warned = False  # surface "claude not on PATH" at most once per run
@@ -4036,7 +4056,13 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
     # 1-shot 抑止 file への session_id 追加. env だけだと session 全体 lifetime で
     # Notification 全件 silent になり、 復帰後の真の入力待ちも消える (2026-05-24
     # 検出 bug)。 file ベースの fine-grain control で「最初の 1 件のみ silent、
-    # 以降は通常通知」 を実現する。
+    # 以降は通常通知」 を実現する。 (env RECAP_RESUME はゲートのみ — 実際の抑止は
+    # この file 登録が必須。split-live 経路 3314 と対。これが無いと復帰直後の
+    # idle_prompt が毎回 Teams へ誤通知される。)
+    try:
+        _add_recap_suppress_session(full_id)
+    except Exception:
+        pass
     if target_cwd:
         # TOCTOU: directory passed `is_dir()` earlier but could vanish before chdir.
         try:
