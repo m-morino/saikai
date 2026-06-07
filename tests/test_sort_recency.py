@@ -121,6 +121,32 @@ def test_n_turns_derived_from_real_msgs_not_inflated():
     assert r["n_turns"] == 3, r["n_turns"]
 
 
+def test_recency_flags_use_current_time():
+    """:active/:recent must reflect NOW, not the load-time is_active/is_recent
+    snapshot (which goes stale as the picker stays open)."""
+    now = time.time()
+    fresh = {"id": "f", "mtime": now - 60}        # 1 min ago
+    old = {"id": "o", "mtime": now - 3600}        # 1 h ago
+    assert recap._is_recent_now(fresh, now) is True
+    assert recap._is_recent_now(old, now) is False
+    assert recap._is_active_now(fresh, now) is True
+    assert recap._is_active_now(old, now) is False
+    # is_open snapshot still wins even when long-untouched
+    opened = {"id": "x", "mtime": now - 99999, "is_open": True}
+    assert recap._is_active_now(opened, now) is True
+
+
+def test_enrich_stamps_last_active_dt():
+    """_enrich_session memoises last_active_dt; _last_active_dt then reads it."""
+    from pathlib import Path
+    parsed = {"first_ts": "2026-01-01T00:00:00.000Z",
+              "last_ts": "2026-01-01T00:00:00.000Z",
+              "real_msgs": [], "mtime": time.time()}
+    r = recap._enrich_session("sid-y", parsed, Path("x.jsonl"), parsed["mtime"])
+    assert r.get("last_active_dt") is not None
+    assert recap._last_active_dt(r) is r["last_active_dt"]   # reads the stamp
+
+
 def test_missing_both_is_none_not_crash():
     s = {"id": "empty"}
     assert recap._last_active_dt(s) is None
@@ -147,6 +173,10 @@ if __name__ == "__main__":
     print("PASS test_sort_select_value_ignores_secondary_column")
     test_n_turns_derived_from_real_msgs_not_inflated()
     print("PASS test_n_turns_derived_from_real_msgs_not_inflated")
+    test_recency_flags_use_current_time()
+    print("PASS test_recency_flags_use_current_time")
+    test_enrich_stamps_last_active_dt()
+    print("PASS test_enrich_stamps_last_active_dt")
     test_missing_both_is_none_not_crash()
     print("PASS test_missing_both_is_none_not_crash")
     print("ALL PASS")

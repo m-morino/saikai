@@ -300,17 +300,7 @@ def _date_bucket(ts_iso: str, now) -> str:
     return _date_label(_iso_date(ts_iso), now)
 
 
-def _last_active_dt(s: dict):
-    """Unified 'last activity' as a naive LOCAL datetime: the LATER of the file
-    mtime and the last message timestamp.
-
-    The Last column, Recency sort, Age filter and Date grouping ALL key off this
-    so they never disagree. last_ts freezes at the last *timestamped* record, but
-    Claude appends untimed metadata (ai-title / permission-mode / last-prompt)
-    that still bumps the file mtime — so a freshly-touched session whose tail is
-    metadata-only must sort/bucket by mtime (what the Last column already shows),
-    not by its stale last-message ts. max() also guards a restored backup whose
-    mtime predates its newest message."""
+def _compute_last_active_dt(s: dict):
     cands = []
     mt = s.get("mtime") or 0.0
     if mt:
@@ -322,6 +312,42 @@ def _last_active_dt(s: dict):
     if lt is not None:
         cands.append(lt)
     return max(cands) if cands else None
+
+
+def _last_active_dt(s: dict):
+    """Unified 'last activity' as a naive LOCAL datetime: the LATER of the file
+    mtime and the last message timestamp.
+
+    The Last column, Recency sort, Age filter and Date grouping ALL key off this
+    so they never disagree. last_ts freezes at the last *timestamped* record, but
+    Claude appends untimed metadata (ai-title / permission-mode / last-prompt)
+    that still bumps the file mtime — so a freshly-touched session whose tail is
+    metadata-only must sort/bucket by mtime (what the Last column already shows),
+    not by its stale last-message ts. max() also guards a restored backup whose
+    mtime predates its newest message.
+
+    Memoised: _enrich_session stamps the value onto the session dict as
+    'last_active_dt' (once per parse/reload), so the per-refresh hot paths read it
+    instead of re-parsing last_ts + rebuilding a datetime for every session on
+    every keystroke — and there is ONE definition of 'last activity', so a new
+    call site can't silently drift (the bug class that started all this). Falls
+    back to computing for dicts that skipped _enrich_session (e.g. unit tests)."""
+    v = s.get("last_active_dt")
+    return v if v is not None else _compute_last_active_dt(s)
+
+
+def _is_recent_now(s: dict, now_ts: float) -> bool:
+    """True if the session was touched < 30 min ago, evaluated against the CURRENT
+    time — not the load-time is_recent snapshot, which goes stale as the picker
+    stays open (a ':recent' search 40 min in would otherwise return the set that
+    was recent AT LAUNCH). Uses the stored mtime; a reload re-stats it."""
+    return (now_ts - (s.get("mtime") or 0.0)) < 1800
+
+
+def _is_active_now(s: dict, now_ts: float) -> bool:
+    """True if running (live-registry snapshot) or touched < 5 min ago, evaluated
+    against the current time (see _is_recent_now re: staleness)."""
+    return bool(s.get("is_open")) or (now_ts - (s.get("mtime") or 0.0)) < 300
 
 
 def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
@@ -855,6 +881,7 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
         "is_active": (sid in active) or age_sec < 300,
         "is_recent": age_sec < 1800,
     }
+    result["last_active_dt"] = _compute_last_active_dt(result)
     if "topics" in parsed:
         result["topics"] = parsed["topics"]
     return result
@@ -2441,6 +2468,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             statuses, text = self._parse_query(q)
             if not statuses and not text:
                 return all_sessions
+            now_ts = time.time()   # recompute recency NOW, not from the load snapshot
             favs = _load_favorites() if ":fav" in statuses else set()
             hidden = _load_hidden() if ":hidden" in statuses else set()
 
@@ -2452,9 +2480,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     return False
                 if ":open" in statuses and not s.get("is_open"):
                     return False
-                if ":active" in statuses and not s.get("is_active"):
+                if ":active" in statuses and not _is_active_now(s, now_ts):
                     return False
-                if ":recent" in statuses and not s.get("is_recent"):
+                if ":recent" in statuses and not _is_recent_now(s, now_ts):
                     return False
                 if text:
                     return (text in (s.get("ai_title") or "").lower()
@@ -2491,13 +2519,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             query = self.query_one("#search", Input).value
             visible = list(self._filter(query))   # copy: _filter may return the shared all_sessions; we sort/tag it in place
             # Claude-Desktop 'Last activity' window: drop rows older than N days.
+            hidden = _load_hidden()
+            favorites = _load_favorites()
             _lastact = _get_lastact_days()
             if _lastact:
                 _cut = datetime.now() - timedelta(days=_lastact)
+                # Pinned favorites are exempt: Claude Desktop keeps pinned items
+                # regardless of the activity window, so narrowing Age must not make
+                # a user-pinned session vanish from the Pinned section.
                 visible = [s for s in visible
-                           if (_last_active_dt(s) or datetime.min) >= _cut]
-            hidden = _load_hidden()
-            favorites = _load_favorites()
+                           if s["id"] in favorites
+                           or (_last_active_dt(s) or datetime.min) >= _cut]
             view_mode = _get_view_mode()
             tree_mode = _get_tree_mode() and len(all_sessions) <= 1000
             cluster_mode = _get_cluster_mode()
