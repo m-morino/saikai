@@ -2542,10 +2542,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             thread = _bg_summarize.get("thread")
             if thread:
                 thread.join()
-            self.call_from_thread(self._refresh_table)
-            self.call_from_thread(
-                lambda: self.notify("Summaries ready", severity="information", timeout=3)
-            )
+            if not getattr(self, "is_running", True):
+                return   # app quit while summarizing — don't marshal into a dead App
+            try:
+                self.call_from_thread(self._refresh_table)
+                self.call_from_thread(
+                    lambda: self.notify("Summaries ready", severity="information", timeout=3)
+                )
+            except Exception:
+                pass
 
         # Status-filter prefixes: typed alongside text in the search input.
         # `:fav python` = favorites whose searchable text matches "python".
@@ -3227,6 +3232,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             )
             pane = TabPane(_LIVE_TERM.tab_label(title, "idle"), term, id=pane_id)
             try:
+                # A previously-dead pane for this sid may still be mounted (kept
+                # for its final frame, only forgotten from the manager); its id
+                # collides with the new pane. Drop it first so add_pane doesn't
+                # raise DuplicateIds and block re-launching a session that exited.
+                try:
+                    tabs.remove_pane(pane_id)
+                except Exception:
+                    pass
                 tabs.add_pane(pane)
             except Exception as e:
                 # add_pane may have already mounted the widget (on_mount spawned
@@ -3283,8 +3296,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def _on_live_status(self, sid: str, status: str) -> None:
             """Called on the UI thread (terminal marshals it) when a pane's
             Busy/Waiting/Idle/dead status changes."""
-            if self._live is None:
-                return
+            if self._live is None or not self._live.has(sid):
+                return   # ignore a callback that lands after the pane was closed
             self._live.set_status(sid, status)
             # Update the tab label.
             try:
@@ -3609,6 +3622,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             for term in self._live.all_terms():
                 try:
                     term.refresh_status()
+                    # refresh_status marshals its callback via call_from_thread,
+                    # which Textual REJECTS from the app's own thread (this poll
+                    # runs on it) — so the callback no-ops. Reconcile the manager
+                    # dict directly from the term's freshly classified status here,
+                    # else a pane that went idle/waiting with no new output never
+                    # updates its marker (the whole point of this poll).
+                    self._live.set_status(term.sid, getattr(term, "_status", ""))
                 except Exception:
                     pass
             try:

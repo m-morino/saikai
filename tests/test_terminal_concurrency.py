@@ -144,6 +144,21 @@ def test_classify_pty_status_basics():
     assert rt.classify_pty_status("x" * 5000 + "\n(y/n)", "") == "waiting"
 
 
+def test_set_status_ignores_forgotten_sid():
+    """A status callback that lands AFTER the pane was closed must not resurrect a
+    ghost entry in the manager's status dict (which statuses() reports as a stale
+    marker / false 'needs input' toast / phantom Esc-close target)."""
+    mgr = rt.LiveSessionManager.__new__(rt.LiveSessionManager)
+    mgr._terms = {"sidA": object()}     # a registered (live) pane
+    mgr._status = {}
+    mgr.set_status("sidA", "busy")
+    assert mgr.statuses() == {"sidA": "busy"}
+    mgr._terms.pop("sidA")              # mimic forget() popping _terms + _status
+    mgr._status.pop("sidA", None)
+    mgr.set_status("sidA", "idle")      # a late callback for the forgotten sid
+    assert "sidA" not in mgr.statuses(), "forgotten sid resurrected as a ghost"
+
+
 def test_note_reap_prunes_finished_threads():
     """note_reap drops already-finished reaps so _reaps can't grow unbounded over
     open/close pane churn — while still tracking in-flight ones. This does NOT
@@ -179,5 +194,7 @@ if __name__ == "__main__":
     print("PASS test_refresh_status_skips_stable_idle_pane")
     test_classify_pty_status_basics()
     print("PASS test_classify_pty_status_basics")
+    test_set_status_ignores_forgotten_sid()
+    print("PASS test_set_status_ignores_forgotten_sid")
     test_note_reap_prunes_finished_threads()
     print("PASS test_note_reap_prunes_finished_threads")
