@@ -725,7 +725,14 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
                 self._consume(chunk)
                 # NEVER touch the UI from this thread — marshal a COALESCED
                 # repaint so a fast stream of small chunks can't flood the UI.
-                self._schedule_pane_refresh()
+                # While scrolled back (copy mode) the pinned view shows the SAME
+                # history lines regardless of new output (_consume keeps the pin
+                # by bumping _scroll), so the repaint would rewrite identical cells
+                # for nothing AND clear a WezTerm Shift+drag selection. Skip it —
+                # scrolling up thus "freezes" the pane so the user can select/copy;
+                # scrolling back to the bottom (_scroll == 0) resumes live repaint.
+                if self._scroll == 0:
+                    self._schedule_pane_refresh()
         finally:
             self._finalize()
 
