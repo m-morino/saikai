@@ -3589,6 +3589,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.notify(f"copied opening prompt ({len(text)} chars)", timeout=3)
 
         def _apply_fresh_sessions(self, fresh) -> None:
+            nonlocal all_sessions
+            # A re-scan that suddenly finds ZERO sessions while we currently HAVE
+            # some is almost always transient (a glob race, a momentarily
+            # unreadable projects dir, a project-resolution hiccup) — NOT the user
+            # deleting everything. Refuse to clobber a populated list with an empty
+            # scan; that was the "all sessions suddenly vanished" bug.
+            if not fresh and all_sessions:
+                try:
+                    self.notify("re-scan returned 0 sessions — kept the current "
+                                "list (likely transient; Ctrl-R to retry)",
+                                severity="warning", timeout=6)
+                except Exception:
+                    pass
+                return
             # Reassign the session list after a re-scan, but KEEP any live pane
             # whose sid fell out of the fresh scan (filter / --days window) so a
             # running pane doesn't vanish from the list or lose its title.
@@ -3599,7 +3613,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         old = self._sid_index.get(sid)
                         if old is not None:
                             fresh.append(old)
-            nonlocal all_sessions
             all_sessions = fresh
             self._sid_index = {s.get("id"): s for s in fresh}
 
