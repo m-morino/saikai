@@ -290,6 +290,25 @@ def test_missing_both_is_none_not_crash():
     assert sessions[0]["id"] == "real"
 
 
+def test_no_app_binding_steals_a_readline_ctrl_key():
+    """recap must never bind an app action to a bare Ctrl+<letter>: those are
+    readline editing keys the user types in the search box and inside live claude
+    panes (and claude itself binds Ctrl+R/T/L). App shortcuts live on FUNCTION
+    keys instead. Ctrl+C (quit) is the sole allowed bare-Ctrl binding. Regression
+    for the Ctrl+K close-all that wiped every live pane (2026-06). Scans the
+    source so it runs without textual (the App/Binding class needs textual)."""
+    import re
+    from pathlib import Path
+    src = Path(__file__).resolve().parent.parent.joinpath("recap.py").read_text(encoding="utf-8")
+    keys = re.findall(r'Binding\(\s*"([^"]+)"', src)
+    assert keys, "no Binding(...) entries found — regex/structure changed?"
+    offenders = [k for k in keys if re.fullmatch(r"ctrl\+[a-z]", k) and k != "ctrl+c"]
+    assert not offenders, f"app bindings on readline Ctrl+letter keys: {offenders}"
+    # the function keys we relocated them onto must actually be bound
+    for must in ("f5", "f6", "f7", "f8", "f9", "f10", "shift+f10"):
+        assert must in keys, f"expected F-key binding {must!r} missing: {keys}"
+
+
 if __name__ == "__main__":
     test_last_active_prefers_mtime_over_stale_last_ts()
     print("PASS test_last_active_prefers_mtime_over_stale_last_ts")
@@ -329,4 +348,6 @@ if __name__ == "__main__":
     print("PASS test_refresh_summary_only_matches_uuid_caches")
     test_missing_both_is_none_not_crash()
     print("PASS test_missing_both_is_none_not_crash")
+    test_no_app_binding_steals_a_readline_ctrl_key()
+    print("PASS test_no_app_binding_steals_a_readline_ctrl_key")
     print("ALL PASS")
