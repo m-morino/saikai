@@ -1007,7 +1007,12 @@ class LiveSessionManager:
         self._status.pop(sid, None)
 
     def set_status(self, sid: str, status: str) -> None:
-        self._status[sid] = status
+        # Only track status for a REGISTERED pane. A status callback marshalled by
+        # the reader just before the pane was closed (forget() popped _terms AND
+        # _status) must not re-insert a ghost entry that statuses() then reports
+        # (stale marker / false "needs input" toast / phantom Esc-close target).
+        if sid in self._terms:
+            self._status[sid] = status
 
     def status(self, sid: str) -> str:
         return self._status.get(sid, "")
