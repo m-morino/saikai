@@ -240,11 +240,15 @@ def _set_status_filter(value: str) -> None:
 
 
 def _get_lastact_days() -> int:
-    """Claude-Desktop 'Last activity' window in days (0 = All time, default)."""
+    """Claude-Desktop 'Last activity' window in days (0 = All time, default).
+    Clamped to the dropdown option set — a stray/negative persisted value (e.g.
+    -3 makes the cutoff a FUTURE time that hides EVERY row) must not silently
+    empty the list, and the box must not show a value it can't represent."""
     try:
-        return int(LASTACT_FILTER_FILE.read_text(encoding="utf-8").strip())
+        v = int(LASTACT_FILTER_FILE.read_text(encoding="utf-8").strip())
     except Exception:
         return 0
+    return v if v in (0, 1, 3, 7, 30) else 0
 
 
 def _set_lastact_days(days: int) -> None:
@@ -449,13 +453,15 @@ def _load_sort() -> list[dict]:
 
 def _sort_select_value():
     """Primary sort column as a #sortsel option ('last'|'date'|'title'), or None
-    if the saved sort leads with a column the dropdown can't show (e.g. a
-    header-click sort by turns/fav). Lets the Sort box display the remembered
-    choice on launch instead of the generic 'Sort' prompt."""
-    for k in _load_sort():
-        if k.get("col") in ("last", "date", "title"):
-            return k["col"]
-    return None
+    if the saved sort LEADS WITH a column the dropdown can't show (e.g. a
+    header-click sort by turns/fav). Only the primary (priority-0) key counts:
+    scanning lower priorities would make the box show a SECONDARY column, and the
+    echo-guard in on_select_changed would then swallow a genuine re-pick of it
+    (the user clicks the shown option, v == this value → early-return, nothing
+    happens). None → compose omits value= and the box shows the prompt."""
+    keys = _load_sort()
+    primary = keys[0].get("col") if keys else None
+    return primary if primary in ("last", "date", "title") else None
 
 
 def _save_sort(keys: list[dict]) -> None:
@@ -834,7 +840,11 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
         "last_ts": parsed.get("last_ts") or parsed["first_ts"],
         "ai_title": parsed.get("ai_title", ""),
         "real_msgs": parsed.get("real_msgs", []),
-        "n_turns": parsed.get("n_turns", 0),
+        # n_turns = human prompts, derived from the already-filtered real_msgs so
+        # tool_result records (also type:"user") don't inflate it 10-50x. Deriving
+        # here (not trusting parsed["n_turns"]) self-heals OLD caches too: real_msgs
+        # was always _is_real_user_msg-filtered, only the counter was wrong.
+        "n_turns": len(parsed.get("real_msgs") or []),
         "jsonl_path": jsonl_path,
         "mtime": mtime,
         "cwd": cwd,
@@ -862,7 +872,7 @@ def parse_session(jsonl_path: Path) -> dict | None:
     cached = _read_json(cache_file, None)
     if (cached and abs(cached.get("mtime", 0) - mtime) < 0.5
             and "origin_cwd" in cached):
-        if _is_hook_session(cached.get("real_msgs", []), cached.get("n_turns", 0)):
+        if _is_hook_session(cached.get("real_msgs", []), len(cached.get("real_msgs") or [])):
             return None
         return _enrich_session(sid, cached, jsonl_path, mtime)
 
@@ -871,7 +881,6 @@ def parse_session(jsonl_path: Path) -> dict | None:
 
     first_ts = last_ts = ai_title = cwd = origin_cwd = git_branch = None
     real_msgs: list[str] = []
-    n_user = 0
 
     try:
         with open(jsonl_path, "rb") as f:
@@ -908,7 +917,6 @@ def parse_session(jsonl_path: Path) -> dict | None:
                 if t == "ai-title":
                     ai_title = obj.get("aiTitle", "") or ai_title
                 if t == "user":
-                    n_user += 1
                     text = _extract_text(obj.get("message", {}).get("content", ""))
                     if _is_real_user_msg(text):
                         real_msgs.append(text[:800].replace("\n", " "))
@@ -918,7 +926,7 @@ def parse_session(jsonl_path: Path) -> dict | None:
     if first_ts is None:
         return None
 
-    if _is_hook_session(real_msgs, n_user):
+    if _is_hook_session(real_msgs, len(real_msgs)):
         return None
 
     parsed = {
@@ -927,7 +935,7 @@ def parse_session(jsonl_path: Path) -> dict | None:
         "last_ts": last_ts or first_ts,
         "ai_title": ai_title or "",
         "real_msgs": real_msgs,
-        "n_turns": n_user,
+        "n_turns": len(real_msgs),
         "cwd": cwd or "",
         "origin_cwd": origin_cwd or cwd or "",
         "git_branch": git_branch or "",

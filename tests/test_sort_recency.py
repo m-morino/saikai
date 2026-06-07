@@ -89,6 +89,38 @@ def test_sort_select_value_reflects_primary_or_none():
         recap._load_sort = orig
 
 
+def test_sort_select_value_ignores_secondary_column():
+    """Only the PRIMARY (priority-0) key maps to the dropdown. A header-click sort
+    with a non-representable primary (turns) + representable secondary (date) must
+    return None — else the box shows 'Created time' and the on_select_changed
+    echo-guard swallows a genuine re-pick of it (the bug a multi-level sort hit)."""
+    orig = recap._load_sort
+    try:
+        recap._load_sort = lambda: [{"col": "turns", "dir": "desc"},
+                                    {"col": "date", "dir": "desc"},
+                                    {"col": "-", "dir": "desc"}]
+        assert recap._sort_select_value() is None
+    finally:
+        recap._load_sort = orig
+
+
+def test_n_turns_derived_from_real_msgs_not_inflated():
+    """Turns = human prompts (len real_msgs), NOT the raw type:'user' record count
+    (tool_result records are also type:'user' and inflated it 10-50x).
+    _enrich_session derives it from the already-filtered real_msgs and ignores a
+    stale/inflated parsed['n_turns'], so even OLD caches self-heal."""
+    from pathlib import Path
+    parsed = {
+        "first_ts": "2026-01-01T00:00:00.000Z",
+        "last_ts": "2026-01-01T01:00:00.000Z",
+        "real_msgs": ["prompt one", "prompt two", "prompt three"],
+        "n_turns": 999,          # inflated raw count — must be ignored
+        "mtime": time.time(),
+    }
+    r = recap._enrich_session("sid-x", parsed, Path("nonexistent.jsonl"), parsed["mtime"])
+    assert r["n_turns"] == 3, r["n_turns"]
+
+
 def test_missing_both_is_none_not_crash():
     s = {"id": "empty"}
     assert recap._last_active_dt(s) is None
@@ -111,6 +143,10 @@ if __name__ == "__main__":
     print("PASS test_date_bucket_uses_mtime")
     test_sort_select_value_reflects_primary_or_none()
     print("PASS test_sort_select_value_reflects_primary_or_none")
+    test_sort_select_value_ignores_secondary_column()
+    print("PASS test_sort_select_value_ignores_secondary_column")
+    test_n_turns_derived_from_real_msgs_not_inflated()
+    print("PASS test_n_turns_derived_from_real_msgs_not_inflated")
     test_missing_both_is_none_not_crash()
     print("PASS test_missing_both_is_none_not_crash")
     print("ALL PASS")
