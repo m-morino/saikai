@@ -2248,7 +2248,7 @@ def _avail_ram_mb():
 
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                  flat: bool = False, cluster_mode: bool = False,
-                 reload_fn=None) -> None:
+                 reload_fn=None, no_summary: bool = False) -> None:
     """Textual-based picker (status bar, mouse-click column sort, ? help overlay).
 
     Layout:
@@ -2376,6 +2376,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  Sort by   Recency / Created time / Alphabetically\n"
                 "  Status    Active / Archived / All\n"
                 "  Age       last 1d / 3d / 7d / 30d / All time\n"
+                "  Search    type to filter; tokens AND with text + each other —\n"
+                "            :fav  :hidden  :open  :active  :recent   (Esc clears)\n"
+                "  Markers   @ open · + active · . recent · live ~ busy · ? waiting · ! unread · = viewed · * fav · x hidden\n"
                 "  (clicking a column header still sorts too)\n\n"
                 "[dim]Press ? or Esc to close[/dim]",
                 id="help-content",
@@ -2637,6 +2640,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def _parse_query(self, q: str) -> tuple[set[str], str]:
             tokens = q.strip().lower().split()
             statuses = {t for t in tokens if t in self._STATUS_TOKENS}
+            # A word that LOOKS like a filter (:foo) but isn't a real one is almost
+            # certainly a typo (:favorite, :recnt). Stash it so a zero-match result
+            # can name it; it still falls through to a literal text search (which is
+            # what produces the zero match that surfaces the hint).
+            self._unknown_tokens = [t for t in tokens
+                                    if t.startswith(":") and t not in self._STATUS_TOKENS]
             text = " ".join(t for t in tokens if t not in statuses)
             return statuses, text
 
@@ -2730,11 +2739,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # Sort dropdown re-ordered nothing until the next launch.)
                 _apply_sort(visible, _load_sort())
             if cluster_mode:
-                # Global Haiku-based clustering: every session gets assigned
-                # to one of ~5-9 themes by a single one-shot LLM call. Cached
-                # in ~/.cache/recap/global-clusters.json so the LLM only runs
-                # for new sessions (or on `--refresh-clusters`).
-                _global_cluster_assign(visible)
+                if no_summary:
+                    # --no-summary means "no LLM calls"; global clustering would
+                    # spawn `claude -p` (up to minutes, surprise network use under
+                    # the alt-screen). Degrade to cache-only per-session topics.
+                    _assign_primary_topic(visible)
+                else:
+                    # Global Haiku-based clustering: every session gets assigned
+                    # to one of ~5-9 themes by a single one-shot LLM call. Cached
+                    # in ~/.cache/recap/global-clusters.json so the LLM only runs
+                    # for new sessions (or on `--refresh-clusters`).
+                    _global_cluster_assign(visible)
                 topic_count = Counter(s["primary_topic"] for s in visible)
                 # Sort buckets:
                 #   0 = named cluster (sorted by size desc, then name asc)
@@ -2976,10 +2991,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # clear the preview (which would otherwise keep the last session's
                 # content and imply a match). Distinguish "filtered to zero" from
                 # "no sessions exist at all".
-                if all_sessions:
-                    msg = "No sessions match — press Esc to clear the search, or widen Status / Age"
-                else:
+                if not all_sessions:
                     msg = "No sessions found under ~/.claude/projects"
+                elif getattr(self, "_unknown_tokens", None):
+                    msg = ("Unknown filter " + " ".join(self._unknown_tokens)
+                           + " — valid: :fav :hidden :open :active :recent")
+                else:
+                    msg = "No sessions match — press Esc to clear the search, or widen Status / Age"
                 try:
                     ph = ["" for _ in specs]
                     ph[(len(specs) - 1) if narrow else 1] = Text(msg, style="dim italic")
@@ -3342,14 +3360,26 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"(F10) or raise RECAP_MAX_LIVE",
                     severity="warning", timeout=6)
                 return
-            # The real limit is memory (each live pane is a node process tree);
-            # warn — but still open — when physical RAM is running low.
+            # The real limit is memory (each live pane is a node process tree).
+            # Default: warn but still open (don't surprise existing users).
+            # RECAP_HARD_RAM_GATE=1 turns the floor into a hard stop. Predictive —
+            # would opening THIS pane (~RECAP_CLAUDE_MB) drop free RAM below
+            # RECAP_MIN_FREE_MB — so the warning lands before you cross the floor.
             _avail = _avail_ram_mb()
             _floor = float(os.environ.get("RECAP_MIN_FREE_MB", "1536") or "1536")
-            if _avail is not None and _avail < _floor:
+            _per = float(os.environ.get("RECAP_CLAUDE_MB", "600") or "600")
+            if _avail is not None and (_avail - _per) < _floor:
+                if os.environ.get("RECAP_HARD_RAM_GATE") == "1":
+                    self.notify(
+                        f"refusing to open: {_avail:.0f} MB free; ~{_per:.0f} MB/pane "
+                        f"would drop below RECAP_MIN_FREE_MB ({_floor:.0f}). Close a "
+                        f"pane (F10) or lower RECAP_CLAUDE_MB / RECAP_MIN_FREE_MB.",
+                        severity="error", timeout=9)
+                    return
                 self.notify(
                     f"low memory: {_avail:.0f} MB free — each live claude is "
-                    f"RAM-heavy; close panes (F10) if it slows down",
+                    f"RAM-heavy (~{_per:.0f} MB); close panes (F10) if it slows. "
+                    f"RECAP_HARD_RAM_GATE=1 to block instead.",
                     severity="warning", timeout=7)
             s = self._sid_index.get(sid)
             try:
@@ -5217,6 +5247,12 @@ def main():
     except Exception:
         repo = None
 
+    if not args.table:
+        # The interactive picker shows nothing until Textual paints, and a cold
+        # cache makes the scan below take seconds. Print a transient breadcrumb so
+        # a cold start isn't indistinguishable from a hung shell (Textual clears
+        # the screen on run(), so this only shows during the pre-UI gap).
+        print(_c("  scanning ~/.claude/projects …", DIM), file=sys.stderr, flush=True)
     sessions = []
     if args.all_projects:
         for d in projects_root.iterdir():
@@ -5365,7 +5401,8 @@ def main():
             return fresh
 
         textual_pick(sessions, repo, args.all_projects, flat=flat,
-                     cluster_mode=cluster_mode, reload_fn=_reload)
+                     cluster_mode=cluster_mode, reload_fn=_reload,
+                     no_summary=args.no_summary)
 
 
 if __name__ == "__main__":
