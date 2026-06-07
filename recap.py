@@ -164,8 +164,23 @@ def _save_set(path: Path, ids: set[str]) -> None:
 
 
 def _toggle_in_set(path: Path, sid: str) -> bool:
-    """Toggle membership of `sid` in the set stored at `path`. Returns new state (True=present)."""
-    s = _load_set(path)
+    """Toggle membership of `sid` in the set stored at `path`. Returns new state.
+
+    Refuses (raises) when the file EXISTS but can't be parsed: _read_json swallows
+    every read error to [], so toggling a transiently-unreadable (locked / mid-
+    write / corrupt) populated file would otherwise save a 1-element set and ERASE
+    every other entry. Failing the toggle is far better than wiping the user's
+    favorites / hidden. (Display callers keep the lenient _load_set — a degraded
+    read there only drops a star for one paint and never persists.)"""
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise RuntimeError(f"{path.name} exists but could not be read "
+                               f"({e!r}); not toggling (won't risk erasing it)") from e
+        s = set(raw) if isinstance(raw, list) else set()
+    else:
+        s = set()
     now_present = sid not in s
     (s.add if now_present else s.discard)(sid)
     _save_set(path, s)
@@ -877,6 +892,15 @@ def _load_active_sessions() -> dict[str, str]:
                 continue
     _active_sessions_cache = out
     return out
+
+
+def _invalidate_active_sessions() -> None:
+    """Drop the memoised live-session registry so the next _load_active_sessions
+    re-reads ~/.claude/sessions. Called on reload — otherwise is_open / is_active
+    stay frozen at the launch-time snapshot for the whole picker lifetime (a
+    session that exited elsewhere keeps showing Open/Running)."""
+    global _active_sessions_cache
+    _active_sessions_cache = None
 
 
 def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> dict:
@@ -3535,13 +3559,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def action_toggle_hide(self) -> None:
             sid = self._cursor_sid()
             if sid:
-                _toggle_in_set(HIDDEN_FILE, sid)
+                try:
+                    _toggle_in_set(HIDDEN_FILE, sid)
+                except Exception as e:
+                    self.notify(f"hide skipped: {e}", severity="error", timeout=6)
+                    return
                 self._refresh_table()
 
         def action_toggle_fav(self) -> None:
             sid = self._cursor_sid()
             if sid:
-                _toggle_in_set(FAVORITE_FILE, sid)
+                try:
+                    _toggle_in_set(FAVORITE_FILE, sid)
+                except Exception as e:
+                    self.notify(f"favorite skipped: {e}", severity="error", timeout=6)
+                    return
                 self._refresh_table()
 
         def action_toggle_view(self) -> None:
@@ -3658,6 +3690,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # is focused so it doesn't disrupt typing into claude.
             if reload_fn is None or self._focused_terminal() is not None:
                 return
+            _invalidate_active_sessions()   # re-read the live registry, not the launch snapshot
             try:
                 fresh = reload_fn()
             except Exception as e:
@@ -3674,6 +3707,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if reload_fn is None:
                 self._refresh_table()
                 return
+            _invalidate_active_sessions()
             try:
                 fresh = reload_fn()
             except Exception as e:
@@ -4918,13 +4952,13 @@ def main():
     args.all_projects = not (args.here or args.project)
 
     if args.refresh_summary and CACHE_DIR.exists():
-        # Only delete summary cache files (named after session UUIDs).
-        # Must NOT touch hidden.json/favorite.json/options.json.
-        protected = {HIDDEN_FILE.name, FAVORITE_FILE.name, OPTIONS_FILE.name}
+        # Delete ONLY the per-session summary caches (named <session-uuid>.json).
+        # The old allowlist missed sort.json and global-clusters.json (expensive
+        # Haiku output) and would erase them; match the UUID instead so EVERY
+        # settings file — current or future — is safe.
         for f in CACHE_DIR.glob("*.json"):
-            if f.name in protected:
-                continue
-            f.unlink()
+            if _UUID_RE.fullmatch(f.stem):
+                f.unlink()
 
     since = None if args.days == 0 else datetime.now(tz=timezone.utc) - timedelta(days=args.days)
     projects_root = Path.home() / ".claude" / "projects"

@@ -241,6 +241,46 @@ def test_render_header_includes_worktree_and_model():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_toggle_in_set_refuses_to_clobber_unreadable_file():
+    """The production-class bug: a transient read error must NOT let a toggle save
+    a 1-element set over a populated favorites/hidden file (erasing the rest)."""
+    import tempfile
+    import shutil
+    import json as _json
+    from pathlib import Path
+    d = Path(tempfile.mkdtemp())
+    try:
+        p = d / "favorite.json"
+        p.write_text('["favA", "favB"]', encoding="utf-8")
+        recap._toggle_in_set(p, "favC")                       # happy path
+        assert set(_json.loads(p.read_text())) == {"favA", "favB", "favC"}
+        p.write_text("{ not valid json", encoding="utf-8")    # exists but unreadable
+        raised = False
+        try:
+            recap._toggle_in_set(p, "favD")
+        except Exception:
+            raised = True
+        assert raised, "must refuse to toggle an unreadable existing file"
+        assert "favD" not in p.read_text(), "must NOT clobber the unreadable file"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_invalidate_active_sessions_drops_cache():
+    """Reload must re-read the live registry, not the frozen launch snapshot."""
+    recap._active_sessions_cache = {"sid": "open"}
+    recap._invalidate_active_sessions()
+    assert recap._active_sessions_cache is None
+
+
+def test_refresh_summary_only_matches_uuid_caches():
+    """--refresh-summary deletes only <uuid>.json summary caches — settings files
+    (sort / clusters / favorites / options) must NOT match the UUID filter."""
+    assert recap._UUID_RE.fullmatch("6019b00c-734f-4e73-932d-b6453956a8fd")
+    for safe in ("sort", "global-clusters", "favorite", "hidden", "options"):
+        assert not recap._UUID_RE.fullmatch(safe), safe
+
+
 def test_missing_both_is_none_not_crash():
     s = {"id": "empty"}
     assert recap._last_active_dt(s) is None
@@ -281,6 +321,12 @@ if __name__ == "__main__":
     print("PASS test_build_forest_windowed_parent_assignment")
     test_render_header_includes_worktree_and_model()
     print("PASS test_render_header_includes_worktree_and_model")
+    test_toggle_in_set_refuses_to_clobber_unreadable_file()
+    print("PASS test_toggle_in_set_refuses_to_clobber_unreadable_file")
+    test_invalidate_active_sessions_drops_cache()
+    print("PASS test_invalidate_active_sessions_drops_cache")
+    test_refresh_summary_only_matches_uuid_caches()
+    print("PASS test_refresh_summary_only_matches_uuid_caches")
     test_missing_both_is_none_not_crash()
     print("PASS test_missing_both_is_none_not_crash")
     print("ALL PASS")
