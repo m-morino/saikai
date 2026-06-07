@@ -93,6 +93,46 @@ def test_pane_refresh_coalesces():
     assert len(queued) == 2, "should re-queue a repaint after the UI painted"
 
 
+def test_current_screen_caches_by_version():
+    """_current_screen reuses the last join until _scr_ver bumps (a feed bumps it),
+    so the host poll / render path don't re-join an unchanged screen."""
+    ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    ct._lock = threading.Lock()
+    ct._scr_ver = 5
+    ct._cached_ver = -1
+    ct._cached_screen = ("", "")
+
+    class _Scr:
+        display = ["line a", "line b"]
+        title = "T"
+    ct._screen = _Scr()
+    assert ct._current_screen() == ("line a\nline b", "T")
+    ct._screen.display = ["CHANGED"]                       # mutate WITHOUT a version bump
+    assert ct._current_screen() == ("line a\nline b", "T"), "should serve the cached join"
+    ct._scr_ver = 6                                        # a feed bumps the version
+    assert ct._current_screen() == ("CHANGED", "T"), "bump → rejoin"
+
+
+def test_refresh_status_skips_stable_idle_pane():
+    """A non-busy pane with no new output (scr_ver unchanged) skips the re-classify;
+    a busy pane is always re-checked so it can still flip to idle."""
+    ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    ct._lock = threading.Lock()
+    ct.is_dead = False
+    ct._screen = object()
+    ct._scr_ver = 3
+    ct._last_poll_ver = 3                  # no output since the last poll
+    ct._status = "idle"
+    calls = []
+    ct._current_screen = lambda: (calls.append(1), ("", ""))[1]
+    ct._update_status = lambda new: None
+    ct.refresh_status()
+    assert calls == [], "stable idle pane must skip the screen-join + classify"
+    ct._status = "busy"                    # busy must always be re-checked
+    ct.refresh_status()
+    assert calls == [1], "busy pane must be re-classified to catch the idle flip"
+
+
 def test_classify_pty_status_basics():
     """Guard the busy/waiting/idle classifier (and the slice-before-strip tail
     handling) so the per-chunk perf trim didn't change its verdicts."""
@@ -133,6 +173,10 @@ if __name__ == "__main__":
     print("PASS test_kill_tracks_reap_for_atexit_join")
     test_pane_refresh_coalesces()
     print("PASS test_pane_refresh_coalesces")
+    test_current_screen_caches_by_version()
+    print("PASS test_current_screen_caches_by_version")
+    test_refresh_status_skips_stable_idle_pane()
+    print("PASS test_refresh_status_skips_stable_idle_pane")
     test_classify_pty_status_basics()
     print("PASS test_classify_pty_status_basics")
     test_note_reap_prunes_finished_threads()
