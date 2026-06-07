@@ -211,6 +211,36 @@ def test_build_forest_windowed_parent_assignment():
     assert by["A"]["parent_id"] is None           # oldest → root
 
 
+def test_render_header_includes_worktree_and_model():
+    """Preview header surfaces worktree + model (+ entry surface), read from the
+    transcript like a statusline. branch was already there."""
+    import tempfile
+    import shutil
+    from pathlib import Path
+    d = Path(tempfile.mkdtemp())
+    try:
+        proj = d / "myproj"
+        proj.mkdir()
+        f = proj / "sess.jsonl"
+        f.write_text(
+            '{"type":"user","timestamp":"2026-01-01T00:00:00.000Z",'
+            '"message":{"content":"hi there please help me build a thing"}}\n'
+            '{"entrypoint":"vscode"}\n'
+            '{"type":"assistant","message":{"model":"claude-opus-4-8",'
+            '"content":[{"type":"text","text":"ok"}]}}\n',
+            encoding="utf-8")
+        s = {"id": "sid123", "ai_title": "T", "first_ts": "2026-01-01T00:00:00.000Z",
+             "last_ts": "2026-01-01T00:00:00.000Z", "n_turns": 1, "mtime": time.time(),
+             "cwd": "/x", "git_branch": "main", "worktree_label": "wt-feature",
+             "jsonl_path": f, "real_msgs": ["hi there please help me build a thing"]}
+        out = "\n".join(recap._render_header(s))
+        assert "worktree:" in out and "wt-feature" in out, out
+        assert "model:" in out and "claude-opus-4-8" in out, out
+        assert "via vscode" in out, out
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_missing_both_is_none_not_crash():
     s = {"id": "empty"}
     assert recap._last_active_dt(s) is None
@@ -249,6 +279,8 @@ if __name__ == "__main__":
     print("PASS test_build_groups_project_order_by_recency")
     test_build_forest_windowed_parent_assignment()
     print("PASS test_build_forest_windowed_parent_assignment")
+    test_render_header_includes_worktree_and_model()
+    print("PASS test_render_header_includes_worktree_and_model")
     test_missing_both_is_none_not_crash()
     print("PASS test_missing_both_is_none_not_crash")
     print("ALL PASS")

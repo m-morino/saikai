@@ -1491,6 +1491,19 @@ def _render_header(s: dict) -> list[str]:
     branch = s.get("git_branch") or ""
     if branch:
         lines.append(f"  branch:   {branch}")
+    wt = s.get("worktree_label") or ""
+    if wt:
+        lines.append(f"  worktree: {_c(wt, GRAY)}")
+    # Model + entry surface, read from the transcript like a statusline. Cheap in
+    # practice: the preview is rendered then cached, so this runs once per session
+    # until its mtime changes.
+    try:
+        _ep, _model = _session_surface_model(found)
+    except Exception:
+        _ep = _model = None
+    if _model or _ep:
+        _meta = [m for m in (_model, (f"via {_ep}" if _ep else "")) if m]
+        lines.append(f"  model:    {_c('  ·  '.join(_meta), GRAY)}")
     lines.extend([
         f"  cwd:      {s.get('cwd','')}",
         f"  start:    {fmt_ts(s['first_ts'])}",
