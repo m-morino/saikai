@@ -393,6 +393,13 @@ _ALT_ANY_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)[hl]")
 # underlined. Strip them before feeding pyte (keyboard-protocol negotiation,
 # irrelevant to the display grid).
 _PRIVATE_SGR_RE = re.compile(r"\x1b\[[<>=][0-9;:]*m")
+# Kitty keyboard protocol push/pop/set/query (CSI >/</=/? … u). pyte doesn't
+# model it and LEAKS the trailing 'u' into the grid — so a kanji being edited
+# appears to gain a stray 'u' (the leaked byte lands at the cursor). claude emits
+# these to negotiate key reporting, but recap encodes keys in the legacy format
+# regardless, so dropping the negotiation is display-only and harmless. (Plain
+# CSI u = SCO restore-cursor has no private marker, so it is NOT stripped.)
+_KITTY_KBD_RE = re.compile(r"\x1b\[[<>=?][0-9;:]*u")
 
 
 def _scroll_row_index(hist_len: int, scroll: int, y: int) -> int:
@@ -762,6 +769,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             chunk = chunk[:_m.start()]
         chunk = chunk.replace("0011Ignore", "")
         chunk = _PRIVATE_SGR_RE.sub("", chunk)   # drop XTMODKEYS \x1b[>4;2m etc. (pyte misreads as SGR-4 underline)
+        chunk = _KITTY_KBD_RE.sub("", chunk)     # drop Kitty-keyboard CSI-u (pyte leaks the trailing 'u' into the grid)
         if not chunk:
             return
         with self._lock:

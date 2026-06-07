@@ -195,6 +195,20 @@ def test_note_reap_prunes_finished_threads():
     ev.set(); live.join()
 
 
+def test_kitty_keyboard_csi_u_is_scrubbed():
+    """pyte leaks the trailing 'u' of the Kitty keyboard protocol's CSI-u
+    push/pop into the grid (so a kanji being edited appears to gain a stray 'u').
+    The pre-pyte scrub drops CSI >/</=/? … u, but NOT plain CSI u (SCO
+    restore-cursor, which carries no private marker)."""
+    sub = rt._KITTY_KBD_RE.sub
+    assert sub("", "\x1b[>1u漢字\x1b[<u") == "漢字"      # push + pop stripped
+    assert sub("", "\x1b[<u") == ""                       # pop alone
+    assert sub("", "\x1b[=1;2u") == ""                    # set
+    assert sub("", "\x1b[?u") == ""                       # query
+    assert sub("", "\x1b[u") == "\x1b[u"                  # SCO restore: PRESERVED
+    assert sub("", "\x1b[1u") == "\x1b[1u"                # numeric, no marker: PRESERVED
+
+
 if __name__ == "__main__":
     test_update_status_marshals_outside_lock()
     print("PASS test_update_status_marshals_outside_lock")
@@ -214,3 +228,5 @@ if __name__ == "__main__":
     print("PASS test_set_status_ignores_forgotten_sid")
     test_note_reap_prunes_finished_threads()
     print("PASS test_note_reap_prunes_finished_threads")
+    test_kitty_keyboard_csi_u_is_scrubbed()
+    print("PASS test_kitty_keyboard_csi_u_is_scrubbed")
