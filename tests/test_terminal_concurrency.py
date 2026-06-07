@@ -144,6 +144,20 @@ def test_classify_pty_status_basics():
     assert rt.classify_pty_status("x" * 5000 + "\n(y/n)", "") == "waiting"
 
 
+def test_encode_key_meta_and_release():
+    """readline keys reach claude: Ctrl+letters AND Meta/Alt word-ops (ESC prefix).
+    The release key must resolve to Textual's real name, not the dead 'ctrl+]'."""
+    assert rt.encode_key("alt+b", None) == "\x1bb"          # backward-word
+    assert rt.encode_key("alt+f", None) == "\x1bf"          # forward-word
+    assert rt.encode_key("alt+d", None) == "\x1bd"          # kill-word
+    assert rt.encode_key("alt+backspace", None) == "\x1b\x7f"  # backward-kill-word
+    assert rt.encode_key("ctrl+w", None) == "\x17"          # word-delete still forwards
+    assert rt.encode_key("ctrl+a", None) == "\x01"
+    assert rt._normalize_key("ctrl+]") == "ctrl+right_square_bracket"
+    if not os.environ.get("RECAP_RELEASE_KEY"):
+        assert rt.RELEASE_FOCUS_KEY == "ctrl+right_square_bracket"
+
+
 def test_set_status_ignores_forgotten_sid():
     """A status callback that lands AFTER the pane was closed must not resurrect a
     ghost entry in the manager's status dict (which statuses() reports as a stale
@@ -194,6 +208,8 @@ if __name__ == "__main__":
     print("PASS test_refresh_status_skips_stable_idle_pane")
     test_classify_pty_status_basics()
     print("PASS test_classify_pty_status_basics")
+    test_encode_key_meta_and_release()
+    print("PASS test_encode_key_meta_and_release")
     test_set_status_ignores_forgotten_sid()
     print("PASS test_set_status_ignores_forgotten_sid")
     test_note_reap_prunes_finished_threads()
