@@ -189,6 +189,28 @@ def test_build_groups_project_order_by_recency():
     assert labels.index(new_lbl) < labels.index(old_lbl), labels
 
 
+def test_build_forest_windowed_parent_assignment():
+    """The O(1) gap-prune in _build_forest must not change parent assignment:
+    a recent same-cwd session still wins over a closer-in-time different-cwd one,
+    and the oldest is a root."""
+    from datetime import timedelta
+    base = datetime(2026, 1, 10, 12, 0, 0)
+
+    def _s(sid, cwd, minutes_ago):
+        t = (base - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        return {"id": sid, "cwd": cwd, "git_branch": "", "first_ts": t, "last_ts": t,
+                "ai_title": "", "real_msgs": []}
+
+    a = _s("A", "/proj/x", 60)      # oldest, same cwd as C
+    b = _s("B", "/other", 30)       # closer in time, different cwd
+    c = _s("C", "/proj/x", 0)       # newest
+    sessions = [c, a, b]
+    recap._build_forest(sessions)
+    by = {s["id"]: s for s in sessions}
+    assert by["C"]["parent_id"] == "A", by["C"]   # cwd weight beats time proximity
+    assert by["A"]["parent_id"] is None           # oldest → root
+
+
 def test_missing_both_is_none_not_crash():
     s = {"id": "empty"}
     assert recap._last_active_dt(s) is None
@@ -225,6 +247,8 @@ if __name__ == "__main__":
     print("PASS test_build_groups_date_order_recent_first")
     test_build_groups_project_order_by_recency()
     print("PASS test_build_groups_project_order_by_recency")
+    test_build_forest_windowed_parent_assignment()
+    print("PASS test_build_forest_windowed_parent_assignment")
     test_missing_both_is_none_not_crash()
     print("PASS test_missing_both_is_none_not_crash")
     print("ALL PASS")
