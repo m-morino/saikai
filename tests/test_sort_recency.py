@@ -352,6 +352,34 @@ def test_build_groups_state_keeps_pinned_live_in_state_group():
     assert set(gd.get("Pinned", [])) == {"run", "wait", "idle"}, gd
 
 
+def test_project_short_strips_prefix_case_insensitively():
+    """Claude lowercases the Windows drive letter in the project-dir name, so the
+    home-prefix strip must be case-INSENSITIVE — a regression where an exact-case
+    startswith left the whole encoded prefix (c--Users-…) in the column."""
+    import re as _re
+    from pathlib import Path as _P
+    home_enc = _re.sub(r"[:/\\.]", "-", str(_P.home()))
+    assert recap.project_short(home_enc + "-CLI-myproj") == "CLI-myproj"
+    if home_enc[:1].isalpha():
+        lowered = home_enc[0].lower() + home_enc[1:]   # Claude-style lowercased drive
+        assert recap.project_short(lowered + "-CLI-myproj") == "CLI-myproj"
+
+
+def test_new_session_stub_has_renderable_fields():
+    """A new-session stub carries the fields the list render/sort/group read, so a
+    just-launched session shows immediately (before its JSONL is scanned)."""
+    s = recap._new_session_stub("sid-123", "/tmp/myproj", "myproj")
+    assert s["id"] == "sid-123" and s["is_open"] is True
+    assert s["summary"] == "myproj"            # Title column
+    assert s["last_active_dt"] is not None     # Last / Recency
+    for k in ("first_ts", "last_ts", "mtime", "cwd", "origin_cwd", "real_msgs",
+              "n_turns", "parent_id", "topics", "ai_title"):
+        assert k in s, k
+    # sorts cleanly alongside a real session (keys off last_active_dt)
+    recap._apply_sort([s, {"id": "x", "mtime": time.time(), "last_ts": _iso_ago(1)}],
+                      [{"col": "last", "dir": "desc"}])
+
+
 def test_pane_title_prefers_human_label_over_id():
     """A live pane's tab shows a human label, not a bare session id:
     ai_title → summary → (first user msg) → the term's launch title → short id."""
@@ -423,6 +451,10 @@ if __name__ == "__main__":
     print("PASS test_build_new_invocation_starts_fresh_session_with_id")
     test_build_groups_state_keeps_pinned_live_in_state_group()
     print("PASS test_build_groups_state_keeps_pinned_live_in_state_group")
+    test_project_short_strips_prefix_case_insensitively()
+    print("PASS test_project_short_strips_prefix_case_insensitively")
+    test_new_session_stub_has_renderable_fields()
+    print("PASS test_new_session_stub_has_renderable_fields")
     test_pane_title_prefers_human_label_over_id()
     print("PASS test_pane_title_prefers_human_label_over_id")
     test_no_internal_identifiers_in_source()
