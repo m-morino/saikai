@@ -209,6 +209,17 @@ def test_kitty_keyboard_csi_u_is_scrubbed():
     assert sub("", "\x1b[1u") == "\x1b[1u"                # numeric, no marker: PRESERVED
 
 
+def test_bracketed_paste_mode_tracking():
+    """recap re-wraps pastes in \\x1b[200~ … \\x1b[201~ only when claude has
+    enabled bracketed-paste mode; the mode is tracked from CSI ?2004 h/l in the
+    output stream (pyte doesn't expose it). Last h/l in a chunk wins."""
+    fa = rt._BRACKETED_RE.findall
+    assert fa("\x1b[?2004h") == ["h"]
+    assert fa("\x1b[?2004l") == ["l"]
+    assert fa("x\x1b[?2004h y \x1b[?2004l") == ["h", "l"]
+    assert fa("no paste mode here") == []
+
+
 if __name__ == "__main__":
     test_update_status_marshals_outside_lock()
     print("PASS test_update_status_marshals_outside_lock")
@@ -230,3 +241,5 @@ if __name__ == "__main__":
     print("PASS test_note_reap_prunes_finished_threads")
     test_kitty_keyboard_csi_u_is_scrubbed()
     print("PASS test_kitty_keyboard_csi_u_is_scrubbed")
+    test_bracketed_paste_mode_tracking()
+    print("PASS test_bracketed_paste_mode_tracking")
