@@ -2380,7 +2380,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "[bold cyan]Split-live (RECAP_SPLIT_LIVE=1)[/bold cyan]\n"
                 "  [yellow]Enter[/yellow]       Open / focus the live claude pane\n"
                 "  [yellow]Shift-F8[/yellow]    New claude session in a folder / git worktree\n"
-                "  [yellow]F2/F3[/yellow]       Prev / next live tab\n"
+                "  [yellow]F2/F3[/yellow]       Prev / next live tab   ·   [yellow]Shift-F3[/yellow]  Next pane needing attention (?/!)\n"
                 "  [yellow]F4[/yellow]          Hide / show the session list\n"
                 "  [yellow]Ctrl-][/yellow]      Return focus: pane → list  (RECAP_RELEASE_KEY to change)\n"
                 "  [yellow]F10[/yellow]         Close the active tab   ·   [yellow]Shift-F10[/yellow]  Close ALL tabs\n"
@@ -2492,6 +2492,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("shift+f10", "close_all_live", "Close all", show=False, priority=True),
             Binding("f2", "prev_tab", "◀Tab", priority=True),
             Binding("f3", "next_tab", "Tab▶", priority=True),
+            Binding("shift+f3", "next_attention", "Next!", priority=True),
             Binding("f4", "toggle_list", "Hide list", priority=True),
         ]
         # The practical limit on concurrent live claude panes is MEMORY — each
@@ -3124,16 +3125,27 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             live_str = ""
             if self._live is not None:
                 cnt = self._live.count
+                # At-a-glance attention counts so "something needs me" is visible
+                # without scanning every row/tab: ?N = panes waiting (needs input),
+                # !M = panes that finished and you haven't responded to yet.
+                _st = self._live.statuses()
+                _wait = sum(1 for v in _st.values() if v == "waiting")
+                _done = len(getattr(self, "_unread", ()))
+                _att = ""
+                if _wait:
+                    _att += f"  [red]?{_wait}[/red]"
+                if _done:
+                    _att += f"  [yellow]!{_done}[/yellow]"
                 avail = _avail_ram_mb()
                 if avail is None:
-                    live_str = f"{sep}Live: {cnt}"
+                    live_str = f"{sep}Live: {cnt}{_att}"
                 else:
                     floor = float(os.environ.get("RECAP_MIN_FREE_MB", "1536") or "1536")
                     per = float(os.environ.get("RECAP_CLAUDE_MB", "600") or "600")
                     fit = max(0, int((avail - floor) / per)) if per > 0 else 0
                     fit = min(fit, max(0, self._live.max_live - cnt))   # MAX_LIVE backstop
                     _col = "green" if fit > 0 else "red"
-                    live_str = (f"{sep}Live: {cnt}  [{_col}]~{fit} fit[/{_col}]"
+                    live_str = (f"{sep}Live: {cnt}{_att}  [{_col}]~{fit} fit[/{_col}]"
                                 f"  ({avail / 1024:.1f}GB free)")
             # Search: when the on-demand bar is hidden, surface the active text
             # query (so a filtered list isn't mistaken for "sessions missing");
@@ -3816,6 +3828,36 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def action_prev_tab(self) -> None:
             self._cycle_tab(-1)
 
+        def action_next_attention(self) -> None:
+            """Shift+F3: jump to the next live pane needing attention — waiting (?)
+            or finished-unread (!) — in tab order, wrapping. Toast if none. Lets you
+            step through exactly the panes that need you instead of every tab."""
+            if _LIVE_TERM is None or self._live is None:
+                return
+            try:
+                tabs = self.query_one("#right", TabbedContent)
+            except Exception:
+                return
+            st = self._live.statuses()
+            unread = getattr(self, "_unread", set())
+            att_sids = {s for s in st if st.get(s) == "waiting" or s in unread}
+            if not att_sids:
+                self.notify("no live panes need attention", timeout=3)
+                return
+            ids = self._live_pane_ids()
+            att_ids = [pid for pid in ids
+                       if any(self._live.pane_id(s) == pid for s in att_sids)]
+            if not att_ids:
+                return
+            active = tabs.active or ""
+            cur_i = ids.index(active) if active in ids else -1
+            nxt = next((pid for pid in att_ids if ids.index(pid) > cur_i), att_ids[0])
+            tabs.active = nxt
+            sid = next((s for s in att_sids if self._live.pane_id(s) == nxt), None)
+            if sid is not None:
+                self._opening_live_sid = sid
+                self.call_after_refresh(lambda: self._focus_live_pane(sid))
+
         def _cycle_tab(self, step: int) -> None:
             if _LIVE_TERM is None:
                 return
@@ -4006,12 +4048,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 active = ""
             for sid, st in cur.items():
-                if st == "waiting" and prev.get(sid) != "waiting" \
-                        and self._live.pane_id(sid) != active:
-                    sess = self._sid_index.get(sid) or {}
-                    title = (sess.get("ai_title") or _first_msg(sess)
-                             or sid[:8])[:50]
+                if self._live.pane_id(sid) == active:
+                    continue   # you're looking at this pane — its tab/marker suffice
+                prev_st = prev.get(sid)
+                sess = self._sid_index.get(sid) or {}
+                title = (sess.get("ai_title") or _first_msg(sess) or sid[:8])[:50]
+                if st == "waiting" and prev_st != "waiting":
                     self.notify(f"needs input: {title}", title="recap", timeout=8)
+                elif st == "idle" and prev_st == "busy":
+                    # A backgrounded pane just FINISHED its turn (busy→idle) — toast
+                    # so you notice WHAT completed without watching every tab. Gated
+                    # on prev=="busy" so a fresh load (→idle) or a y/n answer
+                    # (waiting→idle) doesn't masquerade as a completed task.
+                    self.notify(f"done: {title}", title="recap", timeout=6)
             changed = (cur != prev)
             self._last_status = cur
             if changed:
