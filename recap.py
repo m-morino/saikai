@@ -1494,10 +1494,10 @@ def truncate_visual(s: str, width: int) -> str:
 def project_short(name: str) -> str:
     """Strip the encoded home-dir prefix so the column shows a recognizable
     suffix, e.g. <home>-myrepo → myrepo. Derived from Path.home() so it works for
-    any user / OS — Claude Code encodes a project dir as its cwd with the path
-    separators and dots replaced by '-'."""
+    any user / OS. Case-INSENSITIVE because Claude Code lowercases the Windows
+    drive letter in the encoded project-dir name (`c--Users-…` vs `C:\\Users\\…`)."""
     home_enc = re.sub(r"[:/\\.]", "-", str(Path.home()))
-    if name.startswith(home_enc):
+    if name.lower().startswith(home_enc.lower()):
         return (name[len(home_enc):].lstrip("-") or name)[:14]
     return name[:14]
 
@@ -1523,6 +1523,31 @@ def _pane_title(s: "dict | None", sid: str, term=None) -> str:
         if tt:
             return tt
     return sid[:8]
+
+
+def _new_session_stub(sid: str, cwd: str, title: str) -> dict:
+    """A placeholder session row for a just-launched NEW session whose JSONL is
+    not scanned yet (it may even live under an out-of-scope project dir). Lets the
+    list show the session immediately; the live-pane preserve in
+    _apply_fresh_sessions keeps it across reloads until the real JSONL is found
+    (same id) or the pane closes. Mirrors _enrich_session's field set so the
+    render / sort / group / forest paths don't choke."""
+    now = time.time()
+    iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    enc = re.sub(r"[:/\\.]", "-", str(cwd))
+    if sys.platform == "win32" and len(enc) >= 2 and enc[0].isalpha() and enc[1] == "-":
+        enc = enc[0].lower() + enc[1:]   # Claude lowercases the Windows drive letter
+    s = {
+        "id": sid, "first_ts": iso, "last_ts": iso, "ai_title": "",
+        "summary": title, "real_msgs": [], "n_turns": 0,
+        "jsonl_path": Path.home() / ".claude" / "projects" / enc / f"{sid}.jsonl",
+        "mtime": now, "cwd": cwd, "origin_cwd": cwd, "git_branch": "",
+        "is_open": True, "session_status": "open", "is_active": True,
+        "is_recent": True, "worktree_label": "", "topics": [], "primary_topic": "",
+        "parent_id": None, "parent_score": 0.0, "parent_reasons": [],
+    }
+    s["last_active_dt"] = _compute_last_active_dt(s)
+    return s
 
 
 # ── Display ──────────────────────────────────────────────────────────────────
@@ -3521,7 +3546,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.notify(f"could not build new-session command: {e!r}",
                             severity="error", timeout=8)
                 return
-            if self._spawn_live_pane(sid, argv, cwd, env, d.name or str(d), refresh=True):
+            title = d.name or str(d)
+            if self._spawn_live_pane(sid, argv, cwd, env, title, refresh=False):
+                # Show the new session in the list NOW: its JSONL isn't scanned yet
+                # (and may be under an out-of-scope project dir). Insert a stub row;
+                # _apply_fresh_sessions preserves it across reloads (it's a live
+                # pane), and a reload that finds the real JSONL replaces it (same id).
+                stub = _new_session_stub(sid, str(d), title)
+                all_sessions.append(stub)
+                self._sid_index[sid] = stub
+                self._refresh_table()
                 self.notify(f"new claude session in {d}", timeout=4)
 
         def _spawn_live_pane(self, sid, argv, cwd, env, title, refresh=True) -> bool:
