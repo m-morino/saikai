@@ -402,10 +402,23 @@ def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
         return [(None, list(sessions))]
     groups: list = []
     rest = list(sessions)
-    pinned = [s for s in rest if s["id"] in favorites]
+    # Pinned shortcut section. In STATE grouping the live / actionable states
+    # (Needs input / Running / Open) must NOT be hoisted out — every running or
+    # waiting session must stay visible in its own state group so you don't miss
+    # one that needs you; pin is shown as a ★ badge on the row (marker column)
+    # instead. Only NON-live pinned sessions (Recent / Idle / Archived) get the
+    # Pinned shortcut there. Date / project grouping has no actionability axis, so
+    # all favorites form the Pinned section as before.
+    _LIVE_STATES = ("Needs input", "Running", "Open")
+    if group_by == "state":
+        pinned = [s for s in rest if s["id"] in favorites
+                  and (s.get("_state") or "Idle") not in _LIVE_STATES]
+    else:
+        pinned = [s for s in rest if s["id"] in favorites]
     if pinned:
         groups.append(("Pinned", pinned))
-        rest = [s for s in rest if s["id"] not in favorites]
+        _pset = {s["id"] for s in pinned}
+        rest = [s for s in rest if s["id"] not in _pset]
     if group_by == "date":
         buckets: dict = {}
         bmax: dict = {}     # newest activity per bucket, tracked in the assign pass
