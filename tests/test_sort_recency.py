@@ -352,6 +352,19 @@ def test_build_groups_state_keeps_pinned_live_in_state_group():
     assert set(gd.get("Pinned", [])) == {"run", "wait", "idle"}, gd
 
 
+def test_pane_title_prefers_human_label_over_id():
+    """A live pane's tab shows a human label, not a bare session id:
+    ai_title → summary → (first user msg) → the term's launch title → short id."""
+    sid = "abcd1234-5678-90ab-cdef-1234567890ab"
+    assert recap._pane_title({"ai_title": "Fix auth bug"}, sid) == "Fix auth bug"
+    assert recap._pane_title({"ai_title": "", "summary": "refactor X"}, sid) == "refactor X"
+
+    class _T:
+        title = "my-folder"
+    assert recap._pane_title(None, sid, _T()) == "my-folder"   # new session → folder
+    assert recap._pane_title(None, sid) == "abcd1234"          # last resort: short id
+
+
 def test_no_internal_identifiers_in_source():
     """Public-release hygiene: the source must carry no org-internal names. The
     summarizer backend is generic (RECAP_SUMMARIZE_CMD), project_short derives the
@@ -410,6 +423,8 @@ if __name__ == "__main__":
     print("PASS test_build_new_invocation_starts_fresh_session_with_id")
     test_build_groups_state_keeps_pinned_live_in_state_group()
     print("PASS test_build_groups_state_keeps_pinned_live_in_state_group")
+    test_pane_title_prefers_human_label_over_id()
+    print("PASS test_pane_title_prefers_human_label_over_id")
     test_no_internal_identifiers_in_source()
     print("PASS test_no_internal_identifiers_in_source")
     print("ALL PASS")
