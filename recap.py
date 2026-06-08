@@ -1166,10 +1166,13 @@ def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
     cluster-classification prompt (170+ sessions × ~150 chars) bumps right
     up against. Stdin has no such limit.
 
-    Set RECAP_SUMMARIZE_BACKEND=project-three to use project-three-cli instead of claude -p
-    (avoids personal Haiku quota; model param is ignored for project-three)."""
-    if os.environ.get("RECAP_SUMMARIZE_BACKEND") == "project-three":
-        return call_project-three(prompt, timeout=timeout, raw=raw)
+    Set RECAP_SUMMARIZE_CMD to a shell command to use a different summarizer
+    backend (any LLM CLI / proxy) instead of `claude -p` — e.g. to avoid your
+    personal quota. The command receives the prompt on STDIN and must emit the
+    summary as plain text on STDOUT (see call_external_summarizer)."""
+    _ext = os.environ.get("RECAP_SUMMARIZE_CMD")
+    if _ext:
+        return call_external_summarizer(_ext, prompt, timeout=timeout, raw=raw)
     cmd = ["claude", "-p", "--model", model or SUMMARY_MODEL,
            "--setting-sources", "",
            "--strict-mcp-config",
@@ -1228,13 +1231,21 @@ def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
         _delete_session_files(session_id)
 
 
-def call_project-three(prompt: str, timeout: int = 45, raw: bool = False) -> str:
-    """Call project-three-cli chat as a drop-in for call_claude_haiku.
-
-    Enabled by RECAP_SUMMARIZE_BACKEND=project-three. Uses the company project-three
-    service instead of claude -p, so it doesn't consume personal Haiku quota.
-    JSON format differs: content[0].text instead of result."""
-    cmd = ["project-three-cli", "chat", "--json"]
+def call_external_summarizer(cmd_str: str, prompt: str, timeout: int = 45,
+                             raw: bool = False) -> str:
+    """Generic pluggable summarizer backend (RECAP_SUMMARIZE_CMD). Runs an
+    arbitrary command — any LLM CLI / proxy — feeding the prompt on STDIN and
+    reading the summary from STDOUT as plain text, so you can point recap at a
+    backend other than `claude -p` (e.g. to avoid your personal quota). The
+    command is parsed with shlex; wrap a JSON-returning CLI yourself so it emits
+    plain text (e.g. `your-cli chat | jq -r .text`)."""
+    import shlex
+    try:
+        cmd = shlex.split(cmd_str, posix=(sys.platform != "win32"))
+    except Exception:
+        return ""
+    if not cmd:
+        return ""
     extra: dict = {}
     if sys.platform == "win32":
         extra["creationflags"] = NO_WINDOW
@@ -1254,15 +1265,7 @@ def call_project-three(prompt: str, timeout: int = 45, raw: bool = False) -> str
                 return ""
         if proc.returncode != 0:
             return ""
-        raw_text = raw_out.decode("utf-8", errors="replace")
-        try:
-            payload = json.loads(raw_text)
-            text = "".join(
-                c.get("text", "") for c in payload.get("content", [])
-                if c.get("type") == "text"
-            ).strip()
-        except Exception:
-            text = raw_text.strip()
+        text = raw_out.decode("utf-8", errors="replace").strip()
         if raw:
             return text
         for line in text.split("\n"):
@@ -1274,8 +1277,8 @@ def call_project-three(prompt: str, timeout: int = 45, raw: bool = False) -> str
         global _haiku_missing_warned
         if not _haiku_missing_warned:
             _haiku_missing_warned = True
-            print(_c("  warn: `project-three-cli` not found — summaries will be raw user msgs",
-                     YELLOW), file=sys.stderr)
+            print(_c(f"  warn: RECAP_SUMMARIZE_CMD ({cmd[0]}) not found — "
+                     f"summaries will be raw user msgs", YELLOW), file=sys.stderr)
         return ""
     except Exception:
         return ""
@@ -4018,6 +4021,32 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _set_group_by("none")
             self._refresh_table()
 
+        def _restat_live(self) -> bool:
+            """Live panes append to their JSONL as claude works, but last_active_dt
+            is memoised at load time — so the Last column / Recency sort FREEZE for
+            a session you're actively updating. Re-stat the (few) live sessions and
+            bump mtime + last_active_dt when the file grew. Returns True if any
+            advanced, so the poll repaints even when the status is unchanged (a
+            continuously-busy stream). Busy → Last tracks ~now; once idle it settles
+            at when claude finished (mtime stops growing)."""
+            if self._live is None:
+                return False
+            advanced = False
+            for sid in list(self._live.statuses().keys()):
+                s = self._sid_index.get(sid)
+                jp = s.get("jsonl_path") if s else None
+                if not jp:
+                    continue
+                try:
+                    mt = jp.stat().st_mtime
+                except Exception:
+                    continue
+                if mt > (s.get("mtime") or 0.0):
+                    s["mtime"] = mt
+                    s["last_active_dt"] = _compute_last_active_dt(s)
+                    advanced = True
+            return advanced
+
         def _poll_live_status(self) -> None:
             # Detect background live panes transitioning into "waiting" (needs
             # input) and toast once per transition; keep the list markers live.
@@ -4061,9 +4090,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # on prev=="busy" so a fresh load (→idle) or a y/n answer
                     # (waiting→idle) doesn't masquerade as a completed task.
                     self.notify(f"done: {title}", title="recap", timeout=6)
+            advanced = self._restat_live()   # live JSONLs grew → Last / Recency moved
             changed = (cur != prev)
             self._last_status = cur
-            if changed:
+            if changed or advanced:
                 self._request_refresh()
 
         def action_copy_prompt(self) -> None:
