@@ -400,6 +400,11 @@ _PRIVATE_SGR_RE = re.compile(r"\x1b\[[<>=][0-9;:]*m")
 # regardless, so dropping the negotiation is display-only and harmless. (Plain
 # CSI u = SCO restore-cursor has no private marker, so it is NOT stripped.)
 _KITTY_KBD_RE = re.compile(r"\x1b\[[<>=?][0-9;:]*u")
+# Bracketed-paste mode (CSI ?2004 h/l): claude enables it so it can distinguish a
+# PASTE from typed input. pyte doesn't expose the mode, so we track it from the
+# output stream and re-wrap pastes (\x1b[200~ … \x1b[201~) in on_paste — otherwise
+# claude treats a multi-line paste as typed lines and submits on each newline.
+_BRACKETED_RE = re.compile(r"\x1b\[\?2004([hl])")
 
 
 def _scroll_row_index(hist_len: int, scroll: int, y: int) -> int:
@@ -669,6 +674,11 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
     def on_paste(self, event) -> None:  # events.Paste (bracketed paste)
         text = getattr(event, "text", "")
         if self._pty is not None and not self.is_dead and text:
+            # Re-wrap in bracketed-paste markers when claude enabled the mode
+            # (?2004h, tracked in _consume) so it knows this is a PASTE — else each
+            # embedded newline submits the line and a multi-line paste runs early.
+            if getattr(self, "_bracketed_paste", False):
+                text = "\x1b[200~" + text + "\x1b[201~"
             try:
                 self._pty.write(text)
             except Exception:
@@ -770,6 +780,9 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         chunk = chunk.replace("0011Ignore", "")
         chunk = _PRIVATE_SGR_RE.sub("", chunk)   # drop XTMODKEYS \x1b[>4;2m etc. (pyte misreads as SGR-4 underline)
         chunk = _KITTY_KBD_RE.sub("", chunk)     # drop Kitty-keyboard CSI-u (pyte leaks the trailing 'u' into the grid)
+        _bp = _BRACKETED_RE.findall(chunk)       # track claude's bracketed-paste mode for on_paste (last h/l wins)
+        if _bp:
+            self._bracketed_paste = (_bp[-1] == "h")
         if not chunk:
             return
         with self._lock:
