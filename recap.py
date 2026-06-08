@@ -1510,6 +1510,21 @@ def label_for(s: dict) -> str:
     return fallback if fallback else _c("(empty)", GRAY)
 
 
+def _pane_title(s: "dict | None", sid: str, term=None) -> str:
+    """Human label for a live pane's tab — ai_title → summary → first user
+    message → the term's launch title (e.g. a new session's folder name) → a short
+    id only as a last resort, so a tab never shows just a bare session id."""
+    if s:
+        t = (s.get("ai_title") or s.get("summary") or _first_msg(s) or "").strip()
+        if t:
+            return t
+    if term is not None:
+        tt = (getattr(term, "title", "") or "").strip()
+        if tt:
+            return tt
+    return sid[:8]
+
+
 # ── Display ──────────────────────────────────────────────────────────────────
 def _find_session_jsonl(sid_prefix: str) -> Path | None:
     sid_prefix = _trim_sid(sid_prefix)
@@ -3481,7 +3496,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.notify(f"could not build resume command: {e!r}",
                             severity="error", timeout=8)
                 return
-            title = (s.get("ai_title") if s else None) or sid[:8]
+            title = _pane_title(s, sid)
             self._spawn_live_pane(sid, argv, cwd, env, title, refresh=refresh)
 
         def _open_new_live(self, target_cwd: str) -> None:
@@ -3668,7 +3683,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             try:
                 tabs = self.query_one("#right", TabbedContent)
                 s = self._sid_index.get(sid)
-                title = (s.get("ai_title") if s else None) or sid[:8]
+                title = _pane_title(s, sid, self._live.get(sid))
                 pane = tabs.get_pane(self._live.pane_id(sid))
                 if pane is not None:
                     pane.label = _LIVE_TERM.tab_label(title, status)
@@ -3679,10 +3694,34 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # claude flips status many times/sec and each full rebuild is costly.
             self._request_refresh()
 
-        # NOTE: viewing a tab deliberately does NOT clear its "!" — a completed
-        # session stays flagged until you actually respond (input → claude busy,
-        # handled in _on_live_status). So there is no on_tabbed_content_tab_activated
-        # unread-clear: it would hide completions the moment the tab is shown.
+        def on_tabbed_content_tab_activated(self, event) -> None:
+            # A live tab became active (F2/F3, Shift+F3, click) → move the list
+            # cursor to the matching session so you can see WHICH one it is.
+            # Deliberately does NOT clear the "!" finished-marker — that stays until
+            # you respond (input → claude busy, handled in _on_live_status). The
+            # row-highlight → tab-switch loop is broken naturally: F2/F3 focus the
+            # pane, so the resulting RowHighlighted returns early via the
+            # _focused_terminal guard; a plain click re-switches to the same tab
+            # (a no-op, no re-fire).
+            if self._live is None:
+                return
+            try:
+                active = self.query_one("#right", TabbedContent).active or ""
+            except Exception:
+                return
+            if not active or active == "tab-preview":
+                return
+            sid = next((s for s in self._live.statuses()
+                        if self._live.pane_id(s) == active), None)
+            if sid is None:
+                return
+            try:
+                table = self.query_one("#table", DataTable)
+                row = table.get_row_index(sid)
+            except Exception:
+                return
+            if row != table.cursor_row:
+                table.move_cursor(row=row)
 
         def _on_live_exit(self, sid: str) -> None:
             """Called on the UI thread when a pane's child exits. Keep the tab
@@ -3695,7 +3734,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             try:
                 tabs = self.query_one("#right", TabbedContent)
                 s = self._sid_index.get(sid)
-                title = (s.get("ai_title") if s else None) or sid[:8]
+                title = _pane_title(s, sid, self._live.get(sid))
                 pane = tabs.get_pane(self._live.pane_id(sid))
                 if pane is not None:
                     pane.label = _LIVE_TERM.tab_label(title, "dead")
