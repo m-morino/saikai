@@ -1130,7 +1130,7 @@ STATUS_GLYPH = {
 
 
 def tab_label(title: str, status: str) -> str:
-    """Build a TabPane label like '◐ recap' / '⏳ claude-md' / '✓ project-two'."""
+    """Build a TabPane label like '◐ recap' / '⏳ docs' / '✓ myproj'."""
     glyph = STATUS_GLYPH.get(status, "")
     name = (title or "claude")[:18]
     return f"{glyph} {name}".strip()
