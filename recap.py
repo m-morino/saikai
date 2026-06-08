@@ -2593,7 +2593,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._sid_index = {s.get("id"): s for s in all_sessions}
             self._marked: set = set()        # sids selected for batch launch (Space)
             self._opening_live_sid = None     # sid whose pane should grab focus on open
-            self._unread: set = set()         # live panes answered but not yet viewed
+            self._unread: set = set()         # live panes finished (idle) but not yet responded to → ! marker
             # Live-terminal bookkeeping (None-safe: only used when _LIVE_TERM is
             # available). Pure data structure; the TabbedContent is the UI.
             self._live = (_LIVE_TERM.LiveSessionManager(max_live=self.MAX_LIVE)
@@ -3638,17 +3638,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if self._live is None or not self._live.has(sid):
                 return   # ignore a callback that lands after the pane was closed
             self._live.set_status(sid, status)
-            # Mark "unread" when claude finishes / needs input in a pane the user
-            # isn't currently viewing, so an answered-but-unchecked session is
-            # visually distinct (!) from one already viewed and left as-is (=).
-            # Cleared when the user activates the tab (on_tabbed_content_tab_activated).
-            if status in ("idle", "waiting"):
-                try:
-                    _active = self.query_one("#right", TabbedContent).active or ""
-                except Exception:
-                    _active = ""
-                if self._live.pane_id(sid) != _active:
-                    self._unread.add(sid)
+            # "!" = claude FINISHED its turn (went idle) and you haven't sent input
+            # since. Flagged in the list EVEN for the currently-displayed tab — you
+            # might be looking at the list or another pane, so you'd otherwise miss
+            # WHAT finished. Cleared ONLY when the user sends input (claude goes
+            # busy again), NOT by merely viewing the tab — viewing ≠ responding.
+            if status == "idle":
+                self._unread.add(sid)
+            elif status == "busy":
+                self._unread.discard(sid)
             # Update the tab label.
             try:
                 tabs = self.query_one("#right", TabbedContent)
@@ -3664,21 +3662,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # claude flips status many times/sec and each full rebuild is costly.
             self._request_refresh()
 
-        def on_tabbed_content_tab_activated(self, event) -> None:
-            # Viewing a live pane "reads" it: drop its unread badge so ● (answered,
-            # unchecked) becomes = (viewed, left as-is). Fires on every activation
-            # path — row-highlight switch, F2/F3, click, Enter-open.
-            if self._live is None or not getattr(self, "_unread", None):
-                return
-            try:
-                active = self.query_one("#right", TabbedContent).active or ""
-            except Exception:
-                return
-            cleared = [sid for sid in self._unread if self._live.pane_id(sid) == active]
-            for sid in cleared:
-                self._unread.discard(sid)
-            if cleared:
-                self._request_refresh()
+        # NOTE: viewing a tab deliberately does NOT clear its "!" — a completed
+        # session stays flagged until you actually respond (input → claude busy,
+        # handled in _on_live_status). So there is no on_tabbed_content_tab_activated
+        # unread-clear: it would hide completions the moment the tab is shown.
 
         def _on_live_exit(self, sid: str) -> None:
             """Called on the UI thread when a pane's child exits. Keep the tab
