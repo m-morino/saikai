@@ -1,10 +1,25 @@
 [project]
 name = "recap"
 version = "0.1.0"
-description = "Claude Code session history viewer with LLM summarization"
+description = "A terminal session browser for Claude Code — browse, search, group, and resume past sessions, with an opt-in split-live pane."
+readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "masayuki.morino" }]
-dependencies = []
+license = { file = "LICENSE" }
+# TODO(publish): set your own name / GitHub handle before publishing.
+authors = [{ name = "recap contributors" }]
+keywords = ["claude", "claude-code", "tui", "textual", "sessions", "cli"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "textual>=0.50",
+    "pyte>=0.8",
+    "pywinpty>=2.0 ; sys_platform == 'win32'",
+    "ptyprocess>=0.7 ; sys_platform != 'win32'",
+]
 
 [project.scripts]
 recap = "recap:main"
@@ -14,7 +29,16 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["recap.py"]
+# recap.py imports recap_terminal — BOTH must ship or the wheel is broken.
+only-include = ["recap.py", "recap_terminal.py"]
 
 [tool.hatch.build.targets.sdist]
-include = ["recap.py", "pyproject.toml", ".gitignore"]
+include = [
+    "recap.py",
+    "recap_terminal.py",
+    "pyproject.toml",
+    "README.md",
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.md",
+    ".gitignore",
+]

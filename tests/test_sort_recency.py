@@ -352,6 +352,19 @@ def test_build_groups_state_keeps_pinned_live_in_state_group():
     assert set(gd.get("Pinned", [])) == {"run", "wait", "idle"}, gd
 
 
+def test_no_internal_identifiers_in_source():
+    """Public-release hygiene: the source must carry no org-internal names. The
+    summarizer backend is generic (RECAP_SUMMARIZE_CMD), project_short derives the
+    home prefix from Path.home(), and examples use generic placeholders."""
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parent.parent
+    banned = ("chatagc", "masayuki", "morino", "work-tools", "edge-auth")
+    for fn in ("recap.py", "recap_terminal.py"):
+        src = root.joinpath(fn).read_text(encoding="utf-8").lower()
+        hits = [b for b in banned if b in src]
+        assert not hits, f"{fn} still contains internal identifiers: {hits}"
+
+
 if __name__ == "__main__":
     test_last_active_prefers_mtime_over_stale_last_ts()
     print("PASS test_last_active_prefers_mtime_over_stale_last_ts")
@@ -397,4 +410,6 @@ if __name__ == "__main__":
     print("PASS test_build_new_invocation_starts_fresh_session_with_id")
     test_build_groups_state_keeps_pinned_live_in_state_group()
     print("PASS test_build_groups_state_keeps_pinned_live_in_state_group")
+    test_no_internal_identifiers_in_source()
+    print("PASS test_no_internal_identifiers_in_source")
     print("ALL PASS")

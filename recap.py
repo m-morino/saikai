@@ -1492,11 +1492,13 @@ def truncate_visual(s: str, width: int) -> str:
 
 
 def project_short(name: str) -> str:
-    """Strip the home-path prefix ("C--Users-masayuki-morino-") so the column shows
-    a recognizable suffix. e.g. C--Users-masayuki-morino-CLI-work-tools → CLI-work-tools."""
-    parts = name.split("-")
-    if len(parts) > 4:
-        return "-".join(parts[5:])[:14] or name[:14]
+    """Strip the encoded home-dir prefix so the column shows a recognizable
+    suffix, e.g. <home>-myrepo → myrepo. Derived from Path.home() so it works for
+    any user / OS — Claude Code encodes a project dir as its cwd with the path
+    separators and dots replaced by '-'."""
+    home_enc = re.sub(r"[:/\\.]", "-", str(Path.home()))
+    if name.startswith(home_enc):
+        return (name[len(home_enc):].lstrip("-") or name)[:14]
     return name[:14]
 
 
@@ -1961,8 +1963,8 @@ FREQ_CWD_MIN_DEFAULT = 5
 def _canonical_workspace(cwd: str) -> str:
     """Collapse a git worktree path back to its parent repo.
 
-    The user thinks of `feature-x` as a branch of `work-tools`, but recap sees
-    `work-tools/.worktrees/feature-x/` as a distinct cwd. Without this, every
+    The user thinks of `feature-x` as a branch of `myrepo`, but recap sees
+    `myrepo/.worktrees/feature-x/` as a distinct cwd. Without this, every
     worktree splits its parent repo's session count, so a workspace the user
     visits constantly (just on different branches) can fall below the frequent
     threshold. Collapse to the parent so the count reflects user intent."""
@@ -1996,7 +1998,7 @@ def _assign_primary_topic(sessions: list[dict]) -> None:
 
     'Primary' = the topic from this session's topics list that the maximum
     number of OTHER sessions also have. This produces clusters around common-
-    interest topics (e.g. 'email', 'work-tools') rather than singleton groups
+    interest topics (e.g. 'email', 'backend') rather than singleton groups
     around session-unique topics. Sets s["primary_topic"] (lowercase) or ""
     when the session has no cached topics yet."""
     topic_count: Counter = Counter()
@@ -2091,7 +2093,7 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
         "   catch-all bucket. If a theme would only contain 1-2 sessions,\n"
         "   merge those into the nearest larger theme instead.\n"
         "3. Themes must be semantically distinct from each other — avoid\n"
-        "   pairs like 'work-tools development' + 'tool development'.\n"
+        "   pairs like 'backend development' + 'tool development'.\n"
         "4. Use the 'topics:' keywords on each line as your primary signal;\n"
         "   the title is supporting context.\n\n"
         "Reply with ONLY valid JSON, no prose:\n"
