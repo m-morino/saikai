@@ -327,6 +327,31 @@ def test_build_new_invocation_starts_fresh_session_with_id():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_build_groups_state_keeps_pinned_live_in_state_group():
+    """案B: in STATE grouping a pinned session that is live (Running / Needs input
+    / Open) stays in its state group (pin = ★ badge), NOT hoisted to Pinned; only
+    non-live pinned (Recent / Idle) go to Pinned. Date grouping still hoists every
+    favorite to Pinned (unchanged)."""
+    now = datetime.now()
+    sess = [
+        {"id": "run",  "_state": "Running",     "mtime": time.time(),             "last_ts": _iso_ago(0)},
+        {"id": "wait", "_state": "Needs input", "mtime": time.time(),             "last_ts": _iso_ago(0)},
+        {"id": "idle", "_state": "Idle",         "mtime": time.time() - 9 * 86400, "last_ts": _iso_ago(9)},
+    ]
+    favs = {"run", "wait", "idle"}
+    g = {lbl: [s["id"] for s in members]
+         for lbl, members in recap._build_groups(sess, "state", favs, now)}
+    assert "run" in g.get("Running", []), g            # live pinned stays in its state group
+    assert "wait" in g.get("Needs input", []), g
+    assert "idle" in g.get("Pinned", []), g            # non-live pinned -> Pinned shortcut
+    assert "run" not in g.get("Pinned", []), g         # live pinned NOT hoisted
+    assert "wait" not in g.get("Pinned", []), g
+    # Date grouping unchanged: every favorite hoisted to Pinned.
+    gd = {lbl: [s["id"] for s in members]
+          for lbl, members in recap._build_groups(sess, "date", favs, now)}
+    assert set(gd.get("Pinned", [])) == {"run", "wait", "idle"}, gd
+
+
 if __name__ == "__main__":
     test_last_active_prefers_mtime_over_stale_last_ts()
     print("PASS test_last_active_prefers_mtime_over_stale_last_ts")
@@ -370,4 +395,6 @@ if __name__ == "__main__":
     print("PASS test_no_app_binding_steals_a_readline_ctrl_key")
     test_build_new_invocation_starts_fresh_session_with_id()
     print("PASS test_build_new_invocation_starts_fresh_session_with_id")
+    test_build_groups_state_keeps_pinned_live_in_state_group()
+    print("PASS test_build_groups_state_keeps_pinned_live_in_state_group")
     print("ALL PASS")
