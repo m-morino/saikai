@@ -626,8 +626,11 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
 
         with self._lock:
             cols = screen.columns
-            cursor_x = screen.cursor.x
-            cursor_y = screen.cursor.y
+            # Clamp into the (possibly just-resized) grid — pyte does NOT clamp the
+            # cursor on shrink, so a stale cursor_y >= lines would make the cursor
+            # vanish for a frame (no display row matches y == cursor_y).
+            cursor_x = max(0, min(screen.cursor.x, cols - 1))
+            cursor_y = max(0, min(screen.cursor.y, screen.lines - 1))
             s = self._scroll
             buf = self._buf_for_row(screen, s, y)
             cells = [buf[x] for x in range(cols)] if buf is not None else None
@@ -655,15 +658,21 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             if ch.data == "":
                 continue
             if show_cursor and x == cursor_x:
-                # break the run, emit the cursor cell reversed, restart
+                # break the run, emit the cursor cell reversed, restart. Keep the
+                # cell's real fg/bg/bold and just invert it, so the cursor on a
+                # themed prompt isn't flattened to a default-colour block.
                 flush(x)
                 run_chars = []
-                segments.append(Segment(ch.data or " ", Style(reverse=True)))
+                segments.append(Segment(ch.data or " ",
+                                        _cell_style(ch) + Style(reverse=True)))
                 run_style = None
                 continue
             st = _cell_style(ch)
             if _has_sel and self._in_sel(y, x):
-                st = st + Style(reverse=True)   # recap-owned drag selection
+                # XOR reverse so the selection stays visible even over claude's OWN
+                # reverse-video cells (highlighted menu row / footer); a plain
+                # +reverse=True would no-op on an already-reversed cell.
+                st = st + Style(reverse=not bool(getattr(st, "reverse", False)))
             if st != run_style and run_chars:
                 segments.append(Segment("".join(run_chars), run_style))
                 run_chars = []
