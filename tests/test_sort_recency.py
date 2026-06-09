@@ -421,6 +421,18 @@ def test_no_internal_identifiers_in_source():
         assert not hits, f"{fn} still contains internal identifiers: {hits}"
 
 
+def test_split_live_default_on_with_env_opt_out():
+    """Split-live is the DEFAULT now; RECAP_SPLIT_LIVE is a tri-state OPT-OUT.
+    Only an explicit falsy token (0/false/no/off, case-insensitive, trimmed)
+    disables it → legacy full-takeover. Unset / empty / any other value = on
+    (a typo'd value fails safe to the default, split-live)."""
+    f = recap._split_live_disabled_by_env
+    for keep_on in (None, "", "1", "true", "yes", "on", "flase"):
+        assert f(keep_on) is False, keep_on
+    for opt_out in ("0", "false", "no", "off", "FALSE", " Off ", "NO"):
+        assert f(opt_out) is True, opt_out
+
+
 if __name__ == "__main__":
     test_last_active_prefers_mtime_over_stale_last_ts()
     print("PASS test_last_active_prefers_mtime_over_stale_last_ts")
@@ -476,4 +488,6 @@ if __name__ == "__main__":
     print("PASS test_resolve_resume_cwd_uses_stub_origin_cwd")
     test_no_internal_identifiers_in_source()
     print("PASS test_no_internal_identifiers_in_source")
+    test_split_live_default_on_with_env_opt_out()
+    print("PASS test_split_live_default_on_with_env_opt_out")
     print("ALL PASS")

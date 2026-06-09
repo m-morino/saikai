@@ -3,8 +3,8 @@
 A terminal session browser for [Claude Code](https://claude.com/claude-code).
 recap scans `~/.claude/projects`, shows your past sessions in a searchable,
 sortable, groupable table with an AI-generated one-line summary per session, and
-resumes any of them. With an opt-in **split-live** mode it can also host live
-`claude` panes side-by-side so you can run and watch several sessions at once.
+resumes any of them. By default (**split-live**) it also hosts live `claude`
+panes side-by-side so you can run and watch several sessions at once.
 
 > Single-file [Textual](https://github.com/Textualize/textual) app
 > (`recap.py` + `recap_terminal.py`). Works on **Windows, Linux, and macOS**
@@ -43,13 +43,16 @@ recap --help
 **Search tokens** (combine with text and each other): `:fav` `:hidden` `:open`
 `:active` `:recent`. Group / Sort / Status / Age also have top-bar dropdowns.
 
-### Split-live (opt-in)
+### Split-live (default)
+
+recap runs real interactive `claude` processes in tabs beside the list whenever
+its PTY deps (`pyte`, `pywinpty`/`ptyprocess`) are present — they ship as
+dependencies, so this is the default. To opt out and use the lightweight
+list-only browser (`Enter` = full-screen takeover resume), set the env var:
 
 ```bash
-RECAP_SPLIT_LIVE=1 recap
+RECAP_SPLIT_LIVE=0 recap     # also: false / no / off
 ```
-
-Runs real interactive `claude` processes in tabs beside the list.
 
 | Key | Action |
 |-----|--------|
@@ -71,7 +74,7 @@ Markers in the list: `~` busy · `?` waiting for input · `!` finished (unanswer
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RECAP_SPLIT_LIVE` | off | `1` enables the live-pane mode |
+| `RECAP_SPLIT_LIVE` | on | live-pane mode; set `0`/`false`/`no`/`off` to disable → list-only browser + full-takeover resume |
 | `RECAP_AUTO_REFRESH` | off | seconds between background re-scans |
 | `RECAP_SUMMARIZE_CMD` | — | command to summarize with (prompt on stdin → summary on stdout) instead of `claude -p` |
 | `RECAP_MIN_FREE_MB` / `RECAP_CLAUDE_MB` | 1536 / 600 | free-RAM floor / estimated RAM per live pane |
