@@ -3653,27 +3653,49 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 on_status=self._on_live_status, on_exit=self._on_live_exit,
             )
             pane = TabPane(_LIVE_TERM.tab_label(title, "idle"), term, id=pane_id)
+            # Mount on the UI event loop in a worker so we can AWAIT the removal of
+            # any lingering same-id dead pane BEFORE adding the new one. remove_pane()
+            # is deferred (returns AwaitComplete), so the old synchronous
+            # remove_pane()+add_pane() collided — the removal hadn't flushed, add_pane
+            # raised DuplicateIds, and re-opening an EXITED session silently failed
+            # (its dead pane is kept for the final frame, only forgotten from the
+            # manager). The capacity/RAM gate above already decided this pane WILL
+            # open, so return True now; the worker registers + focuses once the DOM
+            # settles. Runs on the UI loop, never the reader thread → lock invariant
+            # untouched. Repro/fix: tests/test_terminal_concurrency.py.
+            self.run_worker(
+                self._mount_live_pane(tabs, pane_id, pane, term, sid, refresh),
+                name=f"mount-{sid[:8]}", exit_on_error=False,
+            )
+            return True
+
+        async def _mount_live_pane(self, tabs, pane_id, pane, term, sid,
+                                   refresh=True) -> None:
+            """Await-safe mount of a live pane (see _spawn_live_pane). Drops a
+            lingering same-id dead pane and WAITS for the DOM to settle, then adds
+            the new pane, registers it, and focuses it. On failure the half-built
+            term is killed + reaped so no claude is orphaned untracked."""
             try:
-                # A previously-dead pane for this sid may still be mounted (kept
-                # for its final frame, only forgotten from the manager); its id
-                # collides with the new pane. Drop it first so add_pane doesn't
-                # raise DuplicateIds and block re-launching a session that exited.
+                exists = False
                 try:
-                    tabs.remove_pane(pane_id)
+                    exists = tabs.get_pane(pane_id) is not None
                 except Exception:
-                    pass
-                tabs.add_pane(pane)
+                    exists = False
+                if exists:
+                    # exited session being re-opened: remove the kept dead pane and
+                    # WAIT (deferred removal) so add_pane can't hit DuplicateIds.
+                    try:
+                        await tabs.remove_pane(pane_id)
+                    except Exception:
+                        pass
+                await tabs.add_pane(pane)
             except Exception as e:
-                # add_pane may have already mounted the widget (on_mount spawned
-                # the pty); kill it so a half-opened claude isn't orphaned
-                # untracked (it was never register()ed).
                 try:
                     self._live.note_reap(term.kill())
                 except Exception:
                     pass
-                self.notify(f"could not open tab: {e!r}", severity="error",
-                            timeout=8)
-                return False
+                self.notify(f"could not open tab: {e!r}", severity="error", timeout=8)
+                return
             self._live.register(sid, term)
             _log(f"live open: {sid[:8]}  ({self._live.count}/{self._live.max_live})")
             self._opened_sids.add(sid)
@@ -3696,7 +3718,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Batch launch passes refresh=False and repaints ONCE after all opens.
             if refresh:
                 self._refresh_table()
-            return True
 
         def _save_open_panes(self) -> None:
             """Persist {id, cwd} for panes open this session so Shift+F4 can reopen

@@ -274,9 +274,58 @@ def test_bracketed_paste_mode_tracking():
     assert fa("no paste mode here") == []
 
 
+def test_reopen_after_exit_requires_awaited_pane_removal():
+    """Re-opening an EXITED session must not hit Textual DuplicateIds. recap keeps a
+    dead pane mounted (for its final frame) and re-uses the sid's pane id on reopen;
+    TabbedContent.remove_pane() is DEFERRED (returns AwaitComplete), so a synchronous
+    remove_pane()+add_pane(same id) collides. This proves the mechanism behind recap's
+    _mount_live_pane worker: NOT awaiting the removal raises DuplicateIds; awaiting it
+    mounts cleanly. Needs textual (skips without it — the bug was the silent
+    'won't reopen' for every session whose claude had exited)."""
+    try:
+        import asyncio
+        from textual.app import App
+        from textual.widgets import TabbedContent, TabPane, Label
+    except Exception:
+        print("SKIP test_reopen_after_exit_requires_awaited_pane_removal (no textual)")
+        return
+
+    class _A(App):
+        def compose(self):
+            yield TabbedContent(id="tc")
+
+    async def _run(awaited):
+        app = _A()
+        async with app.run_test() as pilot:
+            tc = app.query_one("#tc", TabbedContent)
+            await tc.add_pane(TabPane("first", Label("a"), id="tab-live-x"))
+            await pilot.pause()
+            raised = None
+            try:
+                if awaited:                       # recap's _mount_live_pane fix
+                    await tc.remove_pane("tab-live-x")
+                    await tc.add_pane(TabPane("second", Label("b"), id="tab-live-x"))
+                else:                             # the old buggy synchronous path
+                    tc.remove_pane("tab-live-x")
+                    tc.add_pane(TabPane("second", Label("b"), id="tab-live-x"))
+                await pilot.pause()
+            except Exception as e:                # noqa: BLE001
+                raised = type(e).__name__
+            return raised
+
+    async def _both():
+        return (await _run(awaited=False), await _run(awaited=True))
+
+    sync_raise, awaited_raise = asyncio.run(_both())
+    assert sync_raise == "DuplicateIds", f"sync remove+add should collide, got {sync_raise}"
+    assert awaited_raise is None, f"awaited remove+add must mount cleanly, got {awaited_raise}"
+
+
 if __name__ == "__main__":
     test_update_status_marshals_outside_lock()
     print("PASS test_update_status_marshals_outside_lock")
+    test_reopen_after_exit_requires_awaited_pane_removal()
+    print("PASS test_reopen_after_exit_requires_awaited_pane_removal")
     test_kill_tracks_reap_for_atexit_join()
     print("PASS test_kill_tracks_reap_for_atexit_join")
     test_pane_refresh_coalesces()
