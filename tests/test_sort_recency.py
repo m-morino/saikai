@@ -443,6 +443,29 @@ def test_no_internal_identifiers_in_source():
         assert not emails, f"{f.name} contains e-mail address(es): {emails}"
 
 
+def test_ram_gate_windows_principled():
+    """The live-pane gate is derived from Windows resource management: gate on
+    COMMIT headroom (the documented system-freeze cause) + dwMemoryLoad + a
+    RELATIVE physical floor, NOT raw available-physical (which counts reclaimable
+    standby cache). _ram_fit counts how many ~per_pane panes fit; the binding
+    constraint wins; a None field skips its check; None status (macOS) → unbounded."""
+    MS = recap._MemStatus
+    fit, gate = recap._ram_fit, recap._ram_gate_decision
+    kw = dict(max_load=85, min_commit_mb=2048, min_free_phys_pct=8)
+    plenty = MS(40, 16000, 20000, 32000)            # everything ample
+    assert fit(plenty, 600, **kw)[0] >= 5 and gate(plenty, 600, **kw)[0] is True
+    hot = MS(92, 8000, 8000, 32000)                 # high load → blocked despite free RAM
+    assert fit(hot, 600, **kw)[0] == 0 and gate(hot, 600, **kw)[0] is False
+    low_commit = MS(50, 16000, 2200, 32000)         # commit is the binding (freeze) limit
+    f, why = fit(low_commit, 600, **kw)
+    assert f == 0 and "commit" in why and gate(low_commit, 600, **kw)[0] is False
+    low_phys = MS(50, 2900, 20000, 32000)           # 8% of 32000 = 2560 floor → blocked
+    assert gate(low_phys, 600, **kw)[0] is False
+    assert gate(None, 600, **kw) == (True, "")      # macOS / unknown → never blocks
+    no_commit = MS(None, 16000, None, 32000)        # missing fields skip; phys still applies
+    assert gate(no_commit, 600, **kw)[0] is True
+
+
 def test_wt_column_is_sortable():
     """The Wt (worktree) header must sort: SORT_COLS gates _promote_sort_col and it
     omitted 'wt', so the header was a silent no-op while every other column sorted
@@ -549,6 +572,8 @@ if __name__ == "__main__":
     print("PASS test_resolve_resume_cwd_uses_stub_origin_cwd")
     test_no_internal_identifiers_in_source()
     print("PASS test_no_internal_identifiers_in_source")
+    test_ram_gate_windows_principled()
+    print("PASS test_ram_gate_windows_principled")
     test_wt_column_is_sortable()
     print("PASS test_wt_column_is_sortable")
     test_at_live_capacity_counts_inflight_opens()
