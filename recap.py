@@ -2664,6 +2664,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._marked: set = set()        # sids selected for batch launch (Space)
             self._opening_live_sid = None     # sid whose pane should grab focus on open
             self._unread: set = set()         # live panes finished (idle) but not yet responded to → ! marker
+            self._busy_seen: set = set()      # sids observed busy since their last "done" toast (catches tasks shorter than the poll)
             self._opened_sids: set = set()    # sids opened + kept this session (snapshot source)
             self._opening_sids: set = set()   # opens in flight (register deferred to the mount worker) — counted by the capacity gate + has() dedup
             # Previous session's open panes — for the Shift+F4 restore (split-live).
@@ -3207,7 +3208,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # !M = panes that finished and you haven't responded to yet.
                 _st = self._live.statuses()
                 _wait = sum(1 for v in _st.values() if v == "waiting")
-                _done = len(getattr(self, "_unread", ()))
+                # Intersect with live sids so a just-closed/dead pane (forgotten from
+                # statuses, but cleared from _unread only later by the reader's exit
+                # callback) doesn't inflate the count — matches action_next_attention.
+                _done = len(getattr(self, "_unread", set()) & set(_st))
                 _att = ""
                 if _wait:
                     _att += f"  [red]?{_wait}[/red]"
@@ -3879,6 +3883,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self._unread.add(sid)
             elif status == "busy":
                 self._unread.discard(sid)
+                self._busy_seen.add(sid)   # reader sees every transition (incl. tasks
+                #                            shorter than the poll) → the "done" toast
+                #                            in _poll_live_status keys off this, not a
+                #                            1-tick prev-status snapshot it can miss.
             # Update the tab label.
             try:
                 tabs = self.query_one("#right", TabbedContent)
@@ -3931,6 +3939,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if self._live is None:
                 return
             self._unread.discard(sid)   # a dead pane is no longer a live unread answer
+            self._busy_seen.discard(sid)  # …nor owed a "done" toast
             try:
                 tabs = self.query_one("#right", TabbedContent)
                 s = self._sid_index.get(sid)
@@ -3987,6 +3996,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 idx = len(ids_before)
             self._live.forget(sid)
             self._opened_sids.discard(sid)   # explicit close → drop from restore set
+            self._unread.discard(sid)        # closed → not an unanswered finish (clears !N now, not on the deferred exit callback)
+            self._busy_seen.discard(sid)
             self._save_open_panes()
             try:
                 tabs.remove_pane(pane_id)
@@ -4030,6 +4041,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     pass
             self._live.kill_all()      # kill any still-live terms (parallel, non-blocking)
             self._opened_sids.clear()
+            self._unread.clear()       # all closed → no unanswered finishes, no busy debt
+            self._busy_seen.clear()
             self._save_open_panes()
             try:
                 tabs.active = "tab-preview"
@@ -4346,19 +4359,29 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 active = ""
             for sid, st in cur.items():
+                if st == "busy":
+                    self._busy_seen.add(sid)   # record even for the active pane
                 if self._live.pane_id(sid) == active:
-                    continue   # you're looking at this pane — its tab/marker suffice
+                    # You're looking at this pane — its tab/marker suffice; if it just
+                    # settled, drop the "done" debt so switching away later doesn't
+                    # toast a finish you already watched.
+                    if st != "busy":
+                        self._busy_seen.discard(sid)
+                    continue
                 prev_st = prev.get(sid)
                 sess = self._sid_index.get(sid) or {}
                 title = (sess.get("ai_title") or _first_msg(sess) or sid[:8])[:50]
                 if st == "waiting" and prev_st != "waiting":
                     self.notify(f"needs input: {title}", title="recap", timeout=8)
-                elif st == "idle" and prev_st == "busy":
+                elif st == "idle" and sid in self._busy_seen:
                     # A backgrounded pane just FINISHED its turn (busy→idle) — toast
-                    # so you notice WHAT completed without watching every tab. Gated
-                    # on prev=="busy" so a fresh load (→idle) or a y/n answer
-                    # (waiting→idle) doesn't masquerade as a completed task.
+                    # so you notice WHAT completed without watching every tab. Keyed
+                    # on _busy_seen (set by the reader on the busy edge) not a 1-tick
+                    # prev snapshot, so a task shorter than the poll still toasts; a
+                    # fresh load (→idle) or a y/n answer (waiting→idle, never busy)
+                    # has no _busy_seen entry, so it doesn't masquerade as completed.
                     self.notify(f"done: {title}", title="recap", timeout=6)
+                    self._busy_seen.discard(sid)
             advanced = self._restat_live()   # live JSONLs grew → Last / Recency moved
             changed = (cur != prev)
             self._last_status = cur
