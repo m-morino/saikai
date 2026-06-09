@@ -150,9 +150,23 @@ free key (the leader key works) with a `Provider` exposing the meta actions — 
 discoverable, self-documenting complement to the leader (recap disabled it only
 for the `ctrl+p` collision; `COMMAND_PALETTE_BINDING` is overridable).
 
-**Discoverability:** remapped keys must surface in `?` help (and footer if shown)
-via `key_display`; help documents the two layers — **global** (F-keys, release)
-vs **list-only** (leader sequences).
+**Help & footer — single source, MECE, width-aware** *(user requirement: the
+footer and the `?` overlay currently disagree — the overlay is a hand-written
+string that drifts from the auto-generated footer):*
+- Generate BOTH the always-visible footer AND the `?` overlay from the **same**
+  `DEFAULT_KEYMAP` (+ active overrides), so they can never drift. Each binding
+  carries a `key_display`, a short label (footer) and a long description
+  (overlay), grouped: Navigation / List actions / Split-live / Filter.
+- **Responsive to terminal size** (read `self.app.size`): as width shrinks the
+  footer drops lowest-priority bindings first and falls back to abbreviated
+  `key_display` (priority-ordered so the most-used keys survive); the `?` overlay
+  is a **scrollable** `ModalScreen` (never overflows a short terminal) and, below
+  a width threshold, switches from the multi-column table to a compact
+  one-binding-per-line list with ellipsised descriptions.
+- Degenerate cases: a very small terminal still shows something usable (at least
+  a "press ? for help" hint when the footer is truncated); the overlay scrolls
+  rather than clipping. Document the two layers — **global** (F-keys, release)
+  vs **list-only** (leader sequences).
 
 ---
 
