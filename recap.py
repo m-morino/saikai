@@ -2430,8 +2430,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Ctrl-][/yellow]      Return focus: pane → list  (RECAP_RELEASE_KEY to change)\n"
                 "  [yellow]F10[/yellow]         Close the active tab   ·   [yellow]Shift-F10[/yellow]  Close ALL tabs\n"
                 "  [yellow]Esc[/yellow]         Close / return one pane at a time   ·   [yellow]Ctrl-C[/yellow]  quit-all\n"
-                "  [yellow]Scroll up[/yellow]   Freeze the pane (copy mode): Shift+drag to select while a\n"
-                "              streaming claude keeps running; scroll to the bottom to resume live\n\n"
+                "  [yellow]Shift-F9[/yellow]    Freeze the pane in place (copy mode): Shift+drag selects while\n"
+                "              claude streams · scroll up also freezes · Shift+F9 / typing resumes\n\n"
                 "[bold cyan]Filter / Group / Sort (top-right dropdowns, Desktop-style)[/bold cyan]\n"
                 "  Group by  Date / Project / State / None   (Shift-F7 cycles)\n"
                 "  Sort by   Recency / Created time / Alphabetically\n"
@@ -2527,6 +2527,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("shift+f6", "toggle_cluster", "Cluster", priority=True),
             Binding("shift+f7", "cycle_group", "Group", priority=True),
             Binding("shift+f8", "new_session", "New", priority=True),
+            Binding("shift+f9", "freeze_pane", "Freeze", priority=True),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
             Binding("question_mark", "help", "Help", priority=True),
             # Split-live tab management (opt-in). F10 closes the ACTIVE tab;
@@ -3935,6 +3936,28 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if sid is not None:
                 self._opening_live_sid = sid
                 self.call_after_refresh(lambda: self._focus_live_pane(sid))
+
+        def action_freeze_pane(self) -> None:
+            """Shift+F9: freeze / resume the focused live pane so it holds still for
+            a Shift+drag copy while claude keeps streaming (any keypress also
+            resumes). Without this a streaming pane repaints over your selection."""
+            term = self._focused_terminal()
+            if term is None and self._live is not None:
+                try:
+                    active = self.query_one("#right", TabbedContent).active or ""
+                    for s in self._live.statuses():
+                        if self._live.pane_id(s) == active:
+                            term = self._live.get(s)
+                            break
+                except Exception:
+                    term = None
+            if term is None or getattr(term, "is_dead", False):
+                self.notify("focus a live pane to freeze it", timeout=3)
+                return
+            frozen = term.toggle_freeze()
+            self.notify(
+                "pane frozen — Shift+drag to copy · Shift+F9 / type to resume"
+                if frozen else "pane resumed", timeout=4)
 
         def _cycle_tab(self, step: int) -> None:
             if _LIVE_TERM is None:
