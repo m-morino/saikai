@@ -443,6 +443,20 @@ def test_no_internal_identifiers_in_source():
         assert not emails, f"{f.name} contains e-mail address(es): {emails}"
 
 
+def test_at_live_capacity_counts_inflight_opens():
+    """Regression: the live-pane cap must count BOTH registered panes and in-flight
+    opens (register is deferred to the async mount worker). Without counting the
+    in-flight ones, a Space-batch / Shift+F4-restore loop reads a stale count and
+    overruns RECAP_MAX_LIVE (and races into DuplicateIds)."""
+    f = recap._at_live_capacity
+    assert f(0, 0, 4) is False
+    assert f(3, 0, 4) is False
+    assert f(4, 0, 4) is True            # full on registered alone
+    assert f(2, 2, 4) is True            # 2 registered + 2 in-flight = at cap
+    assert f(0, 4, 4) is True            # in-flight alone reaches the cap
+    assert f(1, 2, 4) is False           # 3 < 4 → room for one more
+
+
 def test_live_pane_mount_awaits_pane_removal():
     """Regression (sessions 30540a39 / 0b01b23a 'won't open'): re-opening a session
     whose claude EXITED must AWAIT the deferred remove_pane of the kept dead pane
@@ -524,6 +538,8 @@ if __name__ == "__main__":
     print("PASS test_resolve_resume_cwd_uses_stub_origin_cwd")
     test_no_internal_identifiers_in_source()
     print("PASS test_no_internal_identifiers_in_source")
+    test_at_live_capacity_counts_inflight_opens()
+    print("PASS test_at_live_capacity_counts_inflight_opens")
     test_live_pane_mount_awaits_pane_removal()
     print("PASS test_live_pane_mount_awaits_pane_removal")
     test_split_live_default_on_with_env_opt_out()
