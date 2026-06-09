@@ -421,6 +421,20 @@ def test_no_internal_identifiers_in_source():
         assert not hits, f"{fn} still contains internal identifiers: {hits}"
 
 
+def test_live_pane_mount_awaits_pane_removal():
+    """Regression (sessions 30540a39 / 0b01b23a 'won't open'): re-opening a session
+    whose claude EXITED must AWAIT the deferred remove_pane of the kept dead pane
+    BEFORE add_pane — else Textual raises DuplicateIds and the reopen fails silently.
+    Guards that _spawn_live_pane delegates to the async _mount_live_pane worker which
+    awaits both. Source scan so it runs without textual."""
+    from pathlib import Path as _P
+    src = _P(__file__).resolve().parent.parent.joinpath("recap.py").read_text(encoding="utf-8")
+    assert "async def _mount_live_pane" in src, "awaited mount worker missing"
+    assert "await tabs.remove_pane(" in src, "remove_pane must be awaited before add_pane"
+    assert "await tabs.add_pane(" in src, "add_pane must be awaited in the mount worker"
+    assert "self.run_worker(" in src, "_spawn_live_pane must schedule the mount worker"
+
+
 def test_split_live_default_on_with_env_opt_out():
     """Split-live is the DEFAULT now; RECAP_SPLIT_LIVE is a tri-state OPT-OUT.
     Only an explicit falsy token (0/false/no/off, case-insensitive, trimmed)
@@ -488,6 +502,8 @@ if __name__ == "__main__":
     print("PASS test_resolve_resume_cwd_uses_stub_origin_cwd")
     test_no_internal_identifiers_in_source()
     print("PASS test_no_internal_identifiers_in_source")
+    test_live_pane_mount_awaits_pane_removal()
+    print("PASS test_live_pane_mount_awaits_pane_removal")
     test_split_live_default_on_with_env_opt_out()
     print("PASS test_split_live_default_on_with_env_opt_out")
     print("ALL PASS")
