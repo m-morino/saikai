@@ -2340,7 +2340,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         from textual.containers import Horizontal, Vertical
         from textual.screen import ModalScreen
         from textual.widgets import (DataTable, Footer, Input, OptionList, RichLog,
-                                     Select, Static, TabbedContent, TabPane)
+                                     Select, Static, TabbedContent, TabPane, Tabs)
         from textual.widgets.option_list import Option
         from rich.text import Text
     except ImportError as e:
@@ -3342,6 +3342,40 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             elif self.focused is search and event.key == "down":
                 table.focus()
                 event.stop()
+
+        def _over_tab_bar(self, event) -> bool:
+            """True when the mouse is over the split-live tab bar. Textual's Tabs
+            doesn't consume mouse-scroll, so such a scroll bubbles up to the App;
+            panes and the list consume their OWN scroll, so anything reaching here
+            over the tab strip is meant for tab navigation."""
+            if _LIVE_TERM is None:
+                return False
+            try:
+                w, _ = self.get_widget_at(event.screen_x, event.screen_y)
+            except Exception:
+                return False
+            node = w
+            while node is not None:
+                if isinstance(node, Tabs):
+                    return True
+                node = node.parent
+            return False
+
+        def on_mouse_scroll_down(self, event) -> None:
+            if self._over_tab_bar(event):
+                self._cycle_tab(+1)        # wheel over the tab bar → next tab
+                try:
+                    event.stop()
+                except Exception:
+                    pass
+
+        def on_mouse_scroll_up(self, event) -> None:
+            if self._over_tab_bar(event):
+                self._cycle_tab(-1)        # wheel over the tab bar → previous tab
+                try:
+                    event.stop()
+                except Exception:
+                    pass
 
         def on_data_table_row_highlighted(self, event) -> None:
             sid = str(event.row_key.value) if event.row_key else None
