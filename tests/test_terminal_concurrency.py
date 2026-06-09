@@ -142,6 +142,11 @@ def test_classify_pty_status_basics():
     assert rt.classify_pty_status("just some output", "✳ ready") == "idle"
     # a prompt in the last 2000 chars is still found after slicing the tail first
     assert rt.classify_pty_status("x" * 5000 + "\n(y/n)", "") == "waiting"
+    # REGRESSION: a numbered list / prose being STREAMED (title shows the busy
+    # spinner) must stay "busy" — the spinner wins over the screen-scrape, else a
+    # working pane false-fires "needs input" on essentially every multi-step run.
+    assert rt.classify_pty_status("1. one\n2. two\n3. three\n", "⠋ Generating…") == "busy"
+    assert rt.classify_pty_status("Would you like to continue?", "⠹ working") == "busy"
 
 
 def test_encode_key_meta_and_release():
