@@ -75,6 +75,19 @@ def _log(msg: str) -> None:
         pass
 
 
+def _ime_anchor_xy(cursor_x, cursor_y, rx, ry, rw, rh):
+    """Pure geometry for the terminal-cursor / IME anchor: map claude's grid cursor
+    (cursor_x, cursor_y) inside a content region at screen origin (rx, ry) sized
+    rw x rh to the absolute screen cell (x, y), clamped into the region. Returns
+    None for an empty region. Kept module-level (no textual dep) so it is unit-
+    testable headless; the widget wraps the result in a textual Offset."""
+    if rw <= 0 or rh <= 0:
+        return None
+    x = rx + max(0, min(int(cursor_x), rw - 1))
+    y = ry + max(0, min(int(cursor_y), rh - 1))
+    return (x, y)
+
+
 # ── global reap-thread registry ───────────────────────────────────────────────
 # Every kill() spawns a daemon thread running `taskkill /F /T` to reap the
 # child's grandchildren (claude's node workers). If recap exits before that
@@ -140,12 +153,13 @@ try:
     from textual import events
     from textual.strip import Strip
     from textual.widget import Widget
+    from textual.geometry import Offset
 except Exception as _te:  # pragma: no cover - textual is a hard dep of recap
     _TEXTUAL_IMPORT_ERROR = repr(_te)
     # Stand-ins so the module still imports for py_compile / pure-function tests
     # on a box without textual.
     Widget = object  # type: ignore
-    Segment = Style = Strip = events = None  # type: ignore
+    Segment = Style = Strip = events = Offset = None  # type: ignore
 
 #: True when every dependency needed for a live pane is importable.
 TERMINAL_AVAILABLE = (
@@ -1076,6 +1090,48 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
     def _do_pane_refresh(self) -> None:   # runs on the UI thread
         self._refresh_pending = False
         self.refresh()
+        self._sync_terminal_cursor()
+
+    def on_focus(self, event=None) -> None:
+        # Anchor the IME the moment the pane is focused (don't wait for a repaint).
+        self._sync_terminal_cursor()
+
+    def _sync_terminal_cursor(self) -> None:
+        """Anchor the real (hidden) terminal cursor at claude's cursor cell so the
+        host terminal's IME / composition popup appears at the claude prompt — not
+        wherever Textual last parked the cursor (e.g. the search box, which owns the
+        cursor until something else sets app.cursor_position). Textual keeps the
+        hardware cursor hidden but still `move_to`s it every repaint, and WezTerm
+        (and other IMEs) anchor the candidate window to that position.
+
+        UI-thread only (called from _do_pane_refresh / on_focus). No-op unless THIS
+        pane is focused and live (scroll at the bottom). Reads the pyte cursor under
+        the lock, then sets app.cursor_position OUTSIDE the lock (per the concurrency
+        invariant — never marshal/block while holding self._lock)."""
+        if Offset is None or self.is_dead or not self.has_focus or self._scroll != 0:
+            return
+        try:
+            app = self.app
+        except Exception:
+            return
+        if app is None:
+            return
+        with self._lock:
+            screen = self._screen
+            if screen is None:
+                return
+            try:
+                cx = int(screen.cursor.x)
+                cy = int(screen.cursor.y)
+            except Exception:
+                return
+        try:
+            region = self.content_region
+            xy = _ime_anchor_xy(cx, cy, region.x, region.y, region.width, region.height)
+            if xy is not None:
+                app.cursor_position = Offset(*xy)
+        except Exception:
+            pass
 
     # ── thread → UI marshaling (defensive) ─────────────────────────────────────
     def _marshal(self, fn: Callable) -> None:

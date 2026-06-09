@@ -274,6 +274,19 @@ def test_bracketed_paste_mode_tracking():
     assert fa("no paste mode here") == []
 
 
+def test_ime_anchor_xy_maps_cursor_into_region():
+    """The IME/terminal-cursor anchor maps claude's grid cursor to an absolute
+    screen cell inside the pane's content region (so WezTerm's composition popup
+    lands at the claude prompt, not the search box). Clamps to the region; None for
+    an empty region."""
+    f = rt._ime_anchor_xy
+    assert f(3, 2, 40, 5, 80, 24) == (43, 7)        # region origin + cursor
+    assert f(0, 0, 40, 5, 80, 24) == (40, 5)        # top-left of the region
+    assert f(100, 50, 40, 5, 80, 24) == (119, 28)   # clamped to last col/row (40+79, 5+23)
+    assert f(-1, -1, 40, 5, 80, 24) == (40, 5)      # negative cursor clamped to 0
+    assert f(5, 5, 0, 0, 0, 0) is None              # empty region → no anchor
+
+
 def test_reopen_after_exit_requires_awaited_pane_removal():
     """Re-opening an EXITED session must not hit Textual DuplicateIds. recap keeps a
     dead pane mounted (for its final frame) and re-uses the sid's pane id on reopen;
@@ -324,6 +337,8 @@ def test_reopen_after_exit_requires_awaited_pane_removal():
 if __name__ == "__main__":
     test_update_status_marshals_outside_lock()
     print("PASS test_update_status_marshals_outside_lock")
+    test_ime_anchor_xy_maps_cursor_into_region()
+    print("PASS test_ime_anchor_xy_maps_cursor_into_region")
     test_reopen_after_exit_requires_awaited_pane_removal()
     print("PASS test_reopen_after_exit_requires_awaited_pane_removal")
     test_kill_tracks_reap_for_atexit_join()
