@@ -70,11 +70,13 @@ model   = "haiku"
 [display]
 auto_refresh = 0     # seconds; 0 = off
 split_live   = true  # false = list-only
-[limits]
-min_free_mb = 1536
-claude_mb   = 600
-hard_ram_gate = false
-max_live    = 64
+[limits]                            # Windows-principled RAM gate — see §A.1
+max_memory_load        = 85         # dwMemoryLoad % high-water (Windows' pressure metric)
+min_commit_headroom_mb = 2048       # keep this much process commit free (the freeze cause)
+min_free_phys_pct      = 8          # keep >= this % of physical RAM available (anti-thrash)
+per_pane_mb            = 600        # est. commit per claude tree (measured when possible)
+hard_ram_gate          = false      # warn (default) vs hard-refuse
+max_live               = 64         # backstop cap
 [keys]               # see §C: action = "key" overrides + optional leader
 # leader  = "ctrl+g"
 # refresh = "f5"
@@ -84,7 +86,46 @@ max_live    = 64
 `display.split_live` (tri-state opt-out, unchanged); `RECAP_AUTO_REFRESH`,
 `RECAP_SUMMARIZE_CMD`→`summary.command`, `RECAP_MIN_FREE_MB`/`RECAP_CLAUDE_MB`,
 `RECAP_HARD_RAM_GATE`, `RECAP_MAX_LIVE`, `RECAP_RELEASE_KEY`→`keys.release`, new
-`RECAP_SUMMARIZE_ENABLED`→`summary.enabled`.
+`RECAP_SUMMARIZE_ENABLED`→`summary.enabled`. The legacy `RECAP_MIN_FREE_MB` /
+`RECAP_CLAUDE_MB` still map (back-compat) but the gate is redesigned — see §A.1.
+
+---
+
+## A.1 RAM gate — derived from Windows resource management
+
+**Problem:** with several live `claude` panes the machine sometimes goes
+unresponsive. The current gate is `ullAvailPhys − RECAP_CLAUDE_MB(600) <
+RECAP_MIN_FREE_MB(1536)` — ad-hoc magic numbers on the wrong signal.
+
+**First-principles (verified against MS docs — `MEMORYSTATUSEX`, "Introduction to
+page files"):**
+- `ullAvailPhys` is **standby + free + zero lists** — it *includes reclaimable
+  cache*, so it over-states real headroom; gating on it lets panes open while the
+  system is already under commit pressure.
+- The documented cause of system-wide **freezing/stalls** is the **system commit
+  charge approaching the commit limit** (RAM + page file). The relevant signal is
+  **commit headroom** = `ullAvailPageFile` (per-process available commit). When it
+  nears zero the OS pages hard and (at 90% of the limit) auto-grows the page file
+  — a disk-I/O storm that *is* the "PC went heavy".
+- `dwMemoryLoad` (0–100) is Windows' own physical-pressure metric — machine-
+  relative, no magic MB.
+
+**Redesigned gate — refuse/warn opening another pane if ANY holds:**
+1. `dwMemoryLoad >= max_memory_load` (default 85) — already under pressure;
+2. `ullAvailPageFile/MB − per_pane_mb < min_commit_headroom_mb` — would eat into
+   the commit headroom that prevents freezing (the primary, principled check);
+3. `ullAvailPhys/MB − per_pane_mb < min_free_phys_pct% × ullTotalPhys/MB` —
+   anti-thrash physical floor, **relative** to the machine, not a fixed 1536.
+
+All three thresholds are relative/Windows-derived. `per_pane_mb` should be
+**measured** when possible — sum the actual private commit of recap's spawned
+claude PIDs via `GetProcessMemoryInfo` (`PrivateUsage`) — falling back to the
+estimate. `_avail_ram_mb()` is extended to return the full `(load, avail_phys,
+avail_commit, total_phys)` tuple (POSIX: derive load/commit from
+`/proc/meminfo` MemAvailable + Commit*; macOS: load only → physical+load checks,
+commit check skipped). **Stretch:** a runtime watcher toasts "memory pressure —
+consider closing panes" when `dwMemoryLoad` crosses the high-water *after* open
+(the gate is open-time only; already-open claude trees can grow).
 
 ---
 
@@ -283,6 +324,27 @@ domain and the department string must appear nowhere after.
    private repo).
 8. Flip the new repo to **public** only after server-side verification.
 9. Keep the `.bundle` in a private, non-synced location.
+
+---
+
+## I. List-UX polish (from review)
+
+- **Colour legend + configurable basis.** The list colours nothing in the help:
+  the **Title hue = project** (palette per project), **Last-column colour =
+  recency** (green <5m / yellow <30m / grey older), the Wt/Topic columns hue by
+  worktree/topic — all undocumented in the TUI (`?` explains only the marker
+  glyphs). Add the colour key to the `?` overlay (folded into §C's MECE+responsive
+  help). Make the Title basis configurable: `[display] color_by =
+  "project" | "worktree" | "topic" | "none"` (default `project`; `none` for users
+  who find the hues noisy — the colour maps already exist, so this is a selector).
+  Optionally expose the recency thresholds (`active_secs` / `recent_secs`).
+- **Skip category (group-header) rows.** When grouping is on, the group-header
+  rows are not selectable sessions; arrow navigation and Enter must **skip** them
+  (cursor jumps header→first child; Enter on a header is a no-op or toggles the
+  group). Verify current behaviour and make non-data rows non-landable.
+- **Split width.** A draggable divider between the list and the pane (persist
+  `display.split_ratio`) plus the existing F4 show/hide and a clickable affordance
+  (see the earlier UX discussion).
 
 ---
 
