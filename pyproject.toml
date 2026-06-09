@@ -1,7 +1,7 @@
 [project]
 name = "recap"
 version = "0.1.0"
-description = "A terminal session browser for Claude Code — browse, search, group, and resume past sessions, with an opt-in split-live pane."
+description = "A terminal session browser for Claude Code — browse, search, group, and resume past sessions, with a built-in split-live pane (on by default)."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }

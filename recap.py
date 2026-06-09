@@ -78,6 +78,15 @@ def _read_json(path: Path, default):
         return default
 
 
+def _split_live_disabled_by_env(env_value) -> bool:
+    """RECAP_SPLIT_LIVE is a tri-state opt-OUT switch (split-live is the default):
+    unset / empty / truthy → split-live stays ON; an explicit falsy token
+    (0/false/no/off, case-insensitive, trimmed) → OFF = legacy full-takeover
+    resume. Split-live still also requires its PTY deps; this only governs the
+    user opt-out, not the dependency fallback."""
+    return (env_value or "").strip().lower() in ("0", "false", "no", "off")
+
+
 def _write_json(path: Path, obj) -> None:
     """Atomically write JSON to path. Uses tempfile + os.replace so concurrent
     readers/writers (worker pool, concurrent reads) cannot observe a torn write."""
@@ -2364,14 +2373,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     except Exception as _lte:  # pragma: no cover - missing sibling / dep
         _LIVE_TERM_REASON = repr(_lte)
         _LIVE_TERM = None
-    # Split-live is OPT-IN while it stabilises: the live render + keystroke path
-    # into a running claude is unproven without an interactive TTY, and the
-    # rendering of claude's full alt-screen UI via pyte is known-imperfect. So
-    # the DEFAULT stays the proven legacy path (static preview + Enter =
-    # full-takeover resume); set RECAP_SPLIT_LIVE=1 to try the live split pane.
-    if _LIVE_TERM is not None and not os.environ.get("RECAP_SPLIT_LIVE"):
+    # Split-live is now the DEFAULT whenever its PTY deps are present. The legacy
+    # full-takeover path is NOT removed — it survives as three things: (a) the
+    # automatic fallback ABOVE when pyte/pywinpty/ptyprocess are missing, (b) an
+    # explicit opt-out (RECAP_SPLIT_LIVE=0/false/no/off → list-only + Enter =
+    # full-takeover resume), and (c) a per-session escape hatch even inside
+    # split-live (action_resume_detached). So RECAP_SPLIT_LIVE is a tri-state
+    # opt-OUT: unset/truthy → on, explicit falsy → off.
+    if _LIVE_TERM is not None and _split_live_disabled_by_env(os.environ.get("RECAP_SPLIT_LIVE")):
         _LIVE_TERM = None
-        _LIVE_TERM_REASON = "split-live is opt-in (set RECAP_SPLIT_LIVE=1 to enable)"
+        _LIVE_TERM_REASON = "split-live disabled via RECAP_SPLIT_LIVE=0 (legacy full-takeover resume)"
 
     # Emulate POSIX SIGHUP on Windows: if this tab's shell dies (tab closed)
     # while the picker is open or a resumed `claude` is running, take recap and
@@ -2423,7 +2434,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Shift-F5[/yellow]    Tree (parent/child) mode\n"
                 "  [yellow]Shift-F7[/yellow]    Cycle grouping: none / Date / Project\n"
                 "  [yellow]Tab[/yellow]         Preview: full ↔ summary\n\n"
-                "[bold cyan]Split-live (RECAP_SPLIT_LIVE=1)[/bold cyan]\n"
+                "[bold cyan]Split-live (default · RECAP_SPLIT_LIVE=0 to disable)[/bold cyan]\n"
                 "  [yellow]Enter[/yellow]       Open / focus the live claude pane\n"
                 "  [yellow]Shift-F8[/yellow]    New claude session in a folder / git worktree\n"
                 "  [yellow]Shift-F4[/yellow]    Reopen the panes from your last session (resume) — anytime\n"
@@ -3733,7 +3744,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             """Shift+F8: pick a folder / git worktree and start a FRESH claude
             session there as a live pane (split-live only)."""
             if _LIVE_TERM is None or self._live is None:
-                self.notify("new session needs split-live (RECAP_SPLIT_LIVE=1)",
+                self.notify(f"new session needs split-live — disabled: {_LIVE_TERM_REASON}",
                             severity="warning", timeout=6)
                 return
             base = str(repo) if repo else str(Path.cwd())
