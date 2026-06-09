@@ -2847,6 +2847,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # is added, so we need to know it before defining columns.
             query = self.query_one("#search", Input).value
             visible = list(self._filter(query))   # copy: _filter may return the shared all_sessions; we sort/tag it in place
+            # Re-stamp recency from the CURRENT time so the +/. markers, the Last
+            # column colour and the State "Recent" bucket agree with the :active /
+            # :recent search tokens (which recompute live). The load-time is_active/
+            # is_recent snapshot otherwise drifts as the picker stays open, so a row
+            # shows "+"/"." that the :active/:recent filter would drop.
+            _now_recency = time.time()
+            for _s in visible:
+                _s["is_active"] = _is_active_now(_s, _now_recency)
+                _s["is_recent"] = _is_recent_now(_s, _now_recency)
             # Claude-Desktop 'Last activity' window: drop rows older than N days.
             hidden = _load_hidden()
             favorites = _load_favorites()
