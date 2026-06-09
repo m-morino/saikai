@@ -493,7 +493,10 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         self._alt = AltScreenTracker()
         self._scroll = 0             # lines scrolled back (0 = live bottom)
         self._frozen = False         # paused repaint: hold the view still so a
-                                     # streaming pane can be Shift+drag-selected
+                                     # streaming pane can be drag-selected
+        self._sel_anchor = None      # (row,col) drag start — recap-OWNED selection
+        self._sel_head = None        # (row,col) drag head; None ⇒ no selection
+        self._sel_prev_frozen = False
         self._esc_carry = ""         # trailing partial escape held across read()s
         self._reader: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -602,20 +605,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             cursor_x = screen.cursor.x
             cursor_y = screen.cursor.y
             s = self._scroll
-            if s > 0:
-                # Scrolled back: window into history.top + live buffer, shifted
-                # up by `s` (read-only — we never call pyte prev_page/next_page,
-                # so live state is untouched and s==0 is the unchanged fast path).
-                hist = screen.history.top
-                idx = _scroll_row_index(len(hist), s, y)
-                if idx < 0:
-                    buf = None
-                elif idx < len(hist):
-                    buf = hist[idx]
-                else:
-                    buf = screen.buffer[idx - len(hist)]
-            else:
-                buf = screen.buffer[y]          # live: defaultdict[x] -> Char
+            buf = self._buf_for_row(screen, s, y)
             cells = [buf[x] for x in range(cols)] if buf is not None else None
 
         if cells is None:
@@ -623,6 +613,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         # Cursor only in the live view (it lives at the bottom, not in history).
         show_cursor = (s == 0 and self.has_focus and y == cursor_y
                        and not self.is_dead)
+        _has_sel = self._sel_anchor is not None and self._sel_head is not None
         segments = []
         run_chars: list[str] = []
         run_style = None
@@ -647,6 +638,8 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
                 run_style = None
                 continue
             st = _cell_style(ch)
+            if _has_sel and self._in_sel(y, x):
+                st = st + Style(reverse=True)   # recap-owned drag selection
             if st != run_style and run_chars:
                 segments.append(Segment("".join(run_chars), run_style))
                 run_chars = []
@@ -728,6 +721,129 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
                 self._scroll = max(0, self._scroll - 3)
         if moved:
             self.refresh()
+        try:
+            event.stop()
+        except Exception:
+            pass
+
+    # ── recap-owned text selection (drag) ─────────────────────────────────────
+    # The host terminal's native Shift+drag can't anchor to a TUI widget — recap
+    # repaints a fixed region, so a streaming pane wipes the native selection (see
+    # recap/CLAUDE.md). recap therefore captures a plain LEFT-drag itself: freeze
+    # on press (stream can't repaint over it), highlight while dragging, copy on
+    # release. Coords are widget-relative display rows/cols, matching render_line.
+    def _buf_for_row(self, screen, s, y):
+        """pyte cell-row backing display row y (lock held). s>0 windows into
+        history.top + live buffer; None = past the scrollback top."""
+        if s > 0:
+            hist = screen.history.top
+            idx = _scroll_row_index(len(hist), s, y)
+            if idx < 0:
+                return None
+            return hist[idx] if idx < len(hist) else screen.buffer[idx - len(hist)]
+        return screen.buffer[y]
+
+    def _in_sel(self, y: int, x: int) -> bool:
+        a, h = self._sel_anchor, self._sel_head
+        if a is None or h is None:
+            return False
+        (r0, c0), (r1, c1) = (a, h) if a <= h else (h, a)
+        if y < r0 or y > r1:
+            return False
+        if r0 == r1:
+            return c0 <= x <= c1
+        if y == r0:
+            return x >= c0
+        if y == r1:
+            return x <= c1
+        return True
+
+    def _extract_selection(self) -> str:
+        a, h = self._sel_anchor, self._sel_head
+        screen = self._screen
+        if a is None or h is None or screen is None:
+            return ""
+        (r0, c0), (r1, c1) = (a, h) if a <= h else (h, a)
+        lines = []
+        with self._lock:
+            s = self._scroll
+            cols = screen.columns
+            for y in range(r0, r1 + 1):
+                buf = self._buf_for_row(screen, s, y)
+                if buf is None:
+                    lines.append("")
+                    continue
+                if r0 == r1:
+                    lo, hi = c0, c1
+                elif y == r0:
+                    lo, hi = c0, cols - 1
+                elif y == r1:
+                    lo, hi = 0, c1
+                else:
+                    lo, hi = 0, cols - 1
+                hi = min(hi, cols - 1)
+                row = "".join(buf[x].data for x in range(max(lo, 0), hi + 1)
+                              if buf[x].data != "")
+                lines.append(row.rstrip())
+        return "\n".join(lines).strip("\n")
+
+    def _copy_text(self, text: str) -> None:
+        """Cross-platform clipboard: Windows `clip` (OSC-52 is unreliable on
+        console hosts), OSC-52 via the app elsewhere (Linux/macOS/WezTerm)."""
+        if not text:
+            return
+        if sys.platform == "win32":
+            try:
+                subprocess.run(["clip"], input=text.encode("utf-16-le"), check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except Exception:
+                pass
+        try:
+            self.app.copy_to_clipboard(text)
+        except Exception:
+            pass
+
+    def on_mouse_down(self, event) -> None:   # events.MouseDown
+        # Left-drag selects. Start a selection + FREEZE so a streaming claude can't
+        # repaint over it; capture the mouse so a drag outside the pane still
+        # tracks. Do NOT stop the event — the click should still focus the pane.
+        if self._screen is None or self.is_dead or getattr(event, "button", 1) != 1:
+            return
+        self._sel_prev_frozen = self._frozen
+        self._frozen = True
+        self._sel_anchor = (event.y, event.x)
+        self._sel_head = (event.y, event.x)
+        try:
+            self.capture_mouse()
+        except Exception:
+            pass
+        self.refresh()
+
+    def on_mouse_move(self, event) -> None:   # events.MouseMove
+        if self._sel_anchor is None:
+            return
+        self._sel_head = (event.y, event.x)
+        self.refresh()
+        try:
+            event.stop()
+        except Exception:
+            pass
+
+    def on_mouse_up(self, event) -> None:     # events.MouseUp
+        if self._sel_anchor is None:
+            return
+        try:
+            self.release_mouse()
+        except Exception:
+            pass
+        dragged = self._sel_head is not None and self._sel_head != self._sel_anchor
+        text = self._extract_selection() if dragged else ""
+        self._sel_anchor = self._sel_head = None
+        self._frozen = self._sel_prev_frozen     # resume (unless Shift+F9-frozen)
+        if text:
+            self._copy_text(text)
+        self.refresh()
         try:
             event.stop()
         except Exception:
