@@ -209,6 +209,47 @@ def test_kitty_keyboard_csi_u_is_scrubbed():
     assert sub("", "\x1b[1u") == "\x1b[1u"                # numeric, no marker: PRESERVED
 
 
+def test_selection_geometry_in_sel():
+    """recap-owned drag-selection geometry: single row = a column span; multi-row
+    = anchor-col→end, full middle rows, 0→head-col on the last. Direction-agnostic."""
+    ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    ct._sel_anchor, ct._sel_head = (2, 3), (2, 7)
+    assert ct._in_sel(2, 3) and ct._in_sel(2, 7) and ct._in_sel(2, 5)
+    assert not ct._in_sel(2, 2) and not ct._in_sel(2, 8) and not ct._in_sel(1, 5)
+    ct._sel_anchor, ct._sel_head = (2, 7), (2, 3)        # reversed = same span
+    assert ct._in_sel(2, 5) and not ct._in_sel(2, 2)
+    ct._sel_anchor, ct._sel_head = (1, 4), (3, 2)        # multi-row
+    assert ct._in_sel(1, 4) and ct._in_sel(1, 99) and not ct._in_sel(1, 3)
+    assert ct._in_sel(2, 0) and ct._in_sel(2, 99)        # middle: full
+    assert ct._in_sel(3, 0) and ct._in_sel(3, 2) and not ct._in_sel(3, 3)
+    assert not ct._in_sel(0, 5) and not ct._in_sel(4, 0)
+    ct._sel_anchor = ct._sel_head = None
+    assert not ct._in_sel(2, 5)
+
+
+def test_extract_selection_slices_and_joins():
+    """Extraction slices each display row by the selection range, drops wide-char
+    stubs ('') and trailing blanks, and joins rows with newlines."""
+    ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    ct._lock = threading.Lock()
+    ct._scroll = 0
+
+    class _C:
+        def __init__(self, d):
+            self.data = d
+
+    class _Scr:
+        columns = 13
+        history = type("H", (), {"top": []})()
+        buffer = {0: {i: _C(c) for i, c in enumerate("hello world  ")}}
+
+    ct._screen = _Scr()
+    ct._sel_anchor, ct._sel_head = (0, 0), (0, 4)
+    assert ct._extract_selection() == "hello"
+    ct._sel_anchor, ct._sel_head = (0, 6), (0, 12)        # to the line end, blanks stripped
+    assert ct._extract_selection() == "world"
+
+
 def test_toggle_freeze_flips_and_resumes():
     """Shift+F9 freeze pauses per-chunk repaints so a streaming pane can be
     Shift+drag-selected; resuming repaints once to catch up to buffered output."""
@@ -254,6 +295,10 @@ if __name__ == "__main__":
     print("PASS test_note_reap_prunes_finished_threads")
     test_kitty_keyboard_csi_u_is_scrubbed()
     print("PASS test_kitty_keyboard_csi_u_is_scrubbed")
+    test_selection_geometry_in_sel()
+    print("PASS test_selection_geometry_in_sel")
+    test_extract_selection_slices_and_joins()
+    print("PASS test_extract_selection_slices_and_joins")
     test_toggle_freeze_flips_and_resumes()
     print("PASS test_toggle_freeze_flips_and_resumes")
     test_bracketed_paste_mode_tracking()
