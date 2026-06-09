@@ -393,6 +393,21 @@ def test_pane_title_prefers_human_label_over_id():
     assert recap._pane_title(None, sid) == "abcd1234"          # last resort: short id
 
 
+def test_resolve_resume_cwd_uses_stub_origin_cwd():
+    """Shift+F4 restore of an OUT-OF-SCOPE session resumes in the right dir: it
+    injects a _new_session_stub with the saved cwd, and _resolve_resume_cwd reads
+    that origin_cwd so `claude --resume` targets the correct directory."""
+    import tempfile
+    import shutil as _sh
+    d = tempfile.mkdtemp()
+    try:
+        stub = recap._new_session_stub("sid-xyz", d, "myproj")
+        assert stub["origin_cwd"] == d
+        assert recap._resolve_resume_cwd("sid-xyz", [stub]) == d
+    finally:
+        _sh.rmtree(d, ignore_errors=True)
+
+
 def test_no_internal_identifiers_in_source():
     """Public-release hygiene: the source must carry no org-internal names. The
     summarizer backend is generic (RECAP_SUMMARIZE_CMD), project_short derives the
@@ -457,6 +472,8 @@ if __name__ == "__main__":
     print("PASS test_new_session_stub_has_renderable_fields")
     test_pane_title_prefers_human_label_over_id()
     print("PASS test_pane_title_prefers_human_label_over_id")
+    test_resolve_resume_cwd_uses_stub_origin_cwd()
+    print("PASS test_resolve_resume_cwd_uses_stub_origin_cwd")
     test_no_internal_identifiers_in_source()
     print("PASS test_no_internal_identifiers_in_source")
     print("ALL PASS")

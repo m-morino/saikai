@@ -100,6 +100,7 @@ CACHE_DIR = Path.home() / ".cache" / "recap"
 SUMMARY_MODEL = "haiku"
 HIDDEN_FILE = CACHE_DIR / "hidden.json"
 FAVORITE_FILE = CACHE_DIR / "favorite.json"
+OPEN_PANES_FILE = CACHE_DIR / "open-panes.json"   # split-live: sids open last session (restore)
 VIEW_MODE_FILE = CACHE_DIR / "view-mode.txt"
 TREE_MODE_FILE = CACHE_DIR / "tree-mode.txt"
 CLUSTER_MODE_FILE = CACHE_DIR / "cluster-mode.txt"
@@ -2425,6 +2426,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "[bold cyan]Split-live (RECAP_SPLIT_LIVE=1)[/bold cyan]\n"
                 "  [yellow]Enter[/yellow]       Open / focus the live claude pane\n"
                 "  [yellow]Shift-F8[/yellow]    New claude session in a folder / git worktree\n"
+                "  [yellow]Shift-F4[/yellow]    Reopen the panes from your last session (resume) — anytime\n"
                 "  [yellow]F2/F3[/yellow]       Prev / next live tab   ·   [yellow]Shift-F3[/yellow]  Next pane needing attention (?/!)\n"
                 "  [yellow]F4[/yellow]          Hide / show the session list\n"
                 "  [yellow]Ctrl-][/yellow]      Return focus: pane → list  (RECAP_RELEASE_KEY to change)\n"
@@ -2528,6 +2530,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("shift+f7", "cycle_group", "Group", priority=True),
             Binding("shift+f8", "new_session", "New", priority=True),
             Binding("shift+f9", "freeze_pane", "Freeze", priority=True),
+            Binding("shift+f4", "restore_panes", "Restore", priority=True),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
             Binding("question_mark", "help", "Help", priority=True),
             # Split-live tab management (opt-in). F10 closes the ACTIVE tab;
@@ -2641,6 +2644,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._marked: set = set()        # sids selected for batch launch (Space)
             self._opening_live_sid = None     # sid whose pane should grab focus on open
             self._unread: set = set()         # live panes finished (idle) but not yet responded to → ! marker
+            self._opened_sids: set = set()    # sids opened + kept this session (snapshot source)
+            # Previous session's open panes — for the Shift+F4 restore (split-live).
+            self._restore_candidates = ((_read_json(OPEN_PANES_FILE, []) or [])
+                                        if _LIVE_TERM is not None else [])
             # Live-terminal bookkeeping (None-safe: only used when _LIVE_TERM is
             # available). Pure data structure; the TabbedContent is the UI.
             self._live = (_LIVE_TERM.LiveSessionManager(max_live=self.MAX_LIVE)
@@ -2661,6 +2668,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # for input raises a toast, and the list markers stay live.
             if self._live is not None:
                 self.set_interval(1.5, self._poll_live_status)
+                if self._restore_candidates:
+                    self.notify(f"{len(self._restore_candidates)} pane(s) from last "
+                                f"session — Shift+F4 to reopen", timeout=8)
             # Pre-warm preview caches off the UI thread so scrolling stays
             # responsive; _update_preview's on-demand warm is the fallback for
             # rows this thread hasn't reached. Open sessions render fresh, skip.
@@ -3655,6 +3665,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return False
             self._live.register(sid, term)
             _log(f"live open: {sid[:8]}  ({self._live.count}/{self._live.max_live})")
+            self._opened_sids.add(sid)
+            self._save_open_panes()
             tabs.active = pane_id
             # Focus the new pane so cursor keys go straight to claude. The
             # post-open _refresh_table re-emits a row-highlight that races this
@@ -3674,6 +3686,48 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if refresh:
                 self._refresh_table()
             return True
+
+        def _save_open_panes(self) -> None:
+            """Persist {id, cwd} for panes open this session so Shift+F4 can reopen
+            them after a restart/upgrade (cwd lets an out-of-scope session resume in
+            the right dir). Best-effort; never blocks the UI."""
+            try:
+                rows = []
+                for sid in sorted(self._opened_sids):
+                    s = self._sid_index.get(sid) or {}
+                    rows.append({"id": sid,
+                                 "cwd": s.get("origin_cwd") or s.get("cwd") or ""})
+                _write_json(OPEN_PANES_FILE, rows)
+            except Exception:
+                pass
+
+        def action_restore_panes(self) -> None:
+            """Shift+F4: reopen the PREVIOUS session's panes (snapshot loaded at
+            startup) — resume each, skipping ones already open. Available anytime,
+            not just at launch. An out-of-scope sid (different project dir) gets a
+            stub injected with its saved cwd so resume targets the right dir."""
+            if _LIVE_TERM is None or self._live is None:
+                return
+            opened = 0
+            for row in list(getattr(self, "_restore_candidates", []) or []):
+                sid = (row.get("id") if isinstance(row, dict) else row) or ""
+                if not sid or self._live.has(sid):
+                    continue
+                cwd = row.get("cwd", "") if isinstance(row, dict) else ""
+                if sid not in self._sid_index:
+                    if cwd and Path(cwd).is_dir():
+                        stub = _new_session_stub(sid, cwd, Path(cwd).name or sid[:8])
+                        all_sessions.append(stub)
+                        self._sid_index[sid] = stub
+                    else:
+                        continue   # not scanned and no usable cwd → can't resume
+                self._open_or_attach_live(sid, refresh=False)
+                opened += 1
+            if opened:
+                self._refresh_table()
+                self.notify(f"reopened {opened} pane(s) from last session", timeout=4)
+            else:
+                self.notify("nothing to restore", timeout=3)
 
         def action_new_session(self) -> None:
             """Shift+F8: pick a folder / git worktree and start a FRESH claude
@@ -3855,6 +3909,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except ValueError:
                 idx = len(ids_before)
             self._live.forget(sid)
+            self._opened_sids.discard(sid)   # explicit close → drop from restore set
+            self._save_open_panes()
             try:
                 tabs.remove_pane(pane_id)
             except Exception:
@@ -3894,6 +3950,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
             self._live.kill_all()      # kill any still-live terms (parallel, non-blocking)
+            self._opened_sids.clear()
+            self._save_open_panes()
             try:
                 tabs.active = "tab-preview"
             except Exception:
