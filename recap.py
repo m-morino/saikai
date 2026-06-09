@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, namedtuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -2291,10 +2291,21 @@ def _build_color_map(values, palette) -> dict[str, str]:
     return used
 
 
-def _avail_ram_mb():
-    """Best-effort available physical RAM in MB (None if unknown). Memory — not
-    CPU/core count — is what limits how many live `claude` node process trees a
-    machine can host, so this gates opening more split-live panes."""
+# System memory snapshot for the live-pane gate. Any field may be None on a
+# platform that can't supply it (the gate skips that constraint). Derived from
+# Windows resource management (MEMORYSTATUSEX / page-file docs): the system-wide
+# FREEZE/stall cause is the commit charge nearing the commit limit, so
+# avail_commit_mb (ullAvailPageFile) is the primary signal — NOT avail_phys_mb,
+# which is standby+free+zero (includes reclaimable cache → over-states headroom).
+_MemStatus = namedtuple("_MemStatus", "load avail_phys_mb avail_commit_mb total_phys_mb")
+_MB = 1024 * 1024
+
+
+def _mem_status():
+    """Return a _MemStatus (None if wholly unknown). Windows: GlobalMemoryStatusEx
+    (load=dwMemoryLoad, commit=ullAvailPageFile). Linux: /proc/meminfo (load
+    derived; commit = CommitLimit − Committed_AS). macOS: no /proc → None (gate
+    disabled there, as before)."""
     try:
         if sys.platform == "win32":
             import ctypes
@@ -2312,15 +2323,72 @@ def _avail_ram_mb():
             ms = _MS()
             ms.dwLength = ctypes.sizeof(_MS)
             if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
-                return ms.ullAvailPhys / (1024 * 1024)
+                return _MemStatus(float(ms.dwMemoryLoad), ms.ullAvailPhys / _MB,
+                                  ms.ullAvailPageFile / _MB, ms.ullTotalPhys / _MB)
         else:
+            info = {}
             with open("/proc/meminfo", encoding="utf-8") as f:
                 for line in f:
-                    if line.startswith("MemAvailable:"):
-                        return int(line.split()[1]) / 1024
+                    k, _, rest = line.partition(":")
+                    info[k.strip()] = rest
+
+            def _kb(key):
+                try:
+                    return int(info[key].split()[0]) / 1024   # KB → MB
+                except Exception:
+                    return None
+            total, availp = _kb("MemTotal"), _kb("MemAvailable")
+            climit, ccur = _kb("CommitLimit"), _kb("Committed_AS")
+            load = (max(0.0, min(100.0, (total - availp) / total * 100.0))
+                    if (total and availp is not None) else None)
+            commit = (climit - ccur) if (climit is not None and ccur is not None) else None
+            return _MemStatus(load, availp, commit, total)
     except Exception:
         return None
     return None
+
+
+def _avail_ram_mb():
+    """Available physical RAM in MB (None if unknown) — thin wrapper over
+    _mem_status() kept for callers that only need the headline number."""
+    st = _mem_status()
+    return st.avail_phys_mb if st is not None else None
+
+
+def _ram_fit(st, per_pane_mb, *, max_load, min_commit_mb,
+             min_free_phys_pct, min_free_phys_mb=0.0):
+    """How many more ~per_pane_mb live panes fit before a Windows-resource gate
+    threshold trips, and which one binds. Returns (count, binding_reason).
+
+    Constraints (a None field skips its check): (1) memory-load high-water
+    (dwMemoryLoad) — already-pressured → 0; (2) commit headroom must stay above
+    min_commit_mb — the documented system-freeze cause, the PRIMARY check; (3) a
+    RELATIVE physical floor (min_free_phys_pct of total, but at least
+    min_free_phys_mb) — anti-thrash, machine-relative not a fixed MB. None st (e.g.
+    macOS) → unbounded."""
+    if st is None or per_pane_mb <= 0:
+        return (999, "")
+    if st.load is not None and st.load >= max_load:
+        return (0, f"memory load {st.load:.0f}% ≥ {max_load:.0f}%")
+    cand = []   # (fit_count_float, reason)
+    if st.avail_commit_mb is not None:
+        cand.append(((st.avail_commit_mb - min_commit_mb) / per_pane_mb,
+                     f"commit headroom {st.avail_commit_mb:.0f}MB (keep {min_commit_mb:.0f})"))
+    if st.avail_phys_mb is not None and st.total_phys_mb:
+        floor = max(min_free_phys_pct / 100.0 * st.total_phys_mb, min_free_phys_mb)
+        cand.append(((st.avail_phys_mb - floor) / per_pane_mb,
+                     f"free RAM {st.avail_phys_mb:.0f}MB (keep {floor:.0f})"))
+    if not cand:
+        return (999, "")
+    fit_f, reason = min(cand, key=lambda c: c[0])
+    return (max(0, int(fit_f)), reason if fit_f < 1 else "")
+
+
+def _ram_gate_decision(st, per_pane_mb, **kw):
+    """(ok, reason) for opening ONE more live pane — ok iff at least one more fits
+    under _ram_fit. Pure; the gate + the statusbar 'fit' indicator share this math."""
+    fit, reason = _ram_fit(st, per_pane_mb, **kw)
+    return (fit >= 1, reason)
 
 
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
@@ -3226,17 +3294,24 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _att += f"  [red]?{_wait}[/red]"
                 if _done:
                     _att += f"  [yellow]!{_done}[/yellow]"
-                avail = _avail_ram_mb()
-                if avail is None:
+                _ms = _mem_status()
+                if _ms is None or _ms.avail_phys_mb is None:
                     live_str = f"{sep}Live: {cnt}{_att}"
                 else:
-                    floor = float(os.environ.get("RECAP_MIN_FREE_MB", "1536") or "1536")
                     per = float(os.environ.get("RECAP_CLAUDE_MB", "600") or "600")
-                    fit = max(0, int((avail - floor) / per)) if per > 0 else 0
+                    # 'fit' from the SAME gate math (commit/load/phys), not a raw
+                    # free-RAM floor, so the indicator matches what the gate allows.
+                    fit, _ = _ram_fit(
+                        _ms, per,
+                        max_load=float(os.environ.get("RECAP_MAX_MEM_LOAD", "85") or "85"),
+                        min_commit_mb=float(os.environ.get("RECAP_MIN_COMMIT_MB", "2048") or "2048"),
+                        min_free_phys_pct=float(os.environ.get("RECAP_MIN_FREE_PHYS_PCT", "8") or "8"),
+                        min_free_phys_mb=float(os.environ.get("RECAP_MIN_FREE_MB", "0") or "0"))
                     fit = min(fit, max(0, self._live.max_live - cnt))   # MAX_LIVE backstop
                     _col = "green" if fit > 0 else "red"
+                    _load = f"{_ms.load:.0f}% load · " if _ms.load is not None else ""
                     live_str = (f"{sep}Live: {cnt}{_att}  [{_col}]~{fit} fit[/{_col}]"
-                                f"  ({avail / 1024:.1f}GB free)")
+                                f"  ({_load}{_ms.avail_phys_mb / 1024:.1f}GB free)")
             # Search: when the on-demand bar is hidden, surface the active text
             # query (so a filtered list isn't mistaken for "sessions missing");
             # otherwise hint how to open it.
@@ -3661,24 +3736,30 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     severity="warning", timeout=6)
                 return False
             # The real limit is memory (each live pane is a node process tree).
-            # Default: warn but still open (don't surprise existing users).
-            # RECAP_HARD_RAM_GATE=1 turns the floor into a hard stop. Predictive —
-            # would opening THIS pane (~RECAP_CLAUDE_MB) drop free RAM below
-            # RECAP_MIN_FREE_MB — so the warning lands before you cross the floor.
-            _avail = _avail_ram_mb()
-            _floor = float(os.environ.get("RECAP_MIN_FREE_MB", "1536") or "1536")
+            # Windows-principled gate (see _ram_fit / spec A.1): the system-freeze
+            # cause is the commit charge nearing the commit limit, so gate on commit
+            # headroom + dwMemoryLoad + a RELATIVE physical floor — NOT raw available-
+            # physical (which counts reclaimable standby cache). Default = warn but
+            # open; RECAP_HARD_RAM_GATE=1 makes it a hard stop. Legacy RECAP_MIN_FREE_MB
+            # still honoured as an absolute floor; RECAP_CLAUDE_MB = est. per pane.
             _per = float(os.environ.get("RECAP_CLAUDE_MB", "600") or "600")
-            if _avail is not None and (_avail - _per) < _floor:
+            _ok, _why = _ram_gate_decision(
+                _mem_status(), _per,
+                max_load=float(os.environ.get("RECAP_MAX_MEM_LOAD", "85") or "85"),
+                min_commit_mb=float(os.environ.get("RECAP_MIN_COMMIT_MB", "2048") or "2048"),
+                min_free_phys_pct=float(os.environ.get("RECAP_MIN_FREE_PHYS_PCT", "8") or "8"),
+                min_free_phys_mb=float(os.environ.get("RECAP_MIN_FREE_MB", "0") or "0"))
+            if not _ok:
                 if os.environ.get("RECAP_HARD_RAM_GATE") == "1":
                     self.notify(
-                        f"refusing to open: {_avail:.0f} MB free; ~{_per:.0f} MB/pane "
-                        f"would drop below RECAP_MIN_FREE_MB ({_floor:.0f}). Close a "
-                        f"pane (F10) or lower RECAP_CLAUDE_MB / RECAP_MIN_FREE_MB.",
+                        f"refusing to open — {_why}; ~{_per:.0f} MB/pane would cross "
+                        f"the floor. Close a pane (F10), lower RECAP_CLAUDE_MB, or "
+                        f"raise the thresholds.",
                         severity="error", timeout=9)
                     return False
                 self.notify(
-                    f"low memory: {_avail:.0f} MB free — each live claude is "
-                    f"RAM-heavy (~{_per:.0f} MB); close panes (F10) if it slows. "
+                    f"memory pressure — {_why}; each live claude is RAM-heavy "
+                    f"(~{_per:.0f} MB). Close panes (F10) if it slows. "
                     f"RECAP_HARD_RAM_GATE=1 to block instead.",
                     severity="warning", timeout=7)
             term = _LIVE_TERM.ClaudeTerminal(
