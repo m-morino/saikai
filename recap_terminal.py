@@ -518,6 +518,9 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         self._sel_anchor = None      # (row,col) drag start — recap-OWNED selection
         self._sel_head = None        # (row,col) drag head; None ⇒ no selection
         self._sel_prev_frozen = False
+        self._frozen_buf = None      # snapshot of the displayed rows while frozen
+                                     # (the reader keeps mutating screen.buffer, so
+                                     # render + copy must read the FROZEN frame)
         self._esc_carry = ""         # trailing partial escape held across read()s
         self._reader: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -696,13 +699,34 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             pass
         event.stop()   # don't leak the key to the host app's bindings
 
+    def _snapshot_frozen(self) -> None:
+        """Pin the currently-DISPLAYED live rows (scroll==0) as fixed lists of
+        immutable pyte Chars, so a frozen view's render AND selection-copy reflect
+        the frame the user sees. The reader keeps feeding pyte into screen.buffer
+        while frozen, so reading it live would render/copy text that scrolled in
+        AFTER the freeze (the wrong-copy bug). Takes the lock (UI-thread caller)."""
+        scr = getattr(self, "_screen", None)   # getattr: __new__-built test instances
+        if scr is None:
+            self._frozen_buf = None
+            return
+        try:
+            with self._lock:
+                cols = scr.columns
+                self._frozen_buf = {y: [scr.buffer[y][x] for x in range(cols)]
+                                    for y in range(scr.lines)}
+        except Exception:
+            self._frozen_buf = None
+
     def toggle_freeze(self) -> bool:
         """Pause/resume per-chunk repaints WITHOUT scrolling, so a streaming pane
-        holds still and a WezTerm Shift+drag selection survives (the reader keeps
-        feeding pyte in the background). On RESUME, repaint once to catch up to
-        whatever streamed while frozen. UI thread. Returns the new frozen state."""
+        holds still and a drag selection survives (the reader keeps feeding pyte in
+        the background). Freeze PINS the displayed frame (snapshot) so render + copy
+        stay consistent; resume drops it and repaints once to catch up. UI thread."""
         self._frozen = not self._frozen
-        if not self._frozen:
+        if self._frozen:
+            self._snapshot_frozen()
+        else:
+            self._frozen_buf = None
             try:
                 self.refresh()
             except Exception:
@@ -762,6 +786,15 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             if idx < 0:
                 return None
             return hist[idx] if idx < len(hist) else screen.buffer[idx - len(hist)]
+        # Live view: while frozen, read the pinned snapshot so render AND copy
+        # reflect the displayed frame, not the still-mutating live buffer (the
+        # reader keeps feeding pyte while frozen). Guard the row length so a
+        # resize-while-frozen falls back to live instead of IndexError. getattr for
+        # the __new__-built test instances that don't run __init__.
+        if getattr(self, "_frozen", False) and getattr(self, "_frozen_buf", None) is not None:
+            row = self._frozen_buf.get(y)
+            if row is not None and len(row) >= screen.columns:
+                return row
         return screen.buffer[y]
 
     def _in_sel(self, y: int, x: int) -> bool:
@@ -833,6 +866,8 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             return
         self._sel_prev_frozen = self._frozen
         self._frozen = True
+        if self._frozen_buf is None:     # entering freeze for this drag → pin frame
+            self._snapshot_frozen()      # (already Shift+F9-frozen → keep its frame)
         self._sel_anchor = (event.y, event.x)
         self._sel_head = (event.y, event.x)
         try:
@@ -862,6 +897,8 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         text = self._extract_selection() if dragged else ""
         self._sel_anchor = self._sel_head = None
         self._frozen = self._sel_prev_frozen     # resume (unless Shift+F9-frozen)
+        if not self._frozen:
+            self._frozen_buf = None              # back to live → drop the snapshot
         if text:
             self._copy_text(text)
         self.refresh()

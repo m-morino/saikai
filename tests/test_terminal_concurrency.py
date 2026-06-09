@@ -255,6 +255,38 @@ def test_extract_selection_slices_and_joins():
     assert ct._extract_selection() == "world"
 
 
+def test_frozen_pane_copy_uses_snapshot_not_live_buffer():
+    """Regression: copying from a FROZEN streaming pane must return the displayed
+    frame, not whatever the reader scrolled into screen.buffer afterwards. Freeze
+    pins the visible rows (_snapshot_frozen); the live buffer then mutates; extract
+    reads the snapshot. Un-freeze drops it and reads live again."""
+    ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    ct._lock = threading.Lock()
+    ct._scroll = 0
+    ct._frozen = False
+    ct._frozen_buf = None
+
+    class _C:
+        def __init__(self, d):
+            self.data = d
+
+    class _Scr:
+        columns = 5
+        lines = 1
+        history = type("H", (), {"top": []})()
+        buffer = {0: {i: _C(c) for i, c in enumerate("hello")}}
+
+    ct._screen = _Scr()
+    ct._frozen = True
+    ct._snapshot_frozen()                                   # pin the displayed "hello"
+    ct._screen.buffer[0] = {i: _C(c) for i, c in enumerate("WORLD")}   # reader mutates live
+    ct._sel_anchor, ct._sel_head = (0, 0), (0, 4)
+    assert ct._extract_selection() == "hello"               # copies the FROZEN frame
+    ct._frozen = False
+    ct._frozen_buf = None
+    assert ct._extract_selection() == "WORLD"               # live again after resume
+
+
 def test_toggle_freeze_flips_and_resumes():
     """Shift+F9 freeze pauses per-chunk repaints so a streaming pane can be
     Shift+drag-selected; resuming repaints once to catch up to buffered output."""
@@ -368,6 +400,8 @@ if __name__ == "__main__":
     print("PASS test_selection_geometry_in_sel")
     test_extract_selection_slices_and_joins()
     print("PASS test_extract_selection_slices_and_joins")
+    test_frozen_pane_copy_uses_snapshot_not_live_buffer()
+    print("PASS test_frozen_pane_copy_uses_snapshot_not_live_buffer")
     test_toggle_freeze_flips_and_resumes()
     print("PASS test_toggle_freeze_flips_and_resumes")
     test_bracketed_paste_mode_tracking()
