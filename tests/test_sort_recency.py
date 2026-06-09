@@ -443,6 +443,17 @@ def test_no_internal_identifiers_in_source():
         assert not emails, f"{f.name} contains e-mail address(es): {emails}"
 
 
+def test_wt_column_is_sortable():
+    """The Wt (worktree) header must sort: SORT_COLS gates _promote_sort_col and it
+    omitted 'wt', so the header was a silent no-op while every other column sorted
+    (the keyfn already supported col=='wt' via worktree_label)."""
+    assert "wt" in recap.SORT_COLS
+    sess = [{"id": "a", "worktree_label": "zeta", "mtime": 1.0},
+            {"id": "b", "worktree_label": "alpha", "mtime": 2.0}]
+    recap._apply_sort(sess, [{"col": "wt", "dir": "asc"}])
+    assert [s["id"] for s in sess] == ["b", "a"]   # alpha before zeta
+
+
 def test_at_live_capacity_counts_inflight_opens():
     """Regression: the live-pane cap must count BOTH registered panes and in-flight
     opens (register is deferred to the async mount worker). Without counting the
@@ -538,6 +549,8 @@ if __name__ == "__main__":
     print("PASS test_resolve_resume_cwd_uses_stub_origin_cwd")
     test_no_internal_identifiers_in_source()
     print("PASS test_no_internal_identifiers_in_source")
+    test_wt_column_is_sortable()
+    print("PASS test_wt_column_is_sortable")
     test_at_live_capacity_counts_inflight_opens()
     print("PASS test_at_live_capacity_counts_inflight_opens")
     test_live_pane_mount_awaits_pane_removal()

@@ -132,7 +132,7 @@ RESUME_HISTORY_FILE = CACHE_DIR / "resume-history.tsv"
 LOG_FILE = CACHE_DIR / "recap.log"
 
 # Sort columns selectable via Ctrl-1/2/3. "-" = inactive (no sort at this priority).
-SORT_COLS = ("-", "date", "last", "proj", "title", "turns", "fav", "topic")
+SORT_COLS = ("-", "date", "last", "proj", "wt", "title", "turns", "fav", "topic")
 SORT_DEFAULT = [
     {"col": "date", "dir": "desc"},
     {"col": "-",    "dir": "desc"},
@@ -5665,8 +5665,12 @@ def main():
             # invocations where the env var isn't propagated.
             proj = find_project_dir(Path.cwd())
             if proj and proj.exists():
-                jsonls = sorted(proj.glob("*.jsonl"),
-                                key=lambda p: p.stat().st_mtime, reverse=True)
+                def _mt(p):   # claude may rotate/remove a transcript between glob+stat
+                    try:
+                        return p.stat().st_mtime
+                    except OSError:
+                        return 0.0
+                jsonls = sorted(proj.glob("*.jsonl"), key=_mt, reverse=True)
                 if jsonls:
                     sid = jsonls[0].stem
         if not sid:
