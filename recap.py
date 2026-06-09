@@ -87,6 +87,15 @@ def _split_live_disabled_by_env(env_value) -> bool:
     return (env_value or "").strip().lower() in ("0", "false", "no", "off")
 
 
+def _at_live_capacity(live_count: int, pending: int, max_live: int) -> bool:
+    """True if opening one more live pane would hit the cap, counting BOTH
+    registered panes (live_count) and in-flight opens (pending — scheduled but not
+    yet registered). Registration is deferred to an async mount worker, so without
+    counting the in-flight ones a batch / Shift+F4-restore loop reads a stale count
+    and blows straight past the cap. Pure + module-level so it is unit-tested."""
+    return (int(live_count) + int(pending)) >= int(max_live)
+
+
 def _write_json(path: Path, obj) -> None:
     """Atomically write JSON to path. Uses tempfile + os.replace so concurrent
     readers/writers (worker pool, concurrent reads) cannot observe a torn write."""
@@ -2656,6 +2665,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._opening_live_sid = None     # sid whose pane should grab focus on open
             self._unread: set = set()         # live panes finished (idle) but not yet responded to → ! marker
             self._opened_sids: set = set()    # sids opened + kept this session (snapshot source)
+            self._opening_sids: set = set()   # opens in flight (register deferred to the mount worker) — counted by the capacity gate + has() dedup
             # Previous session's open panes — for the Shift+F4 restore (split-live).
             self._restore_candidates = ((_read_json(OPEN_PANES_FILE, []) or [])
                                         if _LIVE_TERM is not None else [])
@@ -3521,7 +3531,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._marked.clear()
             opened = 0
             for sid in order:
-                if self._live.at_capacity() and not self._live.has(sid):
+                if (not self._live.has(sid) and sid not in self._opening_sids
+                        and _at_live_capacity(self._live.count, len(self._opening_sids),
+                                              self._live.max_live)):
                     self.notify(
                         f"opened {opened}; hit the {self._live.max_live}-pane "
                         f"backstop — close some (F10) or raise RECAP_MAX_LIVE",
@@ -3569,6 +3581,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 tabs.active = self._live.pane_id(sid)
                 self._opening_live_sid = sid
                 self.call_after_refresh(lambda: self._focus_live_pane(sid))
+                return
+            if sid in self._opening_sids:
+                # an open is already in flight for this sid (mount worker pending);
+                # a second Enter / wheel must not spawn a duplicate — the worker
+                # focuses it once mounted.
                 return
             s = self._sid_index.get(sid)
             try:
@@ -3621,7 +3638,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             assert _LIVE_TERM is not None and self._live is not None
             tabs = self.query_one("#right", TabbedContent)
             pane_id = self._live.pane_id(sid)
-            if self._live.at_capacity():
+            # Count in-flight opens too (register is deferred to _mount_live_pane);
+            # otherwise a batch / restore loop reads a stale count and overruns the cap.
+            if _at_live_capacity(self._live.count, len(self._opening_sids),
+                                 self._live.max_live):
                 self.notify(
                     f"hit the {self._live.max_live}-pane backstop; close one "
                     f"(F10) or raise RECAP_MAX_LIVE",
@@ -3663,6 +3683,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # open, so return True now; the worker registers + focuses once the DOM
             # settles. Runs on the UI loop, never the reader thread → lock invariant
             # untouched. Repro/fix: tests/test_terminal_concurrency.py.
+            # Mark the open in flight BEFORE scheduling so the capacity gate +
+            # has() dedup count it until the worker registers (or gives up).
+            self._opening_sids.add(sid)
             self.run_worker(
                 self._mount_live_pane(tabs, pane_id, pane, term, sid, refresh),
                 name=f"mount-{sid[:8]}", exit_on_error=False,
@@ -3674,50 +3697,72 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             """Await-safe mount of a live pane (see _spawn_live_pane). Drops a
             lingering same-id dead pane and WAITS for the DOM to settle, then adds
             the new pane, registers it, and focuses it. On failure the half-built
-            term is killed + reaped so no claude is orphaned untracked."""
+            term is killed + reaped so no claude is orphaned untracked. `sid` stays
+            in self._opening_sids (added by _spawn_live_pane) until this returns —
+            the `finally` always clears it — so the capacity gate + has() dedup
+            count this in-flight open while register() is pending."""
             try:
-                exists = False
                 try:
-                    exists = tabs.get_pane(pane_id) is not None
-                except Exception:
                     exists = False
-                if exists:
-                    # exited session being re-opened: remove the kept dead pane and
-                    # WAIT (deferred removal) so add_pane can't hit DuplicateIds.
+                    try:
+                        exists = tabs.get_pane(pane_id) is not None
+                    except Exception:
+                        exists = False
+                    if exists:
+                        # exited session being re-opened: remove the kept dead pane
+                        # and WAIT (deferred removal) so add_pane can't DuplicateIds.
+                        try:
+                            await tabs.remove_pane(pane_id)
+                        except Exception:
+                            pass
+                    await tabs.add_pane(pane)
+                except Exception as e:
+                    try:
+                        self._live.note_reap(term.kill())
+                    except Exception:
+                        pass
+                    self.notify(f"could not open tab: {e!r}", severity="error", timeout=8)
+                    return
+                # claude died DURING mount (pyte/ConPTY spawn failed, or an instant
+                # EOF marshalled _finalize while we awaited add_pane). Do NOT register
+                # it — that would re-add a dead 'idle' pane to the manager AND to the
+                # Shift+F4 restore set. Drop the zombie tab and tell the user.
+                if getattr(term, "is_dead", False):
+                    try:
+                        self._live.note_reap(term.kill())
+                    except Exception:
+                        pass
                     try:
                         await tabs.remove_pane(pane_id)
                     except Exception:
                         pass
-                await tabs.add_pane(pane)
-            except Exception as e:
+                    self.notify(f"session {sid[:8]} could not start",
+                                severity="warning", timeout=6)
+                    return
+                self._live.register(sid, term)
+                _log(f"live open: {sid[:8]}  ({self._live.count}/{self._live.max_live})")
+                self._opened_sids.add(sid)
+                self._save_open_panes()
+                tabs.active = pane_id
+                # Focus the new pane so cursor keys go straight to claude. The
+                # post-open _refresh_table re-emits a row-highlight that races this
+                # deferred focus; mark the sid "just opened" so the highlight handler
+                # focuses the PANE too — whichever runs first, focus lands on claude
+                # (and the _focused_terminal guard then keeps it there).
+                self._opening_live_sid = sid
+                self.call_after_refresh(lambda: self._focus_live_pane(sid))
+                # 1-shot teams-notify suppression so the first idle_prompt after
+                # launch doesn't ping (mirrors _resume_claude). Best-effort.
                 try:
-                    self._live.note_reap(term.kill())
+                    _add_recap_suppress_session(sid)
                 except Exception:
                     pass
-                self.notify(f"could not open tab: {e!r}", severity="error", timeout=8)
-                return
-            self._live.register(sid, term)
-            _log(f"live open: {sid[:8]}  ({self._live.count}/{self._live.max_live})")
-            self._opened_sids.add(sid)
-            self._save_open_panes()
-            tabs.active = pane_id
-            # Focus the new pane so cursor keys go straight to claude. The
-            # post-open _refresh_table re-emits a row-highlight that races this
-            # deferred focus; mark the sid "just opened" so the highlight handler
-            # focuses the PANE too — whichever runs first, focus lands on claude
-            # (and the _focused_terminal guard then keeps it there).
-            self._opening_live_sid = sid
-            self.call_after_refresh(lambda: self._focus_live_pane(sid))
-            # 1-shot teams-notify suppression so the first idle_prompt after launch
-            # doesn't ping (mirrors _resume_claude). Best-effort.
-            try:
-                _add_recap_suppress_session(sid)
-            except Exception:
-                pass
-            # Refresh the table so the marker column shows this row is now live.
-            # Batch launch passes refresh=False and repaints ONCE after all opens.
-            if refresh:
-                self._refresh_table()
+                # Refresh the table so the marker column shows this row is now live.
+                # Batch launch passes refresh=False and repaints ONCE after all opens.
+                if refresh:
+                    self._refresh_table()
+            finally:
+                self._opening_sids.discard(sid)
 
         def _save_open_panes(self) -> None:
             """Persist {id, cwd} for panes open this session so Shift+F4 can reopen
