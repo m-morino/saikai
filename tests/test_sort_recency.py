@@ -409,16 +409,37 @@ def test_resolve_resume_cwd_uses_stub_origin_cwd():
 
 
 def test_no_internal_identifiers_in_source():
-    """Public-release hygiene: the source must carry no org-internal names. The
-    summarizer backend is generic (RECAP_SUMMARIZE_CMD), project_short derives the
-    home prefix from Path.home(), and examples use generic placeholders."""
+    """Public-release hygiene: shipped source + docs must carry no author PII or
+    org-internal codenames. PII is computed GENERICALLY (the build machine's OS
+    username / home-dir name) so this guard file embeds no name itself; the
+    codenames are split-concatenated for the same reason. Also flags any e-mail
+    address (allowing example.* / noreply). Scans every shipped .py plus the docs."""
+    import re as _re
     from pathlib import Path as _P
     root = _P(__file__).resolve().parent.parent
-    banned = ("chatagc", "masayuki", "morino", "work-tools", "edge-auth")
-    for fn in ("recap.py", "recap_terminal.py"):
-        src = root.joinpath(fn).read_text(encoding="utf-8").lower()
-        hits = [b for b in banned if b in src]
-        assert not hits, f"{fn} still contains internal identifiers: {hits}"
+    # build-machine identity, derived at runtime — no literal name lives in this file
+    ids = set()
+    for tok in (_P.home().name, os.environ.get("USERNAME", ""), os.environ.get("USER", "")):
+        tok = (tok or "").strip().lower()
+        if len(tok) >= 4:                       # skip trivially short logins
+            ids.add(tok)
+    # known internal codenames, split so they don't appear verbatim in this file
+    codenames = ("chat" + "agc", "work" + "-tools", "edge" + "-auth")
+    email_re = _re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", _re.I)
+    self_name = _P(__file__).name
+    targets = (list(root.glob("*.py")) + list((root / "tests").glob("*.py"))
+               + [root / "README.md", root / "CLAUDE.md", root / "THIRD-PARTY-NOTICES.md"])
+    for f in targets:
+        if not f.exists() or f.name == self_name:
+            continue
+        src = f.read_text(encoding="utf-8")
+        low = src.lower()
+        bad = [n for n in ids if n in low] + [c for c in codenames if c in low]
+        assert not bad, f"{f.name} contains internal identifier(s): {bad}"
+        emails = [e for e in email_re.findall(src)
+                  if not (e.endswith("example.com") or e.endswith("example.org")
+                          or "noreply" in e.lower())]
+        assert not emails, f"{f.name} contains e-mail address(es): {emails}"
 
 
 def test_live_pane_mount_awaits_pane_removal():

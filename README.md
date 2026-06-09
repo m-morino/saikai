@@ -7,19 +7,31 @@ resumes any of them. By default (**split-live**) it also hosts live `claude`
 panes side-by-side so you can run and watch several sessions at once.
 
 > Single-file [Textual](https://github.com/Textualize/textual) app
-> (`recap.py` + `recap_terminal.py`). Works on **Windows, Linux, and macOS**
-> (the live pane uses ConPTY on Windows, a POSIX PTY elsewhere).
+> (`recap.py` + `recap_terminal.py`). The live pane uses ConPTY on Windows and a
+> POSIX PTY elsewhere — see [Platform support](#platform-support) for the
+> per-OS verification status (Windows is the verified platform today).
 
 ## Install
 
-```bash
-# Run directly with uv (recap.py declares its deps inline, PEP 723):
-uv run recap.py
+Requires **Python ≥ 3.10**. The easiest path is
+[uv](https://docs.astral.sh/uv/) — it resolves the deps from the inline PEP-723
+header, no manual venv:
 
-# …or install as a tool:
-uv tool install .        # then: recap
-pip install .            # then: recap
+```bash
+uv run recap.py          # run in place (deps auto-installed)
+uv tool install .        # install the `recap` command on your PATH, then: recap
 ```
+
+Prefer pip / pipx? Both work (deps come from `pyproject.toml`):
+
+```bash
+pipx install .           # isolated + on PATH  (recommended for pip users)
+pip install .            # into the active environment
+```
+
+The split-live pane needs the PTY deps (`pyte`, and `pywinpty` on Windows /
+`ptyprocess` elsewhere); they install automatically with any command above. If
+they're somehow missing, recap still runs in list-only mode (see below).
 
 ## Usage
 
@@ -80,6 +92,33 @@ Markers in the list: `~` busy · `?` waiting for input · `!` finished (unanswer
 | `RECAP_MIN_FREE_MB` / `RECAP_CLAUDE_MB` | 1536 / 600 | free-RAM floor / estimated RAM per live pane |
 | `RECAP_HARD_RAM_GATE` | off | `1` refuses to open a pane that would cross the RAM floor |
 | `RECAP_MAX_LIVE` | 64 | hard cap on concurrent live panes (backstop) |
+
+## Platform support
+
+recap itself is pure Python + Textual; the **split-live pane** is the only
+platform-specific part (it drives a real PTY and the clipboard). Honest status:
+
+| OS | Live-pane PTY | Clipboard (from a frozen pane) | RAM gate source | Status |
+|---|---|---|---|---|
+| **Windows** 10 / 11 | ConPTY (`pywinpty`) | `clip` | `GlobalMemoryStatusEx` | ✅ **developed & daily-driven** |
+| **Linux** | POSIX PTY (`ptyprocess`) | OSC-52 *(needs an OSC-52-capable terminal)* | `/proc/meminfo` | ⚠️ code-complete, **not yet run by the author** |
+| **macOS** | POSIX PTY (`ptyprocess`) | OSC-52 *(iTerm2 / kitty / WezTerm fine; Terminal.app needs it enabled)* | n/a → RAM gate auto-disables | ⚠️ code-complete, **not yet run by the author** |
+
+- **List-only mode** (`RECAP_SPLIT_LIVE=0`) has no PTY dependency and should run
+  anywhere Textual runs.
+- The headless regression tests are platform-independent (they stub out
+  textual / pyte / pywinpty) and pass on the dev machine — run them with plain
+  `python` (no deps needed):
+
+  ```bash
+  python tests/test_sort_recency.py
+  python tests/test_terminal_concurrency.py
+  python tests/test_resource_bounds.py
+  python tests/test_terminal_watchdog.py
+  ```
+
+- Ran it on Linux or macOS? Please open an issue with the result (and any PTY /
+  clipboard quirks) so these rows can move to ✅.
 
 ## License
 
