@@ -2431,7 +2431,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]F4[/yellow]          Hide / show the session list\n"
                 "  [yellow]Ctrl-][/yellow]      Return focus: pane → list  (RECAP_RELEASE_KEY to change)\n"
                 "  [yellow]F10[/yellow]         Close the active tab   ·   [yellow]Shift-F10[/yellow]  Close ALL tabs\n"
-                "  [yellow]Esc[/yellow]         Close / return one pane at a time   ·   [yellow]Ctrl-C[/yellow]  quit-all\n"
+                "  [yellow]Esc[/yellow]         pane → list, then quit-all (snapshots panes; Shift-F4 reopens)   ·   [yellow]Ctrl-C[/yellow]  quit-all\n"
                 "  [yellow]Shift-F9[/yellow]    Freeze the pane in place (copy mode): Shift+drag selects while\n"
                 "              claude streams · scroll up also freezes · Shift+F9 / typing resumes\n\n"
                 "[bold cyan]Filter / Group / Sort (top-right dropdowns, Desktop-style)[/bold cyan]\n"
@@ -3932,7 +3932,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def action_close_all_live(self) -> None:
             # Shift+F10: close ALL live panes at once (parallel kill) but STAY in
-            # recap — unlike Ctrl-C (also quits) or Esc (one at a time). Removes
+            # recap — unlike Ctrl-C / Esc, which snapshot the set + quit. This is an
+            # EXPLICIT close, so it CLEARS the restore snapshot (you won't get these
+            # back via Shift+F4); quitting preserves it, this discards it. Removes
             # mounted panes incl. dead/exited ones (not just live statuses). It's
             # on a function key (not a readline key), so it fires from any focus —
             # no SkipAction forwarding needed, and a single stray press can't reach
@@ -4444,10 +4446,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._update_preview(self._cursor_sid())
 
         def action_quit(self) -> None:
-            # Esc, on the list, closes live claude sessions ONE AT A TIME so an
-            # accidental Esc can't nuke everything; recap quits only once none
-            # remain. (Ctrl-C is the force-quit: kill all + exit.) When a
-            # terminal is focused Esc belongs to claude — this branch just
+            # Esc on the list = quit. With live panes it freezes the WHOLE open set
+            # and exits at once (see action_quit_all) — it does NOT close one-by-one.
+            # The old one-by-one was a "can't-nuke-everything" guard, but each close
+            # dropped a sid from the restore snapshot, so quitting eroded it to empty
+            # and Shift+F4 had nothing to reopen. The snapshot + Shift+F4 restore IS
+            # the safety net now: an accidental Esc is fully recoverable next launch.
+            # (Single-pane close is F10; Ctrl-C also routes here via action_quit_all.)
+            # When a terminal is focused Esc belongs to claude — this branch just
             # returns focus to the list (the terminal usually eats Esc first).
             # First: if the on-demand search bar is open, Esc just dismisses it
             # (keeping the filter, shown in the statusbar) — never quits mid-search.
@@ -4458,28 +4464,25 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.query_one("#table", DataTable).focus()
                 return
             if self._live is not None and self._live.count > 0:
-                tabs = self.query_one("#right", TabbedContent)
-                active = tabs.active or ""
-                sid = None
-                for s in list(self._live.statuses().keys()):
-                    if self._live.pane_id(s) == active:
-                        sid = s
-                        break
-                if sid is None:
-                    live_sids = list(self._live.statuses().keys())
-                    sid = live_sids[-1] if live_sids else None
-                if sid is not None:
-                    self._close_live_sid(sid)
-                    return
+                self.action_quit_all()
+                return
             if self._live is not None:
-                self._live.join_reaps()   # don't orphan the last pane's reap
-            _log("quit: Esc (no live panes left)")
+                self._live.join_reaps()   # join any reaps from earlier F10 closes
+            _log("quit: Esc (no live panes)")
             self.exit(None)
 
         def action_quit_all(self) -> None:
-            # Ctrl-C: force quit — kill every live claude pane (in PARALLEL) and
-            # exit; wait=True joins the reaps so no node worker is orphaned.
-            _log(f"quit: force (Ctrl-C), live={self._live.count if self._live else 0}")
+            # Quit-all (Esc-on-list and Ctrl-C both land here). FREEZE the open-pane
+            # set for Shift+F4 restore BEFORE killing — quitting must preserve the
+            # working set, not erode it. _opened_sids is still the full set here
+            # (Esc no longer closes one-by-one), so this snapshots everything open.
+            # Then kill every live claude pane (in PARALLEL) and exit; wait=True
+            # joins the reaps so no node worker is orphaned.
+            try:
+                self._save_open_panes()
+            except Exception:
+                pass
+            _log(f"quit: all, live={self._live.count if self._live else 0}")
             if self._live is not None:
                 self._live.kill_all(wait=True)
             self.exit(None)

@@ -55,12 +55,13 @@ Runs real interactive `claude` processes in tabs beside the list.
 |-----|--------|
 | `Enter` | open / focus a live pane for the selected session |
 | `Shift+F8` | start a NEW claude session in any folder / git worktree |
+| `Shift+F4` | reopen the panes from your last session (snapshot + resume) — anytime |
 | `F2` / `F3` | previous / next live tab |
 | `Shift+F3` | jump to the next pane needing attention (`?` waiting / `!` finished) |
 | `F4` | hide / show the session list (full-width pane) |
 | `Ctrl+]` | return focus from a pane back to the list (`RECAP_RELEASE_KEY` to change) |
-| `F10` / `Shift+F10` | close the active tab / close all tabs |
-| `Ctrl+C` | quit, killing every live pane |
+| `F10` / `Shift+F10` | close the active tab / close all tabs (explicit close — *not* restored) |
+| `Esc` / `Ctrl+C` | quit: snapshot the open panes, then kill them all (`Shift+F4` reopens them next launch) |
 | scroll up | freeze the pane (copy mode): select/copy while claude keeps running |
 
 Markers in the list: `~` busy · `?` waiting for input · `!` finished (unanswered)
