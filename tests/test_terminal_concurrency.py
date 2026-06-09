@@ -209,6 +209,19 @@ def test_kitty_keyboard_csi_u_is_scrubbed():
     assert sub("", "\x1b[1u") == "\x1b[1u"                # numeric, no marker: PRESERVED
 
 
+def test_toggle_freeze_flips_and_resumes():
+    """Shift+F9 freeze pauses per-chunk repaints so a streaming pane can be
+    Shift+drag-selected; resuming repaints once to catch up to buffered output."""
+    ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    ct._frozen = False
+    refreshed = []
+    ct.refresh = lambda: refreshed.append(1)
+    assert ct.toggle_freeze() is True and ct._frozen is True    # freeze
+    assert refreshed == []                                       # no catch-up on freeze
+    assert ct.toggle_freeze() is False and ct._frozen is False   # resume
+    assert refreshed == [1]                                      # one catch-up repaint
+
+
 def test_bracketed_paste_mode_tracking():
     """recap re-wraps pastes in \\x1b[200~ … \\x1b[201~ only when claude has
     enabled bracketed-paste mode; the mode is tracked from CSI ?2004 h/l in the
@@ -241,5 +254,7 @@ if __name__ == "__main__":
     print("PASS test_note_reap_prunes_finished_threads")
     test_kitty_keyboard_csi_u_is_scrubbed()
     print("PASS test_kitty_keyboard_csi_u_is_scrubbed")
+    test_toggle_freeze_flips_and_resumes()
+    print("PASS test_toggle_freeze_flips_and_resumes")
     test_bracketed_paste_mode_tracking()
     print("PASS test_bracketed_paste_mode_tracking")

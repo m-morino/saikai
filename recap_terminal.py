@@ -492,6 +492,8 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         self._stream = None          # pyte.Stream (feeds str)
         self._alt = AltScreenTracker()
         self._scroll = 0             # lines scrolled back (0 = live bottom)
+        self._frozen = False         # paused repaint: hold the view still so a
+                                     # streaming pane can be Shift+drag-selected
         self._esc_carry = ""         # trailing partial escape held across read()s
         self._reader: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -587,6 +589,13 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             # history stays clean for copy/read. _finalize already repaints once.
             msg = " ⏎ claude exited — Enter relaunches · F10 closes this tab "
             return Strip([Segment(msg[:width] if width else msg, Style(reverse=True))])
+        if self._frozen and not self.is_dead and self._scroll == 0 and y == 0:
+            # Frozen for copy/select: the view holds still while claude streams in
+            # the background, so a WezTerm Shift+drag selection survives. One-row
+            # hint at the TOP (recent output is at the bottom, where you select);
+            # Shift+F9 or any keypress resumes.
+            msg = " ❄ frozen — Shift+drag to copy · Shift+F9 / type to resume "
+            return Strip([Segment(msg[:width] if width else msg, Style(reverse=True))])
 
         with self._lock:
             cols = screen.columns
@@ -660,6 +669,8 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             # Dead pane: let keys bubble so the host's bindings (close tab,
             # switch tab) still work.
             return
+        if self._frozen:
+            self.toggle_freeze()   # any key = done selecting → resume live updates
         data = encode_key(event.key, getattr(event, "character", None))
         if data is None:
             return
@@ -670,6 +681,19 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             # reader's EOF path finalize.
             pass
         event.stop()   # don't leak the key to the host app's bindings
+
+    def toggle_freeze(self) -> bool:
+        """Pause/resume per-chunk repaints WITHOUT scrolling, so a streaming pane
+        holds still and a WezTerm Shift+drag selection survives (the reader keeps
+        feeding pyte in the background). On RESUME, repaint once to catch up to
+        whatever streamed while frozen. UI thread. Returns the new frozen state."""
+        self._frozen = not self._frozen
+        if not self._frozen:
+            try:
+                self.refresh()
+            except Exception:
+                pass
+        return self._frozen
 
     def on_paste(self, event) -> None:  # events.Paste (bracketed paste)
         text = getattr(event, "text", "")
@@ -755,7 +779,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
                 # for nothing AND clear a WezTerm Shift+drag selection. Skip it —
                 # scrolling up thus "freezes" the pane so the user can select/copy;
                 # scrolling back to the bottom (_scroll == 0) resumes live repaint.
-                if self._scroll == 0:
+                if self._scroll == 0 and not self._frozen:
                     self._schedule_pane_refresh()
         finally:
             self._finalize()
