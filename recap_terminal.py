@@ -231,20 +231,27 @@ def classify_pty_status(screen_text: str, title: str = "") -> str:
     thing WezTerm surfaces): a leading braille-spinner glyph (U+2800–U+28FF)
     means it's working; "✳" means ready/idle. We use the title for busy/idle and
     the on-screen text for a permission/forced-choice prompt (waiting).
-    Priority: Waiting (a visible prompt) > Busy > Idle. `screen_text` should be
-    the CURRENT screen (pyte .display), not a rolling byte tail.
+
+    The title spinner is checked FIRST and WINS: a numbered list or "Would you
+    like…" that claude is STREAMING is not a settled prompt, so the screen-scrape
+    must not flip an actively-working pane to "waiting" (the false "needs input"
+    bug — it fired on essentially every multi-step session). Only when NOT
+    generating does a visible permission/forced-choice prompt mean "waiting".
+    Priority: Busy (title spinner) > Waiting (visible prompt) > Busy (body
+    markers) > Idle. `screen_text` should be the CURRENT screen (pyte .display).
     """
-    # Slice to the tail BEFORE the ANSI-strip: pyte's .display is already
-    # escape-free and the classifier only needs the last ~2000 chars, so scrubbing
-    # the whole (possibly huge) screen on every chunk is wasted work.
-    t = _ANSI_RE.sub("", (screen_text or "")[-2000:])
-    # A visible permission / forced-choice prompt is the strongest "needs you".
-    if _WAITING_RE.search(t) or _MENU_RE.search(t):
-        return "waiting"
-    # claude's title spinner = actively working (reliable; survives scrollback).
+    # claude's title spinner = actively working: the definitive real-time signal
+    # (reliable, survives scrollback). Check it FIRST — and skip the screen
+    # ANSI-strip entirely on the common busy tick (the .display can be huge).
     g = (title or "")[:1]
     if g and 0x2800 <= ord(g) <= 0x28FF:
         return "busy"
+    # Slice to the tail BEFORE the ANSI-strip (pyte's .display is escape-free and
+    # we only need the last ~2000 chars). Not generating → a visible permission /
+    # forced-choice prompt is the strongest "needs you".
+    t = _ANSI_RE.sub("", (screen_text or "")[-2000:])
+    if _WAITING_RE.search(t) or _MENU_RE.search(t):
+        return "waiting"
     # Corroborating body markers in case the title was missed this tick.
     _lines = t.splitlines()
     last_line = _lines[-1] if _lines else ""
