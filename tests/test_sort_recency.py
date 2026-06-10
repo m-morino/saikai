@@ -373,8 +373,11 @@ def test_new_session_stub_has_renderable_fields():
     assert s["summary"] == "myproj"            # Title column
     assert s["last_active_dt"] is not None     # Last / Recency
     for k in ("first_ts", "last_ts", "mtime", "cwd", "origin_cwd", "real_msgs",
-              "n_turns", "parent_id", "topics", "ai_title"):
+              "n_turns", "parent_id", "topics", "ai_title",
+              "project_name", "worktree_label", "primary_topic"):  # render colour-maps + columns
         assert k in s, k
+    # the project colour-map / Project column subscript s["project_name"] — must not KeyError
+    assert recap.project_short(s["project_name"]) is not None
     # sorts cleanly alongside a real session (keys off last_active_dt)
     recap._apply_sort([s, {"id": "x", "mtime": time.time(), "last_ts": _iso_ago(1)}],
                       [{"col": "last", "dir": "desc"}])

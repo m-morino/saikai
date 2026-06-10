@@ -1562,7 +1562,8 @@ def _new_session_stub(sid: str, cwd: str, title: str) -> dict:
         "jsonl_path": Path.home() / ".claude" / "projects" / enc / f"{sid}.jsonl",
         "mtime": now, "cwd": cwd, "origin_cwd": cwd, "git_branch": "",
         "is_open": True, "session_status": "open", "is_active": True,
-        "is_recent": True, "worktree_label": "", "topics": [], "primary_topic": "",
+        "is_recent": True, "project_name": enc, "worktree_label": "",
+        "topics": [], "primary_topic": "",
         "parent_id": None, "parent_score": 0.0, "parent_reasons": [],
     }
     s["last_active_dt"] = _compute_last_active_dt(s)
@@ -1964,7 +1965,7 @@ def display_table(sessions: list[dict], repo: Path | None, show_project: bool,
             col_turns = f"{turns:>5}"
             col_lbl   = pad(lbl, title_col_width)
             if show_project:
-                col_proj = pad(project_short(s["project_name"]), 16)
+                col_proj = pad(project_short(s.get("project_name") or ""), 16)
                 row = f" {marker} {HIDDEN_DIM}{col_start} {col_last} {col_proj} {col_id} {col_turns}  {col_lbl}  (hidden){RESET}"
             else:
                 row = f" {marker} {HIDDEN_DIM}{col_start} {col_last} {col_id} {col_turns}  {col_lbl}  (hidden){RESET}"
@@ -1976,7 +1977,7 @@ def display_table(sessions: list[dict], repo: Path | None, show_project: bool,
             col_turns = f"{turns:>5}"
             col_lbl   = pad(lbl, title_col_width)
             if show_project:
-                col_proj = pad(_c(project_short(s["project_name"]), MAGENTA), 16)
+                col_proj = pad(_c(project_short(s.get("project_name") or ""), MAGENTA), 16)
                 print(f" {marker} {col_start} {col_last} {col_proj} {col_id} {col_turns}  {col_lbl}  {commits}")
             else:
                 print(f" {marker} {col_start} {col_last} {col_id} {col_turns}  {col_lbl}  {commits}")
@@ -3066,7 +3067,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             wt_color: dict[str, str] = {}
             if show_proj_col or narrow:
                 project_color = _build_color_map(
-                    (project_short(s["project_name"]) for s in visible),
+                    (project_short(s.get("project_name") or "") for s in visible),
                     _PROJECT_PALETTE,
                 )
             if has_worktrees:
@@ -3198,7 +3199,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     continue
                 row = [marker, fmt_ts(s["first_ts"]), fmt_last_active(s)]
                 if show_proj_col:
-                    proj_txt = project_short(s["project_name"])
+                    proj_txt = project_short(s.get("project_name") or "")
                     row.append(Text(proj_txt, style=project_color.get(proj_txt, "")))
                 if has_worktrees:
                     wt = s.get("worktree_label") or ""
