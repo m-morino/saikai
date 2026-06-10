@@ -466,6 +466,32 @@ def test_ram_gate_windows_principled():
     assert gate(no_commit, 600, **kw)[0] is True
 
 
+def test_parse_macos_vm_stat():
+    """macOS RAM probe: vm_stat + hw.memsize → _MemStatus so the gate works on macOS
+    too (it was disabled there). Available = reclaimable pages (free + inactive +
+    speculative + purgeable) × page size; load = used/total; commit is None (macOS
+    has no fixed commit limit → that check skips); bad input → safe degradation."""
+    sample = (
+        "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+        "Pages free:                               50000.\n"
+        "Pages active:                            200000.\n"
+        "Pages inactive:                          100000.\n"
+        "Pages speculative:                        10000.\n"
+        "Pages wired down:                        150000.\n"
+        "Pages purgeable:                           5000.\n"
+        "Pages stored in compressor:              555555.\n"
+    )
+    total = 16 * 1024 * 1024 * 1024                 # 16 GiB
+    st = recap._parse_macos_vm_stat(sample, total)
+    # reclaimable = 50000+100000+10000+5000 = 165000 pages × 16384 B
+    assert abs(st.avail_phys_mb - 165000 * 16384 / (1024 * 1024)) < 1
+    assert abs(st.total_phys_mb - 16384) < 1
+    assert st.avail_commit_mb is None               # macOS: no commit limit
+    assert 80 < st.load < 90                         # ~84% used
+    assert recap._parse_macos_vm_stat(sample, 0) is None         # bad total → None
+    assert recap._parse_macos_vm_stat("garbage", total).avail_phys_mb == 0.0  # no pages → 0 (blocks, safe)
+
+
 def test_wt_column_is_sortable():
     """The Wt (worktree) header must sort: SORT_COLS gates _promote_sort_col and it
     omitted 'wt', so the header was a silent no-op while every other column sorted
@@ -574,6 +600,8 @@ if __name__ == "__main__":
     print("PASS test_no_internal_identifiers_in_source")
     test_ram_gate_windows_principled()
     print("PASS test_ram_gate_windows_principled")
+    test_parse_macos_vm_stat()
+    print("PASS test_parse_macos_vm_stat")
     test_wt_column_is_sortable()
     print("PASS test_wt_column_is_sortable")
     test_at_live_capacity_counts_inflight_opens()

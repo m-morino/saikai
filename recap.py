@@ -2301,11 +2301,34 @@ _MemStatus = namedtuple("_MemStatus", "load avail_phys_mb avail_commit_mb total_
 _MB = 1024 * 1024
 
 
+def _parse_macos_vm_stat(vm_stat_text, total_bytes):
+    """Parse `vm_stat` output + `sysctl hw.memsize` total into a _MemStatus (macOS).
+    Available ≈ reclaimable pages (free + inactive + speculative + purgeable) × page
+    size; load = used/total. macOS has no fixed commit limit (dynamic swap), so
+    avail_commit_mb is None and that gate check is skipped. Pure → unit-testable
+    (the subprocess call lives in _mem_status)."""
+    m = re.search(r"page size of (\d+) bytes", vm_stat_text or "")
+    pagesize = int(m.group(1)) if m else 4096
+
+    def _pages(label):
+        mm = re.search(rf"{re.escape(label)}:\s+(\d+)", vm_stat_text or "")
+        return int(mm.group(1)) if mm else 0
+    avail_pages = (_pages("Pages free") + _pages("Pages inactive")
+                   + _pages("Pages speculative") + _pages("Pages purgeable"))
+    total = int(total_bytes or 0)
+    if total <= 0:
+        return None
+    avail = max(0, min(avail_pages * pagesize, total))
+    load = max(0.0, min(100.0, (total - avail) / total * 100.0))
+    return _MemStatus(load, avail / _MB, None, total / _MB)
+
+
 def _mem_status():
     """Return a _MemStatus (None if wholly unknown). Windows: GlobalMemoryStatusEx
     (load=dwMemoryLoad, commit=ullAvailPageFile). Linux: /proc/meminfo (load
-    derived; commit = CommitLimit − Committed_AS). macOS: no /proc → None (gate
-    disabled there, as before)."""
+    derived; commit = CommitLimit − Committed_AS). macOS: sysctl hw.memsize + vm_stat
+    (load + physical floor; no fixed commit limit → that check skipped). Any probe
+    failure → None → the gate is simply disabled (safe degradation)."""
     try:
         if sys.platform == "win32":
             import ctypes
@@ -2325,6 +2348,14 @@ def _mem_status():
             if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
                 return _MemStatus(float(ms.dwMemoryLoad), ms.ullAvailPhys / _MB,
                                   ms.ullAvailPageFile / _MB, ms.ullTotalPhys / _MB)
+        elif sys.platform == "darwin":
+            import subprocess
+            total = int(subprocess.run(
+                ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True,
+                timeout=2).stdout.strip())
+            vmstat = subprocess.run(
+                ["vm_stat"], capture_output=True, text=True, timeout=2).stdout
+            return _parse_macos_vm_stat(vmstat, total)
         else:
             info = {}
             with open("/proc/meminfo", encoding="utf-8") as f:
