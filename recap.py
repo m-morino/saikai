@@ -98,6 +98,27 @@ def _color_key_for(s: dict, mode: str) -> str:
     return project_short(s.get("project_name") or "")   # default: project
 
 
+def _first_selectable_row(table, start: int, step: int):
+    """Index of the nearest non-header (selectable) row from `start`
+    (exclusive), walking by `step` (+1 down / -1 up). Header rows carry a
+    `__hdr__*` row key; sessions carry their sid. Returns None when there is no
+    selectable row that way, so the caller can fall back to the other side.
+
+    Pure over the DataTable's `row_count` + `coordinate_to_cell_key` contract —
+    unit-tested with a fake table in tests/test_sort_recency.py."""
+    r = start + step
+    n = table.row_count
+    while 0 <= r < n:
+        try:
+            key, _ = table.coordinate_to_cell_key((r, 0))
+        except Exception:
+            return None
+        if key and not str(key.value).startswith("__hdr__"):
+            return r
+        r += step
+    return None
+
+
 def _read_json(path: Path, default):
     """Read JSON file, returning `default` on any error (missing/corrupt/etc.)."""
     try:
@@ -3925,8 +3946,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if self._focused_terminal() is not None:
                 return
             if sid and sid.startswith("__hdr__"):
-                # Section-header row: not a session — clear the preview (don't
-                # leave a stale one) and show which group this is.
+                # Category header rows are NOT selectable: skip the cursor past
+                # them in the direction of travel so arrow-browsing (and the
+                # initial mount highlight) never parks on a "no session" row.
+                tbl = self.query_one("#table", DataTable)
+                cur = tbl.cursor_row
+                down = cur >= getattr(self, "_last_cursor_row", -1)
+                tgt = _first_selectable_row(tbl, cur, 1 if down else -1)
+                if tgt is None:                       # nothing that way → try back
+                    tgt = _first_selectable_row(tbl, cur, -1 if down else 1)
+                if tgt is not None:
+                    tbl.move_cursor(row=tgt)          # re-fires highlight on a real row
+                    return
+                # No selectable session anywhere (empty state): show the label.
                 if _LIVE_TERM is not None:
                     try:
                         self.query_one("#right", TabbedContent).active = "tab-preview"
@@ -3941,6 +3973,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
                 return
+            # Remember where the cursor is now so the next header-skip knows
+            # which way we're traveling.
+            try:
+                self._last_cursor_row = self.query_one("#table", DataTable).cursor_row
+            except Exception:
+                pass
             # Claude-Desktop-like: highlighting a row shows its content on the
             # right — a LIVE session switches to its terminal tab, a non-live one
             # shows the static preview. Focus stays on the list so arrow-browsing
