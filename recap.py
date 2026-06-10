@@ -1268,7 +1268,7 @@ def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
     backend (any LLM CLI / proxy) instead of `claude -p` — e.g. to avoid your
     personal quota. The command receives the prompt on STDIN and must emit the
     summary as plain text on STDOUT (see call_external_summarizer)."""
-    _ext = os.environ.get("RECAP_SUMMARIZE_CMD")
+    _ext = _cfg("summary", "command", "RECAP_SUMMARIZE_CMD", "", str)
     if _ext:
         return call_external_summarizer(_ext, prompt, timeout=timeout, raw=raw)
     cmd = ["claude", "-p", "--model", model or SUMMARY_MODEL,
@@ -2502,6 +2502,22 @@ def _ram_gate_decision(st, per_pane_mb, **kw):
     return (fit >= 1, reason)
 
 
+def _ram_gate_kwargs() -> dict:
+    """Live-pane gate thresholds resolved env > config > default (spec §A.1). Shared
+    by the open-gate and the statusbar 'fit' indicator so they can't disagree."""
+    return dict(
+        max_load=_cfg("limits", "max_memory_load", "RECAP_MAX_MEM_LOAD", 85.0, float),
+        min_commit_mb=_cfg("limits", "min_commit_headroom_mb", "RECAP_MIN_COMMIT_MB", 2048.0, float),
+        min_free_phys_pct=_cfg("limits", "min_free_phys_pct", "RECAP_MIN_FREE_PHYS_PCT", 8.0, float),
+        min_free_phys_mb=_cfg("limits", "min_free_mb", "RECAP_MIN_FREE_MB", 0.0, float),
+    )
+
+
+def _ram_per_pane_mb() -> float:
+    """Estimated RAM per live pane (env > config > default)."""
+    return _cfg("limits", "per_pane_mb", "RECAP_CLAUDE_MB", 600.0, float)
+
+
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                  flat: bool = False, cluster_mode: bool = False,
                  reload_fn=None, no_summary: bool = False) -> None:
@@ -2568,9 +2584,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     # full-takeover resume), and (c) a per-session escape hatch even inside
     # split-live (action_resume_detached). So RECAP_SPLIT_LIVE is a tri-state
     # opt-OUT: unset/truthy → on, explicit falsy → off.
-    if _LIVE_TERM is not None and _split_live_disabled_by_env(os.environ.get("RECAP_SPLIT_LIVE")):
+    _sl_env = os.environ.get("RECAP_SPLIT_LIVE")
+    if _sl_env not in (None, ""):
+        _split_off = _split_live_disabled_by_env(_sl_env)   # env present → env decides (tri-state)
+    else:
+        _split_off = (_load_config().get("display", {}).get("split_live") is False)  # else config
+    if _LIVE_TERM is not None and _split_off:
         _LIVE_TERM = None
-        _LIVE_TERM_REASON = "split-live disabled via RECAP_SPLIT_LIVE=0 (legacy full-takeover resume)"
+        _LIVE_TERM_REASON = "split-live disabled (RECAP_SPLIT_LIVE=0 / [display] split_live=false)"
 
     # Emulate POSIX SIGHUP on Windows: if this tab's shell dies (tab closed)
     # while the picker is open or a resumed `claude` is running, take recap and
@@ -2748,7 +2769,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         # the real gate is a free-RAM check at spawn time (see
         # _open_or_attach_live), NOT a fixed count or core count. MAX_LIVE is
         # only a runaway backstop; set RECAP_MAX_LIVE for a stricter hard cap.
-        MAX_LIVE = int(os.environ.get("RECAP_MAX_LIVE", "64") or "64")
+        MAX_LIVE = _cfg("limits", "max_live", "RECAP_MAX_LIVE", 64, int)
         CSS = """
         Screen { layout: vertical; }
         #searchrow { dock: top; height: 3; display: none; }   /* on-demand: shown by '/' or typing, hidden by Esc */
@@ -2857,7 +2878,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.query_one("#table", DataTable).focus()
             # Optional auto-refresh: RECAP_AUTO_REFRESH=<seconds> re-scans disk on
             # an interval so sessions started elsewhere appear without F5.
-            _ar = os.environ.get("RECAP_AUTO_REFRESH")
+            _ar = _cfg("display", "auto_refresh", "RECAP_AUTO_REFRESH", "", str)
             if _ar:
                 try:
                     _secs = float(_ar)
@@ -3411,15 +3432,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if _ms is None or _ms.avail_phys_mb is None:
                     live_str = f"{sep}Live: {cnt}{_att}"
                 else:
-                    per = float(os.environ.get("RECAP_CLAUDE_MB", "600") or "600")
+                    per = _ram_per_pane_mb()
                     # 'fit' from the SAME gate math (commit/load/phys), not a raw
                     # free-RAM floor, so the indicator matches what the gate allows.
-                    fit, _ = _ram_fit(
-                        _ms, per,
-                        max_load=float(os.environ.get("RECAP_MAX_MEM_LOAD", "85") or "85"),
-                        min_commit_mb=float(os.environ.get("RECAP_MIN_COMMIT_MB", "2048") or "2048"),
-                        min_free_phys_pct=float(os.environ.get("RECAP_MIN_FREE_PHYS_PCT", "8") or "8"),
-                        min_free_phys_mb=float(os.environ.get("RECAP_MIN_FREE_MB", "0") or "0"))
+                    fit, _ = _ram_fit(_ms, per, **_ram_gate_kwargs())
                     fit = min(fit, max(0, self._live.max_live - cnt))   # MAX_LIVE backstop
                     _col = "green" if fit > 0 else "red"
                     _load = f"{_ms.load:.0f}% load · " if _ms.load is not None else ""
@@ -3855,15 +3871,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # physical (which counts reclaimable standby cache). Default = warn but
             # open; RECAP_HARD_RAM_GATE=1 makes it a hard stop. Legacy RECAP_MIN_FREE_MB
             # still honoured as an absolute floor; RECAP_CLAUDE_MB = est. per pane.
-            _per = float(os.environ.get("RECAP_CLAUDE_MB", "600") or "600")
-            _ok, _why = _ram_gate_decision(
-                _mem_status(), _per,
-                max_load=float(os.environ.get("RECAP_MAX_MEM_LOAD", "85") or "85"),
-                min_commit_mb=float(os.environ.get("RECAP_MIN_COMMIT_MB", "2048") or "2048"),
-                min_free_phys_pct=float(os.environ.get("RECAP_MIN_FREE_PHYS_PCT", "8") or "8"),
-                min_free_phys_mb=float(os.environ.get("RECAP_MIN_FREE_MB", "0") or "0"))
+            _per = _ram_per_pane_mb()
+            _ok, _why = _ram_gate_decision(_mem_status(), _per, **_ram_gate_kwargs())
             if not _ok:
-                if os.environ.get("RECAP_HARD_RAM_GATE") == "1":
+                if _cfg("limits", "hard_ram_gate", "RECAP_HARD_RAM_GATE", False, _cfg_bool):
                     self.notify(
                         f"refusing to open — {_why}; ~{_per:.0f} MB/pane would cross "
                         f"the floor. Close a pane (F10), lower RECAP_CLAUDE_MB, or "
