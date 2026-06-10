@@ -511,6 +511,18 @@ def test_parse_macos_vm_stat():
     assert recap._parse_macos_vm_stat("garbage", total).avail_phys_mb == 0.0  # no pages → 0 (blocks, safe)
 
 
+def test_color_key_for_modes():
+    """[display] color_by selects the Title hue dimension: project (default) /
+    worktree / topic / none."""
+    s = {"project_name": "proj-enc", "worktree_label": "feat-x", "primary_topic": "auth"}
+    assert recap._color_key_for(s, "worktree") == "feat-x"
+    assert recap._color_key_for(s, "topic") == "auth"
+    assert recap._color_key_for(s, "none") == ""
+    assert recap._color_key_for(s, "project") == recap.project_short("proj-enc")
+    assert recap._color_key_for(s, "bogus") == recap.project_short("proj-enc")  # → project default
+    assert recap._color_key_for({}, "topic") == "(none)"   # empty topic → its own bucket
+
+
 def test_wt_column_is_sortable():
     """The Wt (worktree) header must sort: SORT_COLS gates _promote_sort_col and it
     omitted 'wt', so the header was a silent no-op while every other column sorted
@@ -623,6 +635,8 @@ if __name__ == "__main__":
     print("PASS test_ram_gate_windows_principled")
     test_parse_macos_vm_stat()
     print("PASS test_parse_macos_vm_stat")
+    test_color_key_for_modes()
+    print("PASS test_color_key_for_modes")
     test_wt_column_is_sortable()
     print("PASS test_wt_column_is_sortable")
     test_at_live_capacity_counts_inflight_opens()

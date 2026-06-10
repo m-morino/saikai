@@ -86,6 +86,18 @@ def _list_title(s: dict) -> str:
             or (s.get("id") or "")[:8])
 
 
+def _color_key_for(s: dict, mode: str) -> str:
+    """The value a session's TITLE hue is keyed on, per [display] color_by
+    (project | worktree | topic | none)."""
+    if mode == "worktree":
+        return s.get("worktree_label") or ""
+    if mode == "topic":
+        return s.get("primary_topic") or "(none)"
+    if mode == "none":
+        return ""
+    return project_short(s.get("project_name") or "")   # default: project
+
+
 def _read_json(path: Path, default):
     """Read JSON file, returning `default` on any error (missing/corrupt/etc.)."""
     try:
@@ -3409,6 +3421,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     (s.get("primary_topic") or "(none)" for s in visible),
                     _TOPIC_PALETTE,
                 )
+            # Title hue follows [display] color_by (project | worktree | topic | none).
+            _color_by = _cfg("display", "color_by", "RECAP_COLOR_BY", "project")
+            if _color_by not in ("project", "worktree", "topic", "none"):
+                _color_by = "project"
+            if _color_by == "none":
+                _title_color: dict[str, str] = {}
+            else:
+                _title_color = _build_color_map(
+                    (_color_key_for(s, _color_by) for s in visible),
+                    _TOPIC_PALETTE if _color_by == "topic" else _PROJECT_PALETTE,
+                )
 
             # `:hidden` in the query is an explicit request for hidden rows,
             # so bypass the default-view auto-skip — otherwise the filter
@@ -3516,11 +3539,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     raw_title = _ANSI_RE.sub("", tree_prefixes[s["id"]]) + raw_title
                 if s["id"] in getattr(self, "_marked", ()):
                     raw_title = "▣ " + raw_title       # batch-launch selection (Space)
+                _tstyle = _title_color.get(_color_key_for(s, _color_by), "")  # [display] color_by
                 if narrow:
-                    # marker · relative-Last · title (title tinted by project).
-                    proj_txt = project_short(s.get("project_name") or "")
-                    row = [marker, fmt_last_active(s),
-                           Text(raw_title, style=project_color.get(proj_txt, ""))]
+                    # marker · relative-Last · title (title tinted per color_by).
+                    row = [marker, fmt_last_active(s), Text(raw_title, style=_tstyle)]
                     table.add_row(*row, key=s["id"])
                     if first_session_row is None:
                         first_session_row = n
@@ -3537,7 +3559,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if cluster_mode:
                     topic_full = s.get("primary_topic") or "(none)"
                     row.append(Text(topic_full[:14], style=topic_color.get(topic_full, "")))
-                row.append(raw_title)
+                row.append(Text(raw_title, style=_tstyle) if _tstyle else raw_title)
                 table.add_row(*row, key=s["id"])
                 if first_session_row is None:
                     first_session_row = n
