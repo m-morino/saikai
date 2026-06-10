@@ -13,7 +13,7 @@ panes side-by-side so you can run and watch several sessions at once.
 
 ## Install
 
-Requires **Python ≥ 3.10**. The easiest path is
+Requires **Python ≥ 3.11**. The easiest path is
 [uv](https://docs.astral.sh/uv/) — it resolves the deps from the inline PEP-723
 header, no manual venv:
 

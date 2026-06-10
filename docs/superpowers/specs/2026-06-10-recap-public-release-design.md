@@ -39,8 +39,9 @@ then we publish a cleaned history to a fresh repo.
 
 ## A. Configuration system
 
-**Format:** TOML; parse with stdlib `tomllib` (≥3.11) or `tomli` (3.10). Add
-`tomli ; python_version < "3.11"` to the PEP-723 header **and** `pyproject.toml`.
+**Format:** TOML; parse with **stdlib `tomllib`**. The project floor is **Python
+≥ 3.11** (decided to keep deps minimal), so there is **no TOML-parser dependency**
+(`tomli` is not needed).
 
 **Location — use `platformdirs`, not a hand-rolled `~/.config`** *(reviewer fix:
 `XDG_CONFIG_HOME` is unset on Windows, so `~/.config` is non-idiomatic there;
@@ -228,7 +229,7 @@ string that drifts from the auto-generated footer):*
 
 ## E. OSS scaffolding (Standard + `.gitattributes` + reviewer adds)
 
-- `.github/workflows/ci.yml` — matrix **Python 3.10–3.13 × {ubuntu, windows,
+- `.github/workflows/ci.yml` — matrix **Python 3.11–3.13 × {ubuntu, windows,
   macos}**: `py_compile` + the four headless test files + the **history PII gate**
   (§F). Gives real Linux/macOS signal for the core logic.
 - `CONTRIBUTING.md`, `CHANGELOG.md` (Keep a Changelog, seed `0.1.0`),
@@ -273,7 +274,8 @@ a corporate domain.
 ## G. Implementation sequence
 
 1. `__version__` + `platformdirs` config/cache location + TOML load + `Settings`
-   resolver (CLI>env>config>default) + tests; deps (`tomli` marker, `platformdirs`).
+   resolver (CLI>env>config>default) + tests; dep: `platformdirs` (already a
+   textual transitive → zero install weight; no `tomli`, stdlib `tomllib`).
 2. Wire existing knobs through `Settings` (env still wins); no behavior change
    without a config file.
 3. Summary optional (default off) + heuristic Title (visually distinct) + footer hint.

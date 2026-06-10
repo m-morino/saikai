@@ -3,7 +3,7 @@ name = "recap"
 version = "0.1.0"
 description = "A terminal session browser for Claude Code — browse, search, group, and resume past sessions, with a built-in split-live pane (on by default)."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 # TODO(publish): set your own name / GitHub handle before publishing.
 authors = [{ name = "recap contributors" }]
