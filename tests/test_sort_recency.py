@@ -523,6 +523,29 @@ def test_color_key_for_modes():
     assert recap._color_key_for({}, "topic") == "(none)"   # empty topic → its own bucket
 
 
+def test_first_selectable_row_skips_headers():
+    """Category (group-header) rows are not selectable — the cursor walks past
+    them in the travel direction; None when none lie that way (caller flips)."""
+    class _Key:
+        def __init__(self, v): self.value = v
+
+    class _FakeTable:
+        def __init__(self, keys): self._keys = keys
+        @property
+        def row_count(self): return len(self._keys)
+        def coordinate_to_cell_key(self, coord):
+            return _Key(self._keys[coord[0]]), None
+
+    t = _FakeTable(["__hdr__0", "s1", "s2", "__hdr__1", "s3"])
+    assert recap._first_selectable_row(t, 0, 1) == 1      # hdr→down→first session
+    assert recap._first_selectable_row(t, 2, 1) == 4      # skip hdr 3 → 4
+    assert recap._first_selectable_row(t, 3, -1) == 2     # hdr→up→prev session
+    assert recap._first_selectable_row(t, 1, -1) is None  # only hdr above → flip
+    empty = _FakeTable(["__hdr__empty"])                  # no sessions at all
+    assert recap._first_selectable_row(empty, 0, 1) is None
+    assert recap._first_selectable_row(empty, 0, -1) is None
+
+
 def test_wt_column_is_sortable():
     """The Wt (worktree) header must sort: SORT_COLS gates _promote_sort_col and it
     omitted 'wt', so the header was a silent no-op while every other column sorted
@@ -637,6 +660,8 @@ if __name__ == "__main__":
     print("PASS test_parse_macos_vm_stat")
     test_color_key_for_modes()
     print("PASS test_color_key_for_modes")
+    test_first_selectable_row_skips_headers()
+    print("PASS test_first_selectable_row_skips_headers")
     test_wt_column_is_sortable()
     print("PASS test_wt_column_is_sortable")
     test_at_live_capacity_counts_inflight_opens()
