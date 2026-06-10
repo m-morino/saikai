@@ -183,6 +183,37 @@ _CONFIG_TEMPLATE = (
 )
 
 
+_RESERVED_KEY_RE = re.compile(r"^ctrl\+[a-z]$")   # readline/claude editing keys
+
+
+def _validate_keymap(overrides, valid_ids):
+    """Validate [keys] action→key overrides. Returns (applied, errors). Drops +
+    reports: an unknown action id, an empty key, a bare ctrl+<letter> (reserved
+    for readline / claude), and a key already bound to another action. 'leader' is
+    skipped here (handled by the leader state machine, not a Textual binding)."""
+    applied, errors, seen = {}, [], {}
+    valid = set(valid_ids)
+    for action_id, key in (overrides or {}).items():
+        if action_id == "leader":
+            continue
+        if action_id not in valid:
+            errors.append(f"[keys] unknown action '{action_id}'")
+            continue
+        k = str(key or "").strip().lower()
+        if not k:
+            errors.append(f"[keys] '{action_id}': empty key")
+            continue
+        if _RESERVED_KEY_RE.match(k):
+            errors.append(f"[keys] '{action_id}': '{k}' is a reserved readline key")
+            continue
+        if k in seen:
+            errors.append(f"[keys] '{action_id}': '{k}' already bound to '{seen[k]}'")
+            continue
+        seen[k] = action_id
+        applied[action_id] = k
+    return applied, errors
+
+
 def _init_config(force: bool = False) -> int:
     """Write the commented config template to _config_path(); exit code for the CLI."""
     p = _config_path()
@@ -2843,29 +2874,32 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Claude Code binds NO F-keys (verified), so F5-F10 / Shift+F5-7 are
             # safe to capture (priority) even while a claude pane is focused; the
             # freed Ctrl+letters now pass straight through to the Input / claude.
-            Binding("f5", "refresh", "Refresh", priority=True),
-            Binding("f6", "toggle_fav", "★", priority=True),
-            Binding("f7", "toggle_hide", "Hide", priority=True),
-            Binding("f8", "preview_changes", "Changes", priority=True),
-            Binding("f9", "copy_prompt", "Copy", priority=True),
-            Binding("shift+f5", "toggle_tree", "Tree", priority=True),
-            Binding("shift+f6", "toggle_cluster", "Cluster", priority=True),
-            Binding("shift+f7", "cycle_group", "Group", priority=True),
-            Binding("shift+f8", "new_session", "New", priority=True),
-            Binding("shift+f9", "freeze_pane", "Freeze", priority=True),
-            Binding("shift+f4", "restore_panes", "Restore", priority=True),
+            # id= makes each remappable via [keys] in config (App.set_keymap in
+            # on_mount). The id is the user-facing name typed in [keys]. quit /
+            # quit_all / resume / preview have NO id (core nav, not remappable).
+            Binding("f5", "refresh", "Refresh", id="refresh", priority=True),
+            Binding("f6", "toggle_fav", "★", id="favorite", priority=True),
+            Binding("f7", "toggle_hide", "Hide", id="hide", priority=True),
+            Binding("f8", "preview_changes", "Changes", id="diff", priority=True),
+            Binding("f9", "copy_prompt", "Copy", id="copy", priority=True),
+            Binding("shift+f5", "toggle_tree", "Tree", id="tree", priority=True),
+            Binding("shift+f6", "toggle_cluster", "Cluster", id="cluster", priority=True),
+            Binding("shift+f7", "cycle_group", "Group", id="group", priority=True),
+            Binding("shift+f8", "new_session", "New", id="new", priority=True),
+            Binding("shift+f9", "freeze_pane", "Freeze", id="freeze", priority=True),
+            Binding("shift+f4", "restore_panes", "Restore", id="restore", priority=True),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
-            Binding("question_mark", "help", "Help", priority=True),
+            Binding("question_mark", "help", "Help", id="help", priority=True),
             # Split-live tab management (opt-in). F10 closes the ACTIVE tab;
             # Shift+F10 closes ALL — two keys apart so a single stray press can't
             # wipe every pane (that was the accidental "全件終了"). Esc also closes
             # /returns one pane at a time; Ctrl+] returns focus pane → list.
-            Binding("f10", "close_live", "Close tab", show=False, priority=True),
-            Binding("shift+f10", "close_all_live", "Close all", show=False, priority=True),
-            Binding("f2", "prev_tab", "◀Tab", priority=True),
-            Binding("f3", "next_tab", "Tab▶", priority=True),
-            Binding("shift+f3", "next_attention", "Next!", priority=True),
-            Binding("f4", "toggle_list", "Hide list", priority=True),
+            Binding("f10", "close_live", "Close tab", id="close", show=False, priority=True),
+            Binding("shift+f10", "close_all_live", "Close all", id="close_all", show=False, priority=True),
+            Binding("f2", "prev_tab", "◀Tab", id="prev_tab", priority=True),
+            Binding("f3", "next_tab", "Tab▶", id="next_tab", priority=True),
+            Binding("shift+f3", "next_attention", "Next!", id="attention", priority=True),
+            Binding("f4", "toggle_list", "Hide list", id="toggle_list", priority=True),
         ]
         # The practical limit on concurrent live claude panes is MEMORY — each
         # is a full node process tree that sits CPU-idle waiting for input — so
@@ -2970,6 +3004,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._busy_seen: set = set()      # sids observed busy since their last "done" toast (catches tasks shorter than the poll)
             self._opened_sids: set = set()    # sids opened + kept this session (snapshot source)
             self._opening_sids: set = set()   # opens in flight (register deferred to the mount worker) — counted by the capacity gate + has() dedup
+            # Apply [keys] config remaps (validated) via Textual's set_keymap — a
+            # user can rebind any id'd action; invalid entries are reported + skipped.
+            try:
+                _kc = _load_config().get("keys", {})
+                if isinstance(_kc, dict) and _kc:
+                    _ids = {b.id for b in type(self).BINDINGS if getattr(b, "id", None)}
+                    _applied, _errs = _validate_keymap(_kc, _ids)
+                    if _applied:
+                        self.set_keymap(_applied)
+                    for _e in _errs[:4]:
+                        self.notify(_e, severity="warning", timeout=8)
+            except Exception:
+                pass
             # Previous session's open panes — for the Shift+F4 restore (split-live).
             self._restore_candidates = ((_read_json(OPEN_PANES_FILE, []) or [])
                                         if _LIVE_TERM is not None else [])
