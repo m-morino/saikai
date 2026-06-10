@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = [
 #   "textual>=0.50",
 #   "pyte>=0.8",                          # PTY byte-stream -> screen grid (split-live)
