@@ -99,13 +99,18 @@ Markers in the list: `~` busy · `?` waiting for input · `!` finished (unanswer
 
 ## Platform support
 
+**Supported platforms (deliberately bounded): Windows, Linux — including WSL —
+and macOS, on Python ≥ 3.11.** Other platforms are *unsupported*: recap may still
+run on another POSIX OS via the generic POSIX path (and it degrades safely rather
+than crashing), but that's untested and not a target.
+
 recap itself is pure Python + Textual; the **split-live pane** is the only
 platform-specific part (it drives a real PTY and the clipboard). Honest status:
 
 | OS | Live-pane PTY | Clipboard (from a frozen pane) | RAM gate source | Status |
 |---|---|---|---|---|
 | **Windows** 10 / 11 | ConPTY (`pywinpty`) | `clip` | `GlobalMemoryStatusEx` | ✅ **developed & daily-driven** |
-| **Linux** | POSIX PTY (`ptyprocess`) | OSC-52 *(needs an OSC-52-capable terminal)* | `/proc/meminfo` | ⚠️ code-complete, **not yet run by the author** |
+| **Linux** *(incl. WSL)* | POSIX PTY (`ptyprocess`) | OSC-52 *(needs an OSC-52-capable terminal)* | `/proc/meminfo` | ⚠️ code-complete, **not yet run by the author** |
 | **macOS** | POSIX PTY (`ptyprocess`) | OSC-52 *(iTerm2 / kitty / WezTerm fine; Terminal.app needs it enabled)* | `sysctl` + `vm_stat` *(load + physical; no commit limit)* | ⚠️ code-complete, **not yet run by the author** |
 
 - **List-only mode** (`RECAP_SPLIT_LIVE=0`) has no PTY dependency and should run
