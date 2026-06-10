@@ -111,6 +111,23 @@ def test_summarize_session_skips_llm_when_disabled():
         recap._set_summary_forced_off(False)
 
 
+def test_validate_keymap():
+    ids = {"refresh", "favorite", "close", "tree"}
+    applied, errs = recap._validate_keymap({
+        "refresh": "f1",       # ok
+        "favorite": "F6",      # ok (lowercased)
+        "leader": "ctrl+g",    # skipped (handled by the leader state machine)
+        "bogus": "f2",         # unknown action id
+        "close": "ctrl+w",     # reserved readline key
+        "tree": "f1",          # duplicate (f1 already → refresh)
+    }, ids)
+    assert applied == {"refresh": "f1", "favorite": "f6"}
+    assert any("bogus" in e for e in errs)
+    assert any("reserved" in e for e in errs)
+    assert any("already bound" in e for e in errs)
+    assert recap._validate_keymap({}, ids) == ({}, [])
+
+
 def test_init_config_writes_parseable_template():
     import tomllib
     d = Path(tempfile.mkdtemp())
@@ -143,6 +160,8 @@ if __name__ == "__main__":
     print("PASS test_summary_enabled_matrix")
     test_summarize_session_skips_llm_when_disabled()
     print("PASS test_summarize_session_skips_llm_when_disabled")
+    test_validate_keymap()
+    print("PASS test_validate_keymap")
     test_init_config_writes_parseable_template()
     print("PASS test_init_config_writes_parseable_template")
     print("ALL PASS")
