@@ -383,6 +383,22 @@ def test_new_session_stub_has_renderable_fields():
                       [{"col": "last", "dir": "desc"}])
 
 
+def test_list_title_fallback_no_claude_p():
+    """The session-LIST title uses claude's OWN data only (NO claude -p summary):
+    native ai-title → first user message → project label → short id. A freshly-
+    opened session (stub: no ai_title, no msgs) shows the project — never blank,
+    never a claude -p call."""
+    from pathlib import Path as _P
+    assert recap._list_title({"id": "x" * 16, "ai_title": "Fix auth",
+                              "real_msgs": ["hi"]}) == "Fix auth"
+    assert recap._list_title({"id": "x" * 16, "ai_title": "",
+                              "real_msgs": ["do the thing"]}) == "do the thing"
+    stub = recap._new_session_stub("abcd1234-0000-0000-0000-000000000000",
+                                   str(_P.home() / "proj"), "proj")
+    assert recap._list_title(stub) == recap.project_short(stub["project_name"])  # project, not blank
+    assert recap._list_title({"id": "deadbeef-1111"})    # never blank → short id last resort
+
+
 def test_pane_title_prefers_human_label_over_id():
     """A live pane's tab shows a human label, not a bare session id:
     ai_title → summary → (first user msg) → the term's launch title → short id."""
@@ -595,6 +611,8 @@ if __name__ == "__main__":
     print("PASS test_project_short_strips_prefix_case_insensitively")
     test_new_session_stub_has_renderable_fields()
     print("PASS test_new_session_stub_has_renderable_fields")
+    test_list_title_fallback_no_claude_p()
+    print("PASS test_list_title_fallback_no_claude_p")
     test_pane_title_prefers_human_label_over_id()
     print("PASS test_pane_title_prefers_human_label_over_id")
     test_resolve_resume_cwd_uses_stub_origin_cwd()

@@ -70,6 +70,17 @@ def _first_msg(s: dict, n: int = 60) -> str:
     return msgs[0][:n] if msgs else ""
 
 
+def _list_title(s: dict) -> str:
+    """Title for the session LIST using claude's OWN data only — NO `claude -p`
+    summary. Falls through native ai-title → first user message → project label →
+    short id, so a freshly-opened session shows the project immediately (never
+    blank) and fills in as claude writes the first message and its own ai-title.
+    (project_short / _first_msg resolved at call time.)"""
+    return (s.get("ai_title") or _first_msg(s)
+            or project_short(s.get("project_name") or "")
+            or (s.get("id") or "")[:8])
+
+
 def _read_json(path: Path, default):
     """Read JSON file, returning `default` on any error (missing/corrupt/etc.)."""
     try:
@@ -3175,8 +3186,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                             else "x" if is_hidden else " ")
                 marker = f"{marker_a}{marker_s}"
                 # Plain title; collapse any newline/tab so a multi-line ai_title
-                # doesn't push the row to multiple terminal lines.
-                raw_title = (s.get("ai_title") or _first_msg(s) or "")[:80]
+                # doesn't push the row to multiple terminal lines. _list_title uses
+                # claude's own ai-title / first msg / project — never `claude -p` —
+                # so a just-opened session shows the project, not a blank cell.
+                raw_title = _list_title(s)[:80]
                 raw_title = (raw_title.replace("\n", " ")
                                        .replace("\r", " ")
                                        .replace("\t", " "))
@@ -4442,13 +4455,29 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if not jp:
                     continue
                 try:
-                    mt = jp.stat().st_mtime
+                    _st = jp.stat()
                 except Exception:
                     continue
+                mt = _st.st_mtime
                 if mt > (s.get("mtime") or 0.0):
                     s["mtime"] = mt
                     s["last_active_dt"] = _compute_last_active_dt(s)
                     advanced = True
+                    # Fill the Title from claude's OWN data (NO claude -p) while it's
+                    # still missing: a just-opened session has no ai-title / first
+                    # message yet, so re-extract from the growing JSONL until it has
+                    # an ai-title (then it's settled + maybe large → stop). The size
+                    # cap keeps the per-poll re-parse cheap (new sessions are tiny).
+                    if not s.get("ai_title") and _st.st_size < 2_000_000:
+                        try:
+                            fresh = parse_session(jp)
+                            if fresh:
+                                if fresh.get("ai_title"):
+                                    s["ai_title"] = fresh["ai_title"]
+                                if fresh.get("real_msgs"):
+                                    s["real_msgs"] = fresh["real_msgs"]
+                        except Exception:
+                            pass
             return advanced
 
         def _poll_live_status(self) -> None:
