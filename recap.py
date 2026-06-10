@@ -2707,7 +2707,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         from textual.app import App, ComposeResult
         from textual.actions import SkipAction
         from textual.binding import Binding
-        from textual.containers import Horizontal, Vertical
+        from textual.containers import Horizontal, Vertical, VerticalScroll
         from textual.screen import ModalScreen
         from textual.widgets import (DataTable, Footer, Input, OptionList, RichLog,
                                      Select, Static, TabbedContent, TabPane, Tabs)
@@ -2768,18 +2768,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             background: $panel;
             border: solid $accent;
             padding: 1 2;
-            width: 66;
-            height: auto;
-            max-height: 28;
+            width: auto;
+            max-width: 92%;
+            max-height: 90%;
         }
         """
+        # max-width/height are RELATIVE so the modal fits a narrow / short terminal;
+        # VerticalScroll scrolls when content exceeds max-height.
         BINDINGS = [
             Binding("escape", "dismiss", show=False),
             Binding("question_mark", "dismiss", show=False),
         ]
 
         def compose(self) -> ComposeResult:
-            yield Static(
+            body = (
                 "[bold cyan]Navigation[/bold cyan]\n"
                 "  [yellow]↑[/yellow] [yellow]↓[/yellow]         Move rows\n"
                 "  [yellow]Enter[/yellow]       Resume session\n"
@@ -2819,9 +2821,27 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "            :fav  :hidden  :open  :active  :recent   (Esc clears)\n"
                 "  Markers   @ open · + active · . recent · live ~ busy · ? waiting · ! unread · = viewed · * fav · x hidden\n"
                 "  (clicking a column header still sorts too)\n\n"
-                "[dim]Press ? or Esc to close[/dim]",
-                id="help-content",
-            )
+                "[bold cyan]Colours[/bold cyan]  Title hue = project · Last column: "
+                "[green]green[/green] active(<5m) / [yellow]yellow[/yellow] recent(<30m) / dim older\n\n")
+            # Reflect live remaps + leader so the help can't drift from [keys] config.
+            try:
+                app = self.app
+                _rm = getattr(app, "_applied_keymap", {}) or {}
+                if _rm:
+                    body += ("[bold cyan]Your remaps[/bold cyan]  " + " · ".join(
+                        f"{a}→[yellow]{k}[/yellow]" for a, k in list(_rm.items())[:12]) + "\n")
+                if getattr(app, "_leader_key", ""):
+                    _seq = " · ".join(f"{k}→{a}" for k, a in
+                                      list(getattr(app, "_leader_actions", {}).items())[:12])
+                    body += (f"[bold cyan]Leader[/bold cyan]  [yellow]{app._leader_key}[/yellow] then  "
+                             + (_seq or "(no letters mapped)") + "\n")
+                if _rm or getattr(app, "_leader_key", ""):
+                    body += "\n"
+            except Exception:
+                pass
+            body += "[dim]Press ? or Esc to close · scroll for more[/dim]"
+            with VerticalScroll(id="help-content"):
+                yield Static(body)
 
     class NewSessionScreen(ModalScreen):
         """Pick a folder / git worktree, then start a FRESH claude session there.
@@ -3033,6 +3053,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._leader_key = ""          # configured leader (e.g. "ctrl+g"); "" = off
             self._leader_actions = {}      # {letter: action_name} reached via the leader
             self._leader_pending = False   # waiting for the post-leader key
+            self._applied_keymap = {}      # direct rebinds applied (shown in ? help)
             try:
                 _kc = _load_config().get("keys", {})
                 if isinstance(_kc, dict) and _kc:
@@ -3046,6 +3067,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _applied, _errs = _validate_keymap(_direct, _ids)
                     if _applied:
                         self.set_keymap(_applied)
+                        self._applied_keymap = _applied
                     _ld = str(_kc.get("leader") or "").strip().lower()
                     if _ld:
                         self._leader_key = _ld
