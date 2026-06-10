@@ -15,6 +15,9 @@ Usage:
   recap [--days N] [--all-projects] [--pick] [--project PATH]
         [--no-summary] [--refresh-summary]
 """
+
+__version__ = "0.1.0"
+
 import argparse
 import io
 import json
@@ -155,6 +158,79 @@ def _cfg_bool(v, default: bool = False) -> bool:
     if isinstance(v, bool):
         return v
     return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+_CONFIG_TEMPLATE = (
+    "# recap configuration (TOML). Env vars (RECAP_*) override these; CLI flags win.\n\n"
+    "[summary]\n"
+    "enabled = false   # AI summaries call `claude -p` and spend credits — opt-in.\n"
+    'command = ""      # custom backend: prompt on stdin -> summary on stdout ("" = claude -p)\n'
+    'model   = "haiku"\n\n'
+    "[display]\n"
+    "auto_refresh = 0          # seconds between background re-scans (0 = off)\n"
+    "split_live   = true       # false = list-only browser (Enter = full-takeover resume)\n"
+    'color_by     = "project"  # title hue: project | worktree | topic | none\n\n'
+    "[limits]                       # live-pane memory gate (Windows-principled)\n"
+    "max_memory_load        = 85    # refuse/warn above this % memory load\n"
+    "min_commit_headroom_mb = 2048  # keep this much commit headroom free\n"
+    "min_free_phys_pct      = 8     # keep >= this % of physical RAM free\n"
+    "per_pane_mb            = 600   # estimated RAM per live pane\n"
+    "hard_ram_gate          = false # true = refuse (vs warn) when crossed\n"
+    "max_live               = 64    # hard cap on concurrent live panes\n\n"
+    "[keys]\n"
+    '# leader  = "ctrl+g"   # opt-in prefix, then the mnemonic letters below\n'
+    '# refresh = "f5"\n'
+)
+
+
+def _init_config(force: bool = False) -> int:
+    """Write the commented config template to _config_path(); exit code for the CLI."""
+    p = _config_path()
+    if p.exists() and not force:
+        print(_c(f"  config already exists: {p}  (use --force to overwrite)", YELLOW))
+        return 1
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_CONFIG_TEMPLATE, encoding="utf-8")
+        _reset_config_cache()
+        print(_c(f"  wrote config template: {p}", GREEN))
+        return 0
+    except Exception as e:
+        print(_c(f"  could not write {p}: {e!r}", RED))
+        return 1
+
+
+def _print_config() -> int:
+    """Print each resolved setting + its source (default / config / env)."""
+    specs = [
+        ("summary", "enabled", "RECAP_SUMMARIZE_ENABLED", False),
+        ("summary", "command", "RECAP_SUMMARIZE_CMD", ""),
+        ("summary", "model", "RECAP_SUMMARIZE_MODEL", "haiku"),
+        ("display", "auto_refresh", "RECAP_AUTO_REFRESH", 0),
+        ("display", "split_live", "RECAP_SPLIT_LIVE", True),
+        ("display", "color_by", "RECAP_COLOR_BY", "project"),
+        ("limits", "max_memory_load", "RECAP_MAX_MEM_LOAD", 85),
+        ("limits", "min_commit_headroom_mb", "RECAP_MIN_COMMIT_MB", 2048),
+        ("limits", "min_free_phys_pct", "RECAP_MIN_FREE_PHYS_PCT", 8),
+        ("limits", "per_pane_mb", "RECAP_CLAUDE_MB", 600),
+        ("limits", "min_free_mb", "RECAP_MIN_FREE_MB", 0),
+        ("limits", "hard_ram_gate", "RECAP_HARD_RAM_GATE", False),
+        ("limits", "max_live", "RECAP_MAX_LIVE", 64),
+        ("keys", "release", "RECAP_RELEASE_KEY", "ctrl+]"),
+    ]
+    cfg = _load_config()
+    print(f"  config: {_config_path()}  "
+          f"({'exists' if _config_path().is_file() else 'absent'})")
+    for sec, key, env, default in specs:
+        ev = os.environ.get(env)
+        if ev not in (None, ""):
+            src, val = "env", ev
+        elif cfg.get(sec, {}).get(key) is not None:
+            src, val = "config", cfg[sec][key]
+        else:
+            src, val = "default", default
+        print(f"  [{sec}] {key:<22} = {val!r:<14} ({src})")
+    return 0
 
 
 def _split_live_disabled_by_env(env_value) -> bool:
@@ -5822,6 +5898,13 @@ def main():
                "                            'sonnet' (cleaner partitions, 1-3 min).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument("--version", action="version", version=f"recap {__version__}")
+    p.add_argument("--init-config", action="store_true",
+                   help="Write a commented config.toml template to the config path, then exit.")
+    p.add_argument("--print-config", action="store_true",
+                   help="Print the resolved settings + their source (default/config/env), then exit.")
+    p.add_argument("--force", action="store_true",
+                   help="With --init-config: overwrite an existing config file.")
     # default=None on persisted flags so we can detect "not provided" and use
     # the last saved value instead.
     def _nonneg_int(v: str) -> int:
@@ -5909,6 +5992,11 @@ def main():
                    help="Show the in-session sidechain (subagent) tree for SESSION_ID "
                         "using isSidechain+parentUuid metadata (confirmed, not heuristic).")
     args = p.parse_args()
+
+    if args.init_config:
+        sys.exit(_init_config(force=args.force))
+    if args.print_config:
+        sys.exit(_print_config())
 
     if args.preview:
         preview_session(args.preview)

@@ -111,6 +111,25 @@ def test_summarize_session_skips_llm_when_disabled():
         recap._set_summary_forced_off(False)
 
 
+def test_init_config_writes_parseable_template():
+    import tomllib
+    d = Path(tempfile.mkdtemp())
+    f = d / "config.toml"
+    os.environ["RECAP_CONFIG"] = str(f)
+    try:
+        recap._reset_config_cache()
+        assert recap._init_config(force=False) == 0 and f.is_file()
+        with open(f, "rb") as fh:
+            cfg = tomllib.load(fh)                       # template is valid TOML
+        assert cfg["summary"]["enabled"] is False        # documented defaults
+        assert cfg["limits"]["max_live"] == 64
+        assert recap._init_config(force=False) == 1      # refuse overwrite
+        assert recap._init_config(force=True) == 0       # --force overwrites
+    finally:
+        os.environ.pop("RECAP_CONFIG", None)
+        recap._reset_config_cache()
+
+
 if __name__ == "__main__":
     test_config_path_honors_env()
     print("PASS test_config_path_honors_env")
@@ -124,4 +143,6 @@ if __name__ == "__main__":
     print("PASS test_summary_enabled_matrix")
     test_summarize_session_skips_llm_when_disabled()
     print("PASS test_summarize_session_skips_llm_when_disabled")
+    test_init_config_writes_parseable_template()
+    print("PASS test_init_config_writes_parseable_template")
     print("ALL PASS")

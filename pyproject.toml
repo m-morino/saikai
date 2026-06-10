@@ -1,6 +1,6 @@
 [project]
 name = "recap"
-version = "0.1.0"
+dynamic = ["version"]   # read from recap.py __version__ (regex source — no import at build)
 description = "A terminal session browser for Claude Code — browse, search, group, and resume past sessions, with a built-in split-live pane (on by default)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,6 +33,9 @@ dependencies = [
 
 [project.scripts]
 recap = "recap:main"
+
+[tool.hatch.version]
+path = "recap.py"          # regex source: reads __version__ without importing recap.py
 
 [build-system]
 requires = ["hatchling"]
