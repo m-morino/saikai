@@ -89,8 +89,12 @@ Markers in the list: `~` busy · `?` waiting for input · `!` finished (unanswer
 | `RECAP_SPLIT_LIVE` | on | live-pane mode; set `0`/`false`/`no`/`off` to disable → list-only browser + full-takeover resume |
 | `RECAP_AUTO_REFRESH` | off | seconds between background re-scans |
 | `RECAP_SUMMARIZE_CMD` | — | command to summarize with (prompt on stdin → summary on stdout) instead of `claude -p` |
-| `RECAP_MIN_FREE_MB` / `RECAP_CLAUDE_MB` | 1536 / 600 | free-RAM floor / estimated RAM per live pane |
-| `RECAP_HARD_RAM_GATE` | off | `1` refuses to open a pane that would cross the RAM floor |
+| `RECAP_MAX_MEM_LOAD` | 85 | refuse/warn opening a pane above this memory-load % (Win `dwMemoryLoad`; Linux/macOS derived) |
+| `RECAP_MIN_COMMIT_MB` | 2048 | keep this much **commit headroom** free — the system-freeze guard (Win/Linux) |
+| `RECAP_MIN_FREE_PHYS_PCT` | 8 | keep ≥ this % of physical RAM available (anti-thrash floor, machine-relative) |
+| `RECAP_CLAUDE_MB` | 600 | estimated RAM per live pane |
+| `RECAP_MIN_FREE_MB` | 0 | optional absolute physical floor (legacy; max'd with the % floor) |
+| `RECAP_HARD_RAM_GATE` | off | `1` refuses (vs warns) when the gate would be crossed |
 | `RECAP_MAX_LIVE` | 64 | hard cap on concurrent live panes (backstop) |
 
 ## Platform support
@@ -102,7 +106,7 @@ platform-specific part (it drives a real PTY and the clipboard). Honest status:
 |---|---|---|---|---|
 | **Windows** 10 / 11 | ConPTY (`pywinpty`) | `clip` | `GlobalMemoryStatusEx` | ✅ **developed & daily-driven** |
 | **Linux** | POSIX PTY (`ptyprocess`) | OSC-52 *(needs an OSC-52-capable terminal)* | `/proc/meminfo` | ⚠️ code-complete, **not yet run by the author** |
-| **macOS** | POSIX PTY (`ptyprocess`) | OSC-52 *(iTerm2 / kitty / WezTerm fine; Terminal.app needs it enabled)* | n/a → RAM gate auto-disables | ⚠️ code-complete, **not yet run by the author** |
+| **macOS** | POSIX PTY (`ptyprocess`) | OSC-52 *(iTerm2 / kitty / WezTerm fine; Terminal.app needs it enabled)* | `sysctl` + `vm_stat` *(load + physical; no commit limit)* | ⚠️ code-complete, **not yet run by the author** |
 
 - **List-only mode** (`RECAP_SPLIT_LIVE=0`) has no PTY dependency and should run
   anywhere Textual runs.
