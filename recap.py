@@ -1401,8 +1401,30 @@ def _has_cjk(text: str) -> bool:
     return bool(_CJK_RE.search(text or ""))
 
 
+_SUMMARY_FORCED_OFF = False   # set by --no-summary (CLI beats config)
+
+
+def _summary_enabled() -> bool:
+    """AI summaries are OPT-IN — `claude -p` (or a custom backend) spends credits /
+    quota. Enabled iff a custom summarizer command is configured (summary.command /
+    RECAP_SUMMARIZE_CMD) OR [summary] enabled=true (RECAP_SUMMARIZE_ENABLED). Default
+    OFF; --no-summary forces it off regardless of config."""
+    if _SUMMARY_FORCED_OFF:
+        return False
+    if _cfg("summary", "command", "RECAP_SUMMARIZE_CMD", ""):
+        return True
+    return _cfg("summary", "enabled", "RECAP_SUMMARIZE_ENABLED", False, _cfg_bool)
+
+
+def _set_summary_forced_off(v: bool) -> None:
+    """--no-summary forces summaries off for this run (CLI beats config)."""
+    global _SUMMARY_FORCED_OFF
+    _SUMMARY_FORCED_OFF = bool(v)
+
+
 def summarize_session(s: dict) -> str:
-    """Get summary for a session: cache → AI title → LLM.
+    """Get summary for a session: cache → AI title → LLM (only if summaries are
+    enabled — otherwise claude's own data, no `claude -p`).
 
     Claude Code's `aiTitle` follows the language of the first user message,
     so English-mode sessions produce English titles that bypass the
@@ -1425,6 +1447,11 @@ def summarize_session(s: dict) -> str:
         # No content to summarize — cache empty so we don't retry next time
         _save_cache(s["id"], mtime, "", s.get("last_ts", ""))
         return ""
+
+    if not _summary_enabled():
+        # Summaries are opt-in (no `claude -p`): use claude's own ai-title or the
+        # first user message. Do NOT cache (no LLM result to memoise).
+        return s["ai_title"] or _first_msg(s)
 
     sample = "\n---\n".join(s["real_msgs"][:5])[:3000]
     prompt = (
@@ -2893,6 +2920,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if self._restore_candidates:
                     self.notify(f"{len(self._restore_candidates)} pane(s) from last "
                                 f"session — Shift+F4 to reopen", timeout=8)
+            # One-time hint: AI summaries are opt-in (claude -p spends credits).
+            # Show once, only when there's no config file and summaries are off.
+            try:
+                _hint = CACHE_DIR / ".hinted-summary"
+                if (not _summary_enabled() and not _config_path().is_file()
+                        and not _hint.exists()):
+                    self.notify(
+                        "AI summaries are off (they call `claude -p`, spending "
+                        "credits). Enable with `recap --init-config` → set "
+                        "[summary] enabled = true, or RECAP_SUMMARIZE_ENABLED=1.",
+                        title="recap", timeout=10)
+                    _hint.parent.mkdir(parents=True, exist_ok=True)
+                    _hint.write_text("", encoding="utf-8")
+            except Exception:
+                pass
             # Pre-warm preview caches off the UI thread so scrolling stays
             # responsive; _update_preview's on-demand warm is the fallback for
             # rows this thread hasn't reached. Open sessions render fresh, skip.
@@ -6085,6 +6127,7 @@ def main():
     # previous run filled, falling back to the first user message on a miss.
     # Phase 1 (instant): fill all sessions from cache / ai_title / first_msg.
     # This runs synchronously in <1s so the UI starts immediately.
+    _set_summary_forced_off(args.no_summary)   # CLI beats config for this run
     for s in sessions:
         cached = (_load_cache(s["id"], s["mtime"], s.get("last_ts", ""))
                   if not s.get("is_open") else None)
@@ -6093,8 +6136,8 @@ def main():
                         else s["ai_title"] or _first_msg(s))
 
     # Phase 2 (background): LLM-summarize sessions that had no cache hit.
-    # Skipped when --no-summary / --related, or when all are cached.
-    if not (args.no_summary or args.related):
+    # Skipped when summaries are OFF (default; opt-in) / --related, or all cached.
+    if _summary_enabled() and not args.related:
         import threading as _thr
         needs_llm = [s for s in sessions
                      if not s["ai_title"] and not s.get("is_open")

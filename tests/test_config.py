@@ -77,6 +77,40 @@ def test_cfg_bool_parses_truthy_falsy():
     assert recap._cfg_bool(None) is False
 
 
+def test_summary_enabled_matrix():
+    for k in ("RECAP_SUMMARIZE_ENABLED", "RECAP_SUMMARIZE_CMD", "RECAP_CONFIG"):
+        os.environ.pop(k, None)
+    recap._reset_config_cache()
+    recap._set_summary_forced_off(False)
+    try:
+        assert recap._summary_enabled() is False                    # default OFF (opt-in)
+        os.environ["RECAP_SUMMARIZE_ENABLED"] = "1"
+        assert recap._summary_enabled() is True
+        os.environ.pop("RECAP_SUMMARIZE_ENABLED")
+        os.environ["RECAP_SUMMARIZE_CMD"] = "mytool --json"
+        assert recap._summary_enabled() is True                     # custom backend → enabled
+        recap._set_summary_forced_off(True)
+        assert recap._summary_enabled() is False                    # --no-summary wins over config
+    finally:
+        for k in ("RECAP_SUMMARIZE_ENABLED", "RECAP_SUMMARIZE_CMD"):
+            os.environ.pop(k, None)
+        recap._set_summary_forced_off(False)
+        recap._reset_config_cache()
+
+
+def test_summarize_session_skips_llm_when_disabled():
+    recap._set_summary_forced_off(True)   # deterministic OFF, no claude -p
+    try:
+        s = {"id": "sid-nollm-test", "ai_title": "", "is_open": False, "mtime": 1.0,
+             "last_ts": "", "real_msgs": ["build the thing first"]}
+        # returns the first-message heuristic without invoking claude -p
+        assert recap.summarize_session(s) == "build the thing first"
+        s["ai_title"] = "Native Title"
+        assert recap.summarize_session(s) == "Native Title"   # ai_title preferred (still no claude -p)
+    finally:
+        recap._set_summary_forced_off(False)
+
+
 if __name__ == "__main__":
     test_config_path_honors_env()
     print("PASS test_config_path_honors_env")
@@ -86,4 +120,8 @@ if __name__ == "__main__":
     print("PASS test_cfg_precedence_env_over_config_over_default")
     test_cfg_bool_parses_truthy_falsy()
     print("PASS test_cfg_bool_parses_truthy_falsy")
+    test_summary_enabled_matrix()
+    print("PASS test_summary_enabled_matrix")
+    test_summarize_session_skips_llm_when_disabled()
+    print("PASS test_summarize_session_skips_llm_when_disabled")
     print("ALL PASS")
