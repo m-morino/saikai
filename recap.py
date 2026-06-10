@@ -214,6 +214,28 @@ def _validate_keymap(overrides, valid_ids):
     return applied, errors
 
 
+def _leader_map(letters_cfg, id_to_action):
+    """Turn the single-letter [keys] entries into a leader map {letter: action_name}.
+    Multi-char values (F-keys/combos) are handled as direct rebinds elsewhere, not
+    here. Unknown action ids and duplicate letters are dropped + reported. Returns
+    (mapping, errors)."""
+    out, errs, seen = {}, [], set()
+    for action_id, key in (letters_cfg or {}).items():
+        k = str(key or "").strip().lower()
+        if len(k) != 1:
+            continue
+        action = id_to_action.get(action_id)
+        if not action:
+            errs.append(f"[keys] leader: unknown action '{action_id}'")
+            continue
+        if k in seen:
+            errs.append(f"[keys] leader: letter '{k}' already used")
+            continue
+        seen.add(k)
+        out[k] = action
+    return out, errs
+
+
 def _init_config(force: bool = False) -> int:
     """Write the commented config template to _config_path(); exit code for the CLI."""
     p = _config_path()
@@ -3004,16 +3026,35 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._busy_seen: set = set()      # sids observed busy since their last "done" toast (catches tasks shorter than the poll)
             self._opened_sids: set = set()    # sids opened + kept this session (snapshot source)
             self._opening_sids: set = set()   # opens in flight (register deferred to the mount worker) — counted by the capacity gate + has() dedup
-            # Apply [keys] config remaps (validated) via Textual's set_keymap — a
-            # user can rebind any id'd action; invalid entries are reported + skipped.
+            # Keybindings from [keys]: F-key/combo values are DIRECT rebinds
+            # (set_keymap); single-letter values are LEADER sequences (opt-in via
+            # [keys] leader). The leader is handled in on_key, LIST-FOCUS only, so it
+            # can never steal a key from a focused claude pane.
+            self._leader_key = ""          # configured leader (e.g. "ctrl+g"); "" = off
+            self._leader_actions = {}      # {letter: action_name} reached via the leader
+            self._leader_pending = False   # waiting for the post-leader key
             try:
                 _kc = _load_config().get("keys", {})
                 if isinstance(_kc, dict) and _kc:
                     _ids = {b.id for b in type(self).BINDINGS if getattr(b, "id", None)}
-                    _applied, _errs = _validate_keymap(_kc, _ids)
+                    _id2act = {b.id: b.action for b in type(self).BINDINGS
+                               if getattr(b, "id", None)}
+                    _direct = {k: v for k, v in _kc.items()
+                               if k != "leader" and len(str(v).strip()) != 1}
+                    _letters = {k: v for k, v in _kc.items()
+                                if k != "leader" and len(str(v).strip()) == 1}
+                    _applied, _errs = _validate_keymap(_direct, _ids)
                     if _applied:
                         self.set_keymap(_applied)
-                    for _e in _errs[:4]:
+                    _ld = str(_kc.get("leader") or "").strip().lower()
+                    if _ld:
+                        self._leader_key = _ld
+                        self._leader_actions, _lerr = _leader_map(_letters, _id2act)
+                        _errs += _lerr
+                    elif _letters:
+                        _errs.append('[keys] single-letter keys need a leader '
+                                     '(set [keys] leader = "ctrl+g")')
+                    for _e in _errs[:5]:
                         self.notify(_e, severity="warning", timeout=8)
             except Exception:
                 pass
@@ -3716,6 +3757,37 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 event.stop()
                 self.action_quit_all()
                 return
+            # Leader/prefix (opt-in, [keys] leader). The leader arms a pending state;
+            # the next key runs the mapped action. A focused claude pane consumes its
+            # own keys, so the leader only reaches here from the LIST (gated below) —
+            # it can't steal a REPL key. Handled BEFORE search-as-you-type so the
+            # post-leader letter doesn't fall through and open the search box.
+            if self._leader_key:
+                if self._leader_pending:
+                    self._leader_pending = False
+                    event.stop()
+                    if event.key != "escape":
+                        _act = self._leader_actions.get((event.character or "").lower())
+                        _fn = getattr(self, "action_" + _act, None) if _act else None
+                        if callable(_fn):
+                            try:
+                                _fn()
+                            except Exception:
+                                pass
+                    return
+                try:
+                    _tbl = self.query_one("#table", DataTable)
+                except Exception:
+                    _tbl = None
+                if event.key == self._leader_key and self.focused is _tbl:
+                    self._leader_pending = True
+                    if self._leader_actions:
+                        _hint = " · ".join(f"{k}={a}" for k, a in
+                                           list(self._leader_actions.items())[:8])
+                        self.notify(f"leader — {_hint}  (Esc cancels)", timeout=2)
+                    self.set_timer(1.5, self._cancel_leader)
+                    event.stop()
+                    return
             # search-as-you-type: typing while the table is focused redirects into the
             # search input. Arrow keys / control bindings still route normally
             # because we only intercept printable single characters and
@@ -3755,6 +3827,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             elif self.focused is search and event.key == "down":
                 table.focus()
                 event.stop()
+
+        def _cancel_leader(self) -> None:
+            """Leader timed out / cancelled — drop the pending state (the next key
+            types normally again)."""
+            self._leader_pending = False
 
         def _over_tab_bar(self, event) -> bool:
             """True when the mouse is over the split-live tab bar. Textual's Tabs
