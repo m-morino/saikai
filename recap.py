@@ -6,6 +6,7 @@
 #   "pyte>=0.8",                          # PTY byte-stream -> screen grid (split-live)
 #   "pywinpty>=2.0 ; sys_platform == 'win32'",   # Windows ConPTY backend
 #   "ptyprocess>=0.7 ; sys_platform != 'win32'", # POSIX PTY backend
+#   "platformdirs>=3.6",                  # cross-platform config dir (textual transitive)
 # ]
 # ///
 """
@@ -24,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 import uuid
 from collections import Counter, defaultdict, namedtuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -87,6 +89,72 @@ def _read_json(path: Path, default):
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
+
+
+# ── TOML config (opt-in; env vars still win) ─────────────────────────────────
+def _config_path() -> Path:
+    """Resolve the config file path: $RECAP_CONFIG, else the platform config dir
+    (platformdirs — Windows %APPDATA%, Linux ~/.config, macOS Application Support).
+    platformdirs is a textual transitive dep; fall back to ~/.config if absent."""
+    p = os.environ.get("RECAP_CONFIG")
+    if p:
+        return Path(p).expanduser()
+    try:
+        import platformdirs
+        return Path(platformdirs.user_config_dir("recap")) / "config.toml"
+    except Exception:
+        return Path.home() / ".config" / "recap" / "config.toml"
+
+
+_CONFIG_CACHE = None
+
+
+def _reset_config_cache() -> None:
+    """Drop the cached config (tests; or after --init-config writes a new file)."""
+    global _CONFIG_CACHE
+    _CONFIG_CACHE = None
+
+
+def _load_config() -> dict:
+    """Parse the TOML config once (cached). Missing/empty/corrupt → {} (logged),
+    never raises — recap must launch even with a broken config file."""
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is not None:
+        return _CONFIG_CACHE
+    cfg = {}
+    p = _config_path()
+    try:
+        if p and p.is_file():
+            with open(p, "rb") as f:
+                cfg = tomllib.load(f)
+    except Exception as e:
+        _log(f"config: ignoring unreadable {p}: {e!r}")
+        cfg = {}
+    _CONFIG_CACHE = cfg if isinstance(cfg, dict) else {}
+    return _CONFIG_CACHE
+
+
+def _cfg(section: str, key: str, env_var: str, default, cast=str):
+    """Resolve a setting by precedence: env var > config[section][key] > default,
+    cast-safe (a bad value → default). Empty env string is treated as unset."""
+    v = os.environ.get(env_var)
+    if v is None or (isinstance(v, str) and v == ""):
+        v = _load_config().get(section, {}).get(key, None)
+    if v is None:
+        return default
+    try:
+        return cast(v)
+    except Exception:
+        return default
+
+
+def _cfg_bool(v, default: bool = False) -> bool:
+    """Coerce a config/env value to bool (truthy = 1/true/yes/on, case-insensitive)."""
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _split_live_disabled_by_env(env_value) -> bool:
