@@ -128,6 +128,15 @@ def test_validate_keymap():
     assert recap._validate_keymap({}, ids) == ({}, [])
 
 
+def test_leader_map():
+    id2act = {"refresh": "refresh", "favorite": "toggle_fav", "close": "close_live"}
+    m, errs = recap._leader_map(
+        {"refresh": "r", "favorite": "f", "close": "r", "bad": "x", "diff": "f8"}, id2act)
+    assert m == {"r": "refresh", "f": "toggle_fav"}   # 'close'→r dup; 'diff'→f8 multi-char skipped
+    assert any("already used" in e for e in errs)     # duplicate letter
+    assert any("bad" in e for e in errs)              # unknown action id
+
+
 def test_init_config_writes_parseable_template():
     import tomllib
     d = Path(tempfile.mkdtemp())
@@ -162,6 +171,8 @@ if __name__ == "__main__":
     print("PASS test_summarize_session_skips_llm_when_disabled")
     test_validate_keymap()
     print("PASS test_validate_keymap")
+    test_leader_map()
+    print("PASS test_leader_map")
     test_init_config_writes_parseable_template()
     print("PASS test_init_config_writes_parseable_template")
     print("ALL PASS")
