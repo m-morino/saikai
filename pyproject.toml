@@ -11,7 +11,16 @@ keywords = ["claude", "claude-code", "tui", "textual", "sessions", "cli"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Environment :: Console",
+    # Supported environments are LIMITED to what the code actually implements +
+    # can be CI-tested — deliberately NOT "OS Independent" (recap has Windows
+    # ConPTY, POSIX PTY, and per-OS RAM probes). WSL counts as Linux.
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Utilities",
 ]
 dependencies = [

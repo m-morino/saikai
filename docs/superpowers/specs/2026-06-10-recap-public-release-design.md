@@ -28,6 +28,10 @@ then we publish a cleaned history to a fresh repo.
   objects). Exact old-repo disposition + naming: see §H (being decided with user).
 - Public identity: **`m-morino` / `11384605+m-morino@users.noreply.github.com`**
   (ID-based noreply — username-only form breaks if the account is ever renamed).
+- **Supported environments are BOUNDED to the implementation: Windows, Linux
+  (incl. WSL), macOS, Python ≥ 3.11.** Declared via explicit OS classifiers (not
+  "OS Independent"); other platforms are unsupported (degrade-safe, untested).
+  Python floor 3.11 → stdlib `tomllib`, **zero net-new dependencies**.
 
 ## Non-goals
 
@@ -237,7 +241,11 @@ string that drifts from the auto-generated footer):*
   `+ feature_request.md`, `.github/PULL_REQUEST_TEMPLATE.md`.
 - README badges (CI, license, Python); `.gitattributes`: `* text=auto eol=lf`.
 - **Reviewer adds:** `SECURITY.md`; `[project.urls]` (Homepage/Source/Issues);
-  per-version Python classifiers + `Operating System :: OS Independent`.
+  per-version Python classifiers (3.11–3.13). **Supported envs are deliberately
+  BOUNDED** to the implementation: explicit OS classifiers — `Microsoft :: Windows`
+  / `POSIX :: Linux` (WSL counts as Linux) / `MacOS` — and **NOT
+  `Operating System :: OS Independent`** (recap has Windows ConPTY, POSIX PTY, and
+  per-OS RAM probes; other platforms are unsupported, degrade-safe but untested).
 - **PyPI-ready, deferred:** metadata above makes a future PyPI release trivial;
   the Trusted-Publishing (OIDC) release workflow is **deferred** (v1 installs from
   GitHub: `uv tool install .` / `pipx install git+https://github.com/m-morino/recap`).
