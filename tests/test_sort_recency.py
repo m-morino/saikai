@@ -442,6 +442,11 @@ def test_no_internal_identifiers_in_source():
         tok = (tok or "").strip().lower()
         if len(tok) >= 4:                       # skip trivially short logins
             ids.add(tok)
+    # On CI the machine login ("runner" on GitHub Actions) is not author PII and
+    # collides with ordinary English ("test runner"); the identity scan is only
+    # meaningful on the author's own machine. Codename + e-mail checks still run.
+    if os.environ.get("CI"):
+        ids.clear()
     # known internal codenames, split so they don't appear verbatim in this file
     codenames = ("chat" + "agc", "work" + "-tools", "edge" + "-auth")
     email_re = _re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", _re.I)
