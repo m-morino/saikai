@@ -2873,6 +2873,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         ]
 
         def compose(self) -> ComposeResult:
+            _cby = _cfg("display", "color_by", "RECAP_COLOR_BY", "project")
+            if _cby not in ("project", "worktree", "topic", "none"):
+                _cby = "project"
+            _hue = ("no title tint" if _cby == "none"
+                    else f"Title hue = {_cby}")
             body = (
                 "[bold cyan]Navigation[/bold cyan]\n"
                 "  [yellow]↑[/yellow] [yellow]↓[/yellow]         Move rows\n"
@@ -2899,6 +2904,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Shift-F4[/yellow]    Reopen the panes from your last session (resume) — anytime\n"
                 "  [yellow]F2/F3[/yellow]       Prev / next live tab   ·   [yellow]Shift-F3[/yellow]  Next pane needing attention (?/!)\n"
                 "  [yellow]F4[/yellow]          Hide / show the session list\n"
+                "  [dim]Drag the divider bar between the list and the pane to resize (persists)[/dim]\n"
                 "  [yellow]Ctrl-][/yellow]      Return focus: pane → list  (RECAP_RELEASE_KEY to change)\n"
                 "  [yellow]F10[/yellow]         Close the active tab   ·   [yellow]Shift-F10[/yellow]  Close ALL tabs\n"
                 "  [yellow]Esc[/yellow]         pane → list, then quit-all (snapshots panes; Shift-F4 reopens)   ·   [yellow]Ctrl-C[/yellow]  quit-all\n"
@@ -2913,7 +2919,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "            :fav  :hidden  :open  :active  :recent   (Esc clears)\n"
                 "  Markers   @ open · + active · . recent · live ~ busy · ? waiting · ! unread · = viewed · * fav · x hidden\n"
                 "  (clicking a column header still sorts too)\n\n"
-                "[bold cyan]Colours[/bold cyan]  Title hue = project · Last column: "
+                f"[bold cyan]Colours[/bold cyan]  {_hue} ([dim]display.color_by = "
+                "project/worktree/topic/none[/dim]) · Last column: "
                 "[green]green[/green] active(<5m) / [yellow]yellow[/yellow] recent(<30m) / dim older\n\n")
             # Reflect live remaps + leader so the help can't drift from [keys] config.
             try:
