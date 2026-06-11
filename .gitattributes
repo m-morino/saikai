@@ -1,0 +1,4 @@
+# Keep shell scripts + git hooks LF even in a Windows working tree, so they run
+# under sh/bash on every OS (a CRLF shebang breaks `#!/usr/bin/env sh`).
+*.sh        text eol=lf
+scripts/hooks/*  text eol=lf
