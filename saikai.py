@@ -6447,8 +6447,9 @@ def main():
                     "use --days N to limit. Filters (--days/--here/--all) are one-shot "
                     "unless --save-defaults is also passed.",
         epilog="Environment variables:\n"
-               "  SAIKAI_RESUME=1            set on the resumed `claude` child so teams-notify\n"
-               "                            hook suppresses its idle-prompt nag.\n"
+               "  SAIKAI_RESUME=1            set on the resumed `claude` child so your own\n"
+               "                            hooks can tell saikai-resumed sessions apart\n"
+               "                            (e.g. suppress idle notifications).\n"
                "  SAIKAI_NO_AUTO_PERMISSION  if set, do NOT auto-apply --permission-mode auto\n"
                "                            on resume even when the target cwd is frequent.\n"
                "  SAIKAI_FREQ_CWD_MIN=N      minimum session count to flag a cwd as\n"
