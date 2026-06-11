@@ -452,7 +452,9 @@ def test_no_internal_identifiers_in_source():
     email_re = _re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", _re.I)
     self_name = _P(__file__).name
     targets = (list(root.glob("*.py")) + list((root / "tests").glob("*.py"))
+               + list((root / "scripts").glob("*.py"))
                + list((root / "docs").rglob("*.md"))     # docs ship publicly too
+               + list((root / "docs").rglob("*.svg"))    # README screenshots too
                + [root / "README.md", root / "CLAUDE.md", root / "THIRD-PARTY-NOTICES.md"])
     for f in targets:
         if not f.exists() or f.name == self_name:
