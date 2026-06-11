@@ -5098,16 +5098,23 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if sys.platform == "win32":
                 # Textual's copy_to_clipboard is OSC-52, which many Windows console
                 # hosts silently DROP while never raising — so the old code always
-                # claimed success and the `clip` fallback was dead code. Use `clip`
-                # (deterministic) first; DEVNULL so it can't bleed bytes into the
-                # Textual screen.
+                # claimed success and the `clip` fallback was dead code. Set the
+                # clipboard via Win32 CF_UNICODETEXT (codepage-safe: clip.exe under
+                # chcp 65001 mis-decoded UTF-16LE bytes → multibyte text garbled);
+                # fall back to clip.exe (UTF-8) if that fails.
                 try:
-                    subprocess.run(["clip"], input=text.encode("utf-16-le"),
-                                   check=True, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL)
-                    copied = True
+                    import recap_terminal as _rt
+                    copied = _rt.set_clipboard_windows(text)
                 except Exception:
                     copied = False
+                if not copied:
+                    try:
+                        subprocess.run(["clip"], input=text.encode("utf-8"),
+                                       check=True, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+                        copied = True
+                    except Exception:
+                        copied = False
             if not copied:
                 try:
                     self.copy_to_clipboard(text)   # OSC-52: SSH / non-Windows
