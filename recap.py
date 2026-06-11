@@ -4723,6 +4723,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if row != table.cursor_row:
                 table.move_cursor(row=row)
 
+        def _mark_not_open(self, sid: str) -> None:
+            """A pane we hosted for `sid` is gone (explicit close OR its claude
+            exited), so the session is no longer "open". Clear the load-time
+            is_open stamp — the source of the @ marker — so the row stops showing
+            Open immediately (is_active/recent still recompute from mtime, so a
+            just-finished session correctly shows + / .). Invalidate the live-
+            session cache too, or the next rescan would re-read a registry entry
+            for the now-dead PID and resurrect the @."""
+            s = self._sid_index.get(sid)
+            if s is not None:
+                s["is_open"] = False
+            _invalidate_active_sessions()
+
         def _on_live_exit(self, sid: str) -> None:
             """Called on the UI thread when a pane's child exits. Keep the tab
             (so the user sees the final frame) but re-title it; drop it from the
@@ -4742,6 +4755,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
             self._live.forget(sid)
+            self._mark_not_open(sid)    # exited → no longer Open (drop the @ marker)
             self._refresh_table()
 
         def on_claude_terminal_focus_released(self, event) -> None:
@@ -4787,6 +4801,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except ValueError:
                 idx = len(ids_before)
             self._live.forget(sid)
+            self._mark_not_open(sid)         # closed → no longer Open (drop the @ marker)
             self._opened_sids.discard(sid)   # explicit close → drop from restore set
             self._unread.discard(sid)        # closed → not an unanswered finish (clears !N now, not on the deferred exit callback)
             self._busy_seen.discard(sid)
@@ -4826,6 +4841,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if not ids:
                 return
             n = len(ids)
+            for _sid in list(self._live.statuses().keys()):
+                self._mark_not_open(_sid)   # all closed → drop their @ markers
             for pid in ids:
                 try:
                     tabs.remove_pane(pid)
