@@ -4766,7 +4766,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
             self._live.forget(sid)
-            self._mark_not_open(sid)    # exited → no longer Open (drop the @ marker)
+            self._mark_not_open(sid)         # exited → no longer Open (drop the @ marker)
+            # A session whose claude EXITED on its own shouldn't reappear on the
+            # next Shift+F4 restore (matches explicit-close in _close_live_sid).
+            # The dead ✓ tab stays visible THIS session; re-launching it with Enter
+            # re-adds it via _open_or_attach_live. Persist the trimmed snapshot now.
+            self._opened_sids.discard(sid)
+            self._save_open_panes()
             self._refresh_table()
 
         def on_claude_terminal_focus_released(self, event) -> None:
