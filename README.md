@@ -53,6 +53,7 @@ recap --help
 | `↑` `↓` / `Enter` | move / resume the selected session |
 | `/` or just type | open the search & filter bar (`Esc` closes it, keeps the filter) |
 | `F5` | refresh · `F6` ★ favorite · `F7` hide · `F8` changes (diff) · `F9` copy opening prompt |
+| `Shift+F2` | rename the session — type your own name (empty clears it → back to auto title) |
 | `Shift+F5/F6/F7` | tree / cluster / cycle grouping |
 | `Tab` | preview: full ↔ summary · `?` help · `Esc` quit |
 
@@ -120,10 +121,14 @@ platform-specific part (it drives a real PTY and the clipboard). Honest status:
 
 | OS | Live-pane PTY | Clipboard (from a frozen pane) | RAM gate source | Status |
 |---|---|---|---|---|
-| **Windows** 10 / 11 | ConPTY (`pywinpty`) | Win32 `CF_UNICODETEXT` (codepage-safe) | `GlobalMemoryStatusEx` | ✅ **developed & daily-driven** |
+| **Windows** 10 / 11 | ConPTY (`pywinpty`) | Win32 `CF_UNICODETEXT` (codepage-safe) | `GlobalMemoryStatusEx` | ✅ **developed & daily-driven** (on WezTerm) |
 | **Linux** *(incl. WSL)* | POSIX PTY (`ptyprocess`) | OSC-52 *(needs an OSC-52-capable terminal)* | `/proc/meminfo` | ⚠️ code-complete, **not yet run by the author** |
 | **macOS** | POSIX PTY (`ptyprocess`) | OSC-52 *(iTerm2 / kitty / WezTerm fine; Terminal.app needs it enabled)* | `sysctl` + `vm_stat` *(load + physical; no commit limit)* | ⚠️ code-complete, **not yet run by the author** |
 
+- **Terminal-agnostic on Windows:** the clipboard goes through the Win32
+  `CF_UNICODETEXT` API and the PTY through ConPTY, neither of which depends on
+  the host terminal — so **Windows Terminal** uses the same code paths as WezTerm
+  (verified terminal) and is expected to behave identically.
 - **List-only mode** (`RECAP_SPLIT_LIVE=0`) has no PTY dependency and should run
   anywhere Textual runs.
 - The headless regression tests are platform-independent (they stub out
