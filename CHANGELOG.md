@@ -6,17 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
-- **Renamed the project from `recap` to `saikai`** (再開, "resume") ahead of the
-  first public release — `recap` was already taken on PyPI. Everything follows
-  the new name: the modules (`saikai.py` / `saikai_terminal.py`), the `saikai`
-  command, all `SAIKAI_*` environment variables (formerly `RECAP_*`), and the
-  config directory (`recap` → `saikai`; copy your old `config.toml` over once
-  if you had one).
+## [0.1.0] — 2026-06-11
 
-## [0.1.0] — unreleased
-
-Initial public release.
+Initial public release. Developed pre-release under the working name `recap`;
+published as **saikai** (再開, "resume") because `recap` was already taken on
+PyPI. Everything uses the new name: the modules (`saikai.py` /
+`saikai_terminal.py`), the `saikai` command, all `SAIKAI_*` environment
+variables, and the config directory.
 
 ### Added
 - **Session browser** for Claude Code: scans `~/.claude/projects` and shows past

@@ -38,7 +38,7 @@ saikai = "saikai:main"
 Homepage = "https://github.com/m-morino/saikai"
 Repository = "https://github.com/m-morino/saikai"
 Issues = "https://github.com/m-morino/saikai/issues"
-Changelog = "https://github.com/m-morino/saikai/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/m-morino/saikai/blob/master/CHANGELOG.md"
 
 [tool.hatch.version]
 path = "saikai.py"          # regex source: reads __version__ without importing saikai.py
