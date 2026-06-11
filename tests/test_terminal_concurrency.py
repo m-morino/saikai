@@ -73,7 +73,10 @@ def test_kill_tracks_reap_for_atexit_join():
     assert t is not None, "kill() should return a reap thread on win32"
     with rt._REAP_LOCK:
         assert any(x is t for x in rt._REAP_THREADS), "reap not tracked in registry"
-    rt.join_all_reaps(timeout=5)
+    # Generous timeout: this joins a REAL `taskkill` subprocess, which can take
+    # 2-3s even for a nonexistent pid and far longer on a loaded / slow CI runner.
+    # The point under test is that the reap is TRACKED + joinable, not its speed.
+    rt.join_all_reaps(timeout=30)
     assert not t.is_alive(), "reap not joined by join_all_reaps"
 
 
