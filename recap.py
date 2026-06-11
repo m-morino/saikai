@@ -2304,13 +2304,34 @@ def _reset_terminal_modes() -> None:
 
     Why this exists: on Windows, the picker occasionally exits without sending the matching
     'l' sequence for focus / mouse SGR, so the shell receives literal '[I' (focus
-    in) or stray 'm' (SGR mouse release terminator) characters."""
+    in) or stray 'm' (SGR mouse release terminator) characters.
+
+    Also registered as an atexit (see main): Textual restores these on a clean OR
+    exception exit, so this is belt-and-suspenders for the paths that bypass its
+    teardown (driver crash, SystemExit, watchdog). Hard kills (taskkill/OOM)
+    can't run atexit — a fresh terminal is the only cure there. Guarded on
+    isatty so a redirected stderr never receives escape bytes."""
     try:
-        sys.stderr.write(
+        out = sys.stderr
+        if out is None or (hasattr(out, "isatty") and not out.isatty()):
+            return
+        if sys.platform == "win32":
+            # Re-arm VT processing so the sequence is INTERPRETED, not printed,
+            # even if the console mode was reset on the way down.
+            try:
+                import ctypes
+                k32 = ctypes.windll.kernel32
+                h = k32.GetStdHandle(-12)        # STD_ERROR_HANDLE
+                mode = ctypes.c_uint32()
+                if k32.GetConsoleMode(h, ctypes.byref(mode)):
+                    k32.SetConsoleMode(h, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            except Exception:
+                pass
+        out.write(
             "\033[?1000l\033[?1002l\033[?1003l\033[?1004l"
             "\033[?1006l\033[?1015l\033[?2004l\033[?25h"
         )
-        sys.stderr.flush()
+        out.flush()
     except Exception:
         pass
 
@@ -3150,6 +3171,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._opened_sids: set = set()    # sids opened + kept this session (snapshot source)
             self._opening_sids: set = set()   # opens in flight (register deferred to the mount worker) — counted by the capacity gate + has() dedup
             self._last_cursor_row = -1        # prior cursor row → header-skip direction
+            self._mem_pressure_warned = False # memory-pressure toast: once per crossing
             # Restore the persisted list/pane divider position (drag → options.json).
             self._split_ratio = _get_split_ratio()
             self._apply_split_ratio(self._split_ratio)
@@ -5034,6 +5056,25 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # has no _busy_seen entry, so it doesn't masquerade as completed.
                     self.notify(f"done: {title}", title="recap", timeout=6)
                     self._busy_seen.discard(sid)
+            # Memory-pressure watch: with panes open, toast ONCE per crossing
+            # when system load reaches the gate's ceiling (the open/launch gate
+            # already declines new panes — this just tells you why, and to free
+            # some with F10). Hysteresis (-5%) re-arms it after load recovers.
+            if cur:
+                try:
+                    _ms = _mem_status()
+                    _maxl = float(_ram_gate_kwargs().get("max_load") or 85.0)
+                    if _ms is not None and _ms.load is not None:
+                        if _ms.load >= _maxl and not self._mem_pressure_warned:
+                            self._mem_pressure_warned = True
+                            self.notify(
+                                f"memory pressure {_ms.load:.0f}% — consider "
+                                f"closing panes (F10)",
+                                title="recap", severity="warning", timeout=10)
+                        elif _ms.load < _maxl - 5 and self._mem_pressure_warned:
+                            self._mem_pressure_warned = False
+                except Exception:
+                    pass
             advanced = self._restat_live()   # live JSONLs grew → Last / Recency moved
             changed = (cur != prev)
             self._last_status = cur
@@ -5269,6 +5310,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             _apply_sort(all_sessions, _load_sort())
             self._refresh_table()
 
+    # Belt-and-suspenders: even if run()'s teardown is bypassed (SystemExit,
+    # driver crash, watchdog), atexit still disables mouse/focus tracking + shows
+    # the cursor so the shell isn't left echoing '[I' / stray SGR bytes.
+    import atexit
+    atexit.register(_reset_terminal_modes)
     # Wrap the app's run() so a Textual / Rich crash never leaves the user
     # at a frozen alternate screen with no way out. On exception: reset
     # terminal modes, leave alternate screen, dump the traceback so we can
