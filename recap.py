@@ -4154,6 +4154,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     pass
 
         def on_data_table_row_highlighted(self, event) -> None:
+            # Ignore STALE highlight events. A background rebuild (1.5s status
+            # poll, esp. under Recency sort + Group-by-State which reorders every
+            # tick) clears the cursor to row 0 and re-adds rows, QUEUEING a
+            # RowHighlighted for each intermediate position; the synchronous cursor
+            # RESTORE then moves to the saved session. By the time those queued
+            # events run, the cursor has already moved on — acting on them
+            # (header-skip / pane-switch) would drag the selection to the wrong row
+            # ("the selected session keeps changing on its own"). If this event's
+            # row is no longer where the cursor actually is, it's superseded: drop it.
+            try:
+                if event.cursor_row != self.query_one("#table", DataTable).cursor_row:
+                    return
+            except Exception:
+                pass
             sid = str(event.row_key.value) if event.row_key else None
             # A row just opened via Enter wants focus on its PANE (cursor keys go
             # to claude), not the list — consume that marker one-shot here.
