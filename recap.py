@@ -4192,6 +4192,25 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self._last_cursor_row = self.query_one("#table", DataTable).cursor_row
             except Exception:
                 pass
+            # Filtering must NOT yank the foreground. While the search box is
+            # focused, every highlight change is filter-driven (auto): the user
+            # only navigates results AFTER Down moves focus to the table. So if a
+            # search filtered the foreground session out and the cursor auto-moved
+            # to another row, keep the current foreground LIVE pane instead of
+            # switching to the auto-selected one. (Enter-to-open sets just_opened
+            # and is exempt; a preview-only foreground still follows the filter.)
+            if not just_opened:
+                try:
+                    _searching = self.focused is self.query_one("#search", Input)
+                except Exception:
+                    _searching = False
+                if _searching:
+                    try:
+                        _active = self.query_one("#right", TabbedContent).active or ""
+                    except Exception:
+                        _active = ""
+                    if _active and _active != "tab-preview":
+                        return    # foreground is a live pane — don't follow the filter
             # Claude-Desktop-like: highlighting a row shows its content on the
             # right — a LIVE session switches to its terminal tab, a non-live one
             # shows the static preview. Focus stays on the list so arrow-browsing
