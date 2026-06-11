@@ -10,9 +10,9 @@
 # ]
 # ///
 """
-recap — Claude Code session history viewer with LLM summarization
+saikai — Claude Code session history viewer with LLM summarization
 Usage:
-  recap [--days N] [--all-projects] [--pick] [--project PATH]
+  saikai [--days N] [--all-projects] [--pick] [--project PATH]
         [--no-summary] [--refresh-summary]
 """
 
@@ -144,17 +144,17 @@ def _read_json(path: Path, default):
 
 # ── TOML config (opt-in; env vars still win) ─────────────────────────────────
 def _config_path() -> Path:
-    """Resolve the config file path: $RECAP_CONFIG, else the platform config dir
+    """Resolve the config file path: $SAIKAI_CONFIG, else the platform config dir
     (platformdirs — Windows %APPDATA%, Linux ~/.config, macOS Application Support).
     platformdirs is a textual transitive dep; fall back to ~/.config if absent."""
-    p = os.environ.get("RECAP_CONFIG")
+    p = os.environ.get("SAIKAI_CONFIG")
     if p:
         return Path(p).expanduser()
     try:
         import platformdirs
-        return Path(platformdirs.user_config_dir("recap")) / "config.toml"
+        return Path(platformdirs.user_config_dir("saikai")) / "config.toml"
     except Exception:
-        return Path.home() / ".config" / "recap" / "config.toml"
+        return Path.home() / ".config" / "saikai" / "config.toml"
 
 
 _CONFIG_CACHE = None
@@ -168,7 +168,7 @@ def _reset_config_cache() -> None:
 
 def _load_config() -> dict:
     """Parse the TOML config once (cached). Missing/empty/corrupt → {} (logged),
-    never raises — recap must launch even with a broken config file."""
+    never raises — saikai must launch even with a broken config file."""
     global _CONFIG_CACHE
     if _CONFIG_CACHE is not None:
         return _CONFIG_CACHE
@@ -209,7 +209,7 @@ def _cfg_bool(v, default: bool = False) -> bool:
 
 
 _CONFIG_TEMPLATE = (
-    "# recap configuration (TOML). Env vars (RECAP_*) override these; CLI flags win.\n\n"
+    "# saikai configuration (TOML). Env vars (SAIKAI_*) override these; CLI flags win.\n\n"
     "[summary]\n"
     "enabled = false   # AI summaries call `claude -p` and spend credits — opt-in.\n"
     'command = ""      # custom backend: prompt on stdin -> summary on stdout ("" = claude -p)\n'
@@ -305,20 +305,20 @@ def _init_config(force: bool = False) -> int:
 def _print_config() -> int:
     """Print each resolved setting + its source (default / config / env)."""
     specs = [
-        ("summary", "enabled", "RECAP_SUMMARIZE_ENABLED", False),
-        ("summary", "command", "RECAP_SUMMARIZE_CMD", ""),
-        ("summary", "model", "RECAP_SUMMARIZE_MODEL", "haiku"),
-        ("display", "auto_refresh", "RECAP_AUTO_REFRESH", 0),
-        ("display", "split_live", "RECAP_SPLIT_LIVE", True),
-        ("display", "color_by", "RECAP_COLOR_BY", "project"),
-        ("limits", "max_memory_load", "RECAP_MAX_MEM_LOAD", 85),
-        ("limits", "min_commit_headroom_mb", "RECAP_MIN_COMMIT_MB", 2048),
-        ("limits", "min_free_phys_pct", "RECAP_MIN_FREE_PHYS_PCT", 8),
-        ("limits", "per_pane_mb", "RECAP_CLAUDE_MB", 600),
-        ("limits", "min_free_mb", "RECAP_MIN_FREE_MB", 0),
-        ("limits", "hard_ram_gate", "RECAP_HARD_RAM_GATE", False),
-        ("limits", "max_live", "RECAP_MAX_LIVE", 64),
-        ("keys", "release", "RECAP_RELEASE_KEY", "ctrl+]"),
+        ("summary", "enabled", "SAIKAI_SUMMARIZE_ENABLED", False),
+        ("summary", "command", "SAIKAI_SUMMARIZE_CMD", ""),
+        ("summary", "model", "SAIKAI_SUMMARIZE_MODEL", "haiku"),
+        ("display", "auto_refresh", "SAIKAI_AUTO_REFRESH", 0),
+        ("display", "split_live", "SAIKAI_SPLIT_LIVE", True),
+        ("display", "color_by", "SAIKAI_COLOR_BY", "project"),
+        ("limits", "max_memory_load", "SAIKAI_MAX_MEM_LOAD", 85),
+        ("limits", "min_commit_headroom_mb", "SAIKAI_MIN_COMMIT_MB", 2048),
+        ("limits", "min_free_phys_pct", "SAIKAI_MIN_FREE_PHYS_PCT", 8),
+        ("limits", "per_pane_mb", "SAIKAI_CLAUDE_MB", 600),
+        ("limits", "min_free_mb", "SAIKAI_MIN_FREE_MB", 0),
+        ("limits", "hard_ram_gate", "SAIKAI_HARD_RAM_GATE", False),
+        ("limits", "max_live", "SAIKAI_MAX_LIVE", 64),
+        ("keys", "release", "SAIKAI_RELEASE_KEY", "ctrl+]"),
     ]
     cfg = _load_config()
     print(f"  config: {_config_path()}  "
@@ -336,7 +336,7 @@ def _print_config() -> int:
 
 
 def _split_live_disabled_by_env(env_value) -> bool:
-    """RECAP_SPLIT_LIVE is a tri-state opt-OUT switch (split-live is the default):
+    """SAIKAI_SPLIT_LIVE is a tri-state opt-OUT switch (split-live is the default):
     unset / empty / truthy → split-live stays ON; an explicit falsy token
     (0/false/no/off, case-insensitive, trimmed) → OFF = legacy full-takeover
     resume. Split-live still also requires its PTY deps; this only governs the
@@ -371,7 +371,7 @@ def _write_json(path: Path, obj) -> None:
 
 
 # ── Cache ───────────────────────────────────────────────────────────────────
-CACHE_DIR = Path.home() / ".cache" / "recap"
+CACHE_DIR = Path.home() / ".cache" / "saikai"
 SUMMARY_MODEL = "haiku"
 HIDDEN_FILE = CACHE_DIR / "hidden.json"
 FAVORITE_FILE = CACHE_DIR / "favorite.json"
@@ -387,7 +387,7 @@ SORT_FILE = CACHE_DIR / "sort.json"
 GLOBAL_CLUSTERS_FILE = CACHE_DIR / "global-clusters.json"
 OPTIONS_FILE = CACHE_DIR / "options.json"
 RESUME_HISTORY_FILE = CACHE_DIR / "resume-history.tsv"
-LOG_FILE = CACHE_DIR / "recap.log"
+LOG_FILE = CACHE_DIR / "saikai.log"
 
 # Sort columns selectable via Ctrl-1/2/3. "-" = inactive (no sort at this priority).
 SORT_COLS = ("-", "date", "last", "proj", "wt", "title", "turns", "fav", "topic")
@@ -402,9 +402,9 @@ PREVIEW_FULL_DIR = CACHE_DIR / "preview-full"
 
 
 def _log(msg: str) -> None:
-    """Append a timestamped line to CACHE_DIR/recap.log. TUI-safe (a FILE, never
+    """Append a timestamped line to CACHE_DIR/saikai.log. TUI-safe (a FILE, never
     stdout — that would corrupt the Textual display), best-effort, and size-bounded
-    (rotates at ~1 MB, one backup) so it can neither fail recap nor grow without
+    (rotates at ~1 MB, one backup) so it can neither fail saikai nor grow without
     limit. Always on, so the trail is already there when something like 'all
     sessions vanished' happens unexpectedly."""
     try:
@@ -426,13 +426,13 @@ def _load_options() -> dict:
 
 def _save_options(opts: dict) -> None:
     """Merge `opts` into the persisted options so future fields aren't dropped
-    by an older recap version that doesn't know about them."""
+    by an older saikai version that doesn't know about them."""
     merged = _load_options()
     merged.update(opts)
     _write_json(OPTIONS_FILE, merged)
 
 
-# Custom session titles (Shift+F2): a recap-side overlay keyed by sid. Cached
+# Custom session titles (Shift+F2): a saikai-side overlay keyed by sid. Cached
 # with mtime invalidation so the per-session lookup in _enrich_session — called
 # for EVERY session on every load / rescan — costs one stat, not a JSON re-read.
 _CUSTOM_TITLES_CACHE: "dict | None" = None
@@ -440,7 +440,7 @@ _CUSTOM_TITLES_MTIME: "float | None" = None
 
 
 def _load_custom_titles() -> dict:
-    """sid -> user-typed title. recap-side only — never touches claude's
+    """sid -> user-typed title. saikai-side only — never touches claude's
     transcript. Re-read only when the file mtime changes (or after a write)."""
     global _CUSTOM_TITLES_CACHE, _CUSTOM_TITLES_MTIME
     try:
@@ -566,7 +566,7 @@ def _toggle_cluster_mode() -> bool:
 
 def _get_group_by() -> str:
     """Saved grouping axis: 'none' | 'date' | 'project'. Mirrors Claude
-    Desktop's 'Group by' menu (Desktop defaults to Date; recap defaults to
+    Desktop's 'Group by' menu (Desktop defaults to Date; saikai defaults to
     'none' to keep the plain list unless the user opts in)."""
     try:
         v = GROUP_BY_FILE.read_text(encoding="utf-8").strip()
@@ -585,11 +585,11 @@ def _set_group_by(value: str) -> None:
 def _get_split_ratio() -> float:
     """Persisted list/pane divider position as a table-width fraction.
     Precedence: options.json (last drag) > [display] split_ratio /
-    RECAP_SPLIT_RATIO > 0.34 (split-live's default table share). Always clamped
+    SAIKAI_SPLIT_RATIO > 0.34 (split-live's default table share). Always clamped
     to the [_SPLIT_RATIO_LO, _SPLIT_RATIO_HI] band."""
     v = _load_options().get("split_ratio")
     if v is None:
-        v = _cfg("display", "split_ratio", "RECAP_SPLIT_RATIO", 0.34, float)
+        v = _cfg("display", "split_ratio", "SAIKAI_SPLIT_RATIO", 0.34, float)
     try:
         v = float(v)
     except (TypeError, ValueError):
@@ -1053,13 +1053,13 @@ def _is_real_user_msg(text: str) -> bool:
 
 # Distinct prompt patterns from automation hooks (personal-names, etc.) that
 # spawn `claude -p` and leave behind JSONL files in ~/.claude/projects/.
-# Sessions whose first user message matches these are filtered out of recap.
+# Sessions whose first user message matches these are filtered out of saikai.
 HOOK_PROMPT_MARKERS = (
     "以下は git commit で **新しく追加される行のみ**",  # personal-names hook
     "実在する個人情報 (実在人名 kanji",                    # personal-names hook variant
     "回答は JSON のみで",                                  # generic JSON-only hook prompt
     "Reply with ONLY",                                     # English JSON-only hook
-    "Extract 3-5 short topic keywords",                    # recap's own topic extractor
+    "Extract 3-5 short topic keywords",                    # saikai's own topic extractor
 )
 
 
@@ -1100,15 +1100,15 @@ def _is_pid_alive(pid: int) -> bool:
 
 # ── Terminal-death watchdog (Windows SIGHUP emulation) ───────────────────────
 # POSIX delivers SIGHUP to the foreground process group when the controlling
-# terminal closes, so recap and any resumed `claude --resume` child die with the
+# terminal closes, so saikai and any resumed `claude --resume` child die with the
 # tab. Windows has no such cascade: closing a wezterm tab kills that tab's shell
-# (pwsh) but leaves the orphaned cmd→uv→python(recap)→claude chain running
-# forever — recap blocked in subprocess.run(claude), claude idle on a dead pty.
+# (pwsh) but leaves the orphaned cmd→uv→python(saikai)→claude chain running
+# forever — saikai blocked in subprocess.run(claude), claude idle on a dead pty.
 # Confirmed 2026-06-05 via reaper.log: 12 such pairs survived ~24h, and
 # reap-orphan-claude.py is structurally blind to them (it excludes python/uv
 # parents after the 2026-05-23 live-session false-positive incident). This
 # watchdog restores the SIGHUP semantic: find this tab's shell, poll it, and
-# when it dies taskkill recap's OWN subtree (the claude child included). It only
+# when it dies taskkill saikai's OWN subtree (the claude child included). It only
 # ever targets os.getpid()'s tree, so it can never touch another session.
 _SHELL_ANCESTOR_NAMES = frozenset({
     "pwsh.exe", "powershell.exe", "cmd.exe", "bash.exe", "sh.exe", "zsh.exe",
@@ -1175,7 +1175,7 @@ def _find_terminal_anchor(pid_index: dict[int, tuple[str, int]], start_pid: int,
                           term_names: frozenset = _TERM_EMULATOR_NAMES) -> int:
     """Return the PID of this tab's shell: the OUTERMOST shell ancestor below the
     terminal emulator. That is exactly the process that dies on tab/window close
-    — an inner shim (recap.cmd's cmd.exe, the bash wrapper) merely orphans
+    — an inner shim (saikai.cmd's cmd.exe, the bash wrapper) merely orphans
     alongside us, so anchoring on it would never fire. Returns 0 when no shell
     ancestor exists (headless: test runner / scheduled task) so the watchdog
     stays disabled. Cycle- and broken-chain-safe via the visited set."""
@@ -1198,9 +1198,9 @@ def _find_terminal_anchor(pid_index: dict[int, tuple[str, int]], start_pid: int,
 
 def _start_terminal_watchdog(poll_sec: float = 12.0) -> None:
     """Start the Windows terminal-death watchdog. No-op on POSIX (real SIGHUP),
-    when no tab shell is found (headless), or when RECAP_NO_TERMINAL_WATCHDOG is
+    when no tab shell is found (headless), or when SAIKAI_NO_TERMINAL_WATCHDOG is
     set. See the module comment above _SHELL_ANCESTOR_NAMES for the why."""
-    if sys.platform != "win32" or os.environ.get("RECAP_NO_TERMINAL_WATCHDOG"):
+    if sys.platform != "win32" or os.environ.get("SAIKAI_NO_TERMINAL_WATCHDOG"):
         return
     try:
         anchor = _find_terminal_anchor(_win_pid_index(), os.getpid())
@@ -1227,7 +1227,7 @@ def _start_terminal_watchdog(poll_sec: float = 12.0) -> None:
             os._exit(0)
 
     import threading as _thr
-    _thr.Thread(target=_watch, daemon=True, name="recap-terminal-watchdog").start()
+    _thr.Thread(target=_watch, daemon=True, name="saikai-terminal-watchdog").start()
 
 
 _active_sessions_cache: dict[str, str] | None = None
@@ -1473,7 +1473,7 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
 
     On Windows, `proc.kill()` calls TerminateProcess only on the immediate child,
     so `claude.exe`'s `node.exe` workers (and any Haiku helpers under them) become
-    orphans that keep running — observed as recap-originated zombies after Haiku
+    orphans that keep running — observed as saikai-originated zombies after Haiku
     summarisation timeouts. Use `taskkill /F /T` to walk the tree. POSIX kernels
     reap descendants when the session/group leader dies, so this is Windows-only."""
     if sys.platform == "win32":
@@ -1513,11 +1513,11 @@ def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
     cluster-classification prompt (170+ sessions × ~150 chars) bumps right
     up against. Stdin has no such limit.
 
-    Set RECAP_SUMMARIZE_CMD to a shell command to use a different summarizer
+    Set SAIKAI_SUMMARIZE_CMD to a shell command to use a different summarizer
     backend (any LLM CLI / proxy) instead of `claude -p` — e.g. to avoid your
     personal quota. The command receives the prompt on STDIN and must emit the
     summary as plain text on STDOUT (see call_external_summarizer)."""
-    _ext = _cfg("summary", "command", "RECAP_SUMMARIZE_CMD", "", str)
+    _ext = _cfg("summary", "command", "SAIKAI_SUMMARIZE_CMD", "", str)
     if _ext:
         return call_external_summarizer(_ext, prompt, timeout=timeout, raw=raw)
     cmd = ["claude", "-p", "--model", model or SUMMARY_MODEL,
@@ -1580,9 +1580,9 @@ def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
 
 def call_external_summarizer(cmd_str: str, prompt: str, timeout: int = 45,
                              raw: bool = False) -> str:
-    """Generic pluggable summarizer backend (RECAP_SUMMARIZE_CMD). Runs an
+    """Generic pluggable summarizer backend (SAIKAI_SUMMARIZE_CMD). Runs an
     arbitrary command — any LLM CLI / proxy — feeding the prompt on STDIN and
-    reading the summary from STDOUT as plain text, so you can point recap at a
+    reading the summary from STDOUT as plain text, so you can point saikai at a
     backend other than `claude -p` (e.g. to avoid your personal quota). The
     command is parsed with shlex; wrap a JSON-returning CLI yourself so it emits
     plain text (e.g. `your-cli chat | jq -r .text`)."""
@@ -1624,7 +1624,7 @@ def call_external_summarizer(cmd_str: str, prompt: str, timeout: int = 45,
         global _haiku_missing_warned
         if not _haiku_missing_warned:
             _haiku_missing_warned = True
-            print(_c(f"  warn: RECAP_SUMMARIZE_CMD ({cmd[0]}) not found — "
+            print(_c(f"  warn: SAIKAI_SUMMARIZE_CMD ({cmd[0]}) not found — "
                      f"summaries will be raw user msgs", YELLOW), file=sys.stderr)
         return ""
     except Exception:
@@ -1656,13 +1656,13 @@ _SUMMARY_FORCED_OFF = False   # set by --no-summary (CLI beats config)
 def _summary_enabled() -> bool:
     """AI summaries are OPT-IN — `claude -p` (or a custom backend) spends credits /
     quota. Enabled iff a custom summarizer command is configured (summary.command /
-    RECAP_SUMMARIZE_CMD) OR [summary] enabled=true (RECAP_SUMMARIZE_ENABLED). Default
+    SAIKAI_SUMMARIZE_CMD) OR [summary] enabled=true (SAIKAI_SUMMARIZE_ENABLED). Default
     OFF; --no-summary forces it off regardless of config."""
     if _SUMMARY_FORCED_OFF:
         return False
-    if _cfg("summary", "command", "RECAP_SUMMARIZE_CMD", ""):
+    if _cfg("summary", "command", "SAIKAI_SUMMARIZE_CMD", ""):
         return True
-    return _cfg("summary", "enabled", "RECAP_SUMMARIZE_ENABLED", False, _cfg_bool)
+    return _cfg("summary", "enabled", "SAIKAI_SUMMARIZE_ENABLED", False, _cfg_bool)
 
 
 def _set_summary_forced_off(v: bool) -> None:
@@ -2230,7 +2230,7 @@ _MARKER_BLANK = " "
 
 # Markers are intentionally ASCII (1 cell, terminal-width-independent). The
 # previous Unicode glyphs (◉●○★✗) were East-Asian-Ambiguous, which made their
-# cell count depend on the terminal's CJK-width setting — and recap can't
+# cell count depend on the terminal's CJK-width setting — and saikai can't
 # reliably probe that, so columns drifted whenever the user's terminal didn't
 # match the static assumption. Letters trade a bit of visual flair for
 # reliable column alignment everywhere.
@@ -2344,7 +2344,7 @@ def display_table(sessions: list[dict], repo: Path | None, show_project: bool,
     legend = (f"  {len(sessions)} sessions{mode_tag}  ·  "
               f"{_c('*', GOLD)} fav  {_c('+', GREEN)} active(<5m)  "
               f"{_c('.', YELLOW)} recent(<30m)  {_c('x', RED)} hidden  "
-              f"{_c('@', CYAN)} open  ·  recap to resume")
+              f"{_c('@', CYAN)} open  ·  saikai to resume")
     print(_c(legend, DIM))
     print()
 
@@ -2391,17 +2391,17 @@ def _reset_terminal_modes() -> None:
 
 
 # Threshold for "frequent cwd": a directory must have hosted at least this many
-# sessions before recap auto-applies --permission-mode auto on resume. Tuned by
+# sessions before saikai auto-applies --permission-mode auto on resume. Tuned by
 # eye on a working history of ~hundreds of sessions; a handful of long-lived
 # repos comfortably clear it while one-off cwds (downloaded folders, temp
-# experiments) don't. Override with RECAP_FREQ_CWD_MIN env var.
+# experiments) don't. Override with SAIKAI_FREQ_CWD_MIN env var.
 FREQ_CWD_MIN_DEFAULT = 5
 
 
 def _canonical_workspace(cwd: str) -> str:
     """Collapse a git worktree path back to its parent repo.
 
-    The user thinks of `feature-x` as a branch of `myrepo`, but recap sees
+    The user thinks of `feature-x` as a branch of `myrepo`, but saikai sees
     `myrepo/.worktrees/feature-x/` as a distinct cwd. Without this, every
     worktree splits its parent repo's session count, so a workspace the user
     visits constantly (just on different branches) can fall below the frequent
@@ -2424,7 +2424,7 @@ def _frequent_cwds(sessions: list[dict]) -> set[str]:
     parent repo via `_canonical_workspace` so branch-switching doesn't split
     the count."""
     try:
-        min_count = max(2, int(os.environ.get("RECAP_FREQ_CWD_MIN") or FREQ_CWD_MIN_DEFAULT))
+        min_count = max(2, int(os.environ.get("SAIKAI_FREQ_CWD_MIN") or FREQ_CWD_MIN_DEFAULT))
     except ValueError:
         min_count = FREQ_CWD_MIN_DEFAULT
     counts = Counter(_canonical_workspace(s.get("cwd") or "") for s in sessions)
@@ -2455,7 +2455,7 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
     session's own cached topics), this asks Haiku to look across the whole
     history and propose a small set of coherent themes, then assign every
     session to exactly one of them. Result is cached in
-    ~/.cache/recap/global-clusters.json keyed by SID. Sessions added since
+    ~/.cache/saikai/global-clusters.json keyed by SID. Sessions added since
     the last classification fall back to the per-session primary topic until
     the next --refresh-clusters.
 
@@ -2509,10 +2509,10 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
     # Theme-count bounds inspired by Miller (1956) "Magical Number 7 ± 2": the
     # human limit for at-a-glance absolute judgement across categories. 5 keeps
     # each theme meaningful (avoids 2-3 mega-buckets); 9 keeps the picker
-    # scannable. Sweet spot ~7. RECAP_CLUSTER_TARGET_N tunes the suggestion
-    # (Haiku still picks the actual count); RECAP_CLUSTER_MAX caps it hard.
+    # scannable. Sweet spot ~7. SAIKAI_CLUSTER_TARGET_N tunes the suggestion
+    # (Haiku still picks the actual count); SAIKAI_CLUSTER_MAX caps it hard.
     try:
-        target_n = max(3, min(12, int(os.environ.get("RECAP_CLUSTER_TARGET_N") or 7)))
+        target_n = max(3, min(12, int(os.environ.get("SAIKAI_CLUSTER_TARGET_N") or 7)))
     except ValueError:
         target_n = 7
     lo = max(3, target_n - 2)
@@ -2523,7 +2523,7 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
         "RULES:\n"
         "1. Theme names are SPECIFIC work areas — pick the most concrete\n"
         "   label that still covers ~10-30 sessions.\n"
-        "     GOOD: 'recap CLI development', 'meeting-room booking',\n"
+        "     GOOD: 'saikai CLI development', 'meeting-room booking',\n"
         "           'patent classification (Salesforce)', 'email drafting'.\n"
         "     BAD : 'tool development' (too generic), 'personal\n"
         "           productivity' (vague), 'general work', 'misc'.\n"
@@ -2544,9 +2544,9 @@ def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) ->
     # and with the keyword-augmented prompt (each session line carries its
     # extracted topics) the output quality is workable. Sonnet does give
     # cleaner partitions but on 170+ sessions it can take 2-3 minutes —
-    # not interactive. Opt into Sonnet with RECAP_CLUSTER_MODEL=sonnet when
+    # not interactive. Opt into Sonnet with SAIKAI_CLUSTER_MODEL=sonnet when
     # quality matters more than latency.
-    cluster_model = os.environ.get("RECAP_CLUSTER_MODEL") or "haiku"
+    cluster_model = os.environ.get("SAIKAI_CLUSTER_MODEL") or "haiku"
     # Haiku usually finishes in 30-60s for ~200 sessions, but the API
     # latency tail is long — give it 4 minutes before giving up.
     timeout_s = 600 if cluster_model == "sonnet" else 240
@@ -2805,16 +2805,16 @@ def _ram_gate_kwargs() -> dict:
     """Live-pane gate thresholds resolved env > config > default (spec §A.1). Shared
     by the open-gate and the statusbar 'fit' indicator so they can't disagree."""
     return dict(
-        max_load=_cfg("limits", "max_memory_load", "RECAP_MAX_MEM_LOAD", 85.0, float),
-        min_commit_mb=_cfg("limits", "min_commit_headroom_mb", "RECAP_MIN_COMMIT_MB", 2048.0, float),
-        min_free_phys_pct=_cfg("limits", "min_free_phys_pct", "RECAP_MIN_FREE_PHYS_PCT", 8.0, float),
-        min_free_phys_mb=_cfg("limits", "min_free_mb", "RECAP_MIN_FREE_MB", 0.0, float),
+        max_load=_cfg("limits", "max_memory_load", "SAIKAI_MAX_MEM_LOAD", 85.0, float),
+        min_commit_mb=_cfg("limits", "min_commit_headroom_mb", "SAIKAI_MIN_COMMIT_MB", 2048.0, float),
+        min_free_phys_pct=_cfg("limits", "min_free_phys_pct", "SAIKAI_MIN_FREE_PHYS_PCT", 8.0, float),
+        min_free_phys_mb=_cfg("limits", "min_free_mb", "SAIKAI_MIN_FREE_MB", 0.0, float),
     )
 
 
 def _ram_per_pane_mb() -> float:
     """Estimated RAM per live pane (env > config > default)."""
-    return _cfg("limits", "per_pane_mb", "RECAP_CLAUDE_MB", 600.0, float)
+    return _cfg("limits", "per_pane_mb", "SAIKAI_CLAUDE_MB", 600.0, float)
 
 
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
@@ -2836,7 +2836,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
       F7           hide/unhide row       F6            favorite toggle
       Shift-F5     toggle tree display   Shift-F6      toggle cluster
       Tab          preview full/summary  ?             help overlay
-      (recap uses FUNCTION keys only — every Ctrl+letter is left to the
+      (saikai uses FUNCTION keys only — every Ctrl+letter is left to the
        search box / live claude, e.g. Ctrl-W word-delete, Ctrl-R history)
       (":hidden" in the search box reveals hidden rows;
        click a column header to sort, click again to reverse)
@@ -2863,13 +2863,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         sys.exit(1)
 
     # Live split-terminal support is OPTIONAL and degrades gracefully: if
-    # recap_terminal or its PTY/pyte deps are missing, _LIVE_TERM stays None and
+    # saikai_terminal or its PTY/pyte deps are missing, _LIVE_TERM stays None and
     # the picker behaves exactly as before (static preview, Enter = full-takeover
-    # resume). The import lives beside recap.py (single-file script's sibling).
+    # resume). The import lives beside saikai.py (single-file script's sibling).
     _LIVE_TERM = None
-    _LIVE_TERM_REASON = "recap_terminal module not found"
+    _LIVE_TERM_REASON = "saikai_terminal module not found"
     try:
-        import recap_terminal as _LIVE_TERM  # type: ignore
+        import saikai_terminal as _LIVE_TERM  # type: ignore
         if not _LIVE_TERM.TERMINAL_AVAILABLE:
             _LIVE_TERM_REASON = _LIVE_TERM.unavailable_reason() or "unavailable"
             _LIVE_TERM = None
@@ -2879,28 +2879,28 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     # Split-live is now the DEFAULT whenever its PTY deps are present. The legacy
     # full-takeover path is NOT removed — it survives as three things: (a) the
     # automatic fallback ABOVE when pyte/pywinpty/ptyprocess are missing, (b) an
-    # explicit opt-out (RECAP_SPLIT_LIVE=0/false/no/off → list-only + Enter =
+    # explicit opt-out (SAIKAI_SPLIT_LIVE=0/false/no/off → list-only + Enter =
     # full-takeover resume), and (c) a per-session escape hatch even inside
-    # split-live (action_resume_detached). So RECAP_SPLIT_LIVE is a tri-state
+    # split-live (action_resume_detached). So SAIKAI_SPLIT_LIVE is a tri-state
     # opt-OUT: unset/truthy → on, explicit falsy → off.
-    _sl_env = os.environ.get("RECAP_SPLIT_LIVE")
+    _sl_env = os.environ.get("SAIKAI_SPLIT_LIVE")
     if _sl_env not in (None, ""):
         _split_off = _split_live_disabled_by_env(_sl_env)   # env present → env decides (tri-state)
     else:
         _split_off = (_load_config().get("display", {}).get("split_live") is False)  # else config
     if _LIVE_TERM is not None and _split_off:
         _LIVE_TERM = None
-        _LIVE_TERM_REASON = "split-live disabled (RECAP_SPLIT_LIVE=0 / [display] split_live=false)"
+        _LIVE_TERM_REASON = "split-live disabled (SAIKAI_SPLIT_LIVE=0 / [display] split_live=false)"
 
     # Per-pane pyte scrollback depth drives the live process's memory (a full
     # 5000-line history was ~95 MB PER pane). Resolve env > config > default and
     # push it into the widget BEFORE any pane is created. Clamp to a sane band.
     if _LIVE_TERM is not None:
-        _sb = _cfg("limits", "scrollback_lines", "RECAP_SCROLLBACK", 2000, int)
+        _sb = _cfg("limits", "scrollback_lines", "SAIKAI_SCROLLBACK", 2000, int)
         _LIVE_TERM.SCROLLBACK_LINES = max(200, min(50000, _sb))
 
     # Emulate POSIX SIGHUP on Windows: if this tab's shell dies (tab closed)
-    # while the picker is open or a resumed `claude` is running, take recap and
+    # while the picker is open or a resumed `claude` is running, take saikai and
     # its claude child down instead of orphaning the pair (see
     # _start_terminal_watchdog). No-op on POSIX / headless.
     _start_terminal_watchdog()
@@ -2955,7 +2955,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         ]
 
         def compose(self) -> ComposeResult:
-            _cby = _cfg("display", "color_by", "RECAP_COLOR_BY", "project")
+            _cby = _cfg("display", "color_by", "SAIKAI_COLOR_BY", "project")
             if _cby not in ("project", "worktree", "topic", "none"):
                 _cby = "project"
             _hue = ("no title tint" if _cby == "none"
@@ -2972,7 +2972,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  ([dim]:hidden[/dim] in search to find them)\n"
                 "  [yellow]F6[/yellow]          Toggle ★ favorite "
                 "  ([dim]:fav[/dim] in search to filter)\n"
-                "  [yellow]F5[/yellow]          Refresh list  (auto: RECAP_AUTO_REFRESH=secs)\n"
+                "  [yellow]F5[/yellow]          Refresh list  (auto: SAIKAI_AUTO_REFRESH=secs)\n"
                 "  [yellow]F9[/yellow]          Copy this session's opening prompt\n"
                 "  [yellow]F8[/yellow]          Show what this session changed (transcript diff)\n"
                 "  [yellow]Shift-F2[/yellow]    Rename — type your own name (empty clears → auto-title)\n\n"
@@ -2981,14 +2981,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Shift-F5[/yellow]    Tree (parent/child) mode\n"
                 "  [yellow]Shift-F7[/yellow]    Cycle grouping: none / Date / Project\n"
                 "  [yellow]Tab[/yellow]         Preview: full ↔ summary\n\n"
-                "[bold cyan]Split-live (default · RECAP_SPLIT_LIVE=0 to disable)[/bold cyan]\n"
+                "[bold cyan]Split-live (default · SAIKAI_SPLIT_LIVE=0 to disable)[/bold cyan]\n"
                 "  [yellow]Enter[/yellow]       Open / focus the live claude pane\n"
                 "  [yellow]Shift-F8[/yellow]    New claude session in a folder / git worktree\n"
                 "  [yellow]Shift-F4[/yellow]    Reopen the panes from your last session (resume) — anytime\n"
                 "  [yellow]F2/F3[/yellow]       Prev / next live tab   ·   [yellow]Shift-F3[/yellow]  Next pane needing attention (?/!)\n"
                 "  [yellow]F4[/yellow]          Hide / show the session list\n"
                 "  [dim]Drag the divider bar between the list and the pane to resize (persists)[/dim]\n"
-                "  [yellow]Ctrl-][/yellow]      Return focus: pane → list  (RECAP_RELEASE_KEY to change)\n"
+                "  [yellow]Ctrl-][/yellow]      Return focus: pane → list  (SAIKAI_RELEASE_KEY to change)\n"
                 "  [yellow]F10[/yellow]         Close the active tab   ·   [yellow]Shift-F10[/yellow]  Close ALL tabs\n"
                 "  [yellow]Esc[/yellow]         pane → list, then quit-all (snapshots panes; Shift-F4 reopens)   ·   [yellow]Ctrl-C[/yellow]  quit-all\n"
                 "  [yellow]Shift-F9[/yellow]    Freeze the pane in place (copy mode): Shift+drag selects while\n"
@@ -3110,8 +3110,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.dismiss(event.value or "")     # "" = clear; None only via cancel
 
     class PickerApp(App):
-        TITLE = "recap"
-        # Textual's built-in command palette binds Ctrl+P. recap deliberately
+        TITLE = "saikai"
+        # Textual's built-in command palette binds Ctrl+P. saikai deliberately
         # leaves every Ctrl+letter to the search box / live claude (Ctrl+P =
         # readline previous-history), so disable the palette to keep Ctrl+P free.
         ENABLE_COMMAND_PALETTE = False
@@ -3167,8 +3167,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         # is a full node process tree that sits CPU-idle waiting for input — so
         # the real gate is a free-RAM check at spawn time (see
         # _open_or_attach_live), NOT a fixed count or core count. MAX_LIVE is
-        # only a runaway backstop; set RECAP_MAX_LIVE for a stricter hard cap.
-        MAX_LIVE = _cfg("limits", "max_live", "RECAP_MAX_LIVE", 64, int)
+        # only a runaway backstop; set SAIKAI_MAX_LIVE for a stricter hard cap.
+        MAX_LIVE = _cfg("limits", "max_live", "SAIKAI_MAX_LIVE", 64, int)
         CSS = """
         Screen { layout: vertical; }
         #searchrow { dock: top; height: 3; display: none; }   /* on-demand: shown by '/' or typing, hidden by Esc */
@@ -3318,9 +3318,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                           if _LIVE_TERM is not None else None)
             self._refresh_table()
             self.query_one("#table", DataTable).focus()
-            # Optional auto-refresh: RECAP_AUTO_REFRESH=<seconds> re-scans disk on
+            # Optional auto-refresh: SAIKAI_AUTO_REFRESH=<seconds> re-scans disk on
             # an interval so sessions started elsewhere appear without F5.
-            _ar = _cfg("display", "auto_refresh", "RECAP_AUTO_REFRESH", "", str)
+            _ar = _cfg("display", "auto_refresh", "SAIKAI_AUTO_REFRESH", "", str)
             if _ar:
                 try:
                     _secs = float(_ar)
@@ -3343,9 +3343,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         and not _hint.exists()):
                     self.notify(
                         "AI summaries are off (they call `claude -p`, spending "
-                        "credits). Enable with `recap --init-config` → set "
-                        "[summary] enabled = true, or RECAP_SUMMARIZE_ENABLED=1.",
-                        title="recap", timeout=10)
+                        "credits). Enable with `saikai --init-config` → set "
+                        "[summary] enabled = true, or SAIKAI_SUMMARIZE_ENABLED=1.",
+                        title="saikai", timeout=10)
                     _hint.parent.mkdir(parents=True, exist_ok=True)
                     _hint.write_text("", encoding="utf-8")
             except Exception:
@@ -3492,7 +3492,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 import traceback
                 self.notify(
                     f"refresh failed: {e!r}\n{traceback.format_exc()[-400:]}",
-                    severity="error", title="recap", timeout=15,
+                    severity="error", title="saikai", timeout=15,
                 )
 
         def _do_refresh_table(self) -> None:
@@ -3557,7 +3557,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 else:
                     # Global Haiku-based clustering: every session gets assigned
                     # to one of ~5-9 themes by a single one-shot LLM call. Cached
-                    # in ~/.cache/recap/global-clusters.json so the LLM only runs
+                    # in ~/.cache/saikai/global-clusters.json so the LLM only runs
                     # for new sessions (or on `--refresh-clusters`).
                     _global_cluster_assign(visible)
                 topic_count = Counter(s["primary_topic"] for s in visible)
@@ -3640,7 +3640,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _TOPIC_PALETTE,
                 )
             # Title hue follows [display] color_by (project | worktree | topic | none).
-            _color_by = _cfg("display", "color_by", "RECAP_COLOR_BY", "project")
+            _color_by = _cfg("display", "color_by", "SAIKAI_COLOR_BY", "project")
             if _color_by not in ("project", "worktree", "topic", "none"):
                 _color_by = "project"
             if _color_by == "none":
@@ -3723,7 +3723,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 is_hidden = s["id"] in hidden
                 if is_hidden and not show_hidden:
                     continue
-                # A live (recap-hosted) pane's status takes precedence in the
+                # A live (saikai-hosted) pane's status takes precedence in the
                 # marker so a backgrounded session needing input is loud in the
                 # list: ? = waiting, ~ = busy, = = idle-but-live. Falls back to
                 # the file-registry open/active/recent markers otherwise.
@@ -3807,7 +3807,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
             elif n_sessions == 0:
-                # No session rows. A blank TABLE reads as "recap broke", so add a
+                # No session rows. A blank TABLE reads as "saikai broke", so add a
                 # non-selectable placeholder ROW (keyed __hdr__ → _cursor_sid /
                 # Enter / highlight all skip it) explaining WHY it's empty, and
                 # clear the preview (which would otherwise keep the last session's
@@ -3878,7 +3878,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # the MAX_LIVE backstop (each claude is a RAM-heavy node tree), so show
             # how many MORE fit in the free RAM above the floor — green while room
             # remains, red when RAM is at/below the floor. (~ because per-claude
-            # RAM is an estimate; tune with RECAP_CLAUDE_MB.)
+            # RAM is an estimate; tune with SAIKAI_CLAUDE_MB.)
             live_str = ""
             if self._live is not None:
                 cnt = self._live.count
@@ -4280,10 +4280,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # Probe BEFORE tearing down the picker: here resume runs only
                     # AFTER self.exit() leaves the alt-screen, so a "claude not on
                     # PATH" error would print into a half-restored terminal and
-                    # scroll away — the user just sees recap vanish. Surface it now.
+                    # scroll away — the user just sees saikai vanish. Surface it now.
                     if shutil.which("claude") is None:
                         self.notify("claude not found on PATH — cannot resume",
-                                    severity="error", title="recap", timeout=8)
+                                    severity="error", title="saikai", timeout=8)
                         return
                     self.exit(sid)
                 return
@@ -4342,7 +4342,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                               self._live.max_live)):
                     self.notify(
                         f"opened {opened}; hit the {self._live.max_live}-pane "
-                        f"backstop — close some (F10) or raise RECAP_MAX_LIVE",
+                        f"backstop — close some (F10) or raise SAIKAI_MAX_LIVE",
                         severity="warning", timeout=6)
                     break
                 self._open_or_attach_live(sid, refresh=False)   # repaint once below
@@ -4450,7 +4450,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                  self._live.max_live):
                 self.notify(
                     f"hit the {self._live.max_live}-pane backstop; close one "
-                    f"(F10) or raise RECAP_MAX_LIVE",
+                    f"(F10) or raise SAIKAI_MAX_LIVE",
                     severity="warning", timeout=6)
                 return False
             # The real limit is memory (each live pane is a node process tree).
@@ -4458,22 +4458,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # cause is the commit charge nearing the commit limit, so gate on commit
             # headroom + dwMemoryLoad + a RELATIVE physical floor — NOT raw available-
             # physical (which counts reclaimable standby cache). Default = warn but
-            # open; RECAP_HARD_RAM_GATE=1 makes it a hard stop. Legacy RECAP_MIN_FREE_MB
-            # still honoured as an absolute floor; RECAP_CLAUDE_MB = est. per pane.
+            # open; SAIKAI_HARD_RAM_GATE=1 makes it a hard stop. Legacy SAIKAI_MIN_FREE_MB
+            # still honoured as an absolute floor; SAIKAI_CLAUDE_MB = est. per pane.
             _per = _ram_per_pane_mb()
             _ok, _why = _ram_gate_decision(_mem_status(), _per, **_ram_gate_kwargs())
             if not _ok:
-                if _cfg("limits", "hard_ram_gate", "RECAP_HARD_RAM_GATE", False, _cfg_bool):
+                if _cfg("limits", "hard_ram_gate", "SAIKAI_HARD_RAM_GATE", False, _cfg_bool):
                     self.notify(
                         f"refusing to open — {_why}; ~{_per:.0f} MB/pane would cross "
-                        f"the floor. Close a pane (F10), lower RECAP_CLAUDE_MB, or "
+                        f"the floor. Close a pane (F10), lower SAIKAI_CLAUDE_MB, or "
                         f"raise the thresholds.",
                         severity="error", timeout=9)
                     return False
                 self.notify(
                     f"memory pressure — {_why}; each live claude is RAM-heavy "
                     f"(~{_per:.0f} MB). Close panes (F10) if it slows. "
-                    f"RECAP_HARD_RAM_GATE=1 to block instead.",
+                    f"SAIKAI_HARD_RAM_GATE=1 to block instead.",
                     severity="warning", timeout=7)
             term = _LIVE_TERM.ClaudeTerminal(
                 argv, cwd=cwd, env=env, sid=sid, title=title,
@@ -4561,7 +4561,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # 1-shot teams-notify suppression so the first idle_prompt after
                 # launch doesn't ping (mirrors _resume_claude). Best-effort.
                 try:
-                    _add_recap_suppress_session(sid)
+                    _add_saikai_suppress_session(sid)
                 except Exception:
                     pass
                 # Refresh the table so the marker column shows this row is now live.
@@ -4776,7 +4776,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._refresh_table()
 
         def on_claude_terminal_focus_released(self, event) -> None:
-            """The terminal's Ctrl+] (RECAP_RELEASE_KEY) escape hatch: refocus the list."""
+            """The terminal's Ctrl+] (SAIKAI_RELEASE_KEY) escape hatch: refocus the list."""
             self.query_one("#table", DataTable).focus()
             try:
                 event.stop()
@@ -4844,7 +4844,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def action_close_all_live(self) -> None:
             # Shift+F10: close ALL live panes at once (parallel kill) but STAY in
-            # recap — unlike Ctrl-C / Esc, which snapshot the set + quit. This is an
+            # saikai — unlike Ctrl-C / Esc, which snapshot the set + quit. This is an
             # EXPLICIT close, so it CLEARS the restore snapshot (you won't get these
             # back via Shift+F4); quitting preserves it, this discards it. Removes
             # mounted panes incl. dead/exited ones (not just live statuses). It's
@@ -5034,7 +5034,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 import traceback
                 self.notify(
                     f"sort failed: {e!r}\n{traceback.format_exc()[-400:]}",
-                    severity="error", title="recap", timeout=15,
+                    severity="error", title="saikai", timeout=15,
                 )
 
         def on_select_changed(self, event) -> None:
@@ -5127,7 +5127,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self.notify(f"rename failed: {e!r}", severity="error", timeout=6)
                     return
                 clean = name.strip()
-                # Re-fetch the CURRENT dict: a background reload (RECAP_AUTO_REFRESH)
+                # Re-fetch the CURRENT dict: a background reload (SAIKAI_AUTO_REFRESH)
                 # while the modal was open would have replaced _sid_index, leaving
                 # the closure-captured `s` orphaned (its custom_title would never
                 # show). _set_custom_title already persisted to disk; reflect it on
@@ -5147,7 +5147,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
                 self.notify("name cleared — back to auto-title" if not clean
-                            else f"renamed: {clean[:40]}", title="recap", timeout=3)
+                            else f"renamed: {clean[:40]}", title="saikai", timeout=3)
 
             self.push_screen(RenameScreen(current), _save)
 
@@ -5258,7 +5258,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 sess = self._sid_index.get(sid) or {}
                 title = (sess.get("ai_title") or _first_msg(sess) or sid[:8])[:50]
                 if st == "waiting" and prev_st != "waiting":
-                    self.notify(f"needs input: {title}", title="recap", timeout=8)
+                    self.notify(f"needs input: {title}", title="saikai", timeout=8)
                 elif st == "idle" and sid in self._busy_seen:
                     # A backgrounded pane just FINISHED its turn (busy→idle) — toast
                     # so you notice WHAT completed without watching every tab. Keyed
@@ -5266,7 +5266,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # prev snapshot, so a task shorter than the poll still toasts; a
                     # fresh load (→idle) or a y/n answer (waiting→idle, never busy)
                     # has no _busy_seen entry, so it doesn't masquerade as completed.
-                    self.notify(f"done: {title}", title="recap", timeout=6)
+                    self.notify(f"done: {title}", title="saikai", timeout=6)
                     self._busy_seen.discard(sid)
             # Memory-pressure watch: with panes open, toast ONCE per crossing
             # when system load reaches the gate's ceiling (the open/launch gate
@@ -5282,7 +5282,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                             self.notify(
                                 f"memory pressure {_ms.load:.0f}% — consider "
                                 f"closing panes (F10)",
-                                title="recap", severity="warning", timeout=10)
+                                title="saikai", severity="warning", timeout=10)
                         elif _ms.load < _maxl - 5 and self._mem_pressure_warned:
                             self._mem_pressure_warned = False
                 except Exception:
@@ -5315,7 +5315,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # chcp 65001 mis-decoded UTF-16LE bytes → multibyte text garbled);
                 # fall back to clip.exe (UTF-8) if that fails.
                 try:
-                    import recap_terminal as _rt
+                    import saikai_terminal as _rt
                     copied = _rt.set_clipboard_windows(text)
                 except Exception:
                     copied = False
@@ -5365,7 +5365,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._sid_index = {s.get("id"): s for s in fresh}
 
         def _auto_tick(self) -> None:
-            # Quiet periodic re-scan (RECAP_AUTO_REFRESH). Skips while a live pane
+            # Quiet periodic re-scan (SAIKAI_AUTO_REFRESH). Skips while a live pane
             # is focused so it doesn't disrupt typing into claude. The scan itself
             # — disk walk + parse + O(N^2) _build_forest — runs OFF the UI thread:
             # set_interval fires ON the UI thread, so doing it inline froze the
@@ -5408,7 +5408,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def action_refresh(self) -> None:
             # F5: re-scan ~/.claude/projects for new / updated sessions
-            # (recap loads once at startup; this picks up sessions started
+            # (saikai loads once at startup; this picks up sessions started
             # elsewhere while the picker is open).
             if reload_fn is None:
                 self._refresh_table()
@@ -5419,7 +5419,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception as e:
                 _log(f"refresh reload failed: {e!r}")
                 self.notify(f"refresh failed: {e!r}", severity="error",
-                            title="recap", timeout=6)
+                            title="saikai", timeout=6)
                 return
             _log(f"refresh reload: {len(fresh)} sessions")
             self._apply_fresh_sessions(fresh)
@@ -5577,39 +5577,39 @@ def _persist_resume_id(full_id: str, target_cwd: str | None) -> Path:
     return RESUME_HISTORY_FILE
 
 
-_RECAP_SUPPRESS_PATH = Path.home() / ".claude" / "state" / "_recap_resume_oneshot.json"
-_RECAP_SUPPRESS_TTL = 3600.0  # 1h. teams-notify.py 側の RECAP_SUPPRESS_TTL と同期
+_SAIKAI_SUPPRESS_PATH = Path.home() / ".claude" / "state" / "_saikai_resume_oneshot.json"
+_SAIKAI_SUPPRESS_TTL = 3600.0  # 1h. teams-notify.py 側の SAIKAI_SUPPRESS_TTL と同期
 
 
-def _add_recap_suppress_session(session_id: str) -> None:
+def _add_saikai_suppress_session(session_id: str) -> None:
     """teams-notify.py に「次の Notification 1 件だけ silent」 を伝える 1-shot file.
 
-    `RECAP_RESUME=1` env だけだと session lifetime 全体で Notification 抑止に
+    `SAIKAI_RESUME=1` env だけだと session lifetime 全体で Notification 抑止に
     なる過去の事故 (2026-05-24 検出) を構造的に防ぐ。 session_id ごとに 1 件
     だけ「最初の idle_prompt 抑止」 を予約する設計。
 
-    pid 付き tmp + os.replace で並行 recap launch race にも安全。 古い entry
+    pid 付き tmp + os.replace で並行 saikai launch race にも安全。 古い entry
     (>1h) は ついでに prune (= claude が即 crash した stale を回収)。
     """
     import json as _json
     import time as _time
-    _RECAP_SUPPRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _SAIKAI_SUPPRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
     state: dict[str, float] = {}
-    if _RECAP_SUPPRESS_PATH.is_file():
+    if _SAIKAI_SUPPRESS_PATH.is_file():
         try:
-            data = _json.loads(_RECAP_SUPPRESS_PATH.read_text(encoding="utf-8"))
+            data = _json.loads(_SAIKAI_SUPPRESS_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 state = {k: float(v) for k, v in data.items()
                          if isinstance(v, (int, float))}
         except (OSError, _json.JSONDecodeError, ValueError, TypeError):
             state = {}
     now = _time.time()
-    state = {k: v for k, v in state.items() if now - v < _RECAP_SUPPRESS_TTL}
+    state = {k: v for k, v in state.items() if now - v < _SAIKAI_SUPPRESS_TTL}
     state[session_id] = now
-    tmp = _RECAP_SUPPRESS_PATH.with_suffix(f".{os.getpid()}.tmp")
+    tmp = _SAIKAI_SUPPRESS_PATH.with_suffix(f".{os.getpid()}.tmp")
     try:
         tmp.write_text(_json.dumps(state, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, _RECAP_SUPPRESS_PATH)
+        os.replace(tmp, _SAIKAI_SUPPRESS_PATH)
     except Exception:
         try:                       # don't leave a .<pid>.tmp behind on failure
             tmp.unlink()
@@ -5655,7 +5655,7 @@ def _build_claude_invocation(
     ``session_args`` is the session selector, e.g. ``['--resume', sid]`` or
     ``['--session-id', uuid]``. Returns ``(argv, cwd, env)``: argv =
     ``[claude_bin, *session_args, *auto_perm]``, cwd = target dir (or None), env =
-    a prepared os.environ copy (RECAP_RESUME set, ephemeral VIRTUAL_ENV stripped
+    a prepared os.environ copy (SAIKAI_RESUME set, ephemeral VIRTUAL_ENV stripped
     from both the var and PATH). NO side effects — no chdir / print / subprocess.
     Shared by resume (_build_resume_invocation) and new (_build_new_invocation) so
     cwd / auto-permission / venv-strip logic can never drift between them.
@@ -5663,12 +5663,12 @@ def _build_claude_invocation(
     # Auto --permission-mode auto for frequent (= trusted) workspaces.
     extra_args: list[str] = []
     if (target_cwd
-            and not os.environ.get("RECAP_NO_AUTO_PERMISSION")
+            and not os.environ.get("SAIKAI_NO_AUTO_PERMISSION")
             and _canonical_workspace(target_cwd) in _frequent_cwds(sessions)):
         extra_args = ["--permission-mode", "auto"]
 
     env = os.environ.copy()
-    env["RECAP_RESUME"] = "1"   # signal to teams-notify.py: suppress the first idle_prompt
+    env["SAIKAI_RESUME"] = "1"   # signal to teams-notify.py: suppress the first idle_prompt
     # Strip uv's ephemeral VIRTUAL_ENV so the launched session's `uv` doesn't
     # warn about a stale venv.
     leaked_venv = env.pop("VIRTUAL_ENV", None)
@@ -5698,7 +5698,7 @@ def _build_new_invocation(
     target_cwd: str, session_id: str, sessions: list[dict]
 ) -> tuple[list[str], str | None, dict]:
     """Launch a FRESH `claude` in ``target_cwd`` with a pre-assigned
-    ``--session-id``, so recap can key the live pane by that uuid and the new
+    ``--session-id``, so saikai can key the live pane by that uuid and the new
     session links to its list row once claude writes the JSONL (next scan)."""
     return _build_claude_invocation(["--session-id", session_id], target_cwd, sessions)
 
@@ -5723,11 +5723,11 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
     # 1-shot 抑止 file への session_id 追加. env だけだと session 全体 lifetime で
     # Notification 全件 silent になり、 復帰後の真の入力待ちも消える (2026-05-24
     # 検出 bug)。 file ベースの fine-grain control で「最初の 1 件のみ silent、
-    # 以降は通常通知」 を実現する。 (env RECAP_RESUME はゲートのみ — 実際の抑止は
+    # 以降は通常通知」 を実現する。 (env SAIKAI_RESUME はゲートのみ — 実際の抑止は
     # この file 登録が必須。split-live 経路 3314 と対。これが無いと復帰直後の
     # idle_prompt が毎回 Teams へ誤通知される。)
     try:
-        _add_recap_suppress_session(full_id)
+        _add_saikai_suppress_session(full_id)
     except Exception:
         pass
     if target_cwd:
@@ -6264,7 +6264,7 @@ def _tree_walk(sessions: list[dict]) -> list[tuple[dict, str]]:
     # Tree glyphs are ASCII (`| \-  +- \.`) instead of box-drawing `│ └─ ├─ └┄`
     # so the prefix has predictable 1-cell-per-char width. Box-drawing chars
     # are East-Asian-Ambiguous and WezTerm/Windows Terminal render them at 1
-    # or 2 cells depending on `cjk_width` settings — which recap can't probe,
+    # or 2 cells depending on `cjk_width` settings — which saikai can't probe,
     # so deep tree branches drifted by 1 cell per level when the terminal
     # disagreed with our static assumption.
     def walk(sid: str, prefix: str, is_last: bool):
@@ -6402,7 +6402,7 @@ def cmd_sync_desktop() -> None:
                      or f"({sid[:8]})")[:80]
             created_ms = _iso_to_ms(s.get("first_ts"))
             # last activity = the later of last-message ts and file mtime, matching
-            # recap's Recency column (untimed ai-title/permission-mode appends bump
+            # saikai's Recency column (untimed ai-title/permission-mode appends bump
             # mtime but not last_ts) so Desktop orders these sessions the same way.
             active_ms = (max(_iso_to_ms(s.get("last_ts")),
                              int((s.get("mtime") or 0) * 1000))
@@ -6447,27 +6447,27 @@ def main():
                     "use --days N to limit. Filters (--days/--here/--all) are one-shot "
                     "unless --save-defaults is also passed.",
         epilog="Environment variables:\n"
-               "  RECAP_RESUME=1            set on the resumed `claude` child so teams-notify\n"
+               "  SAIKAI_RESUME=1            set on the resumed `claude` child so teams-notify\n"
                "                            hook suppresses its idle-prompt nag.\n"
-               "  RECAP_NO_AUTO_PERMISSION  if set, do NOT auto-apply --permission-mode auto\n"
+               "  SAIKAI_NO_AUTO_PERMISSION  if set, do NOT auto-apply --permission-mode auto\n"
                "                            on resume even when the target cwd is frequent.\n"
-               "  RECAP_FREQ_CWD_MIN=N      minimum session count to flag a cwd as\n"
+               "  SAIKAI_FREQ_CWD_MIN=N      minimum session count to flag a cwd as\n"
                "                            \"frequent\" for auto-permission (default 5).\n"
-               "  RECAP_CLUSTER_MIN_SIZE=N  (legacy, no longer used by the textual picker —\n"
+               "  SAIKAI_CLUSTER_MIN_SIZE=N  (legacy, no longer used by the textual picker —\n"
                "                            cluster mode is now driven by a one-shot\n"
                "                            Haiku classification cached in\n"
-               "                            ~/.cache/recap/global-clusters.json; run\n"
-               "                            `recap --refresh-clusters` to regenerate).\n"
-               "  RECAP_CLUSTER_TARGET_N=N  target theme count for the global classifier\n"
+               "                            ~/.cache/saikai/global-clusters.json; run\n"
+               "                            `saikai --refresh-clusters` to regenerate).\n"
+               "  SAIKAI_CLUSTER_TARGET_N=N  target theme count for the global classifier\n"
                "                            (clamped to [3,12]; the LLM is asked for\n"
                "                            N±2). Default 7 — Miller (1956)'s '7 ± 2'\n"
                "                            for at-a-glance absolute judgement.\n"
-               "  RECAP_CLUSTER_MODEL=...   model used by --refresh-clusters:\n"
+               "  SAIKAI_CLUSTER_MODEL=...   model used by --refresh-clusters:\n"
                "                            'haiku' (default, ~30 s on ~200 sessions),\n"
                "                            'sonnet' (cleaner partitions, 1-3 min).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--version", action="version", version=f"recap {__version__}")
+    p.add_argument("--version", action="version", version=f"saikai {__version__}")
     p.add_argument("--init-config", action="store_true",
                    help="Write a commented config.toml template to the config path, then exit.")
     p.add_argument("--print-config", action="store_true",
@@ -6511,7 +6511,7 @@ def main():
                    help="Skip Haiku summarization (use AI title or first user msg)")
     p.add_argument("--refresh-summary", action="store_true",
                    help="Discard cached Haiku summaries and regenerate. Does NOT touch "
-                        "parsed/topic caches; delete ~/.cache/recap/parsed/ for that.")
+                        "parsed/topic caches; delete ~/.cache/saikai/parsed/ for that.")
     p.add_argument("--preview", metavar="SESSION_ID",
                    help="Print a session's content preview")
     p.add_argument("--preview-full", metavar="SESSION_ID",
@@ -6689,8 +6689,8 @@ def main():
     # Resolve --days / --here / --all from CLI vs saved defaults.
     # CLI args are ONE-SHOT: they only become the new default if the user passes
     # --save-defaults. This prevents test/exploratory invocations from silently
-    # overwriting the user's preferred filter (e.g. running `recap --days 7`
-    # once would otherwise pin every future `recap` to 7 days).
+    # overwriting the user's preferred filter (e.g. running `saikai --days 7`
+    # once would otherwise pin every future `saikai` to 7 days).
     saved_opts = _load_options()
     if args.days is None:
         args.days = saved_opts.get("days", 0)   # 0 = all history

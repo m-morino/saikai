@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Unit tests for the terminal-death watchdog ancestor walk (recap.py).
+"""Unit tests for the terminal-death watchdog ancestor walk (saikai.py).
 
 Covers _find_terminal_anchor — the one piece of watchdog logic whose
 correctness determines whether the watchdog fires on the *right* process.
 The thread/taskkill path is integration-verified separately (it only ever
 targets os.getpid()'s own tree, so a wrong anchor can never hurt another
-session; the worst a logic bug does is fire early/late on recap itself).
+session; the worst a logic bug does is fire early/late on saikai itself).
 
 Run:  uv run --no-project python tests/test_terminal_watchdog.py
 """
@@ -14,9 +14,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import recap  # noqa: E402
+import saikai  # noqa: E402
 
-anchor = recap._find_terminal_anchor
+anchor = saikai._find_terminal_anchor
 fails = 0
 
 
@@ -28,7 +28,7 @@ def check(name, got, want):
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}: got {got}, want {want}")
 
 
-# 1. wezterm → pwsh(tab) → cmd(recap.cmd shim) → uv → python(self).
+# 1. wezterm → pwsh(tab) → cmd(saikai.cmd shim) → uv → python(self).
 #    Anchor must be the tab pwsh, NOT the cmd shim (which orphans with us).
 check("cmd-shim under pwsh tab", anchor({
     1000: ("wezterm-gui.exe", 1),
@@ -38,7 +38,7 @@ check("cmd-shim under pwsh tab", anchor({
     1004: ("python.exe", 1003),
 }, 1004), 1001)
 
-# 2. wezterm → cmd(tab, recap.cmd invoked directly) → uv → python(self).
+# 2. wezterm → cmd(tab, saikai.cmd invoked directly) → uv → python(self).
 #    Here cmd IS the tab shell, so it is the correct anchor.
 check("cmd is the tab shell", anchor({
     1000: ("wezterm-gui.exe", 1),
@@ -76,7 +76,7 @@ check("broken chain → 0", anchor({
     1003: ("python.exe", 1002),
 }, 1003), 0)
 
-# 7. bash `recap` wrapper: wezterm → bash(tab) → uv → python(self).
+# 7. bash `saikai` wrapper: wezterm → bash(tab) → uv → python(self).
 check("bash wrapper tab", anchor({
     1000: ("wezterm-gui.exe", 1),
     1001: ("bash.exe", 1000),

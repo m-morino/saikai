@@ -1,8 +1,8 @@
 # Third-party notices
 
-recap is licensed under the MIT License (see `LICENSE`). It depends on the
+saikai is licensed under the MIT License (see `LICENSE`). It depends on the
 following third-party packages, installed separately via your package manager
-(pip / uv) — recap does **not** bundle or modify their source.
+(pip / uv) — saikai does **not** bundle or modify their source.
 
 | Package | License | Role |
 |---|---|---|
@@ -14,13 +14,13 @@ following third-party packages, installed separately via your package manager
 
 ## Note on pyte (LGPL-3.0)
 
-recap imports `pyte` as an ordinary, unmodified dependency installed by the user
+saikai imports `pyte` as an ordinary, unmodified dependency installed by the user
 (pip/uv). It is **not** copied into this repository or statically combined with
-recap's source. Under the LGPL-3.0 this "use as a separately-installed library"
-case does not impose the LGPL on recap's own code, and the dynamic Python import
-satisfies the requirement that the library remain user-replaceable. recap's own
+saikai's source. Under the LGPL-3.0 this "use as a separately-installed library"
+case does not impose the LGPL on saikai's own code, and the dynamic Python import
+satisfies the requirement that the library remain user-replaceable. saikai's own
 source therefore remains under the MIT License.
 
-If you redistribute recap together with a copy of pyte (e.g. a vendored bundle
+If you redistribute saikai together with a copy of pyte (e.g. a vendored bundle
 or a frozen binary), review the LGPL-3.0 terms — in that case you must keep pyte
 under the LGPL and allow it to be replaced.

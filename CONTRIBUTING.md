@@ -1,16 +1,16 @@
-# Contributing to recap
+# Contributing to saikai
 
-Thanks for your interest! recap is a small, single-file Textual TUI, so the
+Thanks for your interest! saikai is a small, single-file Textual TUI, so the
 contribution loop is deliberately lightweight.
 
 ## Architecture in one paragraph
 
-recap is **two files**: `recap.py` (the session browser — scanning, the table
-UI, config, CLI) and `recap_terminal.py` (the split-live pane widget — the PTY
-reader thread, pyte screen, status classification, clipboard). `recap.py`
-imports `recap_terminal` lazily and **degrades gracefully**: if the PTY deps
-are missing, the live pane is disabled and recap still runs as a list browser.
-Keep that separation — `recap_terminal` must not import `recap`.
+saikai is **two files**: `saikai.py` (the session browser — scanning, the table
+UI, config, CLI) and `saikai_terminal.py` (the split-live pane widget — the PTY
+reader thread, pyte screen, status classification, clipboard). `saikai.py`
+imports `saikai_terminal` lazily and **degrades gracefully**: if the PTY deps
+are missing, the live pane is disabled and saikai still runs as a list browser.
+Keep that separation — `saikai_terminal` must not import `saikai`.
 
 ## Setup
 
@@ -18,7 +18,7 @@ Requires **Python ≥ 3.11** (for stdlib `tomllib`). [uv](https://docs.astral.sh
 is the easiest path:
 
 ```bash
-uv run recap.py            # run in place (deps auto-installed from the PEP-723 header)
+uv run saikai.py            # run in place (deps auto-installed from the PEP-723 header)
 ```
 
 Dependencies: `textual`, `pyte`, `platformdirs`, and a PTY backend
@@ -27,7 +27,7 @@ Dependencies: `textual`, `pyte`, `platformdirs`, and a PTY backend
 ## Tests — run them before every commit
 
 ```bash
-python -m py_compile recap.py recap_terminal.py
+python -m py_compile saikai.py saikai_terminal.py
 python tests/test_config.py
 python tests/test_sort_recency.py
 python tests/test_split_divider.py
@@ -41,17 +41,17 @@ the pure module-level helpers and the threading model headlessly. The one
 exception is the `test_split_divider.py` *runtime smoke*, which needs textual
 installed (it **skips cleanly** otherwise). Anything that only lives inside the
 nested Textual `App` (render, key handling, layout) is **not** unit-testable
-headless — verify those by `py_compile` + the suites + actually running recap.
+headless — verify those by `py_compile` + the suites + actually running saikai.
 
 Only pure functions get unit tests; don't try to unit-test App methods.
 
 ## The concurrency invariants — DO NOT VIOLATE
 
 Each split-live pane runs a background reader thread feeding pyte under a lock,
-while the UI thread also takes that lock. Get this wrong and recap **hard-freezes**.
+while the UI thread also takes that lock. Get this wrong and saikai **hard-freezes**.
 The rules (with the regression that taught us each) are documented at the top of
 [`CLAUDE.md`](CLAUDE.md) — read that section before touching
-`recap_terminal.py` or any threading / lock code. In short:
+`saikai_terminal.py` or any threading / lock code. In short:
 
 1. **Never** call `call_from_thread` / marshal — or any blocking cross-thread
    call — while holding `self._lock`. Compute under the lock, marshal outside it.

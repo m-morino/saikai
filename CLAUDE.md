@@ -1,14 +1,14 @@
-# recap — working notes for Claude Code
+# saikai — working notes for Claude Code
 
-Single-file Textual TUI (`recap.py`) + the split-live terminal widget
-(`recap_terminal.py`). Run interactively with `recap`; split-live (a live
-`claude` PTY in the right pane) is **opt-in** via `RECAP_SPLIT_LIVE=1`.
+Single-file Textual TUI (`saikai.py`) + the split-live terminal widget
+(`saikai_terminal.py`). Run interactively with `saikai`; split-live (a live
+`claude` PTY in the right pane) is **opt-in** via `SAIKAI_SPLIT_LIVE=1`.
 
 ## Concurrency invariants (split-live) — DO NOT VIOLATE
 
 Each split-live pane runs a background **reader thread** (`ClaudeTerminal._read_loop`)
 that feeds pyte under `self._lock`; the **UI thread** also takes `self._lock`
-(`render_line`, `_current_screen`). Get this wrong and recap HARD-FREEZES.
+(`render_line`, `_current_screen`). Get this wrong and saikai HARD-FREEZES.
 
 1. **NEVER call `call_from_thread` / `self._marshal(...)` — or any blocking
    cross-thread call — while holding `self._lock`.** `call_from_thread` blocks
@@ -20,7 +20,7 @@ that feeds pyte under `self._lock`; the **UI thread** also takes `self._lock`
    The reader may be blocked in `_marshal → call_from_thread` waiting for the UI
    → same deadlock. The reader is a daemon and is unblocked by `pty.close(force=True)`.
 3. **Every `kill()`'s `taskkill` reap must be tracked + joined at process exit**
-   (module-level `_REAP_THREADS` + `atexit → join_all_reaps`). Otherwise recap
+   (module-level `_REAP_THREADS` + `atexit → join_all_reaps`). Otherwise saikai
    exits before `taskkill /T` finishes and orphans claude's node workers (the
    SIGHUP-emulation concern from commit 0fd9fcf). `on_unmount`/exceptions/Ctrl-K
    do NOT route through the App's two quit actions.
@@ -43,7 +43,7 @@ that feeds pyte under `self._lock`; the **UI thread** also takes `self._lock`
 - The tests run WITHOUT textual/pyte/pywinpty (soft imports → `Widget` is
   `object`): `python tests/test_terminal_concurrency.py` and
   `python tests/test_resource_bounds.py`. Run them after touching the
-  terminal/threading code; `python -m py_compile recap.py recap_terminal.py` too.
+  terminal/threading code; `python -m py_compile saikai.py saikai_terminal.py` too.
 
 ## Other gotchas
 
@@ -70,5 +70,5 @@ that feeds pyte under `self._lock`; the **UI thread** also takes `self._lock`
 - **`status` comes from claude's OSC-0 title** (leading braille spinner = busy,
   `✳` = idle), NOT from scraping the screen body. Verified via probe; claude
   emits no OSC 9;4 / OSC 133.
-- Live status (busy/waiting/idle) only exists for recap-hosted split-live panes;
+- Live status (busy/waiting/idle) only exists for saikai-hosted split-live panes;
   sessions running elsewhere fall back to file-registry + transcript heuristic.

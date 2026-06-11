@@ -6,15 +6,15 @@
 #      (*@users.noreply.github.com  or  noreply@anthropic.com), or
 #   2. an author OR committer name containing non-ASCII bytes or a "/", or
 #   3. (optional) any pattern from the out-of-repo file named by
-#      $RECAP_HISTORY_DENY, matched against commit messages AND patch text.
+#      $SAIKAI_HISTORY_DENY, matched against commit messages AND patch text.
 #
 # The allowlist IS the design: it rejects corporate / personal identities
 # WITHOUT naming any of them, so this script is safe to publish. Keep real
-# codenames in $RECAP_HISTORY_DENY — a file kept OUTSIDE the repo.
+# codenames in $SAIKAI_HISTORY_DENY — a file kept OUTSIDE the repo.
 #
 # Usage:
 #   scripts/check-history.sh [<git-range>]              # default: HEAD (all history)
-#   RECAP_HISTORY_DENY=~/private/deny.txt scripts/check-history.sh origin/main..HEAD
+#   SAIKAI_HISTORY_DENY=~/private/deny.txt scripts/check-history.sh origin/main..HEAD
 #
 # Enable as a push-time gate (opt-in, not auto-installed):
 #   git config core.hooksPath scripts/hooks
@@ -55,15 +55,15 @@ EOF
 IFS=$OLDIFS
 
 # --- 3: optional deny-pattern scan (codenames live OUTSIDE the repo) ----------
-if [ -n "${RECAP_HISTORY_DENY:-}" ]; then
-    if [ -f "$RECAP_HISTORY_DENY" ]; then
+if [ -n "${SAIKAI_HISTORY_DENY:-}" ]; then
+    if [ -f "$SAIKAI_HISTORY_DENY" ]; then
         if git log "$RANGE" -p --no-color 2>/dev/null \
-             | grep -I -i -f "$RECAP_HISTORY_DENY" >/dev/null 2>&1; then
-            echo "DENY  \$RECAP_HISTORY_DENY pattern found in history (message or diff)"
+             | grep -I -i -f "$SAIKAI_HISTORY_DENY" >/dev/null 2>&1; then
+            echo "DENY  \$SAIKAI_HISTORY_DENY pattern found in history (message or diff)"
             fail=1
         fi
     else
-        echo "WARN  RECAP_HISTORY_DENY=$RECAP_HISTORY_DENY not found — skipping pattern scan" >&2
+        echo "WARN  SAIKAI_HISTORY_DENY=$SAIKAI_HISTORY_DENY not found — skipping pattern scan" >&2
     fi
 fi
 

@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import recap
+import saikai
 
 
 def _iso_ago(days: float) -> str:
@@ -27,7 +27,7 @@ def test_last_active_prefers_mtime_over_stale_last_ts():
     """A session touched now but whose last *timestamped* record is 5d old must
     report ~now, not 5d ago."""
     s = {"mtime": time.time(), "last_ts": _iso_ago(5)}
-    la = recap._last_active_dt(s)
+    la = saikai._last_active_dt(s)
     assert la is not None
     assert abs((datetime.now() - la).total_seconds()) < 5, la
 
@@ -35,7 +35,7 @@ def test_last_active_prefers_mtime_over_stale_last_ts():
 def test_last_active_uses_last_ts_when_newer_than_mtime():
     """Restored backup: mtime older than the newest message -> trust the message."""
     s = {"mtime": time.time() - 10 * 86400, "last_ts": _iso_ago(1)}
-    la = recap._last_active_dt(s)
+    la = saikai._last_active_dt(s)
     assert la is not None
     # ~1 day ago, NOT 10 days ago
     assert 0.5 * 86400 < (datetime.now() - la).total_seconds() < 2 * 86400, la
@@ -47,7 +47,7 @@ def test_recency_sort_puts_freshly_touched_first():
     fresh = {"id": "fresh", "mtime": time.time(),             "last_ts": _iso_ago(5)}
     old   = {"id": "old",   "mtime": time.time() - 3 * 86400, "last_ts": _iso_ago(3)}
     sessions = [old, fresh]                       # deliberately wrong order
-    recap._apply_sort(sessions, [{"col": "last", "dir": "desc"}])
+    saikai._apply_sort(sessions, [{"col": "last", "dir": "desc"}])
     assert [s["id"] for s in sessions] == ["fresh", "old"], [s["id"] for s in sessions]
 
 
@@ -55,15 +55,15 @@ def test_age_filter_keeps_freshly_touched():
     """'Last 24h' must keep a session touched now even if its last message is 5d old."""
     cut = datetime.now() - timedelta(days=1)
     fresh = {"id": "fresh", "mtime": time.time(), "last_ts": _iso_ago(5)}
-    assert (recap._last_active_dt(fresh) or datetime.min) >= cut
+    assert (saikai._last_active_dt(fresh) or datetime.min) >= cut
 
 
 def test_date_bucket_uses_mtime():
     """Group-by-Date must file a now-touched session under Today, not 5 days ago."""
     now = datetime.now()
     s = {"id": "x", "mtime": time.time(), "last_ts": _iso_ago(5)}
-    la = recap._last_active_dt(s)
-    assert recap._date_label(la.date() if la else None, now) == "Today"
+    la = saikai._last_active_dt(s)
+    assert saikai._date_label(la.date() if la else None, now) == "Today"
 
 
 def test_sort_select_value_reflects_primary_or_none():
@@ -71,22 +71,22 @@ def test_sort_select_value_reflects_primary_or_none():
     can't represent (header-click sort by turns/fav) it returns None so compose
     OMITS value= — passing Select.BLANK (== False in Textual 8.2.7) would crash
     launch with InvalidSelectValueError."""
-    orig = recap._load_sort
+    orig = saikai._load_sort
 
     def _spec(col):
         return [{"col": col, "dir": "desc"},
                 {"col": "-", "dir": "desc"}, {"col": "-", "dir": "desc"}]
     try:
-        recap._load_sort = lambda: _spec("last")
-        assert recap._sort_select_value() == "last"
-        recap._load_sort = lambda: _spec("title")
-        assert recap._sort_select_value() == "title"
-        recap._load_sort = lambda: _spec("date")
-        assert recap._sort_select_value() == "date"
-        recap._load_sort = lambda: _spec("turns")     # not a dropdown option
-        assert recap._sort_select_value() is None
+        saikai._load_sort = lambda: _spec("last")
+        assert saikai._sort_select_value() == "last"
+        saikai._load_sort = lambda: _spec("title")
+        assert saikai._sort_select_value() == "title"
+        saikai._load_sort = lambda: _spec("date")
+        assert saikai._sort_select_value() == "date"
+        saikai._load_sort = lambda: _spec("turns")     # not a dropdown option
+        assert saikai._sort_select_value() is None
     finally:
-        recap._load_sort = orig
+        saikai._load_sort = orig
 
 
 def test_sort_select_value_ignores_secondary_column():
@@ -94,14 +94,14 @@ def test_sort_select_value_ignores_secondary_column():
     with a non-representable primary (turns) + representable secondary (date) must
     return None — else the box shows 'Created time' and the on_select_changed
     echo-guard swallows a genuine re-pick of it (the bug a multi-level sort hit)."""
-    orig = recap._load_sort
+    orig = saikai._load_sort
     try:
-        recap._load_sort = lambda: [{"col": "turns", "dir": "desc"},
+        saikai._load_sort = lambda: [{"col": "turns", "dir": "desc"},
                                     {"col": "date", "dir": "desc"},
                                     {"col": "-", "dir": "desc"}]
-        assert recap._sort_select_value() is None
+        assert saikai._sort_select_value() is None
     finally:
-        recap._load_sort = orig
+        saikai._load_sort = orig
 
 
 def test_n_turns_derived_from_real_msgs_not_inflated():
@@ -117,7 +117,7 @@ def test_n_turns_derived_from_real_msgs_not_inflated():
         "n_turns": 999,          # inflated raw count — must be ignored
         "mtime": time.time(),
     }
-    r = recap._enrich_session("sid-x", parsed, Path("nonexistent.jsonl"), parsed["mtime"])
+    r = saikai._enrich_session("sid-x", parsed, Path("nonexistent.jsonl"), parsed["mtime"])
     assert r["n_turns"] == 3, r["n_turns"]
 
 
@@ -127,13 +127,13 @@ def test_recency_flags_use_current_time():
     now = time.time()
     fresh = {"id": "f", "mtime": now - 60}        # 1 min ago
     old = {"id": "o", "mtime": now - 3600}        # 1 h ago
-    assert recap._is_recent_now(fresh, now) is True
-    assert recap._is_recent_now(old, now) is False
-    assert recap._is_active_now(fresh, now) is True
-    assert recap._is_active_now(old, now) is False
+    assert saikai._is_recent_now(fresh, now) is True
+    assert saikai._is_recent_now(old, now) is False
+    assert saikai._is_active_now(fresh, now) is True
+    assert saikai._is_active_now(old, now) is False
     # is_open snapshot still wins even when long-untouched
     opened = {"id": "x", "mtime": now - 99999, "is_open": True}
-    assert recap._is_active_now(opened, now) is True
+    assert saikai._is_active_now(opened, now) is True
 
 
 def test_enrich_stamps_last_active_dt():
@@ -142,25 +142,25 @@ def test_enrich_stamps_last_active_dt():
     parsed = {"first_ts": "2026-01-01T00:00:00.000Z",
               "last_ts": "2026-01-01T00:00:00.000Z",
               "real_msgs": [], "mtime": time.time()}
-    r = recap._enrich_session("sid-y", parsed, Path("x.jsonl"), parsed["mtime"])
+    r = saikai._enrich_session("sid-y", parsed, Path("x.jsonl"), parsed["mtime"])
     assert r.get("last_active_dt") is not None
-    assert recap._last_active_dt(r) is r["last_active_dt"]   # reads the stamp
+    assert saikai._last_active_dt(r) is r["last_active_dt"]   # reads the stamp
 
 
 def test_summary_cache_keys_on_last_ts():
     """Summary cache validity keys on last_ts (content), not mtime: metadata-only
     mtime drift keeps the cache (no needless Haiku re-summarise), a last_ts change
     invalidates it. Legacy caches without last_ts fall back to the mtime window."""
-    orig = recap._read_json
+    orig = saikai._read_json
     try:
-        recap._read_json = lambda *a, **k: {"summary": "S", "last_ts": "T1", "mtime": 100.0}
-        assert recap._load_cache("sid", 999.0, "T1") == "S"     # mtime drifted, last_ts matches → hit
-        assert recap._load_cache("sid", 100.0, "T2") is None    # last_ts changed → miss
-        recap._read_json = lambda *a, **k: {"summary": "L", "mtime": 100.0}  # legacy, no last_ts
-        assert recap._load_cache("sid", 100.4, "x") == "L"      # within mtime tolerance → hit
-        assert recap._load_cache("sid", 200.0, "x") is None     # outside tolerance → miss
+        saikai._read_json = lambda *a, **k: {"summary": "S", "last_ts": "T1", "mtime": 100.0}
+        assert saikai._load_cache("sid", 999.0, "T1") == "S"     # mtime drifted, last_ts matches → hit
+        assert saikai._load_cache("sid", 100.0, "T2") is None    # last_ts changed → miss
+        saikai._read_json = lambda *a, **k: {"summary": "L", "mtime": 100.0}  # legacy, no last_ts
+        assert saikai._load_cache("sid", 100.4, "x") == "L"      # within mtime tolerance → hit
+        assert saikai._load_cache("sid", 200.0, "x") is None     # outside tolerance → miss
     finally:
-        recap._read_json = orig
+        saikai._read_json = orig
 
 
 def test_build_groups_date_order_recent_first():
@@ -169,7 +169,7 @@ def test_build_groups_date_order_recent_first():
     now = datetime.now()
     today = {"id": "t", "mtime": time.time(), "last_ts": _iso_ago(0)}
     old = {"id": "o", "mtime": time.time() - 5 * 86400, "last_ts": _iso_ago(5)}
-    groups = recap._build_groups([old, today], "date", set(), now)
+    groups = saikai._build_groups([old, today], "date", set(), now)
     labels = [g[0] for g in groups]
     assert labels[0] == "Today", labels
     assert labels[1] != "Today" and len(labels) == 2, labels
@@ -182,10 +182,10 @@ def test_build_groups_project_order_by_recency():
          "project_name": "old-proj"}
     b = {"id": "b", "mtime": time.time(), "last_ts": _iso_ago(0),
          "project_name": "new-proj"}
-    groups = recap._build_groups([a, b], "project", set(), now)
+    groups = saikai._build_groups([a, b], "project", set(), now)
     labels = [g[0] for g in groups]
-    new_lbl = recap.project_short("new-proj") or "(none)"
-    old_lbl = recap.project_short("old-proj") or "(none)"
+    new_lbl = saikai.project_short("new-proj") or "(none)"
+    old_lbl = saikai.project_short("old-proj") or "(none)"
     assert labels.index(new_lbl) < labels.index(old_lbl), labels
 
 
@@ -205,7 +205,7 @@ def test_build_forest_windowed_parent_assignment():
     b = _s("B", "/other", 30)       # closer in time, different cwd
     c = _s("C", "/proj/x", 0)       # newest
     sessions = [c, a, b]
-    recap._build_forest(sessions)
+    saikai._build_forest(sessions)
     by = {s["id"]: s for s in sessions}
     assert by["C"]["parent_id"] == "A", by["C"]   # cwd weight beats time proximity
     assert by["A"]["parent_id"] is None           # oldest → root
@@ -233,7 +233,7 @@ def test_render_header_includes_worktree_and_model():
              "last_ts": "2026-01-01T00:00:00.000Z", "n_turns": 1, "mtime": time.time(),
              "cwd": "/x", "git_branch": "main", "worktree_label": "wt-feature",
              "jsonl_path": f, "real_msgs": ["hi there please help me build a thing"]}
-        out = "\n".join(recap._render_header(s))
+        out = "\n".join(saikai._render_header(s))
         assert "worktree:" in out and "wt-feature" in out, out
         assert "model:" in out and "claude-opus-4-8" in out, out
         assert "via vscode" in out, out
@@ -252,12 +252,12 @@ def test_toggle_in_set_refuses_to_clobber_unreadable_file():
     try:
         p = d / "favorite.json"
         p.write_text('["favA", "favB"]', encoding="utf-8")
-        recap._toggle_in_set(p, "favC")                       # happy path
+        saikai._toggle_in_set(p, "favC")                       # happy path
         assert set(_json.loads(p.read_text())) == {"favA", "favB", "favC"}
         p.write_text("{ not valid json", encoding="utf-8")    # exists but unreadable
         raised = False
         try:
-            recap._toggle_in_set(p, "favD")
+            saikai._toggle_in_set(p, "favD")
         except Exception:
             raised = True
         assert raised, "must refuse to toggle an unreadable existing file"
@@ -268,30 +268,30 @@ def test_toggle_in_set_refuses_to_clobber_unreadable_file():
 
 def test_invalidate_active_sessions_drops_cache():
     """Reload must re-read the live registry, not the frozen launch snapshot."""
-    recap._active_sessions_cache = {"sid": "open"}
-    recap._invalidate_active_sessions()
-    assert recap._active_sessions_cache is None
+    saikai._active_sessions_cache = {"sid": "open"}
+    saikai._invalidate_active_sessions()
+    assert saikai._active_sessions_cache is None
 
 
 def test_refresh_summary_only_matches_uuid_caches():
     """--refresh-summary deletes only <uuid>.json summary caches — settings files
     (sort / clusters / favorites / options) must NOT match the UUID filter."""
-    assert recap._UUID_RE.fullmatch("6019b00c-734f-4e73-932d-b6453956a8fd")
+    assert saikai._UUID_RE.fullmatch("6019b00c-734f-4e73-932d-b6453956a8fd")
     for safe in ("sort", "global-clusters", "favorite", "hidden", "options"):
-        assert not recap._UUID_RE.fullmatch(safe), safe
+        assert not saikai._UUID_RE.fullmatch(safe), safe
 
 
 def test_missing_both_is_none_not_crash():
     s = {"id": "empty"}
-    assert recap._last_active_dt(s) is None
+    assert saikai._last_active_dt(s) is None
     # sort must not raise on a None-keyed session mixed with real ones
     sessions = [s, {"id": "real", "mtime": time.time(), "last_ts": _iso_ago(1)}]
-    recap._apply_sort(sessions, [{"col": "last", "dir": "desc"}])
+    saikai._apply_sort(sessions, [{"col": "last", "dir": "desc"}])
     assert sessions[0]["id"] == "real"
 
 
 def test_no_app_binding_steals_a_readline_ctrl_key():
-    """recap must never bind an app action to a bare Ctrl+<letter>: those are
+    """saikai must never bind an app action to a bare Ctrl+<letter>: those are
     readline editing keys the user types in the search box and inside live claude
     panes (and claude itself binds Ctrl+R/T/L). App shortcuts live on FUNCTION
     keys instead. Ctrl+C (quit) is the sole allowed bare-Ctrl binding. Regression
@@ -299,7 +299,7 @@ def test_no_app_binding_steals_a_readline_ctrl_key():
     source so it runs without textual (the App/Binding class needs textual)."""
     import re
     from pathlib import Path
-    src = Path(__file__).resolve().parent.parent.joinpath("recap.py").read_text(encoding="utf-8")
+    src = Path(__file__).resolve().parent.parent.joinpath("saikai.py").read_text(encoding="utf-8")
     keys = re.findall(r'Binding\(\s*"([^"]+)"', src)
     assert keys, "no Binding(...) entries found — regex/structure changed?"
     offenders = [k for k in keys if re.fullmatch(r"ctrl\+[a-z]", k) and k != "ctrl+c"]
@@ -311,18 +311,18 @@ def test_no_app_binding_steals_a_readline_ctrl_key():
 
 def test_build_new_invocation_starts_fresh_session_with_id():
     """New-session launch must pass --session-id (NOT --resume) so claude starts a
-    fresh session keyed to that uuid, with the chosen cwd and RECAP_RESUME env."""
+    fresh session keyed to that uuid, with the chosen cwd and SAIKAI_RESUME env."""
     import tempfile
     import shutil as _sh
     d = tempfile.mkdtemp()
     try:
-        argv, cwd, env = recap._build_new_invocation(
+        argv, cwd, env = saikai._build_new_invocation(
             d, "11111111-2222-3333-4444-555555555555", [])
         assert "--session-id" in argv, argv
         assert "11111111-2222-3333-4444-555555555555" in argv, argv
         assert "--resume" not in argv, argv
         assert cwd == d
-        assert env.get("RECAP_RESUME") == "1"
+        assert env.get("SAIKAI_RESUME") == "1"
     finally:
         _sh.rmtree(d, ignore_errors=True)
 
@@ -340,7 +340,7 @@ def test_build_groups_state_keeps_pinned_live_in_state_group():
     ]
     favs = {"run", "wait", "idle"}
     g = {lbl: [s["id"] for s in members]
-         for lbl, members in recap._build_groups(sess, "state", favs, now)}
+         for lbl, members in saikai._build_groups(sess, "state", favs, now)}
     assert "run" in g.get("Running", []), g            # live pinned stays in its state group
     assert "wait" in g.get("Needs input", []), g
     assert "idle" in g.get("Pinned", []), g            # non-live pinned -> Pinned shortcut
@@ -348,7 +348,7 @@ def test_build_groups_state_keeps_pinned_live_in_state_group():
     assert "wait" not in g.get("Pinned", []), g
     # Date grouping unchanged: every favorite hoisted to Pinned.
     gd = {lbl: [s["id"] for s in members]
-          for lbl, members in recap._build_groups(sess, "date", favs, now)}
+          for lbl, members in saikai._build_groups(sess, "date", favs, now)}
     assert set(gd.get("Pinned", [])) == {"run", "wait", "idle"}, gd
 
 
@@ -359,16 +359,16 @@ def test_project_short_strips_prefix_case_insensitively():
     import re as _re
     from pathlib import Path as _P
     home_enc = _re.sub(r"[:/\\.]", "-", str(_P.home()))
-    assert recap.project_short(home_enc + "-CLI-myproj") == "CLI-myproj"
+    assert saikai.project_short(home_enc + "-CLI-myproj") == "CLI-myproj"
     if home_enc[:1].isalpha():
         lowered = home_enc[0].lower() + home_enc[1:]   # Claude-style lowercased drive
-        assert recap.project_short(lowered + "-CLI-myproj") == "CLI-myproj"
+        assert saikai.project_short(lowered + "-CLI-myproj") == "CLI-myproj"
 
 
 def test_new_session_stub_has_renderable_fields():
     """A new-session stub carries the fields the list render/sort/group read, so a
     just-launched session shows immediately (before its JSONL is scanned)."""
-    s = recap._new_session_stub("sid-123", "/tmp/myproj", "myproj")
+    s = saikai._new_session_stub("sid-123", "/tmp/myproj", "myproj")
     assert s["id"] == "sid-123" and s["is_open"] is True
     assert s["summary"] == "myproj"            # Title column
     assert s["last_active_dt"] is not None     # Last / Recency
@@ -377,9 +377,9 @@ def test_new_session_stub_has_renderable_fields():
               "project_name", "worktree_label", "primary_topic"):  # render colour-maps + columns
         assert k in s, k
     # the project colour-map / Project column subscript s["project_name"] — must not KeyError
-    assert recap.project_short(s["project_name"]) is not None
+    assert saikai.project_short(s["project_name"]) is not None
     # sorts cleanly alongside a real session (keys off last_active_dt)
-    recap._apply_sort([s, {"id": "x", "mtime": time.time(), "last_ts": _iso_ago(1)}],
+    saikai._apply_sort([s, {"id": "x", "mtime": time.time(), "last_ts": _iso_ago(1)}],
                       [{"col": "last", "dir": "desc"}])
 
 
@@ -389,27 +389,27 @@ def test_list_title_fallback_no_claude_p():
     opened session (stub: no ai_title, no msgs) shows the project — never blank,
     never a claude -p call."""
     from pathlib import Path as _P
-    assert recap._list_title({"id": "x" * 16, "ai_title": "Fix auth",
+    assert saikai._list_title({"id": "x" * 16, "ai_title": "Fix auth",
                               "real_msgs": ["hi"]}) == "Fix auth"
-    assert recap._list_title({"id": "x" * 16, "ai_title": "",
+    assert saikai._list_title({"id": "x" * 16, "ai_title": "",
                               "real_msgs": ["do the thing"]}) == "do the thing"
-    stub = recap._new_session_stub("abcd1234-0000-0000-0000-000000000000",
+    stub = saikai._new_session_stub("abcd1234-0000-0000-0000-000000000000",
                                    str(_P.home() / "proj"), "proj")
-    assert recap._list_title(stub) == recap.project_short(stub["project_name"])  # project, not blank
-    assert recap._list_title({"id": "deadbeef-1111"})    # never blank → short id last resort
+    assert saikai._list_title(stub) == saikai.project_short(stub["project_name"])  # project, not blank
+    assert saikai._list_title({"id": "deadbeef-1111"})    # never blank → short id last resort
 
 
 def test_pane_title_prefers_human_label_over_id():
     """A live pane's tab shows a human label, not a bare session id:
     ai_title → summary → (first user msg) → the term's launch title → short id."""
     sid = "abcd1234-5678-90ab-cdef-1234567890ab"
-    assert recap._pane_title({"ai_title": "Fix auth bug"}, sid) == "Fix auth bug"
-    assert recap._pane_title({"ai_title": "", "summary": "refactor X"}, sid) == "refactor X"
+    assert saikai._pane_title({"ai_title": "Fix auth bug"}, sid) == "Fix auth bug"
+    assert saikai._pane_title({"ai_title": "", "summary": "refactor X"}, sid) == "refactor X"
 
     class _T:
         title = "my-folder"
-    assert recap._pane_title(None, sid, _T()) == "my-folder"   # new session → folder
-    assert recap._pane_title(None, sid) == "abcd1234"          # last resort: short id
+    assert saikai._pane_title(None, sid, _T()) == "my-folder"   # new session → folder
+    assert saikai._pane_title(None, sid) == "abcd1234"          # last resort: short id
 
 
 def test_resolve_resume_cwd_uses_stub_origin_cwd():
@@ -420,9 +420,9 @@ def test_resolve_resume_cwd_uses_stub_origin_cwd():
     import shutil as _sh
     d = tempfile.mkdtemp()
     try:
-        stub = recap._new_session_stub("sid-xyz", d, "myproj")
+        stub = saikai._new_session_stub("sid-xyz", d, "myproj")
         assert stub["origin_cwd"] == d
-        assert recap._resolve_resume_cwd("sid-xyz", [stub]) == d
+        assert saikai._resolve_resume_cwd("sid-xyz", [stub]) == d
     finally:
         _sh.rmtree(d, ignore_errors=True)
 
@@ -468,8 +468,8 @@ def test_ram_gate_windows_principled():
     RELATIVE physical floor, NOT raw available-physical (which counts reclaimable
     standby cache). _ram_fit counts how many ~per_pane panes fit; the binding
     constraint wins; a None field skips its check; None status (macOS) → unbounded."""
-    MS = recap._MemStatus
-    fit, gate = recap._ram_fit, recap._ram_gate_decision
+    MS = saikai._MemStatus
+    fit, gate = saikai._ram_fit, saikai._ram_gate_decision
     kw = dict(max_load=85, min_commit_mb=2048, min_free_phys_pct=8)
     plenty = MS(40, 16000, 20000, 32000)            # everything ample
     assert fit(plenty, 600, **kw)[0] >= 5 and gate(plenty, 600, **kw)[0] is True
@@ -501,26 +501,26 @@ def test_parse_macos_vm_stat():
         "Pages stored in compressor:              555555.\n"
     )
     total = 16 * 1024 * 1024 * 1024                 # 16 GiB
-    st = recap._parse_macos_vm_stat(sample, total)
+    st = saikai._parse_macos_vm_stat(sample, total)
     # reclaimable = 50000+100000+10000+5000 = 165000 pages × 16384 B
     assert abs(st.avail_phys_mb - 165000 * 16384 / (1024 * 1024)) < 1
     assert abs(st.total_phys_mb - 16384) < 1
     assert st.avail_commit_mb is None               # macOS: no commit limit
     assert 80 < st.load < 90                         # ~84% used
-    assert recap._parse_macos_vm_stat(sample, 0) is None         # bad total → None
-    assert recap._parse_macos_vm_stat("garbage", total).avail_phys_mb == 0.0  # no pages → 0 (blocks, safe)
+    assert saikai._parse_macos_vm_stat(sample, 0) is None         # bad total → None
+    assert saikai._parse_macos_vm_stat("garbage", total).avail_phys_mb == 0.0  # no pages → 0 (blocks, safe)
 
 
 def test_color_key_for_modes():
     """[display] color_by selects the Title hue dimension: project (default) /
     worktree / topic / none."""
     s = {"project_name": "proj-enc", "worktree_label": "feat-x", "primary_topic": "auth"}
-    assert recap._color_key_for(s, "worktree") == "feat-x"
-    assert recap._color_key_for(s, "topic") == "auth"
-    assert recap._color_key_for(s, "none") == ""
-    assert recap._color_key_for(s, "project") == recap.project_short("proj-enc")
-    assert recap._color_key_for(s, "bogus") == recap.project_short("proj-enc")  # → project default
-    assert recap._color_key_for({}, "topic") == "(none)"   # empty topic → its own bucket
+    assert saikai._color_key_for(s, "worktree") == "feat-x"
+    assert saikai._color_key_for(s, "topic") == "auth"
+    assert saikai._color_key_for(s, "none") == ""
+    assert saikai._color_key_for(s, "project") == saikai.project_short("proj-enc")
+    assert saikai._color_key_for(s, "bogus") == saikai.project_short("proj-enc")  # → project default
+    assert saikai._color_key_for({}, "topic") == "(none)"   # empty topic → its own bucket
 
 
 def test_custom_title_overlay_and_precedence():
@@ -530,26 +530,26 @@ def test_custom_title_overlay_and_precedence():
     import tempfile
     from pathlib import Path
     # precedence in _list_title (pure on the dict)
-    assert recap._list_title({"id": "x", "custom_title": "My Name",
+    assert saikai._list_title({"id": "x", "custom_title": "My Name",
                               "ai_title": "auto"}) == "My Name"
-    assert recap._list_title({"id": "x", "custom_title": "",
+    assert saikai._list_title({"id": "x", "custom_title": "",
                               "ai_title": "auto"}) == "auto"
-    assert recap._list_title({"id": "x", "ai_title": "auto"}) == "auto"  # key absent
+    assert saikai._list_title({"id": "x", "ai_title": "auto"}) == "auto"  # key absent
     # persist round-trip, isolated to a temp file (don't touch real names)
     d = Path(tempfile.mkdtemp())
-    saved = recap.CUSTOM_TITLES_FILE
-    recap.CUSTOM_TITLES_FILE = d / "custom-titles.json"
-    recap._CUSTOM_TITLES_CACHE = None
-    recap._CUSTOM_TITLES_MTIME = None
+    saved = saikai.CUSTOM_TITLES_FILE
+    saikai.CUSTOM_TITLES_FILE = d / "custom-titles.json"
+    saikai._CUSTOM_TITLES_CACHE = None
+    saikai._CUSTOM_TITLES_MTIME = None
     try:
-        recap._set_custom_title("sidX", "Hello 日本語")
-        assert recap._load_custom_titles().get("sidX") == "Hello 日本語"
-        recap._set_custom_title("sidX", "   ")          # blank → clear
-        assert "sidX" not in recap._load_custom_titles()
+        saikai._set_custom_title("sidX", "Hello 日本語")
+        assert saikai._load_custom_titles().get("sidX") == "Hello 日本語"
+        saikai._set_custom_title("sidX", "   ")          # blank → clear
+        assert "sidX" not in saikai._load_custom_titles()
     finally:
-        recap.CUSTOM_TITLES_FILE = saved
-        recap._CUSTOM_TITLES_CACHE = None
-        recap._CUSTOM_TITLES_MTIME = None
+        saikai.CUSTOM_TITLES_FILE = saved
+        saikai._CUSTOM_TITLES_CACHE = None
+        saikai._CUSTOM_TITLES_MTIME = None
 
 
 def test_first_selectable_row_skips_headers():
@@ -566,23 +566,23 @@ def test_first_selectable_row_skips_headers():
             return _Key(self._keys[coord[0]]), None
 
     t = _FakeTable(["__hdr__0", "s1", "s2", "__hdr__1", "s3"])
-    assert recap._first_selectable_row(t, 0, 1) == 1      # hdr→down→first session
-    assert recap._first_selectable_row(t, 2, 1) == 4      # skip hdr 3 → 4
-    assert recap._first_selectable_row(t, 3, -1) == 2     # hdr→up→prev session
-    assert recap._first_selectable_row(t, 1, -1) is None  # only hdr above → flip
+    assert saikai._first_selectable_row(t, 0, 1) == 1      # hdr→down→first session
+    assert saikai._first_selectable_row(t, 2, 1) == 4      # skip hdr 3 → 4
+    assert saikai._first_selectable_row(t, 3, -1) == 2     # hdr→up→prev session
+    assert saikai._first_selectable_row(t, 1, -1) is None  # only hdr above → flip
     empty = _FakeTable(["__hdr__empty"])                  # no sessions at all
-    assert recap._first_selectable_row(empty, 0, 1) is None
-    assert recap._first_selectable_row(empty, 0, -1) is None
+    assert saikai._first_selectable_row(empty, 0, 1) is None
+    assert saikai._first_selectable_row(empty, 0, -1) is None
 
 
 def test_wt_column_is_sortable():
     """The Wt (worktree) header must sort: SORT_COLS gates _promote_sort_col and it
     omitted 'wt', so the header was a silent no-op while every other column sorted
     (the keyfn already supported col=='wt' via worktree_label)."""
-    assert "wt" in recap.SORT_COLS
+    assert "wt" in saikai.SORT_COLS
     sess = [{"id": "a", "worktree_label": "zeta", "mtime": 1.0},
             {"id": "b", "worktree_label": "alpha", "mtime": 2.0}]
-    recap._apply_sort(sess, [{"col": "wt", "dir": "asc"}])
+    saikai._apply_sort(sess, [{"col": "wt", "dir": "asc"}])
     assert [s["id"] for s in sess] == ["b", "a"]   # alpha before zeta
 
 
@@ -590,8 +590,8 @@ def test_at_live_capacity_counts_inflight_opens():
     """Regression: the live-pane cap must count BOTH registered panes and in-flight
     opens (register is deferred to the async mount worker). Without counting the
     in-flight ones, a Space-batch / Shift+F4-restore loop reads a stale count and
-    overruns RECAP_MAX_LIVE (and races into DuplicateIds)."""
-    f = recap._at_live_capacity
+    overruns SAIKAI_MAX_LIVE (and races into DuplicateIds)."""
+    f = saikai._at_live_capacity
     assert f(0, 0, 4) is False
     assert f(3, 0, 4) is False
     assert f(4, 0, 4) is True            # full on registered alone
@@ -607,7 +607,7 @@ def test_live_pane_mount_awaits_pane_removal():
     Guards that _spawn_live_pane delegates to the async _mount_live_pane worker which
     awaits both. Source scan so it runs without textual."""
     from pathlib import Path as _P
-    src = _P(__file__).resolve().parent.parent.joinpath("recap.py").read_text(encoding="utf-8")
+    src = _P(__file__).resolve().parent.parent.joinpath("saikai.py").read_text(encoding="utf-8")
     assert "async def _mount_live_pane" in src, "awaited mount worker missing"
     assert "await tabs.remove_pane(" in src, "remove_pane must be awaited before add_pane"
     assert "await tabs.add_pane(" in src, "add_pane must be awaited in the mount worker"
@@ -615,11 +615,11 @@ def test_live_pane_mount_awaits_pane_removal():
 
 
 def test_split_live_default_on_with_env_opt_out():
-    """Split-live is the DEFAULT now; RECAP_SPLIT_LIVE is a tri-state OPT-OUT.
+    """Split-live is the DEFAULT now; SAIKAI_SPLIT_LIVE is a tri-state OPT-OUT.
     Only an explicit falsy token (0/false/no/off, case-insensitive, trimmed)
     disables it → legacy full-takeover. Unset / empty / any other value = on
     (a typo'd value fails safe to the default, split-live)."""
-    f = recap._split_live_disabled_by_env
+    f = saikai._split_live_disabled_by_env
     for keep_on in (None, "", "1", "true", "yes", "on", "flase"):
         assert f(keep_on) is False, keep_on
     for opt_out in ("0", "false", "no", "off", "FALSE", " Off ", "NO"):

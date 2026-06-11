@@ -6,7 +6,7 @@ Two layers:
   * Runtime smoke (needs textual): the new layout CSS (#grip width:1, #right
     1fr, `#main.nolist #grip { display:none }`) PARSES and mounts, an inline
     styles.width resize applies, and toggling `nolist` hides the grip — i.e. the
-    exact CSS constructs recap's PickerApp now relies on are accepted by the
+    exact CSS constructs saikai's PickerApp now relies on are accepted by the
     installed textual. Skips cleanly when textual is unavailable.
 
 Run (pure only):   python tests/test_split_divider.py
@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import recap
+import saikai
 
 try:
     from textual.app import App
@@ -31,41 +31,41 @@ except Exception:
 
 
 def test_split_ratio_from_x_clamps():
-    lo, hi = recap._SPLIT_RATIO_LO, recap._SPLIT_RATIO_HI
+    lo, hi = saikai._SPLIT_RATIO_LO, saikai._SPLIT_RATIO_HI
     # left=10, width=100 → x=60 → mid
-    assert abs(recap._split_ratio_from_x(60, 10, 100) - 0.5) < 1e-9
-    assert recap._split_ratio_from_x(11, 10, 100) == lo     # dragged toward 0 → floor
-    assert recap._split_ratio_from_x(9999, 10, 100) == hi   # dragged past end → ceil
-    assert recap._split_ratio_from_x(50, 0, 0) == lo        # zero width → no div-by-zero
+    assert abs(saikai._split_ratio_from_x(60, 10, 100) - 0.5) < 1e-9
+    assert saikai._split_ratio_from_x(11, 10, 100) == lo     # dragged toward 0 → floor
+    assert saikai._split_ratio_from_x(9999, 10, 100) == hi   # dragged past end → ceil
+    assert saikai._split_ratio_from_x(50, 0, 0) == lo        # zero width → no div-by-zero
 
 
 def test_split_ratio_persist_roundtrip():
     """_set_split_ratio writes options.json; _get_split_ratio reads it back,
     clamped. Isolated to a temp OPTIONS_FILE so the user's prefs are untouched."""
     d = Path(tempfile.mkdtemp())
-    saved = recap.OPTIONS_FILE
-    for k in ("RECAP_SPLIT_RATIO", "RECAP_CONFIG"):
+    saved = saikai.OPTIONS_FILE
+    for k in ("SAIKAI_SPLIT_RATIO", "SAIKAI_CONFIG"):
         os.environ.pop(k, None)
-    recap._reset_config_cache()
-    recap.OPTIONS_FILE = d / "options.json"
+    saikai._reset_config_cache()
+    saikai.OPTIONS_FILE = d / "options.json"
     try:
-        recap._set_split_ratio(0.42)
-        assert abs(recap._get_split_ratio() - 0.42) < 1e-9
-        recap._set_split_ratio(0.99)                         # clamps to hi
-        assert recap._get_split_ratio() == recap._SPLIT_RATIO_HI
-        recap._set_split_ratio(0.01)                         # clamps to lo
-        assert recap._get_split_ratio() == recap._SPLIT_RATIO_LO
+        saikai._set_split_ratio(0.42)
+        assert abs(saikai._get_split_ratio() - 0.42) < 1e-9
+        saikai._set_split_ratio(0.99)                         # clamps to hi
+        assert saikai._get_split_ratio() == saikai._SPLIT_RATIO_HI
+        saikai._set_split_ratio(0.01)                         # clamps to lo
+        assert saikai._get_split_ratio() == saikai._SPLIT_RATIO_LO
         # absent → default 0.34 (no options key, no env/config)
-        recap.OPTIONS_FILE = d / "empty.json"
-        assert abs(recap._get_split_ratio() - 0.34) < 1e-9
+        saikai.OPTIONS_FILE = d / "empty.json"
+        assert abs(saikai._get_split_ratio() - 0.34) < 1e-9
     finally:
-        recap.OPTIONS_FILE = saved
-        recap._reset_config_cache()
+        saikai.OPTIONS_FILE = saved
+        saikai._reset_config_cache()
 
 
 if HAVE_TEXTUAL:
     class _MiniApp(App):
-        # The new constructs recap's real CSS depends on (replica — the real
+        # The new constructs saikai's real CSS depends on (replica — the real
         # CSS lives in a nested class that can't be imported headless).
         CSS = """
         #main { layout: horizontal; height: 1fr; }
