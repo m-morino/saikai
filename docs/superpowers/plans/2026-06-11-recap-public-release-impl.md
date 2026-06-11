@@ -10,6 +10,8 @@
 
 **Testing reality:** pure module-level helpers → `tests/test_config.py` / `tests/test_sort_recency.py` headless. App methods / render / leader runtime → `python -m py_compile` + run all 4 suites + restart recap to eyeball. Never a big untested batch (the 2026-06 freeze lesson); one tested commit per task.
 
+**Status (2026-06-11): Phases 1–6 implemented.** §A config, §B summary-opt-in, §D CLI, §C keymap+leader+help, §I UX (color_by · header-row skip · draggable divider), and the §F-non-CI history gate + the stretches (atexit tty-restore, memory-pressure toast) all landed with their tests. **§E (OSS scaffolding) and §H (history clean + publish) remain deferred** per the user. Each App-method / render change was checked with `py_compile` + all five suites; a manual restart is the final eyeball for the live UI.
+
 ---
 
 ## Phase 1 — Config core (§A) — the foundation
