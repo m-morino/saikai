@@ -435,6 +435,56 @@ def _scroll_row_index(hist_len: int, scroll: int, y: int) -> int:
     return hist_len - scroll + y
 
 
+def set_clipboard_windows(text: str) -> bool:
+    """Put `text` on the Windows clipboard as CF_UNICODETEXT via Win32 directly.
+
+    Codepage-INDEPENDENT, which is the whole point: piping to `clip.exe` makes it
+    decode stdin using the console's code page, so multibyte text (CJK / emoji)
+    garbles whenever the launch codepage differs from what we encoded for — e.g.
+    UTF-16LE bytes read back as UTF-8 turned 裏がとれております into 'ψL0h0…'.
+    Setting the UTF-16 clipboard format the OS actually stores makes it
+    round-trip no matter how recap was started. Returns False on any failure so
+    the caller can fall back to clip / OSC-52. Windows-only (guard before call)."""
+    import ctypes
+    from ctypes import wintypes
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+    u32 = ctypes.windll.user32
+    k32 = ctypes.windll.kernel32
+    k32.GlobalAlloc.restype = wintypes.HGLOBAL
+    k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    k32.GlobalLock.restype = wintypes.LPVOID
+    k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    k32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    u32.SetClipboardData.restype = wintypes.HANDLE
+    u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    buf = text.encode("utf-16-le") + b"\x00\x00"      # NUL-terminated wide string
+    if not u32.OpenClipboard(None):
+        return False
+    h = None
+    try:
+        u32.EmptyClipboard()
+        h = k32.GlobalAlloc(GMEM_MOVEABLE, len(buf))
+        if not h:
+            return False
+        ptr = k32.GlobalLock(h)
+        if not ptr:
+            return False
+        ctypes.memmove(ptr, buf, len(buf))
+        k32.GlobalUnlock(h)
+        if not u32.SetClipboardData(CF_UNICODETEXT, h):
+            return False
+        h = None        # ownership transferred to the OS — must NOT free it
+        return True
+    except Exception:
+        return False
+    finally:
+        if h:
+            k32.GlobalFree(h)   # SetClipboardData never took ownership → free our block
+        u32.CloseClipboard()
+
+
 class AltScreenTracker:
     """Track alt-screen enter/leave transitions in a raw VT byte stream."""
 
@@ -851,13 +901,19 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         return "\n".join(lines).strip("\n")
 
     def _copy_text(self, text: str) -> None:
-        """Cross-platform clipboard: Windows `clip` (OSC-52 is unreliable on
-        console hosts), OSC-52 via the app elsewhere (Linux/macOS/WezTerm)."""
+        """Cross-platform clipboard: Windows Win32 CF_UNICODETEXT first
+        (codepage-safe — clip.exe mangles multibyte text under a mismatched
+        console codepage), then clip.exe as a fallback, then OSC-52 via the app
+        (Linux/macOS/WezTerm/SSH)."""
         if not text:
             return
         if sys.platform == "win32":
+            if set_clipboard_windows(text):
+                return
             try:
-                subprocess.run(["clip"], input=text.encode("utf-16-le"), check=True,
+                # Fallback if the Win32 path failed (e.g. clipboard locked). UTF-8
+                # because recap.cmd sets chcp 65001; best-effort only.
+                subprocess.run(["clip"], input=text.encode("utf-8"), check=True,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return
             except Exception:
