@@ -224,7 +224,8 @@ _CONFIG_TEMPLATE = (
     "min_free_phys_pct      = 8     # keep >= this % of physical RAM free\n"
     "per_pane_mb            = 600   # estimated RAM per live pane\n"
     "hard_ram_gate          = false # true = refuse (vs warn) when crossed\n"
-    "max_live               = 64    # hard cap on concurrent live panes\n\n"
+    "max_live               = 64    # hard cap on concurrent live panes\n"
+    "scrollback_lines       = 2000  # per-pane scrollback kept in memory (biggest RAM lever)\n\n"
     "[keys]\n"
     '# leader  = "ctrl+g"   # opt-in prefix, then the mnemonic letters below\n'
     '# refresh = "f5"\n'
@@ -2890,6 +2891,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     if _LIVE_TERM is not None and _split_off:
         _LIVE_TERM = None
         _LIVE_TERM_REASON = "split-live disabled (RECAP_SPLIT_LIVE=0 / [display] split_live=false)"
+
+    # Per-pane pyte scrollback depth drives the live process's memory (a full
+    # 5000-line history was ~95 MB PER pane). Resolve env > config > default and
+    # push it into the widget BEFORE any pane is created. Clamp to a sane band.
+    if _LIVE_TERM is not None:
+        _sb = _cfg("limits", "scrollback_lines", "RECAP_SCROLLBACK", 2000, int)
+        _LIVE_TERM.SCROLLBACK_LINES = max(200, min(50000, _sb))
 
     # Emulate POSIX SIGHUP on Windows: if this tab's shell dies (tab closed)
     # while the picker is open or a resumed `claude` is running, take recap and

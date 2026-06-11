@@ -101,6 +101,7 @@ Markers in the list: `~` busy · `?` waiting for input · `!` finished (unanswer
 | `RECAP_MIN_FREE_MB` | 0 | optional absolute physical floor (legacy; max'd with the % floor) |
 | `RECAP_HARD_RAM_GATE` | off | `1` refuses (vs warns) when the gate would be crossed |
 | `RECAP_MAX_LIVE` | 64 | hard cap on concurrent live panes (backstop) |
+| `RECAP_SCROLLBACK` | 2000 | per-pane scrollback lines kept in memory. **Biggest lever on the live process's RAM** (a full pane ≈ cols×lines pyte cells); lower it (e.g. 1000) on a memory-tight machine, raise for deeper history |
 | `RECAP_COLOR_BY` | project | what tints the session title: `project` / `worktree` / `topic` / `none` |
 | `RECAP_SPLIT_RATIO` | 0.34 | initial list/pane split (drag the divider to change; the dragged value persists) |
 

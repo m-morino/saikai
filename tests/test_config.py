@@ -149,6 +149,7 @@ def test_init_config_writes_parseable_template():
             cfg = tomllib.load(fh)                       # template is valid TOML
         assert cfg["summary"]["enabled"] is False        # documented defaults
         assert cfg["limits"]["max_live"] == 64
+        assert cfg["limits"]["scrollback_lines"] == 2000  # the memory lever ships in the template
         assert recap._init_config(force=False) == 1      # refuse overwrite
         assert recap._init_config(force=True) == 0       # --force overwrites
     finally:

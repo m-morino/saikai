@@ -54,6 +54,14 @@ import threading
 import time
 from typing import Callable, Optional
 
+# Per-pane pyte scrollback depth. Each retained history line costs memory
+# (≈ cols × a pyte Char object); at 200 cols a FULL 5000-line history measured
+# ~95 MB PER pane, so a handful of open panes pushed the recap process into the
+# high hundreds of MB. Default trimmed to 2000 (~39 MB worst case); recap.py
+# overrides this at startup from [limits] scrollback_lines / RECAP_SCROLLBACK
+# (clamped). Lower it (e.g. 1000 ≈ 20 MB/pane) on a memory-tight machine.
+SCROLLBACK_LINES = 2000
+
 
 def _log(msg: str) -> None:
     """Best-effort append to the shared recap.log (same file recap.py's _log
@@ -606,7 +614,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             # HistoryScreen keeps scrolled-off lines in .history.top so the pane
             # can scroll back (claude renders to the NORMAL buffer — verified by
             # probe: no ?1049h alt-screen — so terminal-side scrollback applies).
-            self._screen = pyte.HistoryScreen(cols, rows, history=5000)   # (cols, rows)!
+            self._screen = pyte.HistoryScreen(cols, rows, history=SCROLLBACK_LINES)  # (cols, rows)!
             self._stream = pyte.Stream(self._screen)        # feed str; pywinpty already decodes
         except Exception as e:  # pragma: no cover
             self._fail(f"pyte init failed: {e!r}")
