@@ -5,7 +5,7 @@ description = "A terminal session browser for Claude Code — browse, search, gr
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
-# TODO(publish): set your own name / GitHub handle before publishing.
+# Anonymous by design; personalize the display name here if you like (optional).
 authors = [{ name = "recap contributors" }]
 keywords = ["claude", "claude-code", "tui", "textual", "sessions", "cli"]
 classifiers = [
@@ -33,6 +33,12 @@ dependencies = [
 
 [project.scripts]
 recap = "recap:main"
+
+[project.urls]
+Homepage = "https://github.com/m-morino/recap"
+Repository = "https://github.com/m-morino/recap"
+Issues = "https://github.com/m-morino/recap/issues"
+Changelog = "https://github.com/m-morino/recap/blob/main/CHANGELOG.md"
 
 [tool.hatch.version]
 path = "recap.py"          # regex source: reads __version__ without importing recap.py

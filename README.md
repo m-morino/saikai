@@ -1,5 +1,9 @@
 # recap
 
+[![CI](https://github.com/m-morino/recap/actions/workflows/ci.yml/badge.svg)](https://github.com/m-morino/recap/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+
 A terminal session browser for [Claude Code](https://claude.com/claude-code).
 recap scans `~/.claude/projects`, shows your past sessions in a searchable,
 sortable, groupable table with an AI-generated one-line summary per session, and
@@ -96,6 +100,13 @@ Markers in the list: `~` busy · `?` waiting for input · `!` finished (unanswer
 | `RECAP_MIN_FREE_MB` | 0 | optional absolute physical floor (legacy; max'd with the % floor) |
 | `RECAP_HARD_RAM_GATE` | off | `1` refuses (vs warns) when the gate would be crossed |
 | `RECAP_MAX_LIVE` | 64 | hard cap on concurrent live panes (backstop) |
+| `RECAP_COLOR_BY` | project | what tints the session title: `project` / `worktree` / `topic` / `none` |
+| `RECAP_SPLIT_RATIO` | 0.34 | initial list/pane split (drag the divider to change; the dragged value persists) |
+
+recap also reads an optional **TOML config file** for these same knobs (with
+`env > config > default` precedence) plus `[keys]` rebinds. Run `recap
+--init-config` to write a documented template, `recap --print-config` to see the
+resolved location and values.
 
 ## Platform support
 
@@ -109,7 +120,7 @@ platform-specific part (it drives a real PTY and the clipboard). Honest status:
 
 | OS | Live-pane PTY | Clipboard (from a frozen pane) | RAM gate source | Status |
 |---|---|---|---|---|
-| **Windows** 10 / 11 | ConPTY (`pywinpty`) | `clip` | `GlobalMemoryStatusEx` | ✅ **developed & daily-driven** |
+| **Windows** 10 / 11 | ConPTY (`pywinpty`) | Win32 `CF_UNICODETEXT` (codepage-safe) | `GlobalMemoryStatusEx` | ✅ **developed & daily-driven** |
 | **Linux** *(incl. WSL)* | POSIX PTY (`ptyprocess`) | OSC-52 *(needs an OSC-52-capable terminal)* | `/proc/meminfo` | ⚠️ code-complete, **not yet run by the author** |
 | **macOS** | POSIX PTY (`ptyprocess`) | OSC-52 *(iTerm2 / kitty / WezTerm fine; Terminal.app needs it enabled)* | `sysctl` + `vm_stat` *(load + physical; no commit limit)* | ⚠️ code-complete, **not yet run by the author** |
 
@@ -128,6 +139,18 @@ platform-specific part (it drives a real PTY and the clipboard). Honest status:
 
 - Ran it on Linux or macOS? Please open an issue with the result (and any PTY /
   clipboard quirks) so these rows can move to ✅.
+
+## Contributing
+
+Issues and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the dev
+setup, how to run the test suites, and the **concurrency invariants** that keep
+the split-live pane from deadlocking (read those before touching threading code).
+Changes are documented in [CHANGELOG.md](CHANGELOG.md).
+
+## Security
+
+Please report vulnerabilities privately — see [SECURITY.md](SECURITY.md). Don't
+open a public issue for a security problem.
 
 ## License
 

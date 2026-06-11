@@ -1,4 +1,8 @@
-# Keep shell scripts + git hooks LF even in a Windows working tree, so they run
-# under sh/bash on every OS (a CRLF shebang breaks `#!/usr/bin/env sh`).
-*.sh        text eol=lf
+# Normalize line endings: store LF in the repo and let each OS check out its
+# native style for editing (Windows keeps CRLF working-tree, unchanged behavior).
+* text=auto
+
+# Shell scripts + git hooks MUST stay LF even in a Windows working tree, or the
+# CRLF shebang (`#!/usr/bin/env sh\r`) breaks them on Linux/macOS.
+*.sh             text eol=lf
 scripts/hooks/*  text eol=lf
