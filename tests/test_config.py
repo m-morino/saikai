@@ -156,6 +156,36 @@ def test_init_config_writes_parseable_template():
         recap._reset_config_cache()
 
 
+def test_reset_terminal_modes_guarded_and_emits():
+    """atexit/crash terminal restore: silent on a non-tty stderr (never pollutes
+    a redirected stream), emits the mouse/focus disable + show-cursor sequence on
+    a tty. Never raises."""
+    import io
+    import sys as _sys
+    saved = _sys.stderr
+    # non-tty → writes nothing
+    buf = io.StringIO()                       # StringIO.isatty() is False
+    _sys.stderr = buf
+    try:
+        recap._reset_terminal_modes()
+    finally:
+        _sys.stderr = saved
+    assert buf.getvalue() == ""
+    # tty-like → emits the disable sequence, ending with show-cursor (?25h)
+    class _Tty(io.StringIO):
+        def isatty(self):
+            return True
+    tbuf = _Tty()
+    _sys.stderr = tbuf
+    try:
+        recap._reset_terminal_modes()
+    finally:
+        _sys.stderr = saved
+    out = tbuf.getvalue()
+    assert "\033[?1003l" in out and "\033[?1006l" in out and "\033[?1004l" in out
+    assert out.endswith("\033[?25h")
+
+
 if __name__ == "__main__":
     test_config_path_honors_env()
     print("PASS test_config_path_honors_env")
@@ -175,4 +205,6 @@ if __name__ == "__main__":
     print("PASS test_leader_map")
     test_init_config_writes_parseable_template()
     print("PASS test_init_config_writes_parseable_template")
+    test_reset_terminal_modes_guarded_and_emits()
+    print("PASS test_reset_terminal_modes_guarded_and_emits")
     print("ALL PASS")
