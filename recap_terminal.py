@@ -1353,9 +1353,12 @@ class LiveSessionManager:
 
     @staticmethod
     def pane_id(sid: str) -> str:
-        # 8-char prefix keeps the DOM id short but collision-safe enough for a
-        # handful of concurrent panes; full sid lives on the widget.
-        return f"tab-live-{sid[:8]}"
+        # Use the FULL sid (Textual DOM ids have no length limit): an 8-char
+        # prefix can collide between two sessions sharing their first 8 UUID hex
+        # chars, and the mount path would then remove the wrong pane's tab without
+        # killing its process. Nothing parses this back to a sid (every compare
+        # re-derives via pane_id()), so the full form is a safe drop-in.
+        return f"tab-live-{sid}"
 
     @property
     def count(self) -> int:

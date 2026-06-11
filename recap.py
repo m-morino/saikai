@@ -3965,6 +3965,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 pass
 
         def _update_preview(self, sid: str | None) -> None:
+            # Skip the clear + re-render when the SAME session is already shown in
+            # the SAME mode. The 1.5s status poll rebuilds the table and re-fires a
+            # highlight for the selected row every tick; without this guard a
+            # static (non-live) preview gets cleared and rewritten each time —
+            # visible flicker + a disk re-read for nothing. The Tab mode-toggle
+            # changes preview_mode, so it still re-renders; F5 / row changes too.
+            if (sid == getattr(self, "_last_preview_sid", object())
+                    and self.preview_mode == getattr(self, "_last_preview_mode", None)):
+                return
+            self._last_preview_sid = sid
+            self._last_preview_mode = self.preview_mode
             preview = self.query_one("#preview", RichLog)
             preview.clear()
             if not sid:
@@ -5110,8 +5121,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self.notify(f"rename failed: {e!r}", severity="error", timeout=6)
                     return
                 clean = name.strip()
-                if s is not None:
-                    s["custom_title"] = clean    # same dict the list renders → instant
+                # Re-fetch the CURRENT dict: a background reload (RECAP_AUTO_REFRESH)
+                # while the modal was open would have replaced _sid_index, leaving
+                # the closure-captured `s` orphaned (its custom_title would never
+                # show). _set_custom_title already persisted to disk; reflect it on
+                # whichever dict the list renders now.
+                _live_s = self._sid_index.get(sid) or s
+                if _live_s is not None:
+                    _live_s["custom_title"] = clean    # instant, on the rendered dict
                 self._refresh_table()
                 # Relabel an open live tab for this session too.
                 try:
@@ -5119,7 +5136,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         tabs = self.query_one("#right", TabbedContent)
                         pane = tabs.get_pane(self._live.pane_id(sid))
                         if pane is not None:
-                            title = _pane_title(s, sid, self._live.get(sid))
+                            title = _pane_title(_live_s, sid, self._live.get(sid))
                             pane.label = _LIVE_TERM.tab_label(title, self._live.status(sid))
                 except Exception:
                     pass
