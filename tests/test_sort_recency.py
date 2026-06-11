@@ -523,6 +523,35 @@ def test_color_key_for_modes():
     assert recap._color_key_for({}, "topic") == "(none)"   # empty topic → its own bucket
 
 
+def test_custom_title_overlay_and_precedence():
+    """Shift+F2 custom titles: _list_title prefers a user name over ai_title,
+    a blank custom falls through, and the persist round-trip (isolated file)
+    sets / clears via _set_custom_title with mtime-cached reads."""
+    import tempfile
+    from pathlib import Path
+    # precedence in _list_title (pure on the dict)
+    assert recap._list_title({"id": "x", "custom_title": "My Name",
+                              "ai_title": "auto"}) == "My Name"
+    assert recap._list_title({"id": "x", "custom_title": "",
+                              "ai_title": "auto"}) == "auto"
+    assert recap._list_title({"id": "x", "ai_title": "auto"}) == "auto"  # key absent
+    # persist round-trip, isolated to a temp file (don't touch real names)
+    d = Path(tempfile.mkdtemp())
+    saved = recap.CUSTOM_TITLES_FILE
+    recap.CUSTOM_TITLES_FILE = d / "custom-titles.json"
+    recap._CUSTOM_TITLES_CACHE = None
+    recap._CUSTOM_TITLES_MTIME = None
+    try:
+        recap._set_custom_title("sidX", "Hello 日本語")
+        assert recap._load_custom_titles().get("sidX") == "Hello 日本語"
+        recap._set_custom_title("sidX", "   ")          # blank → clear
+        assert "sidX" not in recap._load_custom_titles()
+    finally:
+        recap.CUSTOM_TITLES_FILE = saved
+        recap._CUSTOM_TITLES_CACHE = None
+        recap._CUSTOM_TITLES_MTIME = None
+
+
 def test_first_selectable_row_skips_headers():
     """Category (group-header) rows are not selectable — the cursor walks past
     them in the travel direction; None when none lie that way (caller flips)."""
@@ -660,6 +689,8 @@ if __name__ == "__main__":
     print("PASS test_parse_macos_vm_stat")
     test_color_key_for_modes()
     print("PASS test_color_key_for_modes")
+    test_custom_title_overlay_and_precedence()
+    print("PASS test_custom_title_overlay_and_precedence")
     test_first_selectable_row_skips_headers()
     print("PASS test_first_selectable_row_skips_headers")
     test_wt_column_is_sortable()

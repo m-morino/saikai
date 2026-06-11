@@ -76,12 +76,13 @@ def _first_msg(s: dict, n: int = 60) -> str:
 
 
 def _list_title(s: dict) -> str:
-    """Title for the session LIST using claude's OWN data only — NO `claude -p`
-    summary. Falls through native ai-title → first user message → project label →
-    short id, so a freshly-opened session shows the project immediately (never
-    blank) and fills in as claude writes the first message and its own ai-title.
+    """Title for the session LIST. A user-typed name (Shift+F2, `custom_title`)
+    wins; otherwise claude's OWN data only — NO `claude -p` summary — falling
+    through native ai-title → first user message → project label → short id, so a
+    freshly-opened session shows the project immediately (never blank) and fills
+    in as claude writes the first message and its own ai-title.
     (project_short / _first_msg resolved at call time.)"""
-    return (s.get("ai_title") or _first_msg(s)
+    return (s.get("custom_title") or s.get("ai_title") or _first_msg(s)
             or project_short(s.get("project_name") or "")
             or (s.get("id") or "")[:8])
 
@@ -373,6 +374,7 @@ CACHE_DIR = Path.home() / ".cache" / "recap"
 SUMMARY_MODEL = "haiku"
 HIDDEN_FILE = CACHE_DIR / "hidden.json"
 FAVORITE_FILE = CACHE_DIR / "favorite.json"
+CUSTOM_TITLES_FILE = CACHE_DIR / "custom-titles.json"   # sid -> user-typed name (Shift+F2)
 OPEN_PANES_FILE = CACHE_DIR / "open-panes.json"   # split-live: sids open last session (restore)
 VIEW_MODE_FILE = CACHE_DIR / "view-mode.txt"
 TREE_MODE_FILE = CACHE_DIR / "tree-mode.txt"
@@ -427,6 +429,54 @@ def _save_options(opts: dict) -> None:
     merged = _load_options()
     merged.update(opts)
     _write_json(OPTIONS_FILE, merged)
+
+
+# Custom session titles (Shift+F2): a recap-side overlay keyed by sid. Cached
+# with mtime invalidation so the per-session lookup in _enrich_session — called
+# for EVERY session on every load / rescan — costs one stat, not a JSON re-read.
+_CUSTOM_TITLES_CACHE: "dict | None" = None
+_CUSTOM_TITLES_MTIME: "float | None" = None
+
+
+def _load_custom_titles() -> dict:
+    """sid -> user-typed title. recap-side only — never touches claude's
+    transcript. Re-read only when the file mtime changes (or after a write)."""
+    global _CUSTOM_TITLES_CACHE, _CUSTOM_TITLES_MTIME
+    try:
+        m = CUSTOM_TITLES_FILE.stat().st_mtime
+    except OSError:
+        _CUSTOM_TITLES_CACHE, _CUSTOM_TITLES_MTIME = {}, None
+        return {}
+    if _CUSTOM_TITLES_CACHE is not None and m == _CUSTOM_TITLES_MTIME:
+        return _CUSTOM_TITLES_CACHE
+    raw = _read_json(CUSTOM_TITLES_FILE, {})
+    _CUSTOM_TITLES_CACHE = raw if isinstance(raw, dict) else {}
+    _CUSTOM_TITLES_MTIME = m
+    return _CUSTOM_TITLES_CACHE
+
+
+def _set_custom_title(sid: str, name: str) -> None:
+    """Set (or clear, when `name` is blank) the custom title for `sid`. Strict
+    read so a transiently-unreadable file isn't clobbered to a 1-entry map
+    (mirrors _toggle_in_set's guard for favorites / hidden)."""
+    global _CUSTOM_TITLES_CACHE, _CUSTOM_TITLES_MTIME
+    name = (name or "").strip()
+    if CUSTOM_TITLES_FILE.exists():
+        try:
+            raw = json.loads(CUSTOM_TITLES_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise RuntimeError(
+                f"{CUSTOM_TITLES_FILE.name} exists but is unreadable ({e!r}); "
+                f"not writing (won't risk erasing your names)") from e
+        d = raw if isinstance(raw, dict) else {}
+    else:
+        d = {}
+    if name:
+        d[sid] = name
+    else:
+        d.pop(sid, None)
+    _write_json(CUSTOM_TITLES_FILE, d)
+    _CUSTOM_TITLES_CACHE, _CUSTOM_TITLES_MTIME = None, None   # force reload next read
 
 
 def _load_set(path: Path) -> set[str]:
@@ -1243,6 +1293,7 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
         "first_ts": parsed["first_ts"],
         "last_ts": parsed.get("last_ts") or parsed["first_ts"],
         "ai_title": parsed.get("ai_title", ""),
+        "custom_title": _load_custom_titles().get(sid, ""),   # Shift+F2 overlay (cached)
         "real_msgs": parsed.get("real_msgs", []),
         # n_turns = human prompts, derived from the already-filtered real_msgs so
         # tool_result records (also type:"user") don't inflate it 10-50x. Deriving
@@ -1833,11 +1884,13 @@ def label_for(s: dict) -> str:
 
 
 def _pane_title(s: "dict | None", sid: str, term=None) -> str:
-    """Human label for a live pane's tab — ai_title → summary → first user
-    message → the term's launch title (e.g. a new session's folder name) → a short
-    id only as a last resort, so a tab never shows just a bare session id."""
+    """Human label for a live pane's tab — custom name (Shift+F2) → ai_title →
+    summary → first user message → the term's launch title (e.g. a new session's
+    folder name) → a short id only as a last resort, so a tab never shows just a
+    bare session id."""
     if s:
-        t = (s.get("ai_title") or s.get("summary") or _first_msg(s) or "").strip()
+        t = (s.get("custom_title") or s.get("ai_title") or s.get("summary")
+             or _first_msg(s) or "").strip()
         if t:
             return t
     if term is not None:
@@ -2913,7 +2966,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  ([dim]:fav[/dim] in search to filter)\n"
                 "  [yellow]F5[/yellow]          Refresh list  (auto: RECAP_AUTO_REFRESH=secs)\n"
                 "  [yellow]F9[/yellow]          Copy this session's opening prompt\n"
-                "  [yellow]F8[/yellow]          Show what this session changed (transcript diff)\n\n"
+                "  [yellow]F8[/yellow]          Show what this session changed (transcript diff)\n"
+                "  [yellow]Shift-F2[/yellow]    Rename — type your own name (empty clears → auto-title)\n\n"
                 "[bold cyan]Display modes[/bold cyan]\n"
                 "  [yellow]Shift-F6[/yellow]    Cluster (topic) mode\n"
                 "  [yellow]Shift-F5[/yellow]    Tree (parent/child) mode\n"
@@ -3010,6 +3064,43 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 self.dismiss(None)
 
+    class RenameScreen(ModalScreen):
+        """Type a custom name for the selected session (Shift+F2). Enter saves;
+        an EMPTY value clears the custom name (reverts to the auto title); Esc
+        cancels. Returns the typed string (possibly "") on submit, None on
+        cancel — the caller distinguishes clear ("") from cancel (None)."""
+        CSS = """
+        RenameScreen { align: center middle; }
+        #rename-box { background: $panel; border: solid $accent; padding: 1 2;
+                      width: 72; height: auto; }
+        #rename-input { margin: 1 0; border: tall $accent; }
+        """
+        BINDINGS = [Binding("escape", "cancel", show=False)]
+
+        def __init__(self, current: str):
+            super().__init__()
+            self._current = current
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="rename-box"):
+                yield Static("[bold cyan]Rename session[/bold cyan]   "
+                             "[dim]Enter saves · empty clears (back to auto) · "
+                             "Esc cancels[/dim]")
+                yield Input(value=self._current, placeholder="custom name",
+                            id="rename-input")
+
+        def on_mount(self) -> None:
+            try:
+                self.query_one("#rename-input", Input).focus()
+            except Exception:
+                pass
+
+        def action_cancel(self) -> None:
+            self.dismiss(None)
+
+        def on_input_submitted(self, event) -> None:
+            self.dismiss(event.value or "")     # "" = clear; None only via cancel
+
     class PickerApp(App):
         TITLE = "recap"
         # Textual's built-in command palette binds Ctrl+P. recap deliberately
@@ -3062,6 +3153,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("f3", "next_tab", "Tab▶", id="next_tab", priority=True),
             Binding("shift+f3", "next_attention", "Next!", id="attention", priority=True),
             Binding("f4", "toggle_list", "Hide list", id="toggle_list", priority=True),
+            Binding("shift+f2", "rename", "Rename", id="rename", priority=True),
         ]
         # The practical limit on concurrent live claude panes is MEMORY — each
         # is a full node process tree that sits CPU-idle waiting for input — so
@@ -3370,7 +3462,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if ":recent" in statuses and not _is_recent_now(s, now_ts):
                     return False
                 if text:
-                    return (text in (s.get("ai_title") or "").lower()
+                    return (text in (s.get("custom_title") or "").lower()
+                            or text in (s.get("ai_title") or "").lower()
                             or text in " ".join(s.get("real_msgs") or []).lower()
                             or text in sid
                             or text in (s.get("project_name") or "").lower()
@@ -4938,6 +5031,44 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self.notify(f"favorite skipped: {e}", severity="error", timeout=6)
                     return
                 self._refresh_table()
+
+        def action_rename(self) -> None:
+            # A focused live pane owns Shift+F2 (it goes to claude); only rename
+            # when the list has focus.
+            if self._focused_terminal() is not None:
+                raise SkipAction()
+            sid = self._cursor_sid()
+            if not sid:
+                return
+            s = self._sid_index.get(sid)
+            current = (s or {}).get("custom_title") or ""
+
+            def _save(name) -> None:
+                if name is None:
+                    return                       # Esc → no change
+                try:
+                    _set_custom_title(sid, name)
+                except Exception as e:
+                    self.notify(f"rename failed: {e!r}", severity="error", timeout=6)
+                    return
+                clean = name.strip()
+                if s is not None:
+                    s["custom_title"] = clean    # same dict the list renders → instant
+                self._refresh_table()
+                # Relabel an open live tab for this session too.
+                try:
+                    if self._live is not None and self._live.has(sid):
+                        tabs = self.query_one("#right", TabbedContent)
+                        pane = tabs.get_pane(self._live.pane_id(sid))
+                        if pane is not None:
+                            title = _pane_title(s, sid, self._live.get(sid))
+                            pane.label = _LIVE_TERM.tab_label(title, self._live.status(sid))
+                except Exception:
+                    pass
+                self.notify("name cleared — back to auto-title" if not clean
+                            else f"renamed: {clean[:40]}", title="recap", timeout=3)
+
+            self.push_screen(RenameScreen(current), _save)
 
         def action_toggle_view(self) -> None:
             _toggle_view_mode()
