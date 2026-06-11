@@ -1,18 +1,18 @@
 [project]
-name = "recap"
-dynamic = ["version"]   # read from recap.py __version__ (regex source — no import at build)
+name = "saikai"
+dynamic = ["version"]   # read from saikai.py __version__ (regex source — no import at build)
 description = "A terminal session browser for Claude Code — browse, search, group, and resume past sessions, with a built-in split-live pane (on by default)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 # Anonymous by design; personalize the display name here if you like (optional).
-authors = [{ name = "recap contributors" }]
+authors = [{ name = "saikai contributors" }]
 keywords = ["claude", "claude-code", "tui", "textual", "sessions", "cli"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Environment :: Console",
     # Supported environments are LIMITED to what the code actually implements +
-    # can be CI-tested — deliberately NOT "OS Independent" (recap has Windows
+    # can be CI-tested — deliberately NOT "OS Independent" (saikai has Windows
     # ConPTY, POSIX PTY, and per-OS RAM probes). WSL counts as Linux.
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
@@ -32,29 +32,29 @@ dependencies = [
 ]
 
 [project.scripts]
-recap = "recap:main"
+saikai = "saikai:main"
 
 [project.urls]
-Homepage = "https://github.com/m-morino/recap"
-Repository = "https://github.com/m-morino/recap"
-Issues = "https://github.com/m-morino/recap/issues"
-Changelog = "https://github.com/m-morino/recap/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/m-morino/saikai"
+Repository = "https://github.com/m-morino/saikai"
+Issues = "https://github.com/m-morino/saikai/issues"
+Changelog = "https://github.com/m-morino/saikai/blob/main/CHANGELOG.md"
 
 [tool.hatch.version]
-path = "recap.py"          # regex source: reads __version__ without importing recap.py
+path = "saikai.py"          # regex source: reads __version__ without importing saikai.py
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-# recap.py imports recap_terminal — BOTH must ship or the wheel is broken.
-only-include = ["recap.py", "recap_terminal.py"]
+# saikai.py imports saikai_terminal — BOTH must ship or the wheel is broken.
+only-include = ["saikai.py", "saikai_terminal.py"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "recap.py",
-    "recap_terminal.py",
+    "saikai.py",
+    "saikai_terminal.py",
     "pyproject.toml",
     "README.md",
     "LICENSE",

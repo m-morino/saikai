@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-recap_terminal — a live, interactive PTY terminal as a Textual widget.
+saikai_terminal — a live, interactive PTY terminal as a Textual widget.
 
-This module backs recap's TRUE SPLIT-LIVE mode: the left pane stays the
+This module backs saikai's TRUE SPLIT-LIVE mode: the left pane stays the
 session DataTable; the right pane hosts one or more live `claude` processes,
 each in its own tab, each rendered from a real pseudo-console.
 
@@ -23,7 +23,7 @@ unproven until interactively tested):
 
 POSIX note: pywinpty is Windows-only. On POSIX we fall back to ``ptyprocess``,
 which exposes the same surface we use (spawn / read / write / setwinsize /
-isalive / pid). The widget runs on both; recap's primary host is Windows.
+isalive / pid). The widget runs on both; saikai's primary host is Windows.
 
 NOTE — what can and cannot be verified without an interactive TTY
 -----------------------------------------------------------------
@@ -31,7 +31,7 @@ CANNOT (needs a human at a terminal):
   * the live visual render (Textual paints the alternate screen) and real
     keyboard forwarding into a running ``claude``.
 CAN (and was, on this machine):
-  * ``python -m py_compile recap_terminal.py``
+  * ``python -m py_compile saikai_terminal.py``
   * PTY spawn + threaded read + EOF + exit detection
     (``cmd /c echo … & exit`` round-trip)
   * pyte ctor/resize argument order, cell-attribute extraction, alt-screen
@@ -56,22 +56,22 @@ from typing import Callable, Optional
 
 # Per-pane pyte scrollback depth. Each retained history line costs memory
 # (≈ cols × a pyte Char object); at 200 cols a FULL 5000-line history measured
-# ~95 MB PER pane, so a handful of open panes pushed the recap process into the
-# high hundreds of MB. Default trimmed to 2000 (~39 MB worst case); recap.py
-# overrides this at startup from [limits] scrollback_lines / RECAP_SCROLLBACK
+# ~95 MB PER pane, so a handful of open panes pushed the saikai process into the
+# high hundreds of MB. Default trimmed to 2000 (~39 MB worst case); saikai.py
+# overrides this at startup from [limits] scrollback_lines / SAIKAI_SCROLLBACK
 # (clamped). Lower it (e.g. 1000 ≈ 20 MB/pane) on a memory-tight machine.
 SCROLLBACK_LINES = 2000
 
 
 def _log(msg: str) -> None:
-    """Best-effort append to the shared recap.log (same file recap.py's _log
-    writes; standalone here so this module keeps no recap import). Size-bounded,
+    """Best-effort append to the shared saikai.log (same file saikai.py's _log
+    writes; standalone here so this module keeps no saikai import). Size-bounded,
     never raises. `[term]` tags lines from the split-live PTY layer so a
     post-mortem can tell the process lifecycle from the list-side events."""
     try:
-        d = os.path.join(os.path.expanduser("~"), ".cache", "recap")
+        d = os.path.join(os.path.expanduser("~"), ".cache", "saikai")
         os.makedirs(d, exist_ok=True)
-        lf = os.path.join(d, "recap.log")
+        lf = os.path.join(d, "saikai.log")
         try:
             if os.path.getsize(lf) > 1_000_000:
                 os.replace(lf, lf + ".1")
@@ -98,7 +98,7 @@ def _ime_anchor_xy(cursor_x, cursor_y, rx, ry, rw, rh):
 
 # ── global reap-thread registry ───────────────────────────────────────────────
 # Every kill() spawns a daemon thread running `taskkill /F /T` to reap the
-# child's grandchildren (claude's node workers). If recap exits before that
+# child's grandchildren (claude's node workers). If saikai exits before that
 # taskkill finishes the daemon dies and the workers orphan (the 0fd9fcf hazard).
 # on_unmount-driven teardown and exceptions don't route through the App's
 # join_reaps, so track EVERY reap here and join them at interpreter exit.
@@ -133,7 +133,7 @@ def join_all_reaps(timeout: float = 3.0) -> None:
 atexit.register(join_all_reaps)
 
 # ── Soft imports ─────────────────────────────────────────────────────────────
-# The widget is only constructed when these are present (recap probes
+# The widget is only constructed when these are present (saikai probes
 # TERMINAL_AVAILABLE before offering split-live). Importing this module never
 # raises just because a dep is missing — that keeps the preview fallback intact
 # and lets py_compile / unit tests run without textual/pyte/pywinpty.
@@ -162,7 +162,7 @@ try:
     from textual.strip import Strip
     from textual.widget import Widget
     from textual.geometry import Offset
-except Exception as _te:  # pragma: no cover - textual is a hard dep of recap
+except Exception as _te:  # pragma: no cover - textual is a hard dep of saikai
     _TEXTUAL_IMPORT_ERROR = repr(_te)
     # Stand-ins so the module still imports for py_compile / pure-function tests
     # on a box without textual.
@@ -179,7 +179,7 @@ TERMINAL_AVAILABLE = (
 
 def unavailable_reason() -> Optional[str]:
     """Human-readable reason the live terminal can't run, or None if it can.
-    recap surfaces this in a toast so the user knows why it fell back to the
+    saikai surfaces this in a toast so the user knows why it fell back to the
     static preview."""
     if pyte is None:
         return "pyte not installed (add 'pyte>=0.8' to the script deps)"
@@ -355,7 +355,7 @@ _KEYMAP.update({
 
 def _normalize_key(spec: str) -> str:
     """Map a human key spec (e.g. 'ctrl+]') to Textual's key name
-    ('ctrl+right_square_bracket') so RECAP_RELEASE_KEY accepts either form."""
+    ('ctrl+right_square_bracket') so SAIKAI_RELEASE_KEY accepts either form."""
     s = (spec or "").strip().lower()
     repl = {"]": "right_square_bracket", "[": "left_square_bracket",
             "\\": "backslash", "_": "underscore", "^": "circumflex_accent"}
@@ -368,13 +368,13 @@ def _normalize_key(spec: str) -> str:
 #: focused terminal swallows every key, so without this the user is trapped. Esc
 #: goes to claude (interrupt) and the readline editing keys (Ctrl+A/B/E/W/K/…) are
 #: forwarded, so the default is Ctrl+] — a control char ConPTY delivers reliably,
-#: rarely needed in claude (readline char-search). Override with RECAP_RELEASE_KEY
+#: rarely needed in claude (readline char-search). Override with SAIKAI_RELEASE_KEY
 #: (human form like 'ctrl+]' or a Textual name). Popped from _KEYMAP so it is
 #: never forwarded to the child. NOTE: Textual names ']' as right_square_bracket,
 #: so the literal 'ctrl+]' string would never match — _normalize_key fixes that.
-RELEASE_FOCUS_KEY = _normalize_key(os.environ.get("RECAP_RELEASE_KEY") or "ctrl+]")
+RELEASE_FOCUS_KEY = _normalize_key(os.environ.get("SAIKAI_RELEASE_KEY") or "ctrl+]")
 _KEYMAP.pop(RELEASE_FOCUS_KEY, None)
-# F2/F3 are reserved by recap for prev/next tab (priority bindings); never
+# F2/F3 are reserved by saikai for prev/next tab (priority bindings); never
 # forward them to the child, so tab-switching works even while a pane is focused.
 for _rk in ("f2", "f3", "f4"):
     _KEYMAP.pop(_rk, None)
@@ -425,7 +425,7 @@ _PRIVATE_SGR_RE = re.compile(r"\x1b\[[<>=][0-9;:]*m")
 # Kitty keyboard protocol push/pop/set/query (CSI >/</=/? … u). pyte doesn't
 # model it and LEAKS the trailing 'u' into the grid — so a kanji being edited
 # appears to gain a stray 'u' (the leaked byte lands at the cursor). claude emits
-# these to negotiate key reporting, but recap encodes keys in the legacy format
+# these to negotiate key reporting, but saikai encodes keys in the legacy format
 # regardless, so dropping the negotiation is display-only and harmless. (Plain
 # CSI u = SCO restore-cursor has no private marker, so it is NOT stripped.)
 _KITTY_KBD_RE = re.compile(r"\x1b\[[<>=?][0-9;:]*u")
@@ -451,7 +451,7 @@ def set_clipboard_windows(text: str) -> bool:
     garbles whenever the launch codepage differs from what we encoded for — e.g.
     UTF-16LE bytes read back as UTF-8 turned 裏がとれております into 'ψL0h0…'.
     Setting the UTF-16 clipboard format the OS actually stores makes it
-    round-trip no matter how recap was started. Returns False on any failure so
+    round-trip no matter how saikai was started. Returns False on any failure so
     the caller can fall back to clip / OSC-52. Windows-only (guard before call)."""
     import ctypes
     from ctypes import wintypes
@@ -546,14 +546,14 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         """
         argv      : list — ALWAYS a list (string argv is over-quoted by the
                     ConPTY shell layer; see pywinpty spike gotcha #3).
-        cwd, env  : child working dir / environment (recap builds these via
+        cwd, env  : child working dir / environment (saikai builds these via
                     its shared _build_resume_invocation helper).
-        sid       : the recap session id this pane is attached to (or None for
+        sid       : the saikai session id this pane is attached to (or None for
                     a brand-new session). Passed back to on_status/on_exit.
         title     : tab label seed.
         on_status : called (sid, status) when Busy/Waiting/Idle changes, so
-                    recap can mirror it onto the DataTable marker + tab label.
-        on_exit   : called (sid) when the child exits, so recap can re-title
+                    saikai can mirror it onto the DataTable marker + tab label.
+        on_exit   : called (sid) when the child exits, so saikai can re-title
                     the tab and stop polling.
         """
         super().__init__(**kw)
@@ -573,7 +573,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         self._scroll = 0             # lines scrolled back (0 = live bottom)
         self._frozen = False         # paused repaint: hold the view still so a
                                      # streaming pane can be drag-selected
-        self._sel_anchor = None      # (row,col) drag start — recap-OWNED selection
+        self._sel_anchor = None      # (row,col) drag start — saikai-OWNED selection
         self._sel_head = None        # (row,col) drag head; None ⇒ no selection
         self._sel_prev_frozen = False
         self._frozen_buf = None      # snapshot of the displayed rows while frozen
@@ -838,10 +838,10 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         except Exception:
             pass
 
-    # ── recap-owned text selection (drag) ─────────────────────────────────────
-    # The host terminal's native Shift+drag can't anchor to a TUI widget — recap
+    # ── saikai-owned text selection (drag) ─────────────────────────────────────
+    # The host terminal's native Shift+drag can't anchor to a TUI widget — saikai
     # repaints a fixed region, so a streaming pane wipes the native selection (see
-    # recap/CLAUDE.md). recap therefore captures a plain LEFT-drag itself: freeze
+    # saikai/CLAUDE.md). saikai therefore captures a plain LEFT-drag itself: freeze
     # on press (stream can't repaint over it), highlight while dragging, copy on
     # release. Coords are widget-relative display rows/cols, matching render_line.
     def _buf_for_row(self, screen, s, y):
@@ -920,7 +920,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
                 return
             try:
                 # Fallback if the Win32 path failed (e.g. clipboard locked). UTF-8
-                # because recap.cmd sets chcp 65001; best-effort only.
+                # because saikai.cmd sets chcp 65001; best-effort only.
                 subprocess.run(["clip"], input=text.encode("utf-8"), check=True,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return
@@ -1277,7 +1277,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
 
         The FAST part (close() → cancel_io() → reader unblocks) runs inline; the
         SLOW part (taskkill /T, ~hundreds ms–seconds) runs OFF the UI thread so
-        closing one pane — or many in parallel — never freezes recap. Idempotent."""
+        closing one pane — or many in parallel — never freezes saikai. Idempotent."""
         self._stop.set()
         pty, pid = self._pty, self._pid
         self._pty = None
@@ -1334,9 +1334,9 @@ def _safe_isalive(pty) -> bool:
 # Session / tab manager
 # ══════════════════════════════════════════════════════════════════════════════
 class LiveSessionManager:
-    """Bookkeeping for the live terminal tabs hosted in recap's right pane.
+    """Bookkeeping for the live terminal tabs hosted in saikai's right pane.
 
-    Pure data structure (no Textual coupling) so it is unit-testable: recap's
+    Pure data structure (no Textual coupling) so it is unit-testable: saikai's
     PickerApp owns the TabbedContent and asks this object what to do.
 
       * ``pane_id(sid)``    — deterministic TabPane id for a session.
@@ -1446,7 +1446,7 @@ STATUS_GLYPH = {
 
 
 def tab_label(title: str, status: str) -> str:
-    """Build a TabPane label like '◐ recap' / '⏳ docs' / '✓ myproj'."""
+    """Build a TabPane label like '◐ saikai' / '⏳ docs' / '✓ myproj'."""
     glyph = STATUS_GLYPH.get(status, "")
     name = (title or "claude")[:18]
     return f"{glyph} {name}".strip()

@@ -1,6 +1,6 @@
 """Headless regression tests for ClaudeTerminal threading.
 
-Runs WITHOUT textual/pyte/pywinpty: recap_terminal soft-imports them (Widget
+Runs WITHOUT textual/pyte/pywinpty: saikai_terminal soft-imports them (Widget
 falls back to object), so ClaudeTerminal can be built via __new__ with just the
 fields under test. Run:  python tests/test_terminal_concurrency.py
 """
@@ -9,7 +9,7 @@ import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import recap_terminal as rt
+import saikai_terminal as rt
 
 
 def test_update_status_marshals_outside_lock():
@@ -162,7 +162,7 @@ def test_encode_key_meta_and_release():
     assert rt.encode_key("ctrl+w", None) == "\x17"          # word-delete still forwards
     assert rt.encode_key("ctrl+a", None) == "\x01"
     assert rt._normalize_key("ctrl+]") == "ctrl+right_square_bracket"
-    if not os.environ.get("RECAP_RELEASE_KEY"):
+    if not os.environ.get("SAIKAI_RELEASE_KEY"):
         assert rt.RELEASE_FOCUS_KEY == "ctrl+right_square_bracket"
 
 
@@ -218,7 +218,7 @@ def test_kitty_keyboard_csi_u_is_scrubbed():
 
 
 def test_selection_geometry_in_sel():
-    """recap-owned drag-selection geometry: single row = a column span; multi-row
+    """saikai-owned drag-selection geometry: single row = a column span; multi-row
     = anchor-col→end, full middle rows, 0→head-col on the last. Direction-agnostic."""
     ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
     ct._sel_anchor, ct._sel_head = (2, 3), (2, 7)
@@ -304,7 +304,7 @@ def test_toggle_freeze_flips_and_resumes():
 
 
 def test_bracketed_paste_mode_tracking():
-    """recap re-wraps pastes in \\x1b[200~ … \\x1b[201~ only when claude has
+    """saikai re-wraps pastes in \\x1b[200~ … \\x1b[201~ only when claude has
     enabled bracketed-paste mode; the mode is tracked from CSI ?2004 h/l in the
     output stream (pyte doesn't expose it). Last h/l in a chunk wins."""
     fa = rt._BRACKETED_RE.findall
@@ -328,10 +328,10 @@ def test_ime_anchor_xy_maps_cursor_into_region():
 
 
 def test_reopen_after_exit_requires_awaited_pane_removal():
-    """Re-opening an EXITED session must not hit Textual DuplicateIds. recap keeps a
+    """Re-opening an EXITED session must not hit Textual DuplicateIds. saikai keeps a
     dead pane mounted (for its final frame) and re-uses the sid's pane id on reopen;
     TabbedContent.remove_pane() is DEFERRED (returns AwaitComplete), so a synchronous
-    remove_pane()+add_pane(same id) collides. This proves the mechanism behind recap's
+    remove_pane()+add_pane(same id) collides. This proves the mechanism behind saikai's
     _mount_live_pane worker: NOT awaiting the removal raises DuplicateIds; awaiting it
     mounts cleanly. Needs textual (skips without it — the bug was the silent
     'won't reopen' for every session whose claude had exited)."""
@@ -355,7 +355,7 @@ def test_reopen_after_exit_requires_awaited_pane_removal():
             await pilot.pause()
             raised = None
             try:
-                if awaited:                       # recap's _mount_live_pane fix
+                if awaited:                       # saikai's _mount_live_pane fix
                     await tc.remove_pane("tab-live-x")
                     await tc.add_pane(TabPane("second", Label("b"), id="tab-live-x"))
                 else:                             # the old buggy synchronous path

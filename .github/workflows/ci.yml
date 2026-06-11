@@ -26,7 +26,7 @@ jobs:
           python-version: ${{ matrix.python }}
 
       # Deps mirror pyproject (textual / pyte / platformdirs). The PTY backends
-      # (pywinpty / ptyprocess) are intentionally NOT installed: recap_terminal
+      # (pywinpty / ptyprocess) are intentionally NOT installed: saikai_terminal
       # soft-imports them, so the suites — including the textual run_test smoke —
       # run headless without a real PTY.
       - name: Install dependencies
@@ -36,7 +36,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m py_compile recap.py recap_terminal.py
+          python -m py_compile saikai.py saikai_terminal.py
           for t in test_config test_sort_recency test_split_divider test_resource_bounds test_terminal_concurrency; do
             echo "== $t =="
             python "tests/$t.py"
