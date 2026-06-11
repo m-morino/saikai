@@ -87,6 +87,7 @@ def test_pane_refresh_coalesces():
     queued = []
     ct._marshal = lambda fn: queued.append(fn)   # simulate the UI queue (don't run)
     ct.refresh = lambda: None
+    ct._sync_terminal_cursor = lambda: None      # cursor sync needs a mounted widget
     ct._schedule_pane_refresh()
     ct._schedule_pane_refresh()
     ct._schedule_pane_refresh()
