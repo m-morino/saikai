@@ -119,6 +119,20 @@ def _first_selectable_row(table, start: int, step: int):
     return None
 
 
+# Draggable list/pane divider: the table's width as a fraction of #main. Banded
+# so neither pane can be dragged shut (keeps the grip reachable + claude usable).
+_SPLIT_RATIO_LO, _SPLIT_RATIO_HI = 0.15, 0.85
+
+
+def _split_ratio_from_x(screen_x, main_left, main_width,
+                        lo=_SPLIT_RATIO_LO, hi=_SPLIT_RATIO_HI):
+    """Table-width fraction for a divider drag at absolute column `screen_x`,
+    given #main's left edge + width. Clamped to [lo, hi]. Pure — unit-tested."""
+    if main_width <= 0:
+        return lo
+    return max(lo, min(hi, (screen_x - main_left) / main_width))
+
+
 def _read_json(path: Path, default):
     """Read JSON file, returning `default` on any error (missing/corrupt/etc.)."""
     try:
@@ -515,6 +529,27 @@ def _set_group_by(value: str) -> None:
         value = "none"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     GROUP_BY_FILE.write_text(value, encoding="utf-8")
+
+
+def _get_split_ratio() -> float:
+    """Persisted list/pane divider position as a table-width fraction.
+    Precedence: options.json (last drag) > [display] split_ratio /
+    RECAP_SPLIT_RATIO > 0.34 (split-live's default table share). Always clamped
+    to the [_SPLIT_RATIO_LO, _SPLIT_RATIO_HI] band."""
+    v = _load_options().get("split_ratio")
+    if v is None:
+        v = _cfg("display", "split_ratio", "RECAP_SPLIT_RATIO", 0.34, float)
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        v = 0.34
+    return max(_SPLIT_RATIO_LO, min(_SPLIT_RATIO_HI, v))
+
+
+def _set_split_ratio(v: float) -> None:
+    """Persist the dragged divider position (clamped) to options.json."""
+    v = max(_SPLIT_RATIO_LO, min(_SPLIT_RATIO_HI, float(v)))
+    _save_options({"split_ratio": round(v, 4)})
 
 
 def _get_status_filter() -> str:
@@ -2794,6 +2829,30 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     # when something goes wrong inside the framework's event loop.
     os.environ.setdefault("TEXTUAL_LOG", str(CACHE_DIR / "textual-debug.log"))
 
+    class SplitGrip(Static):
+        """A 1-column draggable divider between the session list and the right
+        pane. Mouse-down captures the pointer; subsequent moves resize the list
+        (the pane is `1fr`, so it absorbs the remainder); mouse-up persists the
+        ratio. can_focus stays False so it never steals keyboard focus."""
+        _dragging = False
+
+        def on_mouse_down(self, event) -> None:
+            self._dragging = True
+            self.capture_mouse()
+            event.stop()
+
+        def on_mouse_move(self, event) -> None:
+            if self._dragging:
+                self.app._drag_split(event.screen_x)
+                event.stop()
+
+        def on_mouse_up(self, event) -> None:
+            if self._dragging:
+                self._dragging = False
+                self.release_mouse()
+                self.app._commit_split_ratio()
+                event.stop()
+
     class HelpScreen(ModalScreen):
         CSS = """
         HelpScreen { align: center middle; }
@@ -2992,14 +3051,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         #lastsel { width: 12; }
         #statusbar { height: 1; background: $surface; color: $warning; }
         #main { layout: horizontal; height: 1fr; }
-        #table { width: 60%; }
-        #main.split #table { width: 34%; }   /* split-live: give the live pane the room */
-        #right { width: 66%; border-left: solid $accent; }
-        .right { width: 40%; border-left: solid $accent; }
-        /* F4 hides the session list so the live pane (or preview) is full-width */
+        #table { width: 60%; }                /* default; inline style overrides on mount/drag */
+        #main.split #table { width: 34%; }    /* split-live: give the live pane the room */
+        /* #grip is the draggable divider; #right is 1fr so it absorbs the rest. */
+        #grip { width: 1; background: $panel; }
+        #grip:hover { background: $accent; }
+        #right { width: 1fr; }
+        .right { width: 1fr; }
+        /* F4 hides the session list (+ its grip) so the pane is full-width;
+           #right is 1fr → it fills 100% automatically once the list is gone. */
         #main.nolist #table { display: none; }
-        #main.nolist #right { width: 100%; }
-        #main.nolist .right { width: 100%; }
+        #main.nolist #grip { display: none; }
         #preview { padding: 0 1; height: 1fr; }
         ClaudeTerminal { width: 1fr; height: 1fr; }
         """
@@ -3053,6 +3115,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             yield Static("", id="statusbar")
             with Horizontal(id="main", classes=("split" if _LIVE_TERM is not None else "")):
                 yield DataTable(cursor_type="row", zebra_stripes=True, id="table")
+                yield SplitGrip("", id="grip")   # draggable list/pane divider
                 if _LIVE_TERM is not None:
                     # Split-live: the preview becomes the first tab; live claude
                     # panes are appended as TabPanes on Enter.
@@ -3064,7 +3127,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # Legacy / graceful-fallback layout: bare preview pane.
                     # The RichLog keeps id="preview" (so _update_preview's
                     # query is identical in both layouts) and ALSO carries the
-                    # #right sizing class so the 40% width rule applies.
+                    # .right class so it sizes as the 1fr pane beside the grip.
                     yield RichLog(id="preview", classes="right", wrap=True,
                                   highlight=False, markup=False)
             yield Footer()
@@ -3079,6 +3142,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._busy_seen: set = set()      # sids observed busy since their last "done" toast (catches tasks shorter than the poll)
             self._opened_sids: set = set()    # sids opened + kept this session (snapshot source)
             self._opening_sids: set = set()   # opens in flight (register deferred to the mount worker) — counted by the capacity gate + has() dedup
+            self._last_cursor_row = -1        # prior cursor row → header-skip direction
+            # Restore the persisted list/pane divider position (drag → options.json).
+            self._split_ratio = _get_split_ratio()
+            self._apply_split_ratio(self._split_ratio)
             # Keybindings from [keys]: F-key/combo values are DIRECT rebinds
             # (set_keymap); single-letter values are LEADER sequences (opt-in via
             # [keys] leader). The leader is handled in on_key, LIST-FOCUS only, so it
@@ -3742,6 +3809,30 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return None if val.startswith("__hdr__") else val
             except Exception:
                 return None
+
+        def _apply_split_ratio(self, ratio: float) -> None:
+            """Set the list width to `ratio` of #main (the pane is 1fr → it
+            absorbs the rest). Inline style beats the CSS width rule."""
+            try:
+                self.query_one("#table", DataTable).styles.width = f"{ratio * 100:.1f}%"
+            except Exception:
+                pass
+
+        def _drag_split(self, screen_x: int) -> None:
+            """Live divider drag: recompute the list/pane ratio from the pointer
+            column and apply it (persisted only on mouse-up, in _commit)."""
+            try:
+                reg = self.query_one("#main").region
+                self._split_ratio = _split_ratio_from_x(screen_x, reg.x, reg.width)
+                self._apply_split_ratio(self._split_ratio)
+            except Exception:
+                pass
+
+        def _commit_split_ratio(self) -> None:
+            try:
+                _set_split_ratio(getattr(self, "_split_ratio", _get_split_ratio()))
+            except Exception:
+                pass
 
         def _update_preview(self, sid: str | None) -> None:
             preview = self.query_one("#preview", RichLog)
