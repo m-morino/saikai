@@ -12,16 +12,44 @@ panes side-by-side so you can run and watch several sessions at once.
 The name is the Japanese *saikai* (再開, "resume" — and 再会, "reunion"):
 you reopen past sessions and pick up where you left off.
 
-> Single-file [Textual](https://github.com/Textualize/textual) app
-> (`saikai.py` + `saikai_terminal.py`). The live pane uses ConPTY on Windows and a
-> POSIX PTY elsewhere — see [Platform support](#platform-support) for the
-> per-OS verification status (Windows is the verified platform today).
+![The saikai session browser: a sortable table of every Claude Code session with a live preview pane](docs/assets/saikai-browse.svg)
+
+<sub>Screenshots show fictional demo data — regenerate them any time with
+`uv run scripts/make_screenshots.py`.</sub>
+
+## Highlights
+
+- **Every session, one table** — every Claude Code conversation on your
+  machine, sorted by real last activity, grouped by date / project / topic,
+  filtered as you type.
+- **Resume in place** — `Enter` reopens a session with `claude --resume` in the
+  working directory it was started from (worktree-aware).
+- **Split-live panes** — host several live `claude` sessions in tabs beside the
+  list; markers show at a glance who is busy `~`, waiting for your input `?`,
+  or finished `!`. Quit and `Shift+F4` restores the whole pane set later.
+- **Session hygiene** — favorite `★`, hide, rename; AI one-line titles; an
+  inferred parent/child tree and LLM topic clusters for big histories.
+- **RAM-aware** — a memory gate (commit headroom + load + physical floor)
+  warns before a new pane would push the machine into thrashing.
+- **Unintrusive by design** — read-only over claude's own transcript files; no
+  daemon, no database. Two Python files on top of
+  [Textual](https://github.com/Textualize/textual), MIT-licensed.
+
+> The live pane uses ConPTY on Windows and a POSIX PTY elsewhere — see
+> [Platform support](#platform-support) for the per-OS verification status
+> (Windows is the verified platform today).
 
 ## Install
 
 Requires **Python ≥ 3.11**. The easiest path is
 [uv](https://docs.astral.sh/uv/) — it resolves the deps from the inline PEP-723
 header, no manual venv:
+
+```bash
+uv tool install git+https://github.com/m-morino/saikai   # no clone needed → `saikai` on PATH
+```
+
+From a clone:
 
 ```bash
 uv run saikai.py          # run in place (deps auto-installed)
@@ -31,8 +59,8 @@ uv tool install .        # install the `saikai` command on your PATH, then: saik
 Prefer pip / pipx? Both work (deps come from `pyproject.toml`):
 
 ```bash
-pipx install .           # isolated + on PATH  (recommended for pip users)
-pip install .            # into the active environment
+pipx install git+https://github.com/m-morino/saikai   # isolated + on PATH
+pip install .                                         # into the active environment
 ```
 
 The split-live pane needs the PTY deps (`pyte`, and `pywinpty` on Windows /
@@ -63,6 +91,8 @@ saikai --help
 `:active` `:recent`. Group / Sort / Status / Age also have top-bar dropdowns.
 
 ### Split-live (default)
+
+![Split-live: the session list on the left with a live claude pane running on the right](docs/assets/saikai-split-live.svg)
 
 saikai runs real interactive `claude` processes in tabs beside the list whenever
 its PTY deps (`pyte`, `pywinpty`/`ptyprocess`) are present — they ship as
@@ -139,7 +169,9 @@ platform-specific part (it drives a real PTY and the clipboard). Honest status:
   `python` (no deps needed):
 
   ```bash
+  python tests/test_config.py
   python tests/test_sort_recency.py
+  python tests/test_split_divider.py
   python tests/test_terminal_concurrency.py
   python tests/test_resource_bounds.py
   python tests/test_terminal_watchdog.py
