@@ -123,13 +123,16 @@ Option A — asciinema (recommended, cross-platform)
 
 Option B — WezTerm built-in (Windows/macOS/Linux, no extra deps)
 ──────────────────────────────────────────────────────────────────
-  1. Open a WezTerm tab, resize to 128×35:
-       wezterm cli set-window-size --cols 128 --rows 35
-  2. Run:  uv run scripts/record_demo.py --setup-only
+  1. Run:  uv run scripts/record_demo.py --setup-only
      (exits after creating the demo home; prints the SAIKAI_ env vars to set)
-  3. In the same shell:  saikai --all-projects
-  4. Record with WezTerm's Ctrl+Shift+R  (or: wezterm record …)
-  5. Export via gifski or ffmpeg for a GIF.
+  2. Set the printed env vars in a WezTerm shell.
+  3. Start a cast:  wezterm record -o docs/assets/saikai-native.cast
+  4. In the recorded shell:  uv run saikai --all-projects
+  5. Exit the recorded shell, then replay with:
+       wezterm replay docs/assets/saikai-native.cast
+
+For an MP4 that captures terminal chrome, IME, and mouse behavior, use the OS
+screen recorder while following the same sequence.
 
 Suggested demo sequence (≈ 45 seconds)
 ───────────────────────────────────────
@@ -190,6 +193,14 @@ def _record(demo_home: Path) -> None:
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # Windows may default stdout to CP932; the guide contains box drawing and
+    # arrows. Preserve the guide where supported and degrade unsupported glyphs
+    # instead of crashing before recording starts.
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, OSError):
+        pass
+
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--guide",      action="store_true",
@@ -206,10 +217,22 @@ def main() -> None:
 
     if args.setup_only:
         print("Demo home created.  Set these env vars before running saikai:\n")
-        for var in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
-            print(f"  export {var}={demo_home}")
-        print(f"  export SAIKAI_SUMMARIZE_ENABLED=0")
-        print(f"  export SAIKAI_AUTO_REFRESH=0")
+        values = {
+            "HOME": str(demo_home),
+            "USERPROFILE": str(demo_home),
+            "APPDATA": str(demo_home),
+            "LOCALAPPDATA": str(demo_home),
+            "SAIKAI_SUMMARIZE_ENABLED": "0",
+            "SAIKAI_AUTO_REFRESH": "0",
+        }
+        if sys.platform == "win32":
+            for var, value in values.items():
+                escaped = value.replace("'", "''")
+                print(f"  $env:{var} = '{escaped}'")
+        else:
+            import shlex
+            for var, value in values.items():
+                print(f"  export {var}={shlex.quote(value)}")
         print(f"\nThen run:  saikai --all-projects")
         return
 

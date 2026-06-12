@@ -16,15 +16,11 @@ without closing anything or losing scrollback.
 [ccmanager](https://github.com/kbwo/ccmanager), which manages a live multi-agent
 roster; saikai is for navigating and resuming the history.
 
-<!-- swap the next line for the GIF once recorded:
-     ![saikai demo](docs/assets/saikai-demo.gif)
--->
-![The saikai session browser: a sortable table of every Claude Code session with a live preview pane](docs/assets/saikai-browse.svg)
+![saikai demo](docs/assets/saikai-demo.gif)
 
-<sub>Screenshots show fictional demo data — regenerate with
-`uv run scripts/make_screenshots.py`. Record an animated GIF with
-`uv run scripts/record_demo.py` ([asciinema](https://asciinema.org/) required)
-then `agg saikai-demo.cast saikai-demo.gif`.</sub>
+<sub>The demo uses fictional, leak-checked data. Regenerate the animated GIF
+headlessly with `uv run scripts/make_demo_gif.py`; use
+`uv run scripts/record_demo.py --guide` for a native-terminal recording.</sub>
 
 ## Highlights
 
