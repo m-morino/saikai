@@ -12,9 +12,9 @@ saikai は `~/.claude/projects` の履歴全体を検索可能な 1 つの表に
 既定の **split-live** モードでは複数セッションをタブでライブ実行しながら
 一覧と並べて表示し、コンテキストを失わず行き来できます。
 
-名前は「**再開**」と「**再会**」から。[ccmanager](https://github.com/kbwo/ccmanager)
-（ライブ・マルチエージェント管理）との併用に向いています — ccmanager が
-アクティブな複数エージェントを束ね、saikai が過去の履歴を掘り起こします。
+名前は「**再開**」と「**再会**」から。
+[ccmanager](https://github.com/kbwo/ccmanager)（ライブ・マルチエージェント管理）と
+役割が違うので、両方入れると Claude Code 生活がひと回り楽になります。
 
 ![saikai のセッションブラウザ: 全 Claude Code セッションのソート可能な一覧とプレビューペイン](docs/assets/saikai-browse.svg)
 
