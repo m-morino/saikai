@@ -1,4 +1,4 @@
-# saikai — working notes for Claude Code
+# saikai — working notes for Codex
 
 Single-file Textual TUI (`saikai.py`) + the split-live terminal widget
 (`saikai_terminal.py`). Run interactively with `saikai`; split-live (a live
@@ -31,12 +31,12 @@ that feeds pyte under `self._lock`; the **UI thread** also takes `self._lock`
    Regression: `test_posix_kill_signals_only_and_closes_off_thread`.
 3. **Every `kill()`'s `taskkill` reap must be tracked + joined at process exit**
    (module-level `_REAP_THREADS` + `atexit → join_all_reaps`). Otherwise saikai
-   exits before `taskkill /T` finishes and orphans claude's node workers (the
+   exits before `taskkill /T` finishes and orphans Codex's node workers (the
    SIGHUP-emulation concern from commit 0fd9fcf). `on_unmount`/exceptions/Ctrl-K
    do NOT route through the App's two quit actions.
 4. Coalesce UI work driven by PTY output: per-chunk repaints via
    `_schedule_pane_refresh`, status-driven table rebuilds via `_request_refresh`.
-   A streaming claude flips status / emits chunks many times per second — a full
+   A streaming Codex flips status / emits chunks many times per second — a full
    rebuild or a `call_from_thread` per event pegs the UI thread.
 
 ## Testing discipline (learned the hard way, 2026-06)
@@ -61,7 +61,7 @@ that feeds pyte under `self._lock`; the **UI thread** also takes `self._lock`
   convert to LOCAL before any comparison against `datetime.now()` (Age filter,
   Date grouping) — using the UTC value mis-buckets near-midnight sessions.
 - **"Last activity" = `_last_active_dt(s) = max(mtime, last_ts)`, never raw
-  `last_ts`.** last_ts freezes at the last *timestamped* JSONL record, but claude
+  `last_ts`.** last_ts freezes at the last *timestamped* JSONL record, but Codex
   appends untimed metadata (ai-title / permission-mode / last-prompt) that still
   bumps the file mtime. The Last column, Recency sort, Age filter and Date/Project
   grouping ALL key off `_last_active_dt` so they agree — keying any one off raw
@@ -77,8 +77,8 @@ that feeds pyte under `self._lock`; the **UI thread** also takes `self._lock`
   (`_sort_select_value` etc.) so they show the remembered choice; a Select built
   WITH a value also fires `Changed` on mount, so `on_select_changed` guards
   against re-applying / rebuilding for the value it already has.
-- **`status` comes from claude's OSC-0 title** (leading braille spinner = busy,
-  `✳` = idle), NOT from scraping the screen body. Verified via probe; claude
+- **`status` comes from Codex's OSC-0 title** (leading braille spinner = busy,
+  `✳` = idle), NOT from scraping the screen body. Verified via probe; Codex
   emits no OSC 9;4 / OSC 133.
 - Live status (busy/waiting/idle) only exists for saikai-hosted split-live panes;
   sessions running elsewhere fall back to file-registry + transcript heuristic.

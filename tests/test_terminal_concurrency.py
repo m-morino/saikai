@@ -247,6 +247,16 @@ def test_encode_key_meta_and_release():
         assert rt.RELEASE_FOCUS_KEY == "ctrl+right_square_bracket"
 
 
+def test_configure_release_focus_key_restores_old_key():
+    old = rt.RELEASE_FOCUS_KEY
+    try:
+        assert rt.configure_release_focus_key("ctrl+g") == "ctrl+g"
+        assert rt.encode_key("ctrl+g", None) is None
+        assert rt.encode_key("ctrl+right_square_bracket", None) == "\x1d"
+    finally:
+        rt.configure_release_focus_key(old)
+
+
 def test_set_status_ignores_forgotten_sid():
     """A status callback that lands AFTER the pane was closed must not resurrect a
     ghost entry in the manager's status dict (which statuses() reports as a stale
@@ -480,6 +490,8 @@ if __name__ == "__main__":
     print("PASS test_classify_pty_status_basics")
     test_encode_key_meta_and_release()
     print("PASS test_encode_key_meta_and_release")
+    test_configure_release_focus_key_restores_old_key()
+    print("PASS test_configure_release_focus_key_restores_old_key")
     test_set_status_ignores_forgotten_sid()
     print("PASS test_set_status_ignores_forgotten_sid")
     test_note_reap_prunes_finished_threads()

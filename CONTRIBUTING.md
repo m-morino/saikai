@@ -33,17 +33,15 @@ python tests/test_sort_recency.py
 python tests/test_split_divider.py
 python tests/test_resource_bounds.py
 python tests/test_terminal_concurrency.py
+python tests/test_terminal_watchdog.py
+python tests/test_keyboard_leader.py
 ```
 
-**Testing reality:** the suites are written to run **without** textual / pyte /
-the PTY backend (soft imports make `Widget` fall back to `object`), so they test
-the pure module-level helpers and the threading model headlessly. The one
-exception is the `test_split_divider.py` *runtime smoke*, which needs textual
-installed (it **skips cleanly** otherwise). Anything that only lives inside the
-nested Textual `App` (render, key handling, layout) is **not** unit-testable
-headless — verify those by `py_compile` + the suites + actually running saikai.
-
-Only pure functions get unit tests; don't try to unit-test App methods.
+Most suites also run without textual / pyte / a PTY backend through soft
+imports. With textual installed, `test_split_divider.py` and
+`test_keyboard_leader.py` additionally use `App.run_test()` + `Pilot` to verify
+real nested-App layout, focus, and key handling. Run the suite through `uv run`
+before release so these Pilot paths do not skip.
 
 ## The concurrency invariants — DO NOT VIOLATE
 

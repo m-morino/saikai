@@ -377,6 +377,7 @@ _KEYMAP.update({
     "ctrl+backslash": "\x1c", "ctrl+right_square_bracket": "\x1d",
     "ctrl+circumflex_accent": "\x1e", "ctrl+underscore": "\x1f",
 })
+_BASE_KEYMAP = dict(_KEYMAP)
 
 
 def _normalize_key(spec: str) -> str:
@@ -398,8 +399,21 @@ def _normalize_key(spec: str) -> str:
 #: (human form like 'ctrl+]' or a Textual name). Popped from _KEYMAP so it is
 #: never forwarded to the child. NOTE: Textual names ']' as right_square_bracket,
 #: so the literal 'ctrl+]' string would never match — _normalize_key fixes that.
-RELEASE_FOCUS_KEY = _normalize_key(os.environ.get("SAIKAI_RELEASE_KEY") or "ctrl+]")
-_KEYMAP.pop(RELEASE_FOCUS_KEY, None)
+RELEASE_FOCUS_KEY = ""
+
+
+def configure_release_focus_key(spec: str) -> str:
+    """Apply the configured pane-release key and keep it out of PTY forwarding."""
+    global RELEASE_FOCUS_KEY
+    old = RELEASE_FOCUS_KEY
+    if old in _BASE_KEYMAP and old not in ("f2", "f3", "f4"):
+        _KEYMAP[old] = _BASE_KEYMAP[old]
+    RELEASE_FOCUS_KEY = _normalize_key(spec or "ctrl+]")
+    _KEYMAP.pop(RELEASE_FOCUS_KEY, None)
+    return RELEASE_FOCUS_KEY
+
+
+configure_release_focus_key(os.environ.get("SAIKAI_RELEASE_KEY") or "ctrl+]")
 # F2/F3 are reserved by saikai for prev/next tab (priority bindings); never
 # forward them to the child, so tab-switching works even while a pane is focused.
 for _rk in ("f2", "f3", "f4"):

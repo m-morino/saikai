@@ -11,8 +11,10 @@ Run:  python tests/test_sort_recency.py
 """
 import os
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import saikai
@@ -325,6 +327,65 @@ def test_build_new_invocation_starts_fresh_session_with_id():
         assert env.get("SAIKAI_RESUME") == "1"
     finally:
         _sh.rmtree(d, ignore_errors=True)
+
+
+def test_auto_permission_requires_explicit_opt_in():
+    """A frequently-used cwd is not a trust boundary; auto permission is opt-in."""
+    import shutil as _sh
+    d = tempfile.mkdtemp()
+    sessions = [{"cwd": d, "origin_cwd": d} for _ in range(5)]
+    keys = ("SAIKAI_CONFIG", "SAIKAI_AUTO_PERMISSION", "SAIKAI_NO_AUTO_PERMISSION")
+    old_env = {key: os.environ.get(key) for key in keys}
+    try:
+        os.environ["SAIKAI_CONFIG"] = str(Path(d) / "absent-config.toml")
+        os.environ.pop("SAIKAI_AUTO_PERMISSION", None)
+        os.environ.pop("SAIKAI_NO_AUTO_PERMISSION", None)
+        saikai._reset_config_cache()
+        argv, _, _ = saikai._build_new_invocation(
+            d, "11111111-2222-3333-4444-555555555555", sessions)
+        assert "--permission-mode" not in argv, argv
+        os.environ["SAIKAI_AUTO_PERMISSION"] = "1"
+        argv, _, _ = saikai._build_new_invocation(
+            d, "11111111-2222-3333-4444-555555555555", sessions)
+        assert argv[-2:] == ["--permission-mode", "auto"], argv
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        saikai._reset_config_cache()
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def test_current_defaults_are_state_and_recency():
+    old_group = saikai.GROUP_BY_FILE
+    old_sort = saikai.SORT_FILE
+    d = Path(tempfile.mkdtemp())
+    try:
+        saikai.GROUP_BY_FILE = d / "group-by.txt"
+        saikai.SORT_FILE = d / "sort.json"
+        assert saikai._get_group_by() == "state"
+        assert saikai._load_sort()[0] == {"col": "last", "dir": "desc"}
+    finally:
+        saikai.GROUP_BY_FILE = old_group
+        saikai.SORT_FILE = old_sort
+
+
+def test_reset_saved_cli_options_preserves_ui_preferences():
+    old = saikai.OPTIONS_FILE
+    d = Path(tempfile.mkdtemp())
+    try:
+        saikai.OPTIONS_FILE = d / "options.json"
+        saikai._write_json(saikai.OPTIONS_FILE, {
+            "days": 7, "scope": "here", "split_ratio": 0.47, "search_bar": False,
+        })
+        saikai._reset_saved_cli_options()
+        assert saikai._read_json(saikai.OPTIONS_FILE, {}) == {
+            "split_ratio": 0.47, "search_bar": False,
+        }
+    finally:
+        saikai.OPTIONS_FILE = old
 
 
 def test_build_groups_state_keeps_pinned_live_in_state_group():
@@ -676,6 +737,12 @@ if __name__ == "__main__":
     print("PASS test_no_app_binding_steals_a_readline_ctrl_key")
     test_build_new_invocation_starts_fresh_session_with_id()
     print("PASS test_build_new_invocation_starts_fresh_session_with_id")
+    test_auto_permission_requires_explicit_opt_in()
+    print("PASS test_auto_permission_requires_explicit_opt_in")
+    test_current_defaults_are_state_and_recency()
+    print("PASS test_current_defaults_are_state_and_recency")
+    test_reset_saved_cli_options_preserves_ui_preferences()
+    print("PASS test_reset_saved_cli_options_preserves_ui_preferences")
     test_build_groups_state_keeps_pinned_live_in_state_group()
     print("PASS test_build_groups_state_keeps_pinned_live_in_state_group")
     test_project_short_strips_prefix_case_insensitively()
