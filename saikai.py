@@ -5158,7 +5158,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._save_open_panes()
             self._refresh_table()
 
-        def on_claude_terminal_focus_released(self, event) -> None:
+        def on_agent_terminal_focus_released(self, event) -> None:
             """The terminal's Ctrl+] (SAIKAI_RELEASE_KEY) escape hatch: refocus the list."""
             self.query_one("#table", DataTable).focus()
             try:
