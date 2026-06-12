@@ -1459,6 +1459,7 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
     origin_cwd = parsed.get("origin_cwd") or cwd
     result = {
         "id": sid,
+        "provider": parsed.get("provider") or _ACTIVE_PROVIDER.id,
         "first_ts": parsed["first_ts"],
         "last_ts": parsed.get("last_ts") or parsed["first_ts"],
         "ai_title": parsed.get("ai_title", ""),
@@ -1607,7 +1608,7 @@ def load_sessions_in_dir(project_dir: Path, since: datetime | None) -> list[dict
 
 
 # ── LLM summarization via claude -p ──────────────────────────────────────────
-PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+PROJECTS_ROOT = _ACTIVE_PROVIDER.history_roots()[0]
 
 
 # UUID v4 shape — prevents glob metacharacters in `claude -p` JSON output
@@ -2082,9 +2083,10 @@ def _new_session_stub(sid: str, cwd: str, title: str) -> dict:
     if sys.platform == "win32" and len(enc) >= 2 and enc[0].isalpha() and enc[1] == "-":
         enc = enc[0].lower() + enc[1:]   # Claude lowercases the Windows drive letter
     s = {
-        "id": sid, "first_ts": iso, "last_ts": iso, "ai_title": "",
+        "id": sid, "provider": _ACTIVE_PROVIDER.id,
+        "first_ts": iso, "last_ts": iso, "ai_title": "",
         "summary": title, "real_msgs": [], "n_turns": 0,
-        "jsonl_path": Path.home() / ".claude" / "projects" / enc / f"{sid}.jsonl",
+        "jsonl_path": PROJECTS_ROOT / enc / f"{sid}.jsonl",
         "mtime": now, "cwd": cwd, "origin_cwd": cwd, "git_branch": "",
         "is_open": True, "session_status": "open", "is_active": True,
         "is_recent": True, "project_name": enc, "worktree_label": "",
@@ -2098,7 +2100,7 @@ def _new_session_stub(sid: str, cwd: str, title: str) -> dict:
 # ── Display ──────────────────────────────────────────────────────────────────
 def _find_session_jsonl(sid_prefix: str) -> Path | None:
     sid_prefix = _trim_sid(sid_prefix)
-    projects = Path.home() / ".claude" / "projects"
+    projects = PROJECTS_ROOT
     for p in projects.rglob(f"{sid_prefix}*.jsonl"):
         if "subagents" not in str(p):
             return p
@@ -4143,7 +4145,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # content and imply a match). Distinguish "filtered to zero" from
                 # "no sessions exist at all".
                 if not all_sessions:
-                    msg = "No sessions found under ~/.claude/projects"
+                    msg = f"No sessions found under {PROJECTS_ROOT}"
                 elif getattr(self, "_unknown_tokens", None):
                     msg = ("Unknown filter " + " ".join(self._unknown_tokens)
                            + " — valid: :fav :hidden :open :active :recent")
@@ -5707,6 +5709,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         copied = True
                     except Exception:
                         copied = False
+            elif sys.platform == "darwin":
+                try:
+                    import saikai_terminal as _rt
+                    copied = _rt.set_clipboard_macos(text)
+                except Exception:
+                    copied = False
             if not copied:
                 try:
                     self.copy_to_clipboard(text)   # OSC-52: SSH / non-Windows
@@ -6216,18 +6224,25 @@ def _resume_claude(full_id: str, sessions: list[dict]) -> None:
 
 
 # ── Project lookup ───────────────────────────────────────────────────────────
+def _project_dirs(projects_root: Path) -> list[Path]:
+    """Return provider history directories, or an empty list before first use."""
+    try:
+        return [d for d in projects_root.iterdir()
+                if d.is_dir() and d.name != "memory"]
+    except OSError:
+        return []
+
+
 def _path_to_key(p: Path) -> str:
     s = str(p.resolve()).lower()
     return re.sub(r"[\\/:.\-]+", "-", s).strip("-")
 
 
 def find_project_dir(cwd: Path) -> Path | None:
-    projects_root = Path.home() / ".claude" / "projects"
+    projects_root = PROJECTS_ROOT
     cwd_key = _path_to_key(cwd)
     best, best_len = None, 0
-    for cand in projects_root.iterdir():
-        if not cand.is_dir() or cand.name == "memory":
-            continue
+    for cand in _project_dirs(projects_root):
         cand_key = re.sub(r"[\-\.]+", "-", cand.name.lower()).strip("-")
         if cwd_key.endswith(cand_key) or cand_key in cwd_key:
             if len(cand_key) > best_len:
@@ -6827,9 +6842,7 @@ def cmd_sync_desktop() -> None:
         if c:
             known.add(c)
     created = skipped = 0
-    for d in PROJECTS_ROOT.iterdir():
-        if not d.is_dir() or d.name == "memory":
-            continue
+    for d in _project_dirs(PROJECTS_ROOT):
         for s in load_sessions_in_dir(d, None):
             sid = s["id"]
             if sid in known:
@@ -7092,11 +7105,10 @@ def main():
         # Need sessions loaded for the classifier. Reuse the same scope the
         # picker uses (defaults to all projects so the cache covers everything).
         since = None if args.days in (None, 0) else datetime.now(tz=timezone.utc) - timedelta(days=args.days)
-        projects_root = Path.home() / ".claude" / "projects"
+        projects_root = PROJECTS_ROOT
         sessions = []
-        for d in projects_root.iterdir():
-            if d.is_dir() and d.name != "memory":
-                sessions.extend(load_sessions_in_dir(d, since))
+        for d in _project_dirs(projects_root):
+            sessions.extend(load_sessions_in_dir(d, since))
         _global_cluster_assign(sessions, force_refresh=True)
         cache = _read_json(GLOBAL_CLUSTERS_FILE, {})
         clusters = cache.get("clusters") or []
@@ -7171,7 +7183,7 @@ def main():
                 f.unlink()
 
     since = None if args.days == 0 else datetime.now(tz=timezone.utc) - timedelta(days=args.days)
-    projects_root = Path.home() / ".claude" / "projects"
+    projects_root = PROJECTS_ROOT
     cwd = Path.cwd()
 
     try:
@@ -7187,12 +7199,11 @@ def main():
         # cache makes the scan below take seconds. Print a transient breadcrumb so
         # a cold start isn't indistinguishable from a hung shell (Textual clears
         # the screen on run(), so this only shows during the pre-UI gap).
-        print(_c("  scanning ~/.claude/projects …", DIM), file=sys.stderr, flush=True)
+        print(_c(f"  scanning {projects_root} …", DIM), file=sys.stderr, flush=True)
     sessions = []
     if args.all_projects:
-        for d in projects_root.iterdir():
-            if d.is_dir() and d.name != "memory":
-                sessions.extend(load_sessions_in_dir(d, since))
+        for d in _project_dirs(projects_root):
+            sessions.extend(load_sessions_in_dir(d, since))
     else:
         target = Path(args.project) if args.project else find_project_dir(cwd)
         if not target or not target.exists():
@@ -7304,9 +7315,8 @@ def main():
         def _reload():
             fresh = []
             if args.all_projects:
-                for d in projects_root.iterdir():
-                    if d.is_dir() and d.name != "memory":
-                        fresh.extend(load_sessions_in_dir(d, since))
+                for d in _project_dirs(projects_root):
+                    fresh.extend(load_sessions_in_dir(d, since))
             else:
                 tgt = Path(args.project) if args.project else find_project_dir(cwd)
                 if tgt and tgt.exists():

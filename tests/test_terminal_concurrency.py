@@ -261,6 +261,10 @@ def test_encode_key_meta_and_release():
     assert rt.encode_key("alt+backspace", None) == "\x1b\x7f"  # backward-kill-word
     assert rt.encode_key("ctrl+w", None) == "\x17"          # word-delete still forwards
     assert rt.encode_key("ctrl+a", None) == "\x01"
+    assert rt.encode_key("alt+left", None) == "\x1b[1;3D"
+    assert rt.encode_key("ctrl+right", None) == "\x1b[1;5C"
+    assert rt.encode_key("ctrl+shift+up", None) == "\x1b[1;6A"
+    assert rt.encode_key("shift+delete", None) == "\x1b[3;2~"
     assert rt._normalize_key("ctrl+]") == "ctrl+right_square_bracket"
     if not os.environ.get("SAIKAI_RELEASE_KEY"):
         assert rt.RELEASE_FOCUS_KEY == "ctrl+right_square_bracket"
@@ -274,6 +278,74 @@ def test_configure_release_focus_key_restores_old_key():
         assert rt.encode_key("ctrl+right_square_bracket", None) == "\x1d"
     finally:
         rt.configure_release_focus_key(old)
+
+
+def test_copy_text_uses_pbcopy_on_macos_before_osc52():
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+
+    old_platform = rt.sys.platform
+    old_run = rt.subprocess.run
+    term = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    try:
+        rt.sys.platform = "darwin"
+        rt.subprocess.run = fake_run
+        term._copy_text("日本語")
+    finally:
+        rt.sys.platform = old_platform
+        rt.subprocess.run = old_run
+    assert calls and calls[0][0] == ["pbcopy"], calls
+    assert calls[0][1]["input"] == "日本語".encode("utf-8")
+
+
+def test_set_clipboard_macos_skips_remote_sessions():
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+
+    old_run = rt.subprocess.run
+    old_ssh = os.environ.get("SSH_TTY")
+    try:
+        rt.subprocess.run = fake_run
+        os.environ.pop("SSH_TTY", None)
+        assert rt.set_clipboard_macos("local") is True
+        os.environ["SSH_TTY"] = "/dev/pts/1"
+        assert rt.set_clipboard_macos("remote") is False
+    finally:
+        rt.subprocess.run = old_run
+        if old_ssh is None:
+            os.environ.pop("SSH_TTY", None)
+        else:
+            os.environ["SSH_TTY"] = old_ssh
+    assert len(calls) == 1 and calls[0][0] == ["pbcopy"], calls
+
+
+def test_copy_text_skips_pbcopy_on_macos_over_ssh():
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+
+    old_platform = rt.sys.platform
+    old_run = rt.subprocess.run
+    old_ssh = os.environ.get("SSH_CONNECTION")
+    term = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    try:
+        rt.sys.platform = "darwin"
+        rt.subprocess.run = fake_run
+        os.environ["SSH_CONNECTION"] = "client 1 server 2"
+        term._copy_text("remote")
+    finally:
+        rt.sys.platform = old_platform
+        rt.subprocess.run = old_run
+        if old_ssh is None:
+            os.environ.pop("SSH_CONNECTION", None)
+        else:
+            os.environ["SSH_CONNECTION"] = old_ssh
+    assert not calls, calls
 
 
 def test_set_status_ignores_forgotten_sid():
@@ -513,6 +585,12 @@ if __name__ == "__main__":
     print("PASS test_encode_key_meta_and_release")
     test_configure_release_focus_key_restores_old_key()
     print("PASS test_configure_release_focus_key_restores_old_key")
+    test_copy_text_uses_pbcopy_on_macos_before_osc52()
+    print("PASS test_copy_text_uses_pbcopy_on_macos_before_osc52")
+    test_set_clipboard_macos_skips_remote_sessions()
+    print("PASS test_set_clipboard_macos_skips_remote_sessions")
+    test_copy_text_skips_pbcopy_on_macos_over_ssh()
+    print("PASS test_copy_text_skips_pbcopy_on_macos_over_ssh")
     test_set_status_ignores_forgotten_sid()
     print("PASS test_set_status_ignores_forgotten_sid")
     test_note_reap_prunes_finished_threads()

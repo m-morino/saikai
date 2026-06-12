@@ -53,6 +53,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so the table features are visible at a glance.
 
 ### Fixed
+- Extracted agent-specific launch capabilities into `saikai_provider.py`.
+  Claude remains the integrated provider; a non-selectable Codex contract
+  validates the extension boundary without overstating support.
+- Claude history discovery now respects `CLAUDE_CONFIG_DIR`.
+- Missing or not-yet-created provider history roots now scan as empty instead
+  of crashing.
+- The split-live PTY widget is now agent-neutral and accepts an injected status
+  classifier while retaining the previous `ClaudeTerminal` import alias.
+- CI now installs and smoke-tests the real PTY backend on Windows, Linux, and
+  macOS. Local macOS clipboard copy uses `pbcopy` before OSC-52 fallback.
+- Modified navigation keys such as Ctrl/Alt+Arrow are forwarded to split-live
+  children using xterm-compatible sequences.
 - Config values shown by Settings / `--print-config` now match runtime:
   `summary.model` and `keys.release` are applied, while `split_ratio` and
   `scrollback_lines` are included in the resolved-settings list.

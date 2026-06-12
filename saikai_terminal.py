@@ -3,14 +3,12 @@
 saikai_terminal — a live, interactive PTY terminal as a Textual widget.
 
 This module backs saikai's TRUE SPLIT-LIVE mode: the left pane stays the
-session DataTable; the right pane hosts one or more live `claude` processes,
+session DataTable; the right pane hosts one or more live agent CLI processes,
 each in its own tab, each rendered from a real pseudo-console.
 
-Building blocks (spot-checked non-interactively on this Windows box via uv-run;
-the live visual render + keystroke path still need an interactive TTY — see NOTE.
-NOTE: an earlier draft over-claimed "verified on CPython 3.13.5"; the live
-render was NOT executed against a running claude — treat render fidelity as
-unproven until interactively tested):
+Building blocks (real PTY lifecycle is smoke-tested on all CI operating
+systems; live visual render + keystroke behavior still needs native interactive
+review — see NOTE):
 
   * pywinpty (ConPTY)  — spawn an interactive child attached to a pseudo
     console; blocking read() returns ``str`` and raises ``EOFError`` at EOF;
@@ -29,11 +27,10 @@ NOTE — what can and cannot be verified without an interactive TTY
 -----------------------------------------------------------------
 CANNOT (needs a human at a terminal):
   * the live visual render (Textual paints the alternate screen) and real
-    keyboard forwarding into a running ``claude``.
-CAN (and was, on this machine):
+    keyboard forwarding into a running agent CLI.
+CAN:
   * ``python -m py_compile saikai_terminal.py``
-  * PTY spawn + threaded read + EOF + exit detection
-    (``cmd /c echo … & exit`` round-trip)
+  * PTY spawn + resize + threaded read + EOF + exit detection
   * pyte ctor/resize argument order, cell-attribute extraction, alt-screen
     mode-bit detection
   * the pure functions here: ``encode_key``, ``classify_pty_status``,
@@ -399,6 +396,13 @@ _KEYMAP.update({
     "ctrl+circumflex_accent": "\x1e", "ctrl+underscore": "\x1f",
 })
 _BASE_KEYMAP = dict(_KEYMAP)
+_MODIFIED_CSI_FINALS = {
+    "up": "A", "down": "B", "right": "C", "left": "D",
+    "home": "H", "end": "F",
+}
+_MODIFIED_TILDE_KEYS = {
+    "insert": "2", "delete": "3", "pageup": "5", "pagedown": "6",
+}
 
 
 def _normalize_key(spec: str) -> str:
@@ -450,6 +454,17 @@ def encode_key(key: str, character: Optional[str]) -> Optional[str]:
     mapped = _KEYMAP.get(key)
     if mapped is not None:
         return mapped
+    parts = key.split("+")
+    base, modifiers = parts[-1], set(parts[:-1])
+    if modifiers and modifiers <= {"shift", "alt", "ctrl"}:
+        # Textual normalizes host-terminal input; emit the standard xterm
+        # modifier form expected by interactive children, independent of the
+        # outer terminal emulator. Modifier parameter: 1 + Shift + 2*Alt + 4*Ctrl.
+        mod = 1 + ("shift" in modifiers) + 2 * ("alt" in modifiers) + 4 * ("ctrl" in modifiers)
+        if base in _MODIFIED_CSI_FINALS:
+            return f"\x1b[1;{mod}{_MODIFIED_CSI_FINALS[base]}"
+        if base in _MODIFIED_TILDE_KEYS:
+            return f"\x1b[{_MODIFIED_TILDE_KEYS[base]};{mod}~"
     # Meta / Alt = ESC prefix — readline word ops (alt+b/f/d backward/forward/
     # kill-word, alt+. , alt+backspace = backward-kill-word) must reach claude too.
     if key.startswith("alt+"):
@@ -554,6 +569,18 @@ def set_clipboard_windows(text: str) -> bool:
         u32.CloseClipboard()
 
 
+def set_clipboard_macos(text: str) -> bool:
+    """Use the local macOS clipboard, but leave remote sessions to OSC-52."""
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
+        return False
+    try:
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
 class AltScreenTracker:
     """Track alt-screen enter/leave transitions in a raw VT byte stream."""
 
@@ -578,7 +605,7 @@ class AltScreenTracker:
 class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textual
     """A live PTY terminal rendered from a pyte screen buffer via the Line API.
 
-    One instance owns exactly one child process (an interactive ``claude``,
+    One instance owns exactly one child process (an interactive agent CLI,
     or any argv). It spawns on mount, reads in a background thread, feeds the
     bytes to pyte, and marshals a repaint onto the UI thread. Keys are encoded
     to PTY bytes in ``on_key``; resize is propagated to both pyte and the PTY.
@@ -599,7 +626,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         env: Optional[dict] = None,
         *,
         sid: Optional[str] = None,
-        title: str = "claude",
+        title: str = "agent",
         on_status: Optional[Callable[[str, str], None]] = None,
         on_exit: Optional[Callable[[str], None]] = None,
         status_classifier: Optional[Callable[[str, str], str]] = None,
@@ -735,7 +762,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # pane isn't just a frozen frame with no cue on how to act. Reads only
             # atomic int/bool (no lock); live view only (s==0) so scrolled-back
             # history stays clean for copy/read. _finalize already repaints once.
-            msg = " ⏎ claude exited — Enter relaunches · F10 closes this tab "
+            msg = " ⏎ agent exited — Enter relaunches · F10 closes this tab "
             return Strip([Segment(msg[:width] if width else msg, Style(reverse=True))])
         if self._frozen and not self.is_dead and self._scroll == 0 and y == 0:
             # Frozen for copy/select: the view holds still while claude streams in
@@ -972,10 +999,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         return "\n".join(lines).strip("\n")
 
     def _copy_text(self, text: str) -> None:
-        """Cross-platform clipboard: Windows Win32 CF_UNICODETEXT first
+        """Cross-platform clipboard: native OS clipboard first
         (codepage-safe — clip.exe mangles multibyte text under a mismatched
-        console codepage), then clip.exe as a fallback, then OSC-52 via the app
-        (Linux/macOS/WezTerm/SSH)."""
+        console codepage), then OSC-52 via the app (Linux/remote terminals)."""
         if not text:
             return
         if sys.platform == "win32":
@@ -989,6 +1015,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 return
             except Exception:
                 pass
+        elif sys.platform == "darwin":
+            # Textual's OSC-52 path does not work in Terminal.app. Over SSH the
+            # helper deliberately declines so OSC-52 can target the client.
+            if set_clipboard_macos(text):
+                return
         try:
             self.app.copy_to_clipboard(text)
         except Exception:
@@ -1243,7 +1274,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         """Reader-thread teardown: mark dead, notify the host (on the UI
         thread), repaint once more so the final frame is shown."""
         if not self.is_dead:
-            _log(f"exit: sid={(getattr(self, 'sid', None) or '?')[:8]} (claude ended)")
+            _log(f"exit: sid={(getattr(self, 'sid', None) or '?')[:8]} (agent ended)")
         self.is_dead = True
         if self._status != "dead":
             self._status = "dead"
@@ -1456,7 +1487,7 @@ class LiveSessionManager:
 
       * ``pane_id(sid)``    — deterministic TabPane id for a session.
       * ``register/forget`` — track sid -> AgentTerminal.
-      * ``at_capacity``     — enforce a concurrent-claude cap.
+      * ``at_capacity``     — enforce a concurrent-agent cap.
       * ``statuses``        — last-known status per sid for the DataTable.
     """
 
@@ -1563,5 +1594,5 @@ STATUS_GLYPH = {
 def tab_label(title: str, status: str) -> str:
     """Build a TabPane label like '◐ saikai' / '⏳ docs' / '✓ myproj'."""
     glyph = STATUS_GLYPH.get(status, "")
-    name = (title or "claude")[:18]
+    name = (title or "agent")[:18]
     return f"{glyph} {name}".strip()

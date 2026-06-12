@@ -185,12 +185,17 @@ resolved location and values — or press **`Space ,`** inside the app: the
 Settings screen edits the list options in place and shows every config knob
 with its resolved value and source (`e` there opens config.toml in your editor).
 
+Claude Code is the currently integrated provider. Agent-specific launch and
+status contracts live in `saikai_provider.py`; a Codex contract validates the
+extension boundary, but Codex is not selectable until its history discovery and
+live-state integration are complete. Claude history discovery respects
+`CLAUDE_CONFIG_DIR`.
+
 ## Platform support
 
-**Supported platforms (deliberately bounded): Windows, Linux — including WSL —
-and macOS, on Python ≥ 3.11.** Other platforms are *unsupported*: saikai may still
-run on another POSIX OS via the generic POSIX path (and it degrades safely rather
-than crashing), but that's untested and not a target.
+**Verified support is deliberately bounded to Windows 10 / 11 on Python ≥
+3.11.** Linux, WSL2, and macOS remain implemented but experimental until their
+real PTY paths receive sustained native testing. Other platforms are unsupported.
 
 saikai itself is pure Python + Textual; the **split-live pane** is the only
 platform-specific part (it drives a real PTY and the clipboard). Honest status:
@@ -198,8 +203,8 @@ platform-specific part (it drives a real PTY and the clipboard). Honest status:
 | OS | Live-pane PTY | Clipboard (from a frozen pane) | RAM gate source | Status |
 |---|---|---|---|---|
 | **Windows** 10 / 11 | ConPTY (`pywinpty`) | Win32 `CF_UNICODETEXT` (codepage-safe) | `GlobalMemoryStatusEx` | ✅ **developed & daily-driven** (on WezTerm) |
-| **Linux** *(incl. WSL)* | POSIX PTY (`ptyprocess`) | OSC-52 *(needs an OSC-52-capable terminal)* | `/proc/meminfo` | ⚠️ code-complete, **not yet run by the author** |
-| **macOS** | POSIX PTY (`ptyprocess`) | OSC-52 *(iTerm2 / kitty / WezTerm fine; Terminal.app needs it enabled)* | `sysctl` + `vm_stat` *(load + physical; no commit limit)* | ⚠️ code-complete, **not yet run by the author** |
+| **Linux** *(incl. WSL2)* | POSIX PTY (`ptyprocess`) | OSC-52 *(terminal / tmux / SSH policy must allow it)* | `/proc/meminfo` | ⚠️ **experimental; native reviewers wanted** |
+| **macOS** | POSIX PTY (`ptyprocess`) | local `pbcopy`; OSC-52 fallback for remote-capable terminals | `sysctl` + `vm_stat` *(load + physical; no commit limit)* | ⚠️ **experimental; macOS reviewers wanted** |
 
 - **Terminal-agnostic on Windows:** the clipboard goes through the Win32
   `CF_UNICODETEXT` API and the PTY through ConPTY, neither of which depends on
@@ -213,16 +218,21 @@ platform-specific part (it drives a real PTY and the clipboard). Honest status:
 
   ```bash
   python tests/test_config.py
+  python tests/test_providers.py
   python tests/test_sort_recency.py
   python tests/test_split_divider.py
   python tests/test_terminal_concurrency.py
   python tests/test_resource_bounds.py
   python tests/test_terminal_watchdog.py
   python tests/test_keyboard_leader.py
+  python tests/test_pty_backend.py
   ```
 
-- Ran it on Linux or macOS? Please open an issue with the result (and any PTY /
-  clipboard quirks) so these rows can move to ✅.
+- Linux/WSL2/macOS reviewers are wanted. Please report the terminal, local vs
+  SSH/tmux setup, PTY teardown result, key quirks, and clipboard behavior.
+- CI installs each OS's real PTY backend and smoke-tests spawn, resize, output,
+  and EOF on Windows, Linux, and macOS. This is not a substitute for interactive
+  review across terminal emulators, SSH, tmux, IMEs, and clipboard policies.
 
 ## Contributing
 
