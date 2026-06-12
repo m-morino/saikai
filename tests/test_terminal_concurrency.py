@@ -233,6 +233,25 @@ def test_classify_pty_status_basics():
     assert rt.classify_pty_status("Would you like to continue?", "⠹ working") == "busy"
 
 
+def test_status_classifier_profiles_and_injection():
+    generic = rt.classifier_for_profile("generic")
+    assert generic is rt.classify_generic_status
+    assert rt.classifier_for_profile("claude") is rt.classify_pty_status
+    assert generic("", "⠋ generating") == "idle"  # generic agents cannot trust Claude OSC
+    assert generic("Do you want to proceed? (y/n)", "⠋ generating") == "waiting"
+    try:
+        rt.classifier_for_profile("unknown")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown classifier profile must fail")
+
+    marker = lambda screen, title: "waiting"
+    term = rt.AgentTerminal(["agent"], status_classifier=marker)
+    assert term._status_classifier is marker
+    assert rt.ClaudeTerminal is rt.AgentTerminal  # compatibility alias
+
+
 def test_encode_key_meta_and_release():
     """readline keys reach claude: Ctrl+letters AND Meta/Alt word-ops (ESC prefix).
     The release key must resolve to Textual's real name, not the dead 'ctrl+]'."""
@@ -488,6 +507,8 @@ if __name__ == "__main__":
     print("PASS test_refresh_status_skips_stable_idle_pane")
     test_classify_pty_status_basics()
     print("PASS test_classify_pty_status_basics")
+    test_status_classifier_profiles_and_injection()
+    print("PASS test_status_classifier_profiles_and_injection")
     test_encode_key_meta_and_release()
     print("PASS test_encode_key_meta_and_release")
     test_configure_release_focus_key_restores_old_key()
