@@ -35,6 +35,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from saikai_provider import get_provider
+
 # Force UTF-8 output on Windows
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -43,6 +45,10 @@ if sys.platform == "win32":
 # CREATE_NO_WINDOW prevents a console window flash when launching command-line
 # helpers (git, taskkill) from a GUI terminal on Windows. No-op on POSIX.
 NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+# Claude remains the only user-selectable provider until another provider has
+# normalized history discovery wired into the session list.
+_ACTIVE_PROVIDER = get_provider("claude")
 
 # ── ANSI helpers ────────────────────────────────────────────────────────────
 RESET = "\033[0m"
@@ -3510,7 +3516,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         #main.nolist #table { display: none; }
         #main.nolist #grip { display: none; }
         #preview { padding: 0 1; height: 1fr; }
-        ClaudeTerminal { width: 1fr; height: 1fr; }
+        AgentTerminal { width: 1fr; height: 1fr; }
         """
 
         preview_mode = "summary"   # "summary" or "full"
@@ -4662,7 +4668,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Split-live: if a terminal is focused, Enter belongs to claude.
             # A plain `return` still counts as "handled", so the priority binding
             # would SWALLOW the key; raise SkipAction so Textual forwards it to
-            # the focused ClaudeTerminal (whose on_key writes \r to the PTY).
+            # the focused AgentTerminal (whose on_key writes \r to the PTY).
             if self._focused_terminal() is not None:
                 raise SkipAction()
             # Batch launch: if rows are marked (Space), open a pane for each.
@@ -4723,7 +4729,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         # ── split-live helpers ────────────────────────────────────────────────
         def _focused_terminal(self):
-            """Return the focused LIVE ClaudeTerminal, or None.
+            """Return the focused LIVE AgentTerminal, or None.
 
             A DEAD pane (claude exited) deliberately counts as None: otherwise
             Enter/Esc/Tab/? all SkipAction into a corpse and the user can neither
@@ -4732,7 +4738,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if _LIVE_TERM is None:
                 return None
             foc = self.focused
-            if isinstance(foc, _LIVE_TERM.ClaudeTerminal) and not getattr(foc, "is_dead", False):
+            if isinstance(foc, _LIVE_TERM.AgentTerminal) and not getattr(foc, "is_dead", False):
                 return foc
             return None
 
@@ -4847,9 +4853,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"(~{_per:.0f} MB). Close panes (F10) if it slows. "
                     f"SAIKAI_HARD_RAM_GATE=1 to block instead.",
                     severity="warning", timeout=7)
-            term = _LIVE_TERM.ClaudeTerminal(
+            term = _LIVE_TERM.AgentTerminal(
                 argv, cwd=cwd, env=env, sid=sid, title=title,
                 on_status=self._on_live_status, on_exit=self._on_live_exit,
+                status_classifier=_LIVE_TERM.classifier_for_profile(
+                    _ACTIVE_PROVIDER.status_profile),
             )
             pane = TabPane(_LIVE_TERM.tab_label(title, "idle"), term, id=pane_id)
             # Mount on the UI event loop in a worker so we can AWAIT the removal of
@@ -6110,9 +6118,16 @@ def _build_claude_invocation(
         parts = [p for p in env.get("PATH", "").split(os.pathsep) if cmp(p) != cmp(venv_bin)]
         env["PATH"] = os.pathsep.join(parts)
 
-    claude_bin = shutil.which("claude", path=env.get("PATH")) or "claude"
-    argv = [claude_bin, *session_args, *extra_args]
-    return argv, target_cwd, env
+    if len(session_args) == 2 and session_args[0] == "--resume":
+        spec = _ACTIVE_PROVIDER.build_resume(
+            session_args[1], cwd=target_cwd, env=env, extra_args=extra_args)
+    elif len(session_args) == 2 and session_args[0] == "--session-id":
+        spec = _ACTIVE_PROVIDER.build_new(
+            cwd=target_cwd, requested_id=session_args[1], env=env,
+            extra_args=extra_args)
+    else:
+        raise ValueError(f"unsupported Claude session selector: {session_args!r}")
+    return spec.argv, spec.cwd, spec.env
 
 
 def _build_resume_invocation(
