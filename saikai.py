@@ -312,9 +312,11 @@ DEFAULT_LEADER_LETTERS = {           # action id -> letter (config orientation)
     "group": "g", "tree": "t", "cluster": "c", "new": "n",
     "restore": "p", "freeze": "z", "attention": "a", "toggle_list": "l",
     "close": "x", "prev_tab": "[", "next_tab": "]", "mark": " ",
+    "settings": ",",
 }
 # Leader-only action ids (no Binding / F-key behind them): id -> action name.
-LEADER_VIRTUAL_ACTIONS = {"sort": "sort", "order": "order", "mark": "toggle_mark"}
+LEADER_VIRTUAL_ACTIONS = {"sort": "sort", "order": "order", "mark": "toggle_mark",
+                          "settings": "settings"}
 
 # Leader families: action name -> family, in display order. The which-key hint
 # and the ? help render the map grouped this way (Session / View / Panes)
@@ -327,6 +329,7 @@ LEADER_FAMILY_OF = {
     "copy_prompt": "Session", "preview_changes": "Session", "refresh": "Session",
     "sort": "View", "order": "View", "cycle_group": "View",
     "toggle_tree": "View", "toggle_cluster": "View", "toggle_list": "View",
+    "settings": "View",
     "new_session": "Panes", "restore_panes": "Panes", "freeze_pane": "Panes",
     "next_attention": "Panes", "close_live": "Panes", "prev_tab": "Panes",
     "next_tab": "Panes", "toggle_mark": "Panes",
@@ -408,28 +411,33 @@ def _init_config(force: bool = False) -> int:
         return 1
 
 
-def _print_config() -> int:
-    """Print each resolved setting + its source (default / config / env)."""
-    specs = [
-        ("summary", "enabled", "SAIKAI_SUMMARIZE_ENABLED", False),
-        ("summary", "command", "SAIKAI_SUMMARIZE_CMD", ""),
-        ("summary", "model", "SAIKAI_SUMMARIZE_MODEL", "haiku"),
-        ("display", "auto_refresh", "SAIKAI_AUTO_REFRESH", 0),
-        ("display", "split_live", "SAIKAI_SPLIT_LIVE", True),
-        ("display", "color_by", "SAIKAI_COLOR_BY", "project"),
-        ("limits", "max_memory_load", "SAIKAI_MAX_MEM_LOAD", 85),
-        ("limits", "min_commit_headroom_mb", "SAIKAI_MIN_COMMIT_MB", 2048),
-        ("limits", "min_free_phys_pct", "SAIKAI_MIN_FREE_PHYS_PCT", 8),
-        ("limits", "per_pane_mb", "SAIKAI_CLAUDE_MB", 600),
-        ("limits", "min_free_mb", "SAIKAI_MIN_FREE_MB", 0),
-        ("limits", "hard_ram_gate", "SAIKAI_HARD_RAM_GATE", False),
-        ("limits", "max_live", "SAIKAI_MAX_LIVE", 64),
-        ("keys", "release", "SAIKAI_RELEASE_KEY", "ctrl+]"),
-    ]
+# Every config-file/env knob with its env var + default — the single source the
+# CLI --print-config AND the in-app Settings screen render from (they must not
+# disagree about what exists or what won).
+_CONFIG_SPECS = [
+    ("summary", "enabled", "SAIKAI_SUMMARIZE_ENABLED", False),
+    ("summary", "command", "SAIKAI_SUMMARIZE_CMD", ""),
+    ("summary", "model", "SAIKAI_SUMMARIZE_MODEL", "haiku"),
+    ("display", "auto_refresh", "SAIKAI_AUTO_REFRESH", 0),
+    ("display", "split_live", "SAIKAI_SPLIT_LIVE", True),
+    ("display", "color_by", "SAIKAI_COLOR_BY", "project"),
+    ("limits", "max_memory_load", "SAIKAI_MAX_MEM_LOAD", 85),
+    ("limits", "min_commit_headroom_mb", "SAIKAI_MIN_COMMIT_MB", 2048),
+    ("limits", "min_free_phys_pct", "SAIKAI_MIN_FREE_PHYS_PCT", 8),
+    ("limits", "per_pane_mb", "SAIKAI_CLAUDE_MB", 600),
+    ("limits", "min_free_mb", "SAIKAI_MIN_FREE_MB", 0),
+    ("limits", "hard_ram_gate", "SAIKAI_HARD_RAM_GATE", False),
+    ("limits", "max_live", "SAIKAI_MAX_LIVE", 64),
+    ("keys", "release", "SAIKAI_RELEASE_KEY", "ctrl+]"),
+]
+
+
+def _resolved_settings() -> list:
+    """[(section, key, value, source), …] resolved env > config > default,
+    one row per _CONFIG_SPECS entry. Pure given the env + config file."""
     cfg = _load_config()
-    print(f"  config: {_config_path()}  "
-          f"({'exists' if _config_path().is_file() else 'absent'})")
-    for sec, key, env, default in specs:
+    out = []
+    for sec, key, env, default in _CONFIG_SPECS:
         ev = os.environ.get(env)
         if ev not in (None, ""):
             src, val = "env", ev
@@ -437,6 +445,15 @@ def _print_config() -> int:
             src, val = "config", cfg[sec][key]
         else:
             src, val = "default", default
+        out.append((sec, key, val, src))
+    return out
+
+
+def _print_config() -> int:
+    """Print each resolved setting + its source (default / config / env)."""
+    print(f"  config: {_config_path()}  "
+          f"({'exists' if _config_path().is_file() else 'absent'})")
+    for sec, key, val, src in _resolved_settings():
         print(f"  [{sec}] {key:<22} = {val!r:<14} ({src})")
     return 0
 
@@ -2961,7 +2978,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         from textual.containers import Horizontal, Vertical, VerticalScroll
         from textual.screen import ModalScreen
         from textual.widgets import (DataTable, Footer, Input, OptionList, RichLog,
-                                     Select, Static, TabbedContent, TabPane, Tabs)
+                                     Select, Static, Switch, TabbedContent,
+                                     TabPane, Tabs)
         from textual.widgets.option_list import Option
         from rich.text import Text
     except ImportError as e:
@@ -3086,6 +3104,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]␣g[/yellow] [dim]⇧F7[/dim]    Cycle grouping: Date / Project / State / none\n"
                 "  [yellow]␣s[/yellow] / [yellow]␣o[/yellow]    Cycle the sort column / flip its direction\n"
                 "  [yellow]␣t[/yellow] [dim]⇧F5[/dim]    Tree (parent/child) mode   ·   [yellow]␣c[/yellow] [dim]⇧F6[/dim]  Cluster (topic) mode\n"
+                "  [yellow]␣,[/yellow]         Settings — list options + the resolved config\n"
                 "  [yellow]Tab[/yellow]        Preview: full ↔ summary\n\n"
                 "[bold cyan]Split-live (default · SAIKAI_SPLIT_LIVE=0 to disable)[/bold cyan]\n"
                 "  [yellow]Enter[/yellow]      Open / focus the live claude pane\n"
@@ -3142,6 +3161,131 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             body += "[dim]Press ? or Esc to close · scroll for more[/dim]"
             with VerticalScroll(id="help-content"):
                 yield Static(body)
+
+    class SettingsScreen(ModalScreen):
+        """␣, — Settings, hybrid by design. TOP: the list options saikai itself
+        persists (Group / Sort / Status / Age / Tree / Cluster) are editable in
+        place and apply instantly — the Selects forward into the top-bar
+        dropdowns, so there is exactly ONE apply/persist path. BOTTOM: the
+        config.toml / env knobs, read-only with their resolved value + source
+        (rewriting the TOML would destroy its comments — `e` opens the file in
+        an editor instead; changes there apply on the next launch)."""
+        CSS = """
+        SettingsScreen { align: center middle; }
+        #set-box { background: $panel; border: solid $accent; padding: 1 2;
+                   width: 92; max-width: 95%; height: auto; max-height: 90%; }
+        #set-rows { height: auto; }
+        #set-rows Select { width: 20; }
+        #set-toggles { height: 3; }
+        #set-toggles Static { width: auto; padding: 1 1 0 2; }
+        #set-config { height: auto; max-height: 18; }
+        """
+        BINDINGS = [
+            Binding("escape", "dismiss", show=False),
+            Binding("e", "edit_config", show=False, priority=True),
+        ]
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="set-box"):
+                yield Static("[bold cyan]Settings[/bold cyan]   [dim]top: applies "
+                             "instantly · bottom: config.toml — [/dim][yellow]e[/yellow]"
+                             "[dim] opens it (applies on restart) · Esc closes[/dim]\n")
+                with Horizontal(id="set-rows"):
+                    yield Select(
+                        [("Date", "date"), ("Project", "project"),
+                         ("State", "state"), ("None", "none")],
+                        prompt="Group", id="set-group", value=_get_group_by(),
+                    )
+                    _kw = {"prompt": "Sort", "id": "set-sort"}
+                    _sv = _sort_select_value()
+                    if _sv is not None:
+                        _kw["value"] = _sv
+                    yield Select(
+                        [("Recency", "last"), ("Created time", "date"),
+                         ("Alphabetically", "title")],
+                        **_kw,
+                    )
+                    yield Select(
+                        [("Active", "active"), ("Archived", "archived"),
+                         ("All", "all")],
+                        prompt="Status", id="set-status",
+                        value=_get_status_filter(),
+                    )
+                    yield Select(
+                        [("All time", "0"), ("1d", "1"), ("3d", "3"),
+                         ("7d", "7"), ("30d", "30")],
+                        prompt="Age", id="set-age",
+                        value=str(_get_lastact_days()),
+                    )
+                with Horizontal(id="set-toggles"):
+                    yield Static("Tree")
+                    yield Switch(value=_get_tree_mode(), id="set-tree")
+                    yield Static("Cluster")
+                    yield Switch(value=_get_cluster_mode(), id="set-cluster")
+                _p = _config_path()
+                _state = ("exists" if _p.is_file()
+                          else "absent — e creates it from the template")
+                body = (f"[bold cyan]config.toml[/bold cyan]  [dim]{_p}  "
+                        f"({_state})[/dim]\n")
+                for sec, key, val, src in _resolved_settings():
+                    _sc = {"env": "yellow", "config": "green"}.get(src, "dim")
+                    body += (f"  [dim]\\[{sec}][/dim] {key:<22} = {val!r:<14} "
+                             f"[{_sc}]({src})[/{_sc}]\n")
+                with VerticalScroll(id="set-config"):
+                    yield Static(body)
+
+        def on_select_changed(self, event) -> None:
+            # Forward into the matching TOP-BAR dropdown: its on_select_changed
+            # is the one true apply/persist path (it guards same-value re-fires).
+            tgt = {"set-group": "#groupsel", "set-sort": "#sortsel",
+                   "set-status": "#statussel", "set-age": "#lastsel"}.get(
+                       event.select.id or "")
+            if not tgt or event.value in (None, False):   # False == Select.BLANK
+                return
+            try:
+                self.app.query_one(tgt, Select).value = event.value
+            except Exception:
+                pass
+
+        def on_switch_changed(self, event) -> None:
+            try:
+                if event.switch.id == "set-tree":
+                    if _get_tree_mode() != bool(event.value):
+                        self.app.action_toggle_tree()
+                elif event.switch.id == "set-cluster":
+                    if _get_cluster_mode() != bool(event.value):
+                        self.app.action_toggle_cluster()
+            except Exception:
+                pass
+
+        def action_edit_config(self) -> None:
+            """Open config.toml in an editor (create from the template first if
+            absent). $VISUAL/$EDITOR run with the TUI suspended; otherwise fall
+            back to the OS opener. Changes apply on the next saikai launch."""
+            p = _config_path()
+            if not p.is_file():
+                try:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(_CONFIG_TEMPLATE, encoding="utf-8")
+                except Exception as e:
+                    self.notify(f"could not create {p}: {e!r}", severity="error")
+                    return
+            ed = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+            try:
+                if ed:
+                    with self.app.suspend():
+                        subprocess.run([*ed.split(), str(p)])
+                elif sys.platform == "win32":
+                    os.startfile(str(p))                      # noqa: S606
+                else:
+                    opener = "open" if sys.platform == "darwin" else "xdg-open"
+                    subprocess.Popen([opener, str(p)],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                self.notify("config.toml changes apply on the next launch",
+                            timeout=6)
+            except Exception as e:
+                self.notify(f"could not open an editor: {e!r}", severity="error")
 
     class NewSessionScreen(ModalScreen):
         """Pick a folder / git worktree, then start a FRESH claude session there.
@@ -5662,6 +5806,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 raise SkipAction()
             self.preview_mode = "summary" if self.preview_mode == "full" else "full"
             self._update_preview(self._cursor_sid())
+
+        def action_settings(self) -> None:
+            """␣, — the Settings modal (list options + resolved config). Leader
+            entry only fires from the LIST, so no extra focus guard is needed;
+            the guard below covers any future direct binding."""
+            if self._focused_terminal() is not None or isinstance(self.focused, Input):
+                return
+            self.push_screen(SettingsScreen())
 
         def action_help(self) -> None:
             # '?' is a priority binding; don't pop the help modal over a focused
