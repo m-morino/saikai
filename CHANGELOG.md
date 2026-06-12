@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Keyboard-first by default.** `Space` (in the list) is now a leader key with
+  a built-in mnemonic map — `Space f` favorite, `Space h` hide, `Space s` /
+  `Space o` cycle the sort column / direction (previously mouse-only),
+  `Space Space` batch-mark, and more; the first presses hint the full map and
+  `?` always shows it live. `Alt+←/→` resizes the list/pane split from the
+  keyboard (persisted like a drag). Configure via `[keys]`: `leader = "none"`
+  disables, `leader_defaults = false` empties the map, single letters remap.
+- **Japanese documentation**: full `README.ja.md`, cross-linked from the
+  English README.
+
+### Changed
+- **Calmer chrome, lower learning load:** the footer shows only the four core
+  keys (`⏎` `Tab` `?` `Esc`) — everything else lives in `?` help and the
+  leader hint; the status bar drops the OFF-state noise, keeps Sort/Group
+  visible, and gains a standing `␣ leader · ? keys` breadcrumb.
+- Date group headers are locale-neutral English (`Jun 11`, `2025-12-03`)
+  instead of Japanese (`6月11日`).
+- README screenshots now show Date grouping, the sort indicator, and a pinned
+  favorite, so the table features are visible at a glance.
+
 ## [0.1.0] — 2026-06-11
 
 Initial public release. Developed pre-release under the working name `recap`;

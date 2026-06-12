@@ -4,6 +4,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
+**English** | [日本語](README.ja.md)
+
 A terminal session browser for [Claude Code](https://claude.com/claude-code).
 saikai scans `~/.claude/projects`, shows your past sessions in a searchable,
 sortable, groupable table with an AI-generated one-line summary per session, and
@@ -31,6 +33,10 @@ you reopen past sessions and pick up where you left off.
   inferred parent/child tree and LLM topic clusters for big histories.
 - **RAM-aware** — a memory gate (commit headroom + load + physical floor)
   warns before a new pane would push the machine into thrashing.
+- **Keyboard-first** — everything works without a mouse: `Space` is a leader
+  key with mnemonic letters (`Space f` = favorite, `Space s` = sort …),
+  `Alt+←/→` resizes the split, `?` shows the live key map. The mouse is a
+  bonus (click to sort, drag the divider), never a requirement.
 - **Unintrusive by design** — read-only over claude's own transcript files; no
   daemon, no database. Two Python files on top of
   [Textual](https://github.com/Textualize/textual), MIT-licensed.
@@ -89,6 +95,36 @@ saikai --help
 
 **Search tokens** (combine with text and each other): `:fav` `:hidden` `:open`
 `:active` `:recent`. Group / Sort / Status / Age also have top-bar dropdowns.
+
+### Keyboard-first: the Space leader
+
+saikai is fully usable without a mouse — the mouse is a bonus, never a
+requirement. Press **`Space`** in the list (the *leader*), then one mnemonic
+letter (the first few presses pop up the full map as a hint; `?` shows it too):
+
+| | | | |
+|---|---|---|---|
+| `f` ★ favorite | `h` hide | `e` rename (edit) | `r` refresh |
+| `d` diff (changes) | `y` copy prompt (yank) | `s` cycle **s**ort column | `o` flip sort **o**rder |
+| `g` cycle grouping | `t` tree | `c` cluster | `n` new session |
+| `p` restore panes | `z` freeze pane | `a` next attention | `l` hide/show list |
+| `x` close tab | `[` / `]` prev / next tab | `Space` mark for batch launch | |
+
+The leader fires **only while the session list is focused** — a live claude
+pane or the search box always receives its own keys. More keyboard parity:
+
+- **Resize the split**: `Alt+←` / `Alt+→` nudge the list/pane divider (the
+  position persists, exactly like dragging it).
+- **Dropdowns**: `/` shows the filter bar; `Tab` / `Shift+Tab` walk into the
+  Group / Sort / Status / Age dropdowns, `Enter` opens one.
+- **Everything** else already has an F-key (tables above) and `?` lists the
+  live bindings, including your remaps.
+
+Don't like the defaults? In `config.toml`: `[keys] leader = "none"` turns the
+mode off (Space then marks directly, as before), `leader = "ctrl+g"` moves it,
+`leader_defaults = false` empties the map, and any `action = "x"` single-letter
+entry remaps one sequence. **Mouse extras** (never required): click a column
+header to sort, drag the divider, click rows and dropdowns.
 
 ### Split-live (default)
 
@@ -175,6 +211,7 @@ platform-specific part (it drives a real PTY and the clipboard). Honest status:
   python tests/test_terminal_concurrency.py
   python tests/test_resource_bounds.py
   python tests/test_terminal_watchdog.py
+  python tests/test_keyboard_leader.py
   ```
 
 - Ran it on Linux or macOS? Please open an issue with the result (and any PTY /
