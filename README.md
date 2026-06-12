@@ -1,6 +1,7 @@
 # saikai
 
 [![CI](https://github.com/m-morino/saikai/actions/workflows/ci.yml/badge.svg)](https://github.com/m-morino/saikai/actions/workflows/ci.yml)
+[![PyPI version](https://img.shields.io/pypi/v/saikai)](https://pypi.org/project/saikai/)
 [![GitHub release](https://img.shields.io/github/v/release/m-morino/saikai)](https://github.com/m-morino/saikai/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
@@ -52,11 +53,11 @@ headlessly with `uv run scripts/make_demo_gif.py`; use
 ## Install
 
 Requires **Python ≥ 3.11**. The easiest path is
-[uv](https://docs.astral.sh/uv/) — it resolves the deps from the inline PEP-723
-header, no manual venv:
+[uv](https://docs.astral.sh/uv/) — it installs the PyPI package in an isolated
+environment, no manual venv:
 
 ```bash
-uv tool install git+https://github.com/m-morino/saikai@v0.2.0   # stable release → `saikai` on PATH
+uv tool install saikai   # stable release → `saikai` on PATH
 ```
 
 From a clone:
@@ -69,8 +70,8 @@ uv tool install .        # install the `saikai` command on your PATH, then: saik
 Prefer pip / pipx? Both work (deps come from `pyproject.toml`):
 
 ```bash
-pipx install git+https://github.com/m-morino/saikai@v0.2.0   # isolated + on PATH
-pip install .                                         # into the active environment
+pipx install saikai   # isolated + on PATH
+pip install saikai   # into the active environment
 ```
 
 The split-live pane needs the PTY deps (`pyte`, and `pywinpty` on Windows /

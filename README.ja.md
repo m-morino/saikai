@@ -1,6 +1,7 @@
 # saikai
 
 [![CI](https://github.com/m-morino/saikai/actions/workflows/ci.yml/badge.svg)](https://github.com/m-morino/saikai/actions/workflows/ci.yml)
+[![PyPI version](https://img.shields.io/pypi/v/saikai)](https://pypi.org/project/saikai/)
 [![GitHub release](https://img.shields.io/github/v/release/m-morino/saikai)](https://github.com/m-morino/saikai/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
@@ -51,11 +52,11 @@ saikai は `~/.claude/projects` の履歴全体を検索可能な 1 つの表に
 ## インストール
 
 **Python ≥ 3.11** が必要です。いちばん簡単なのは
-[uv](https://docs.astral.sh/uv/) — インライン PEP-723 ヘッダーから依存を
-解決するので、venv の手作業は不要です:
+[uv](https://docs.astral.sh/uv/) — PyPI パッケージを隔離環境へ導入するため、
+venv の手作業は不要です:
 
 ```bash
-uv tool install git+https://github.com/m-morino/saikai@v0.2.0   # 安定版 → `saikai` が PATH に
+uv tool install saikai   # 安定版 → `saikai` が PATH に
 ```
 
 クローンから:
@@ -68,8 +69,8 @@ uv tool install .        # `saikai` コマンドを PATH に入れて: saikai
 pip / pipx 派でも大丈夫です（依存は `pyproject.toml` から）:
 
 ```bash
-pipx install git+https://github.com/m-morino/saikai@v0.2.0   # 隔離環境 + PATH
-pip install .                                         # アクティブな環境へ
+pipx install saikai   # 隔離環境 + PATH
+pip install saikai   # アクティブな環境へ
 ```
 
 split-live ペインには PTY 系の依存（`pyte`、Windows は `pywinpty` / それ以外は
