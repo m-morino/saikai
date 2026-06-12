@@ -294,6 +294,27 @@ def classify_pty_status(screen_text: str, title: str = "") -> str:
     return "idle"
 
 
+def classify_generic_status(screen_text: str, title: str = "") -> str:
+    """Conservative status classifier for agents without a trusted OSC title."""
+    t = _ANSI_RE.sub("", (screen_text or "")[-2000:])
+    if _WAITING_RE.search(t) or _MENU_RE.search(t):
+        return "waiting"
+    lines = t.splitlines()
+    last_line = lines[-1] if lines else ""
+    if _BUSY_RE.search(t) or _SPINNER_RE.search(last_line):
+        return "busy"
+    return "idle"
+
+
+def classifier_for_profile(profile: str) -> Callable[[str, str], str]:
+    """Resolve a provider's declared status profile to a terminal classifier."""
+    profiles = {"claude": classify_pty_status, "generic": classify_generic_status}
+    try:
+        return profiles[profile]
+    except KeyError as exc:
+        raise ValueError(f"unknown status classifier profile: {profile!r}") from exc
+
+
 # ── pyte cell → rich.Style ───────────────────────────────────────────────────
 _HEX6 = re.compile(r"\A[0-9a-fA-F]{6}\Z")
 
@@ -554,7 +575,7 @@ class AltScreenTracker:
 # ══════════════════════════════════════════════════════════════════════════════
 # The widget
 # ══════════════════════════════════════════════════════════════════════════════
-class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textual
+class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textual
     """A live PTY terminal rendered from a pyte screen buffer via the Line API.
 
     One instance owns exactly one child process (an interactive ``claude``,
@@ -569,7 +590,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
     """
 
     can_focus = True
-    DEFAULT_CSS = "ClaudeTerminal { width: 1fr; height: 1fr; }"
+    DEFAULT_CSS = "AgentTerminal { width: 1fr; height: 1fr; }"
 
     def __init__(
         self,
@@ -581,6 +602,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         title: str = "claude",
         on_status: Optional[Callable[[str, str], None]] = None,
         on_exit: Optional[Callable[[str], None]] = None,
+        status_classifier: Optional[Callable[[str, str], str]] = None,
         **kw,
     ) -> None:
         """
@@ -604,6 +626,7 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         self.title = title
         self._on_status = on_status
         self._on_exit = on_exit
+        self._status_classifier = status_classifier or classify_pty_status
 
         self._pty = None
         self._pid: Optional[int] = None
@@ -1130,7 +1153,8 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
         # glyph), not a rolling byte tail: a tail keeps stale "esc to interrupt"
         # / answered prompts that scrolled up and would misclassify an idle pane.
         _txt, _title = self._current_screen()
-        self._update_status(classify_pty_status(_txt, _title))
+        classifier = getattr(self, "_status_classifier", classify_pty_status)
+        self._update_status(classifier(_txt, _title))
 
     def _current_screen(self) -> tuple:
         """(visible text, title) under the lock. `title` is claude's OSC-0 title
@@ -1167,7 +1191,8 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             return
         self._last_poll_ver = self._scr_ver
         txt, title = self._current_screen()
-        self._update_status(classify_pty_status(txt, title))
+        classifier = getattr(self, "_status_classifier", classify_pty_status)
+        self._update_status(classifier(txt, title))
 
     def _update_status(self, new: str) -> None:
         """Debounce: a new status must persist >=2 ticks (reader OR host poll)
@@ -1416,6 +1441,10 @@ def _safe_isalive(pty) -> bool:
         return False
 
 
+# Backward-compatible import name while callers migrate to the agent-neutral API.
+ClaudeTerminal = AgentTerminal
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Session / tab manager
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1426,14 +1455,14 @@ class LiveSessionManager:
     PickerApp owns the TabbedContent and asks this object what to do.
 
       * ``pane_id(sid)``    — deterministic TabPane id for a session.
-      * ``register/forget`` — track sid -> ClaudeTerminal.
+      * ``register/forget`` — track sid -> AgentTerminal.
       * ``at_capacity``     — enforce a concurrent-claude cap.
       * ``statuses``        — last-known status per sid for the DataTable.
     """
 
     def __init__(self, max_live: int = 4) -> None:
         self.max_live = max_live
-        self._terms: dict[str, "ClaudeTerminal"] = {}     # sid -> widget
+        self._terms: dict[str, "AgentTerminal"] = {}     # sid -> widget
         self._status: dict[str, str] = {}                 # sid -> status
         self._reaps: list = []                            # in-flight taskkill threads
 
@@ -1456,10 +1485,10 @@ class LiveSessionManager:
     def has(self, sid: str) -> bool:
         return sid in self._terms
 
-    def get(self, sid: str) -> Optional["ClaudeTerminal"]:
+    def get(self, sid: str) -> Optional["AgentTerminal"]:
         return self._terms.get(sid)
 
-    def register(self, sid: str, term: "ClaudeTerminal") -> None:
+    def register(self, sid: str, term: "AgentTerminal") -> None:
         self._terms[sid] = term
         self._status[sid] = "idle"
 
@@ -1481,7 +1510,7 @@ class LiveSessionManager:
     def statuses(self) -> dict[str, str]:
         return dict(self._status)
 
-    def all_terms(self) -> list["ClaudeTerminal"]:
+    def all_terms(self) -> list["AgentTerminal"]:
         return list(self._terms.values())
 
     def note_reap(self, thread) -> None:
