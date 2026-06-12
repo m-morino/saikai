@@ -77,8 +77,9 @@ split-live ペインには PTY 系の依存（`pyte`、Windows は `pywinpty` / 
 ## 使い方
 
 ```bash
-saikai                 # 現在のプロジェクト（git リポジトリ）のセッション
-saikai --all-projects  # ~/.claude/projects 配下の全プロジェクト
+saikai                 # 全プロジェクト・全履歴（これが既定）
+saikai --here          # 現在のプロジェクト（git リポジトリ）のみ
+saikai --days 7        # 直近 7 日のみ（ワンショット。--save-defaults で永続化）
 saikai --table         # 静的な一覧（非対話）
 saikai --help
 ```

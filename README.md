@@ -83,8 +83,9 @@ they're somehow missing, saikai still runs in list-only mode (see below).
 ## Usage
 
 ```bash
-saikai                 # sessions for the current project (git repo)
-saikai --all-projects  # every project under ~/.claude/projects
+saikai                 # every project, full history (the default)
+saikai --here          # only the current project (git repo)
+saikai --days 7        # only the last 7 days (one-shot; --save-defaults persists)
 saikai --table         # static, non-interactive table
 saikai --help
 ```
