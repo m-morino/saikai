@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-06-13
+
+### Fixed
+- PyPI's project description now uses absolute GitHub URLs for the demo images,
+  Japanese README, license, changelog, contribution guide, security policy, and
+  third-party notices. PyPI does not resolve repository-relative Markdown links,
+  so these links and images were broken on the initial 0.2.1 PyPI page.
+
 ## [0.2.1] — 2026-06-13
 
 ### Added
@@ -141,7 +149,8 @@ variables, and the config directory.
   `CF_UNICODETEXT` API, so multibyte text (CJK / emoji) no longer garbles under a
   UTF-8 console code page.
 
-[Unreleased]: https://github.com/m-morino/saikai/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/m-morino/saikai/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/m-morino/saikai/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/m-morino/saikai/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/m-morino/saikai/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/m-morino/saikai/releases/tag/v0.1.0

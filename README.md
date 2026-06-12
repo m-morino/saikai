@@ -3,10 +3,10 @@
 [![CI](https://github.com/m-morino/saikai/actions/workflows/ci.yml/badge.svg)](https://github.com/m-morino/saikai/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/saikai)](https://pypi.org/project/saikai/)
 [![GitHub release](https://img.shields.io/github/v/release/m-morino/saikai)](https://github.com/m-morino/saikai/releases/latest)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/m-morino/saikai/blob/master/LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
-**English** | [日本語](README.ja.md)
+**English** | [日本語](https://github.com/m-morino/saikai/blob/master/README.ja.md)
 
 Dozens of Claude Code sessions, one searchable table. saikai scans your entire
 `~/.claude/projects` history, lets you filter and group by date / project /
@@ -18,7 +18,7 @@ without closing anything or losing scrollback.
 [ccmanager](https://github.com/kbwo/ccmanager), which manages a live multi-agent
 roster; saikai is for navigating and resuming the history.
 
-![saikai demo](docs/assets/saikai-demo.gif)
+![saikai demo](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-demo.gif)
 
 <sub>The demo uses fictional, leak-checked data. Regenerate the animated GIF
 headlessly with `uv run scripts/make_demo_gif.py`; use
@@ -136,7 +136,7 @@ header to sort, drag the divider, click rows and dropdowns.
 
 ### Split-live (default)
 
-![Split-live: the session list on the left with a live claude pane running on the right](docs/assets/saikai-split-live.svg)
+![Split-live: the session list on the left with a live claude pane running on the right](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-split-live.svg)
 
 saikai runs real interactive `claude` processes in tabs beside the list whenever
 its PTY deps (`pyte`, `pywinpty`/`ptyprocess`) are present — they ship as
@@ -241,20 +241,20 @@ platform-specific part (it drives a real PTY and the clipboard). Honest status:
 
 ## Contributing
 
-Issues and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the dev
+Issues and PRs welcome — see [CONTRIBUTING.md](https://github.com/m-morino/saikai/blob/master/CONTRIBUTING.md) for the dev
 setup, how to run the test suites, and the **concurrency invariants** that keep
 the split-live pane from deadlocking (read those before touching threading code).
-Changes are documented in [CHANGELOG.md](CHANGELOG.md).
+Changes are documented in [CHANGELOG.md](https://github.com/m-morino/saikai/blob/master/CHANGELOG.md).
 
 ## Security
 
-Please report vulnerabilities privately — see [SECURITY.md](SECURITY.md). Don't
+Please report vulnerabilities privately — see [SECURITY.md](https://github.com/m-morino/saikai/blob/master/SECURITY.md). Don't
 open a public issue for a security problem.
 
 ## License
 
-saikai is released under the [MIT License](LICENSE). It depends on a few
+saikai is released under the [MIT License](https://github.com/m-morino/saikai/blob/master/LICENSE). It depends on a few
 third-party packages installed separately (textual, pyte, pywinpty/ptyprocess) —
-see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Note `pyte` is LGPL-3.0; it
+see [THIRD-PARTY-NOTICES.md](https://github.com/m-morino/saikai/blob/master/THIRD-PARTY-NOTICES.md). Note `pyte` is LGPL-3.0; it
 is used as an unmodified, separately-installed dependency, which keeps saikai's
 own code MIT.
