@@ -27,6 +27,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - README screenshots now show Date grouping, the sort indicator, and a pinned
   favorite, so the table features are visible at a glance.
 
+### Fixed
+- **Linux/macOS: quitting (`Esc` / `Ctrl+C`) or closing a tab (`F10`) with a
+  live pane open hard-froze saikai.** ptyprocess buffers the PTY master fd in an
+  `io.BufferedRWPair`: the background reader blocks in `read()` holding the
+  buffer lock, and `pty.close()` — which saikai called on the UI thread — takes
+  that same lock before the child is signalled, deadlocking the UI forever. The
+  POSIX kill path now only posts signals (SIGHUP/SIGTERM to the process group,
+  the `taskkill /T` analog) from the UI thread and runs the blocking close on a
+  tracked reaper thread, with SIGKILL escalation. Windows was never affected
+  (pywinpty's close cancels console I/O natively).
+
 ## [0.1.0] — 2026-06-11
 
 Initial public release. Developed pre-release under the working name `recap`;

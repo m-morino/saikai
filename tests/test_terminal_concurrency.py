@@ -80,6 +80,86 @@ def test_kill_tracks_reap_for_atexit_join():
     assert not t.is_alive(), "reap not joined by join_all_reaps"
 
 
+def test_posix_kill_signals_only_and_closes_off_thread():
+    """POSIX kill() must NEVER call pty.close()/terminate() on the calling (UI)
+    thread. ptyprocess wraps the master fd in io.BufferedRWPair; the reader
+    thread blocks in fileobj.read1() HOLDING the buffer's reader lock, and
+    fileobj.close() takes that same lock — and ptyprocess.close() signals the
+    child only AFTER the fileobj close, so the read never returns: an inline
+    close deadlocks the UI forever (the 2026-06 Linux Esc-quit freeze). The UI
+    thread may only post signals; the blocking close belongs to the reap thread."""
+    sigs = []
+    closed_on = []
+
+    class _FakePty:
+        def isalive(self):
+            return False                      # child died from the signals
+
+        def close(self, force=True):
+            closed_on.append(threading.current_thread())
+
+    ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    ct._stop = threading.Event()
+    ct._pty = _FakePty()
+    ct._pid = 4242
+    ct.sid = "x"
+    caller = threading.current_thread()
+    old_win, old_post = rt._IS_WIN, rt._post_signal
+    rt._IS_WIN = False
+    rt._post_signal = lambda pid, name: sigs.append((pid, name))
+    try:
+        with rt._REAP_LOCK:
+            rt._REAP_THREADS.clear()
+        t = ct.kill()
+        assert t is not None, "POSIX kill() must return its reap thread"
+        assert (4242, "SIGHUP") in sigs and (4242, "SIGTERM") in sigs, sigs
+        with rt._REAP_LOCK:
+            assert any(x is t for x in rt._REAP_THREADS), "POSIX reap not tracked"
+        t.join(timeout=5)
+        assert not t.is_alive(), "reap thread hung"
+        assert closed_on, "pty.close() never ran"
+        assert all(th is not caller for th in closed_on), \
+            "DEADLOCK HAZARD: pty.close() ran on the calling (UI) thread"
+        assert (4242, "SIGKILL") not in sigs, "dead child must not be SIGKILLed"
+        # idempotent: a 2nd kill() must not re-signal a (recycled) PID
+        n = len(sigs)
+        assert ct.kill() is None and len(sigs) == n
+    finally:
+        rt._IS_WIN, rt._post_signal = old_win, old_post
+
+
+def test_posix_reap_escalates_to_sigkill():
+    """A child that survives SIGHUP/SIGTERM past the deadline gets SIGKILL from
+    the reap thread, and the pty is still closed afterwards."""
+    sigs = []
+    closed = []
+
+    class _Stubborn:
+        def isalive(self):
+            return True                       # ignores HUP/TERM
+
+        def close(self, force=True):
+            closed.append(True)
+
+    old_post = rt._post_signal
+    rt._post_signal = lambda pid, name: sigs.append((pid, name))
+    try:
+        rt.ClaudeTerminal._reap_posix(_Stubborn(), 99, deadline_s=0.05)
+    finally:
+        rt._post_signal = old_post
+    assert (99, "SIGKILL") in sigs, f"no SIGKILL escalation: {sigs}"
+    assert closed, "pty.close() skipped after the escalation"
+
+
+def test_post_signal_never_raises():
+    """_post_signal resolves the signal by NAME (so the POSIX branch stays
+    importable/testable on Windows, where SIGHUP doesn't exist) and swallows
+    every failure: missing signal, missing pid, nonexistent process."""
+    rt._post_signal(None, "SIGHUP")           # no pid → no-op
+    rt._post_signal(999999999, "SIGHUP")      # pid > pid_max → ESRCH swallowed
+    rt._post_signal(999999999, "NO_SUCH_SIG") # unknown name → no-op
+
+
 def test_pane_refresh_coalesces():
     """_schedule_pane_refresh queues at most ONE repaint until the UI paints it
     (then re-queues), so a burst of PTY chunks can't flood call_from_thread."""
@@ -384,6 +464,12 @@ if __name__ == "__main__":
     print("PASS test_reopen_after_exit_requires_awaited_pane_removal")
     test_kill_tracks_reap_for_atexit_join()
     print("PASS test_kill_tracks_reap_for_atexit_join")
+    test_posix_kill_signals_only_and_closes_off_thread()
+    print("PASS test_posix_kill_signals_only_and_closes_off_thread")
+    test_posix_reap_escalates_to_sigkill()
+    print("PASS test_posix_reap_escalates_to_sigkill")
+    test_post_signal_never_raises()
+    print("PASS test_post_signal_never_raises")
     test_pane_refresh_coalesces()
     print("PASS test_pane_refresh_coalesces")
     test_current_screen_caches_by_version()

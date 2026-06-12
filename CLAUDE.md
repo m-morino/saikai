@@ -18,7 +18,16 @@ that feeds pyte under `self._lock`; the **UI thread** also takes `self._lock`
    `_update_status` and `tests/test_terminal_concurrency.py`.)
 2. **Never join the reader thread from `on_unmount` / `kill()` on the UI thread.**
    The reader may be blocked in `_marshal → call_from_thread` waiting for the UI
-   → same deadlock. The reader is a daemon and is unblocked by `pty.close(force=True)`.
+   → same deadlock. The reader is a daemon; it is unblocked by `pty.close(force=True)`
+   on **Windows only** (cancel_io) — on POSIX by the **child's death → EOF**.
+2b. **POSIX: NEVER call ptyprocess `close()`/`terminate()` on the UI thread.**
+   ptyprocess wraps the master fd in `io.BufferedRWPair`; the reader blocks in
+   `read1()` HOLDING the buffer's reader lock, and `close()` takes that same lock
+   — and ptyprocess only signals the child AFTER the fileobj close, so the read
+   never returns → UI hard-freeze (the 2026-06-12 Linux Esc-quit freeze).
+   `kill()` posts signals only (`_post_signal`: killpg SIGHUP/SIGTERM ≈
+   `taskkill /T`); the blocking close runs on the `_reap_posix` reap thread.
+   Regression: `test_posix_kill_signals_only_and_closes_off_thread`.
 3. **Every `kill()`'s `taskkill` reap must be tracked + joined at process exit**
    (module-level `_REAP_THREADS` + `atexit → join_all_reaps`). Otherwise saikai
    exits before `taskkill /T` finishes and orphans claude's node workers (the

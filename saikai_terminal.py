@@ -48,11 +48,16 @@ from __future__ import annotations
 import atexit
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
 from typing import Callable, Optional
+
+# Platform branch as a module flag (not inline sys.platform checks) so the
+# headless tests can exercise the POSIX kill path on the Windows dev box.
+_IS_WIN = sys.platform == "win32"
 
 # Per-pane pyte scrollback depth. Each retained history line costs memory
 # (≈ cols × a pyte Char object); at 200 cols a FULL 5000-line history measured
@@ -131,6 +136,27 @@ def join_all_reaps(timeout: float = 3.0) -> None:
 
 
 atexit.register(join_all_reaps)
+
+
+def _post_signal(pid, sig_name: str) -> None:
+    """POSIX: send `sig_name` to pid's process GROUP (ptyprocess setsid()s the
+    child, so pgid == pid and the group covers claude's node workers — the
+    `taskkill /T` analog), falling back to the single process. The signal is
+    looked up by NAME so this module — and the headless tests that exercise the
+    POSIX kill path — stay importable on Windows, where signal.SIGHUP doesn't
+    exist. Never raises; no-op for a missing signal or pid."""
+    sig = getattr(signal, sig_name, None)
+    if not pid or sig is None:
+        return
+    try:
+        os.killpg(pid, sig)     # AttributeError on Windows lands in the except
+        return
+    except Exception:
+        pass
+    try:
+        os.kill(pid, sig)
+    except Exception:
+        pass
 
 # ── Soft imports ─────────────────────────────────────────────────────────────
 # The widget is only constructed when these are present (saikai probes
@@ -1272,33 +1298,60 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
 
     def kill(self):
         """Stop the reader and kill the child PROCESS TREE. Returns the daemon
-        thread reaping the grandchildren (or None) so a caller that must not exit
-        before the reap completes (kill_all on quit) can join it.
+        reap thread (or None) so a caller that must not exit before the reap
+        completes (kill_all on quit) can join it. Idempotent.
 
-        The FAST part (close() → cancel_io() → reader unblocks) runs inline; the
-        SLOW part (taskkill /T, ~hundreds ms–seconds) runs OFF the UI thread so
-        closing one pane — or many in parallel — never freezes saikai. Idempotent."""
+        Windows: pywinpty's close() cancels console I/O natively, so it both
+        unblocks the blocked reader AND returns fast — safe inline; only the
+        slow `taskkill /T` runs on a reap thread.
+
+        POSIX: ptyprocess's close()/terminate() must NEVER run on this (UI)
+        thread. Both block (multiple 0.1 s sleeps) — and close() DEADLOCKS:
+        ptyprocess wraps the master fd in io.BufferedRWPair, the reader thread
+        sits in fileobj.read1() HOLDING the buffer's reader lock, and
+        fileobj.close() takes that same lock. close() only signals the child
+        AFTER closing the fileobj, so the read never returns and the lock is
+        never released → hard freeze of the UI (the 2026-06 Linux Esc-quit
+        freeze; Windows never hit it because pywinpty has no such shared lock).
+        So here the UI thread only POSTS SIGNALS (non-blocking): SIGHUP+SIGTERM
+        to the child's process group (≈ taskkill /T). The child's death EOFs
+        the master, the reader unblocks and releases the lock, and the reap
+        thread below escalates to SIGKILL if needed and closes the pty safely
+        off-thread."""
         self._stop.set()
         pty, pid = self._pty, self._pid
         self._pty = None
-        self._pid = None        # idempotent: a 2nd kill() must not re-taskkill a (recycled) PID
+        self._pid = None        # idempotent: a 2nd kill() must not re-kill a (recycled) PID
+        if pty is None and pid is None:
+            return None
         if pid:
             _log(f"kill: sid={(getattr(self, 'sid', None) or '?')[:8]} pid={pid}")
-        if pty is not None:
-            try:
-                pty.close(force=True)   # → terminate() → cancel_io(): unblock reader fast
-            except Exception:
+        if _IS_WIN:
+            if pty is not None:
                 try:
-                    pty.terminate(force=True)
+                    pty.close(force=True)   # → terminate() → cancel_io(): unblock reader fast
                 except Exception:
-                    pass
-        if sys.platform == "win32" and pid:
-            t = threading.Thread(target=self._reap_tree, args=(pid,),
-                                 name=f"reap-{pid}", daemon=True)
-            t.start()
-            _track_reap(t)   # joined at interpreter exit (atexit) on every exit path
-            return t
-        return None
+                    try:
+                        pty.terminate(force=True)
+                    except Exception:
+                        pass
+            if pid:
+                t = threading.Thread(target=self._reap_tree, args=(pid,),
+                                     name=f"reap-{pid}", daemon=True)
+                t.start()
+                _track_reap(t)   # joined at interpreter exit (atexit) on every exit path
+                return t
+            return None
+        # POSIX: signals only on this thread (see docstring); blocking close on
+        # the reap thread. SIGHUP = what the kernel would send on master close;
+        # SIGTERM = belt-and-braces for a SIGHUP-ignoring child.
+        _post_signal(pid, "SIGHUP")
+        _post_signal(pid, "SIGTERM")
+        t = threading.Thread(target=self._reap_posix, args=(pty, pid),
+                             name=f"reap-{pid or 'pty'}", daemon=True)
+        t.start()
+        _track_reap(t)   # joined at quit (kill_all wait=True) and atexit
+        return t
 
     @staticmethod
     def _reap_tree(pid) -> None:
@@ -1313,6 +1366,25 @@ class ClaudeTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o text
             )
         except Exception:
             pass
+
+    @staticmethod
+    def _reap_posix(pty, pid, deadline_s: float = 2.0) -> None:
+        # POSIX analog of _reap_tree: bounded wait for the (already signalled)
+        # child to die, escalate to SIGKILL, then close the pty fd. The close
+        # MUST stay off the UI thread — BufferedRWPair.close() blocks on the
+        # reader lock until the reader unblocks at EOF; harmless on this daemon
+        # (joined bounded at quit/atexit), fatal on the UI thread. deadline_s is
+        # injectable for the headless tests.
+        deadline = time.monotonic() + deadline_s
+        while pty is not None and _safe_isalive(pty) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if pty is None or _safe_isalive(pty):
+            _post_signal(pid, "SIGKILL")
+        if pty is not None:
+            try:
+                pty.close(force=True)
+            except Exception:
+                pass
 
     # ── messages ────────────────────────────────────────────────────────────────
     if events is not None:  # only define when textual present
