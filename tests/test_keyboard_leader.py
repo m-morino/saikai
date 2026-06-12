@@ -121,6 +121,19 @@ def test_leader_groups_by_family():
     assert saikai._leader_groups({}) == []
 
 
+def test_leader_hint_item_separates_key_from_action():
+    """A menu choice must not look like one misspelled command (e.g. ffav)."""
+    assert saikai._leader_hint_item("f", "fav") == (
+        "[yellow]f[/yellow] [dim]→[/dim] fav"
+    )
+    assert saikai._leader_hint_item(" ", "mark") == (
+        "[yellow]␣[/yellow] [dim]→[/dim] mark"
+    )
+    assert saikai._leader_hint_item("[", "tab◀") == (
+        r"[yellow]\[[/yellow] [dim]→[/dim] tab◀"
+    )
+
+
 def _write_demo_session() -> str:
     sid = str(uuid.uuid4())
     pdir = _FAKE_HOME / ".claude" / "projects" / "-home-alex-code-demo"
@@ -369,6 +382,8 @@ if __name__ == "__main__":
     print("PASS test_leader_label_short_names")
     test_leader_groups_by_family()
     print("PASS test_leader_groups_by_family")
+    test_leader_hint_item_separates_key_from_action()
+    print("PASS test_leader_hint_item_separates_key_from_action")
     test_pilot_space_leader_and_divider()
     print("PASS test_pilot_space_leader_and_divider")
     test_pilot_custom_leader_does_not_leave_space_as_menu()

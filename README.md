@@ -37,8 +37,8 @@ headlessly with `uv run scripts/make_demo_gif.py`; use
   inferred parent/child tree and LLM topic clusters for big histories.
 - **RAM-aware** — a memory gate (commit headroom + load + physical floor)
   warns before a new pane would push the machine into thrashing.
-- **Keyboard-first** — everything works without a mouse: `Space` is a leader
-  key with mnemonic letters (`Space f` = favorite, `Space s` = sort …),
+- **Keyboard-first** — everything works without a mouse: `Space` opens a
+  mnemonic command menu (`Space f` = favorite, `Space s` = sort …),
   `Alt+←/→` resizes the split, `?` shows the live key map. The mouse is a
   bonus (click to sort, drag the divider), never a requirement.
 - **Unintrusive by design** — read-only over claude's own transcript files; no
@@ -107,6 +107,13 @@ that pops up when you pause).
    | `y` copy prompt (yank) | `t` tree · `c` cluster | `a` next attention |
    | `d` diff (changes) | `l` hide/show list | `x` close tab · `[` `]` tabs |
    | `r` refresh | `,` settings · `/` hide/show bar | `Space` mark for batch launch |
+
+   Space is a deliberate menu key, not a claim that every TUI should use a
+   Space leader: it only arms while the session list owns focus, so search
+   fields and live agent panes keep a literal Space. It also avoids taking a
+   letter away from type-to-search. The trade-off is that list marking becomes
+   `Space Space`; set `[keys] leader = "none"` if conventional Space-to-mark is
+   more important to you.
 
 3. **`Ctrl+]` returns focus** from a live claude pane to the list (the pane
    owns every other key, so claude works normally inside it).

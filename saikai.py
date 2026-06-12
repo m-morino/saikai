@@ -359,6 +359,12 @@ def _leader_groups(actions: dict) -> list:
     return [(f, fams[f]) for f in LEADER_FAMILY_ORDER if fams[f]]
 
 
+def _leader_hint_item(key: str, label: str) -> str:
+    """Render one menu choice with an unambiguous key/action separator."""
+    shown_key = "␣" if key == " " else key.replace("[", "\\[")
+    return f"[yellow]{shown_key}[/yellow] [dim]→[/dim] {label}"
+
+
 def _resolve_leader(keys_cfg, id_to_action):
     """Resolve the leader key + letter map: built-in defaults, then the user's
     [keys] single-letter entries layered over them (a user letter replaces both
@@ -3142,7 +3148,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]/[/yellow]           Jump to search (or just start typing) · [yellow]␣/[/yellow] hides/shows the bar\n"
                 "  [yellow]Esc[/yellow]         Leave the current context: search/dropdown → list · list → quit\n"
                 "  [yellow]?[/yellow]           Help (this screen)\n\n"
-                "[bold cyan]Session ops[/bold cyan]  [dim](␣x = Space then x — the leader; F-keys are the aliases)[/dim]\n"
+                "[bold cyan]Session ops[/bold cyan]  [dim](␣x = Space then x; F-keys are the aliases)[/dim]\n"
                 "  [yellow]␣f[/yellow] [dim]F6[/dim]     Toggle ★ favorite   ([dim]:fav[/dim] in search to filter)\n"
                 "  [yellow]␣h[/yellow] [dim]F7[/dim]     Toggle hide/unhide  ([dim]:hidden[/dim] in search to find them)\n"
                 "  [yellow]␣e[/yellow] [dim]⇧F2[/dim]    Rename — type your own name (empty clears → auto-title)\n"
@@ -3190,14 +3196,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         f"{a}→[yellow]{k}[/yellow]" for a, k in list(_rm.items())[:12]) + "\n")
                 if getattr(app, "_leader_key", ""):
                     _lk = "Space" if app._leader_key == "space" else app._leader_key
-                    body += (f"[bold cyan]Leader[/bold cyan]  [yellow]{_lk}[/yellow] "
+                    body += (f"[bold cyan]Menu key[/bold cyan]  [yellow]{_lk}[/yellow] "
                              "in the list, then one letter (pause to see this map in place):\n")
                     _groups = _leader_groups(getattr(app, "_leader_actions", {}))
                     for _fam, _pairs in _groups:
-                        _seq = "  ".join(
-                            f"[yellow]{'␣' if k == ' ' else k.replace('[', chr(92) + '[')}"
-                            f"[/yellow]{lbl}"
-                            for k, lbl in _pairs)
+                        _seq = "  ".join(_leader_hint_item(k, lbl)
+                                        for k, lbl in _pairs)
                         body += f"  {_fam:<8} {_seq}\n"
                     if not _groups:
                         body += "  (no letters mapped)\n"
@@ -4502,13 +4506,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             lines = []
             for fam, pairs in _leader_groups(self._leader_actions):
-                # escape '[' for Rich markup (the prev_tab letter)
-                seq = "  ".join(
-                    f"[yellow]{'␣' if k == ' ' else k.replace('[', chr(92) + '[')}"
-                    f"[/yellow]{lbl}"
-                    for k, lbl in pairs)
+                seq = "  ".join(_leader_hint_item(k, lbl) for k, lbl in pairs)
                 lines.append(f"[bold cyan]{fam:<7}[/bold cyan] {seq}")
-            self.notify("\n".join(lines), timeout=4)
+            self.notify("\n".join(lines), title="Command menu · press one key",
+                        timeout=4)
 
         def _over_tab_bar(self, event) -> bool:
             """True when the mouse is over the split-live tab bar. Textual's Tabs
