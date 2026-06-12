@@ -7,7 +7,7 @@ Single-file Textual TUI (`saikai.py`) + the split-live terminal widget
 
 ## Concurrency invariants (split-live) — DO NOT VIOLATE
 
-Each split-live pane runs a background **reader thread** (`ClaudeTerminal._read_loop`)
+Each split-live pane runs a background **reader thread** (`AgentTerminal._read_loop`)
 that feeds pyte under `self._lock`; the **UI thread** also takes `self._lock`
 (`render_line`, `_current_screen`). Get this wrong and saikai HARD-FREEZES.
 
@@ -53,7 +53,11 @@ that feeds pyte under `self._lock`; the **UI thread** also takes `self._lock`
 - The tests run WITHOUT textual/pyte/pywinpty (soft imports → `Widget` is
   `object`): `python tests/test_terminal_concurrency.py` and
   `python tests/test_resource_bounds.py`. Run them after touching the
-  terminal/threading code; `python -m py_compile saikai.py saikai_terminal.py` too.
+  terminal/threading code; `python -m py_compile saikai.py saikai_terminal.py
+  saikai_provider.py` too.
+- Agent-specific launch/status capability declarations belong in
+  `saikai_provider.py`; PTY locking, rendering, input, resize, and teardown stay
+  provider-neutral in `saikai_terminal.py`.
 
 ## Other gotchas
 

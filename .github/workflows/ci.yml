@@ -26,19 +26,16 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # Deps mirror pyproject (textual / pyte / platformdirs). The PTY backends
-      # (pywinpty / ptyprocess) are intentionally NOT installed: saikai_terminal
-      # soft-imports them, so the suites — including the textual run_test smoke —
-      # run headless without a real PTY.
+      # Install the built package contract, including the platform PTY backend.
       - name: Install dependencies
-        run: python -m pip install --upgrade pip textual pyte platformdirs
+        run: python -m pip install --upgrade pip .
 
       - name: Compile + run test suites
         shell: bash
         run: |
           set -euo pipefail
-          python -m py_compile saikai.py saikai_terminal.py
-          for t in test_config test_sort_recency test_split_divider test_resource_bounds test_terminal_concurrency test_terminal_watchdog test_keyboard_leader; do
+          python -m py_compile saikai.py saikai_terminal.py saikai_provider.py
+          for t in test_config test_providers test_sort_recency test_split_divider test_resource_bounds test_terminal_concurrency test_terminal_watchdog test_keyboard_leader test_pty_backend; do
             echo "== $t =="
             python "tests/$t.py"
           done

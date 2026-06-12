@@ -4,6 +4,7 @@ Run:  python tests/test_providers.py
 """
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,6 +23,12 @@ def test_claude_provider_contract():
     assert caps.can_resume and caps.can_create and caps.can_preassign_id
     assert caps.has_reliable_live_status
     assert caps.has_transcript_changes and caps.has_desktop_sync
+    home = Path("test-home")
+    assert provider.history_format == "claude-project-jsonl"
+    assert provider.history_roots(home=home, env={}) == [home / ".claude" / "projects"]
+    assert provider.history_roots(
+        home=home, env={"CLAUDE_CONFIG_DIR": "custom-claude"},
+    ) == [Path("custom-claude") / "projects"]
 
     resume = provider.build_resume(
         "sid-1", cwd="/work", env=_env(), extra_args=["--permission-mode", "auto"],
@@ -49,6 +56,12 @@ def test_codex_provider_contract():
     assert not caps.can_preassign_id
     assert not caps.has_reliable_live_status
     assert not caps.has_transcript_changes and not caps.has_desktop_sync
+    home = Path("test-home")
+    assert provider.history_format == "codex-rollout-jsonl"
+    assert provider.history_roots(home=home, env={}) == [home / ".codex" / "sessions"]
+    assert provider.history_roots(
+        home=home, env={"CODEX_HOME": "custom-codex"},
+    ) == [Path("custom-codex") / "sessions"]
 
     resume = provider.build_resume(
         "thread-1", cwd="/work", env=_env(), executable="codex-test",
@@ -74,6 +87,12 @@ def test_provider_registry_is_explicit():
         raise AssertionError("unknown provider must fail")
 
 
+def test_provider_module_ships_in_wheel_manifest():
+    root = Path(__file__).resolve().parent.parent
+    pyproject = root.joinpath("pyproject.toml").read_text(encoding="utf-8")
+    assert '"saikai_provider.py"' in pyproject
+
+
 if __name__ == "__main__":
     test_claude_provider_contract()
     print("PASS test_claude_provider_contract")
@@ -81,4 +100,6 @@ if __name__ == "__main__":
     print("PASS test_codex_provider_contract")
     test_provider_registry_is_explicit()
     print("PASS test_provider_registry_is_explicit")
+    test_provider_module_ships_in_wheel_manifest()
+    print("PASS test_provider_module_ships_in_wheel_manifest")
     print("ALL PASS")

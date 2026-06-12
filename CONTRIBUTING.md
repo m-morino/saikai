@@ -27,14 +27,16 @@ Dependencies: `textual`, `pyte`, `platformdirs`, and a PTY backend
 ## Tests — run them before every commit
 
 ```bash
-python -m py_compile saikai.py saikai_terminal.py
+python -m py_compile saikai.py saikai_terminal.py saikai_provider.py
 python tests/test_config.py
+python tests/test_providers.py
 python tests/test_sort_recency.py
 python tests/test_split_divider.py
 python tests/test_resource_bounds.py
 python tests/test_terminal_concurrency.py
 python tests/test_terminal_watchdog.py
 python tests/test_keyboard_leader.py
+python tests/test_pty_backend.py
 ```
 
 Most suites also run without textual / pyte / a PTY backend through soft
@@ -42,6 +44,11 @@ imports. With textual installed, `test_split_divider.py` and
 `test_keyboard_leader.py` additionally use `App.run_test()` + `Pilot` to verify
 real nested-App layout, focus, and key handling. Run the suite through `uv run`
 before release so these Pilot paths do not skip.
+
+Agent-specific launch behavior belongs in `saikai_provider.py`; PTY rendering,
+input, resize, and teardown stay provider-neutral in `saikai_terminal.py`.
+`test_pty_backend.py` is the exception to the headless suites: it opens the
+platform's real PTY backend and verifies spawn, resize, output, and EOF.
 
 ## The concurrency invariants — DO NOT VIOLATE
 

@@ -145,8 +145,19 @@ def test_enrich_stamps_last_active_dt():
               "last_ts": "2026-01-01T00:00:00.000Z",
               "real_msgs": [], "mtime": time.time()}
     r = saikai._enrich_session("sid-y", parsed, Path("x.jsonl"), parsed["mtime"])
+    assert r["provider"] == "claude"
     assert r.get("last_active_dt") is not None
     assert saikai._last_active_dt(r) is r["last_active_dt"]   # reads the stamp
+
+
+def test_enrich_preserves_parser_provider():
+    """A future history parser can select its provider before sessions mix."""
+    from pathlib import Path
+    parsed = {"provider": "codex", "first_ts": "2026-01-01T00:00:00.000Z",
+              "last_ts": "2026-01-01T00:00:00.000Z",
+              "real_msgs": [], "mtime": time.time()}
+    r = saikai._enrich_session("sid-z", parsed, Path("x.jsonl"), parsed["mtime"])
+    assert r["provider"] == "codex"
 
 
 def test_summary_cache_keys_on_last_ts():
@@ -455,11 +466,18 @@ def test_project_short_strips_prefix_case_insensitively():
         assert saikai.project_short(lowered + "-CLI-myproj") == "CLI-myproj"
 
 
+def test_project_dirs_tolerates_missing_history_root():
+    """Fresh/custom provider roots may not exist yet; scanning stays empty."""
+    from pathlib import Path
+    assert saikai._project_dirs(Path("definitely-missing-history-root")) == []
+
+
 def test_new_session_stub_has_renderable_fields():
     """A new-session stub carries the fields the list render/sort/group read, so a
     just-launched session shows immediately (before its JSONL is scanned)."""
     s = saikai._new_session_stub("sid-123", "/tmp/myproj", "myproj")
     assert s["id"] == "sid-123" and s["is_open"] is True
+    assert s["provider"] == "claude"
     assert s["summary"] == "myproj"            # Title column
     assert s["last_active_dt"] is not None     # Last / Recency
     for k in ("first_ts", "last_ts", "mtime", "cwd", "origin_cwd", "real_msgs",
@@ -744,6 +762,8 @@ if __name__ == "__main__":
     print("PASS test_recency_flags_use_current_time")
     test_enrich_stamps_last_active_dt()
     print("PASS test_enrich_stamps_last_active_dt")
+    test_enrich_preserves_parser_provider()
+    print("PASS test_enrich_preserves_parser_provider")
     test_summary_cache_keys_on_last_ts()
     print("PASS test_summary_cache_keys_on_last_ts")
     test_build_groups_date_order_recent_first()
@@ -778,6 +798,8 @@ if __name__ == "__main__":
     print("PASS test_build_groups_state_keeps_pinned_live_in_state_group")
     test_project_short_strips_prefix_case_insensitively()
     print("PASS test_project_short_strips_prefix_case_insensitively")
+    test_project_dirs_tolerates_missing_history_root()
+    print("PASS test_project_dirs_tolerates_missing_history_root")
     test_new_session_stub_has_renderable_fields()
     print("PASS test_new_session_stub_has_renderable_fields")
     test_list_title_fallback_no_claude_p()

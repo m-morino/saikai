@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import os
+from pathlib import Path
 import shutil
 from typing import Mapping, Sequence
 
@@ -35,7 +37,17 @@ class AgentProvider(ABC):
     display_name: str
     executable_name: str
     status_profile: str = "generic"
+    history_format: str
     capabilities = ProviderCapabilities()
+
+    @abstractmethod
+    def history_roots(
+        self,
+        *,
+        home: Path | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> list[Path]:
+        raise NotImplementedError
 
     def resolve_executable(self, env: Mapping[str, str]) -> str:
         return shutil.which(self.executable_name, path=env.get("PATH")) or self.executable_name
@@ -83,12 +95,23 @@ class ClaudeProvider(AgentProvider):
     display_name = "Claude Code"
     executable_name = "claude"
     status_profile = "claude"
+    history_format = "claude-project-jsonl"
     capabilities = ProviderCapabilities(
         can_preassign_id=True,
         has_reliable_live_status=True,
         has_transcript_changes=True,
         has_desktop_sync=True,
     )
+
+    def history_roots(
+        self,
+        *,
+        home: Path | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> list[Path]:
+        env_map = os.environ if env is None else env
+        root = Path(env_map.get("CLAUDE_CONFIG_DIR") or ((home or Path.home()) / ".claude"))
+        return [root / "projects"]
 
     def build_resume(
         self,
@@ -128,7 +151,18 @@ class CodexProvider(AgentProvider):
     display_name = "Codex"
     executable_name = "codex"
     status_profile = "generic"
+    history_format = "codex-rollout-jsonl"
     capabilities = ProviderCapabilities()
+
+    def history_roots(
+        self,
+        *,
+        home: Path | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> list[Path]:
+        env_map = os.environ if env is None else env
+        root = Path(env_map.get("CODEX_HOME") or ((home or Path.home()) / ".codex"))
+        return [root / "sessions"]
 
     def build_resume(
         self,
