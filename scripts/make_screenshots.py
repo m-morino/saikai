@@ -110,6 +110,12 @@ def fake_run(self, *a, **kw):
         async with self.run_test(size=SIZE) as pilot:
             await pilot.pause(0.8)
             ASSETS.mkdir(parents=True, exist_ok=True)
+            # Show the browser off properly: Date grouping (section headers),
+            # a ★ favorite, and the Sort/Group state visible in the status bar.
+            await pilot.press("shift+f7")       # Group: Date
+            await pilot.press("f6")             # ★ the selected session
+            await pilot.press("down")
+            await pilot.pause(0.4)
             self.save_screenshot(filename="saikai-browse.svg", path=str(ASSETS))
             await pilot.press("enter")          # open a live pane (mock claude)
             for _ in range(40):                 # wait for the PTY to paint
