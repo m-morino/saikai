@@ -45,6 +45,7 @@ def test_resolve_leader_defaults_on():
     assert m["s"] == "sort" and m["o"] == "order"      # leader-only actions
     assert m[" "] == "toggle_mark"                     # double-Space = mark
     assert m["["] == "prev_tab" and m["]"] == "next_tab"
+    assert m[","] == "settings"                        # ␣, = Settings modal
 
 
 def test_resolve_leader_disable_and_custom_key():
@@ -99,6 +100,7 @@ def test_leader_groups_by_family():
     by_fam = dict(groups)
     assert ("f", "fav") in by_fam["Session"]
     assert ("s", "sort") in by_fam["View"] and ("g", "group") in by_fam["View"]
+    assert (",", "settings") in by_fam["View"]
     assert (" ", "mark") in by_fam["Panes"] and ("[", "tab◀") in by_fam["Panes"]
     # unknown action -> last family, not dropped
     g2 = saikai._leader_groups({"q": "made_up_action"})
@@ -175,6 +177,58 @@ def test_pilot_space_leader_and_divider():
     assert facts.get("bar_shown"), facts
 
 
+def test_pilot_settings_screen():
+    """␣, opens the Settings modal; changing its Group select forwards into the
+    top-bar dropdown (the one true apply path) and persists; Esc closes."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_settings_screen (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+    from textual.widgets import Select
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                await pilot.press("space")              # leader…
+                await pilot.press("comma")              # …then , = settings
+                await pilot.pause(0.3)
+                facts["modal"] = type(self.screen).__name__
+                try:
+                    sel = self.screen.query_one("#set-group", Select)
+                    sel.value = "project"               # edit inside the modal
+                    await pilot.pause(0.3)
+                    facts["persisted"] = saikai._get_group_by()
+                    facts["topbar"] = self.query_one("#groupsel", Select).value
+                except Exception as e:                  # noqa: BLE001
+                    facts["error"] = repr(e)
+                await pilot.press("escape")             # close the modal
+                await pilot.pause(0.2)
+                facts["closed"] = type(self.screen).__name__
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("modal") == "SettingsScreen", facts
+    assert facts.get("persisted") == "project", facts
+    assert facts.get("topbar") == "project", facts
+    assert facts.get("closed") != "SettingsScreen", facts
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -192,4 +246,6 @@ if __name__ == "__main__":
     print("PASS test_leader_groups_by_family")
     test_pilot_space_leader_and_divider()
     print("PASS test_pilot_space_leader_and_divider")
+    test_pilot_settings_screen()
+    print("PASS test_pilot_settings_screen")
     print("ALL PASS")
