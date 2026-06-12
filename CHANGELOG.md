@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-06-13
+
+### Added
+- PyPI is now the primary installation channel: `uv tool install saikai` or
+  `pipx install saikai`. A release-triggered GitHub Actions workflow builds,
+  verifies, and publishes the universal wheel and source distribution through
+  PyPI Trusted Publishing.
+
+### Changed
+- User-facing documentation calls the Space prefix a command menu rather than
+  presenting editor-specific "leader" terminology as a general TUI convention.
+- The README documents why Space is used only while the session list owns focus,
+  its `Space Space` marking trade-off, and how to restore conventional
+  Space-to-mark behavior.
+
+### Fixed
+- Command-menu choices now render with an explicit separator (`f → fav`) in
+  both the delayed menu and `?` help instead of looking like misspelled commands
+  such as `ffav`.
+- The real-PTY backend smoke test now reports a skip, rather than a failure,
+  when the platform PTY backend is intentionally unavailable.
+
 ## [0.2.0] — 2026-06-12
 
 ### Added
@@ -119,6 +141,7 @@ variables, and the config directory.
   `CF_UNICODETEXT` API, so multibyte text (CJK / emoji) no longer garbles under a
   UTF-8 console code page.
 
-[Unreleased]: https://github.com/m-morino/saikai/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/m-morino/saikai/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/m-morino/saikai/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/m-morino/saikai/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/m-morino/saikai/releases/tag/v0.1.0
