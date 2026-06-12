@@ -134,6 +134,13 @@ def _split_ratio_from_x(screen_x, main_left, main_width,
     return max(lo, min(hi, (screen_x - main_left) / main_width))
 
 
+def _nudge_split_ratio(cur: float, delta: float,
+                       lo=_SPLIT_RATIO_LO, hi=_SPLIT_RATIO_HI) -> float:
+    """Keyboard nudge (Alt+←/→) for the list/pane divider — same clamp as a
+    mouse drag. Pure — unit-tested."""
+    return max(lo, min(hi, cur + delta))
+
+
 def _read_json(path: Path, default):
     """Read JSON file, returning `default` on any error (missing/corrupt/etc.)."""
     try:
@@ -227,8 +234,15 @@ _CONFIG_TEMPLATE = (
     "max_live               = 64    # hard cap on concurrent live panes\n"
     "scrollback_lines       = 2000  # per-pane scrollback kept in memory (biggest RAM lever)\n\n"
     "[keys]\n"
-    '# leader  = "ctrl+g"   # opt-in prefix, then the mnemonic letters below\n'
-    '# refresh = "f5"\n'
+    "# Keyboard-first: Space (in the list) is a LEADER key by default — press it,\n"
+    "# then a mnemonic letter: f=favorite h=hide e=rename r=refresh d=diff y=copy\n"
+    "# s=sort o=order g=group t=tree c=cluster n=new p=restore z=freeze\n"
+    "# a=attention l=list x=close [=prev-tab ]=next-tab Space=mark. Press ? in the\n"
+    "# app for the live map. Everything below is optional fine-tuning:\n"
+    '# leader          = "ctrl+g"  # use another leader ("none" disables the mode)\n'
+    "# leader_defaults = false     # start from an EMPTY letter map\n"
+    '# favorite        = "v"       # single letter = leader sequence remap\n'
+    '# refresh         = "f5"      # multi-char    = direct key rebind\n'
 )
 
 
@@ -270,7 +284,9 @@ def _leader_map(letters_cfg, id_to_action):
     (mapping, errors)."""
     out, errs, seen = {}, [], set()
     for action_id, key in (letters_cfg or {}).items():
-        k = str(key or "").strip().lower()
+        k = str(key or "").lower()
+        if k != " ":          # a literal space IS a valid letter (leader-leader = mark)
+            k = k.strip()
         if len(k) != 1:
             continue
         action = id_to_action.get(action_id)
@@ -283,6 +299,68 @@ def _leader_map(letters_cfg, id_to_action):
         seen.add(k)
         out[k] = action
     return out, errs
+
+
+# Keyboard-first defaults: the leader fires ONLY while the session table is
+# focused, so Space can never steal a key from a claude pane or the search box.
+# Everything here is overridable from [keys]; leader = "none" turns the mode
+# off, leader_defaults = false starts from an empty letter map.
+DEFAULT_LEADER_KEY = "space"
+DEFAULT_LEADER_LETTERS = {           # action id -> letter (config orientation)
+    "favorite": "f", "hide": "h", "rename": "e", "refresh": "r",
+    "diff": "d", "copy": "y", "sort": "s", "order": "o",
+    "group": "g", "tree": "t", "cluster": "c", "new": "n",
+    "restore": "p", "freeze": "z", "attention": "a", "toggle_list": "l",
+    "close": "x", "prev_tab": "[", "next_tab": "]", "mark": " ",
+}
+# Leader-only action ids (no Binding / F-key behind them): id -> action name.
+LEADER_VIRTUAL_ACTIONS = {"sort": "sort", "order": "order", "mark": "toggle_mark"}
+
+
+def _resolve_leader(keys_cfg, id_to_action):
+    """Resolve the leader key + letter map: built-in defaults, then the user's
+    [keys] single-letter entries layered over them (a user letter replaces both
+    its action's default letter AND any default action sitting on that letter).
+    Returns (leader_key, {letter: action_name}, errors). Pure — unit-tested."""
+    kc = keys_cfg if isinstance(keys_cfg, dict) else {}
+    id2act = dict(id_to_action or {})
+    for vid, act in LEADER_VIRTUAL_ACTIONS.items():
+        id2act.setdefault(vid, act)
+    ld = str(kc.get("leader") or "").strip().lower()
+    if ld in ("none", "off", "false", "0"):
+        return "", {}, []
+    leader = ld or DEFAULT_LEADER_KEY
+    letters = (dict(DEFAULT_LEADER_LETTERS)
+               if _cfg_bool(kc.get("leader_defaults"), True) else {})
+    for act_id, key in kc.items():
+        if act_id in ("leader", "leader_defaults"):
+            continue
+        k = str(key or "").lower()
+        if k != " ":
+            k = k.strip()
+        if len(k) != 1:
+            continue                  # multi-char values are direct rebinds
+        letters = {a: v for a, v in letters.items() if v != k and a != act_id}
+        letters[act_id] = k
+    mapping, errs = _leader_map(letters, id2act)
+    return leader, mapping, errs
+
+
+def _leader_label(action: str) -> str:
+    """Short human label for a leader hint / help row, derived from the action
+    name (toggle_fav → fav, preview_changes → diff, next_attention → next!)."""
+    special = {"toggle_fav": "fav", "preview_changes": "diff",
+               "copy_prompt": "copy", "next_attention": "next!",
+               "new_session": "new", "restore_panes": "restore",
+               "freeze_pane": "freeze", "close_live": "close",
+               "prev_tab": "tab◀", "next_tab": "tab▶",
+               "toggle_list": "list", "toggle_mark": "mark"}
+    if action in special:
+        return special[action]
+    for pre in ("toggle_", "cycle_"):
+        if action.startswith(pre):
+            return action[len(pre):]
+    return action
 
 
 def _init_config(force: bool = False) -> int:
@@ -668,7 +746,7 @@ def _iso_date(ts_iso: str):
 
 def _date_label(d, now) -> str:
     """Claude-Desktop-style date-section label from a local date (None -> '—'):
-    Today / Yesterday / 'M月D日' (this year) / 'YYYY/M/D' (older)."""
+    Today / Yesterday / 'Jun 11' (this year) / 'YYYY-MM-DD' (older)."""
     if d is None:
         return "—"
     today = now.date()
@@ -677,8 +755,8 @@ def _date_label(d, now) -> str:
     if (today - d).days == 1:
         return "Yesterday"
     if d.year == today.year:
-        return f"{d.month}月{d.day}日"
-    return f"{d.year}/{d.month}/{d.day}"
+        return f"{d.strftime('%b')} {d.day}"
+    return d.isoformat()
 
 
 def _date_bucket(ts_iso: str, now) -> str:
@@ -2987,7 +3065,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Shift-F4[/yellow]    Reopen the panes from your last session (resume) — anytime\n"
                 "  [yellow]F2/F3[/yellow]       Prev / next live tab   ·   [yellow]Shift-F3[/yellow]  Next pane needing attention (?/!)\n"
                 "  [yellow]F4[/yellow]          Hide / show the session list\n"
-                "  [dim]Drag the divider bar between the list and the pane to resize (persists)[/dim]\n"
+                "  [yellow]Alt-←/→[/yellow]     Resize the list/pane split — or drag the divider (persists)\n"
                 "  [yellow]Ctrl-][/yellow]      Return focus: pane → list  (SAIKAI_RELEASE_KEY to change)\n"
                 "  [yellow]F10[/yellow]         Close the active tab   ·   [yellow]Shift-F10[/yellow]  Close ALL tabs\n"
                 "  [yellow]Esc[/yellow]         pane → list, then quit-all (snapshots panes; Shift-F4 reopens)   ·   [yellow]Ctrl-C[/yellow]  quit-all\n"
@@ -3001,7 +3079,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  Search    [yellow]/[/yellow] or type to open the bar; tokens AND with text + each other —\n"
                 "            :fav  :hidden  :open  :active  :recent   (Esc clears)\n"
                 "  Markers   @ open · + active · . recent · live ~ busy · ? waiting · ! unread · = viewed · * fav · x hidden\n"
-                "  (clicking a column header still sorts too)\n\n"
+                "  [yellow]/[/yellow] shows the bar with the dropdowns; [yellow]Tab[/yellow]/[yellow]Shift-Tab[/yellow] walk into them, [yellow]Enter[/yellow]\n"
+                "  opens one. Leader [yellow]s[/yellow]/[yellow]o[/yellow] cycles the sort column / direction without the bar\n"
+                "  (a column-header click still sorts too)\n\n"
                 f"[bold cyan]Colours[/bold cyan]  {_hue} ([dim]display.color_by = "
                 "project/worktree/topic/none[/dim]) · Last column: "
                 "[green]green[/green] active(<5m) / [yellow]yellow[/yellow] recent(<30m) / dim older\n\n")
@@ -3013,10 +3093,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     body += ("[bold cyan]Your remaps[/bold cyan]  " + " · ".join(
                         f"{a}→[yellow]{k}[/yellow]" for a, k in list(_rm.items())[:12]) + "\n")
                 if getattr(app, "_leader_key", ""):
-                    _seq = " · ".join(f"{k}→{a}" for k, a in
-                                      list(getattr(app, "_leader_actions", {}).items())[:12])
-                    body += (f"[bold cyan]Leader[/bold cyan]  [yellow]{app._leader_key}[/yellow] then  "
-                             + (_seq or "(no letters mapped)") + "\n")
+                    _lk = "Space" if app._leader_key == "space" else app._leader_key
+                    _seq = "  ".join(
+                        f"[yellow]{'␣' if k == ' ' else k}[/yellow]{_leader_label(a)}"
+                        for k, a in sorted(getattr(app, "_leader_actions", {}).items()))
+                    body += (f"[bold cyan]Leader[/bold cyan]  [yellow]{_lk}[/yellow] in the list, then:"
+                             f"  {_seq or '(no letters mapped)'}\n"
+                             "  [dim]([keys] in config: leader = \"none\" disables · "
+                             "leader_defaults = false clears · any  action = \"x\"  remaps)[/dim]\n")
                 if _rm or getattr(app, "_leader_key", ""):
                     body += "\n"
             except Exception:
@@ -3138,17 +3222,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # id= makes each remappable via [keys] in config (App.set_keymap in
             # on_mount). The id is the user-facing name typed in [keys]. quit /
             # quit_all / resume / preview have NO id (core nav, not remappable).
-            Binding("f5", "refresh", "Refresh", id="refresh", priority=True),
-            Binding("f6", "toggle_fav", "★", id="favorite", priority=True),
-            Binding("f7", "toggle_hide", "Hide", id="hide", priority=True),
-            Binding("f8", "preview_changes", "Changes", id="diff", priority=True),
-            Binding("f9", "copy_prompt", "Copy", id="copy", priority=True),
-            Binding("shift+f5", "toggle_tree", "Tree", id="tree", priority=True),
-            Binding("shift+f6", "toggle_cluster", "Cluster", id="cluster", priority=True),
-            Binding("shift+f7", "cycle_group", "Group", id="group", priority=True),
-            Binding("shift+f8", "new_session", "New", id="new", priority=True),
-            Binding("shift+f9", "freeze_pane", "Freeze", id="freeze", priority=True),
-            Binding("shift+f4", "restore_panes", "Restore", id="restore", priority=True),
+            # show=False on the F-keys: the footer stays at the four core keys
+            # (⏎ Tab ? Esc — low learning load); the full set lives in ? help,
+            # the leader hint, and the statusbar's "␣ leader · ? keys" crumb.
+            Binding("f5", "refresh", "Refresh", id="refresh", show=False, priority=True),
+            Binding("f6", "toggle_fav", "★", id="favorite", show=False, priority=True),
+            Binding("f7", "toggle_hide", "Hide", id="hide", show=False, priority=True),
+            Binding("f8", "preview_changes", "Changes", id="diff", show=False, priority=True),
+            Binding("f9", "copy_prompt", "Copy", id="copy", show=False, priority=True),
+            Binding("shift+f5", "toggle_tree", "Tree", id="tree", show=False, priority=True),
+            Binding("shift+f6", "toggle_cluster", "Cluster", id="cluster", show=False, priority=True),
+            Binding("shift+f7", "cycle_group", "Group", id="group", show=False, priority=True),
+            Binding("shift+f8", "new_session", "New", id="new", show=False, priority=True),
+            Binding("shift+f9", "freeze_pane", "Freeze", id="freeze", show=False, priority=True),
+            Binding("shift+f4", "restore_panes", "Restore", id="restore", show=False, priority=True),
             Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
             Binding("question_mark", "help", "Help", id="help", priority=True),
             # Split-live tab management (opt-in). F10 closes the ACTIVE tab;
@@ -3157,11 +3244,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # /returns one pane at a time; Ctrl+] returns focus pane → list.
             Binding("f10", "close_live", "Close tab", id="close", show=False, priority=True),
             Binding("shift+f10", "close_all_live", "Close all", id="close_all", show=False, priority=True),
-            Binding("f2", "prev_tab", "◀Tab", id="prev_tab", priority=True),
-            Binding("f3", "next_tab", "Tab▶", id="next_tab", priority=True),
-            Binding("shift+f3", "next_attention", "Next!", id="attention", priority=True),
-            Binding("f4", "toggle_list", "Hide list", id="toggle_list", priority=True),
-            Binding("shift+f2", "rename", "Rename", id="rename", priority=True),
+            Binding("f2", "prev_tab", "◀Tab", id="prev_tab", show=False, priority=True),
+            Binding("f3", "next_tab", "Tab▶", id="next_tab", show=False, priority=True),
+            Binding("shift+f3", "next_attention", "Next!", id="attention", show=False, priority=True),
+            Binding("f4", "toggle_list", "Hide list", id="toggle_list", show=False, priority=True),
+            Binding("shift+f2", "rename", "Rename", id="rename", show=False, priority=True),
+            # Keyboard divider — footer-hidden (documented in ? help); the
+            # actions SkipAction-forward when a pane / input is focused.
+            Binding("alt+left", "shrink_list", "List◀", id="shrink_list",
+                    show=False, priority=True),
+            Binding("alt+right", "grow_list", "▶List", id="grow_list",
+                    show=False, priority=True),
         ]
         # The practical limit on concurrent live claude panes is MEMORY — each
         # is a full node process tree that sits CPU-idle waiting for input — so
@@ -3276,37 +3369,33 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._split_ratio = _get_split_ratio()
             self._apply_split_ratio(self._split_ratio)
             # Keybindings from [keys]: F-key/combo values are DIRECT rebinds
-            # (set_keymap); single-letter values are LEADER sequences (opt-in via
-            # [keys] leader). The leader is handled in on_key, LIST-FOCUS only, so it
-            # can never steal a key from a focused claude pane.
-            self._leader_key = ""          # configured leader (e.g. "ctrl+g"); "" = off
+            # (set_keymap); single-letter values are LEADER sequences. The leader is
+            # ON BY DEFAULT (Space + DEFAULT_LEADER_LETTERS) and is handled in
+            # on_key, LIST-FOCUS only, so it can never steal a key from a focused
+            # claude pane or the search box. [keys] leader = "none" disables it.
+            self._leader_key = ""          # resolved leader key; "" = off
             self._leader_actions = {}      # {letter: action_name} reached via the leader
             self._leader_pending = False   # waiting for the post-leader key
+            self._leader_hints_shown = 0   # auto-hint the map the first few times only
             self._applied_keymap = {}      # direct rebinds applied (shown in ? help)
             try:
                 _kc = _load_config().get("keys", {})
-                if isinstance(_kc, dict) and _kc:
-                    _ids = {b.id for b in type(self).BINDINGS if getattr(b, "id", None)}
-                    _id2act = {b.id: b.action for b in type(self).BINDINGS
-                               if getattr(b, "id", None)}
-                    _direct = {k: v for k, v in _kc.items()
-                               if k != "leader" and len(str(v).strip()) != 1}
-                    _letters = {k: v for k, v in _kc.items()
-                                if k != "leader" and len(str(v).strip()) == 1}
-                    _applied, _errs = _validate_keymap(_direct, _ids)
-                    if _applied:
-                        self.set_keymap(_applied)
-                        self._applied_keymap = _applied
-                    _ld = str(_kc.get("leader") or "").strip().lower()
-                    if _ld:
-                        self._leader_key = _ld
-                        self._leader_actions, _lerr = _leader_map(_letters, _id2act)
-                        _errs += _lerr
-                    elif _letters:
-                        _errs.append('[keys] single-letter keys need a leader '
-                                     '(set [keys] leader = "ctrl+g")')
-                    for _e in _errs[:5]:
-                        self.notify(_e, severity="warning", timeout=8)
+                _kc = _kc if isinstance(_kc, dict) else {}
+                _ids = {b.id for b in type(self).BINDINGS if getattr(b, "id", None)}
+                _id2act = {b.id: b.action for b in type(self).BINDINGS
+                           if getattr(b, "id", None)}
+                _direct = {k: v for k, v in _kc.items()
+                           if k not in ("leader", "leader_defaults")
+                           and len(str(v).strip()) != 1}
+                _applied, _errs = _validate_keymap(_direct, _ids)
+                if _applied:
+                    self.set_keymap(_applied)
+                    self._applied_keymap = _applied
+                self._leader_key, self._leader_actions, _lerr = (
+                    _resolve_leader(_kc, _id2act))
+                _errs += _lerr
+                for _e in _errs[:5]:
+                    self.notify(_e, severity="warning", timeout=8)
             except Exception:
                 pass
             # Previous session's open panes — for the Shift+F4 restore (split-live).
@@ -3857,15 +3946,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Scope: "All projects" when --all-projects, else repo name
             scope = "All projects" if show_project else (repo.name if repo else "All projects")
 
-            # Mode toggles with Rich markup color
-            tree_str = "[green]ON[/green]" if _get_tree_mode() else "[dim]OFF[/dim]"
-            cluster_str = "[green]ON[/green]" if _get_cluster_mode() else "[dim]OFF[/dim]"
-            _GROUP_LABEL = {"none": "[dim]off[/dim]", "date": "[green]Date[/green]",
+            sep = "  [dim]·[/dim]  "
+            # Mode toggles: show Tree/Cluster only when ON (a row of OFFs is
+            # noise); Group stays visible — dimmed when off — so the feature
+            # advertises itself.
+            tree_str = f"{sep}Tree: [green]ON[/green]" if _get_tree_mode() else ""
+            cluster_str = (f"{sep}Cluster: [green]ON[/green]"
+                           if _get_cluster_mode() else "")
+            _GROUP_LABEL = {"date": "[green]Date[/green]",
                             "project": "[green]Project[/green]",
                             "state": "[green]State[/green]"}
-            group_str = _GROUP_LABEL.get(_get_group_by(), "[dim]off[/dim]")
-
-            sep = "  [dim]·[/dim]  "
+            group_str = ("Group: " + _GROUP_LABEL[_get_group_by()]
+                         if _get_group_by() in _GROUP_LABEL
+                         else "[dim]Group: off[/dim]")
             # Active Desktop-style filters (only shown when non-default).
             _filt = []
             if _get_status_filter() != "active":
@@ -3923,8 +4016,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     search_str = f"{sep}[yellow]search: {_qd!r}[/yellow]"
                 else:
                     search_str = f"{sep}[dim]/ search[/dim]"
+            # Standing keyboard breadcrumb — the footer is trimmed to the core
+            # four keys, so this is where leader/help discoverability lives.
+            _kb = ("[dim]␣ leader · ? keys[/dim]" if self._leader_key
+                   else "[dim]? keys[/dim]")
             text = (f"  {n} sessions{search_str}{sep}{sort_str}{sep}"
-                    f"{scope}{sep}Group: {group_str}{filt_str}{sep}Tree: {tree_str}{sep}Cluster: {cluster_str}{live_str}")
+                    f"{scope}{sep}{group_str}{filt_str}{tree_str}{cluster_str}"
+                    f"{live_str}{sep}{_kb}")
             self.query_one("#statusbar", Static).update(text)
 
         def _cursor_sid(self) -> str | None:
@@ -4078,10 +4176,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _tbl = None
                 if event.key == self._leader_key and self.focused is _tbl:
                     self._leader_pending = True
-                    if self._leader_actions:
-                        _hint = " · ".join(f"{k}={a}" for k, a in
-                                           list(self._leader_actions.items())[:8])
-                        self.notify(f"leader — {_hint}  (Esc cancels)", timeout=2)
+                    # Auto-hint the full map the first few presses, then stay
+                    # quiet (a double-Space mark spree must not spam toasts).
+                    if self._leader_actions and self._leader_hints_shown < 3:
+                        self._leader_hints_shown += 1
+                        _hint = "  ".join(
+                            f"{'␣' if k == ' ' else k}:{_leader_label(a)}"
+                            for k, a in sorted(self._leader_actions.items()))
+                        self.notify(f"leader → {_hint}", timeout=4)
                     self.set_timer(1.5, self._cancel_leader)
                     event.stop()
                     return
@@ -4098,7 +4200,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if self.focused is table:
                 if (event.key == "space" and _LIVE_TERM is not None
                         and not search.value):
-                    # Space toggles a batch-launch mark (split-live only). Only when
+                    # Space toggles a batch-launch mark (split-live only). With the
+                    # default Space LEADER this is unreachable (leader consumed the
+                    # key above; mark = leader→Space, i.e. double-Space) — it's the
+                    # fallback for [keys] leader = "none" / another leader. Only when
                     # no query is in progress: once typing has started, Space must
                     # reach the search box so multi-word queries work.
                     self.action_toggle_mark()
@@ -5528,6 +5633,33 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             _toggle_sort_dir(int(priority))
             _apply_sort(all_sessions, _load_sort())
             self._refresh_table()
+
+        # Leader-only spellings (no F-key): keyboard parity with a header click.
+        def action_sort(self) -> None:
+            """Leader `s` — cycle the primary sort column."""
+            self.action_cycle_sort("1")
+
+        def action_order(self) -> None:
+            """Leader `o` — reverse the primary sort direction."""
+            self.action_toggle_dir("1")
+
+        # Keyboard divider (Alt+←/→): same clamp + persistence as a mouse drag.
+        # Priority bindings reach here even over a focused pane — forward the
+        # key in that case (Alt+arrows may mean something to claude).
+        def action_shrink_list(self) -> None:
+            self._nudge_split(-0.04)
+
+        def action_grow_list(self) -> None:
+            self._nudge_split(+0.04)
+
+        def _nudge_split(self, delta: float) -> None:
+            if self._focused_terminal() is not None or isinstance(
+                    self.focused, (Select, Input)):
+                raise SkipAction()
+            self._split_ratio = _nudge_split_ratio(
+                getattr(self, "_split_ratio", None) or _get_split_ratio(), delta)
+            self._apply_split_ratio(self._split_ratio)
+            self._commit_split_ratio()
 
     # Belt-and-suspenders: even if run()'s teardown is bypassed (SystemExit,
     # driver crash, watchdog), atexit still disables mouse/focus tracking + shows
