@@ -82,4 +82,4 @@ batch, and don't "fix" a cosmetic race with a lock that can deadlock.
 Open an issue first for anything non-trivial. In the PR, confirm the tests +
 `py_compile` pass and that any threading change respects the invariants above.
 By contributing you agree your work is licensed under the project's
-[MIT License](LICENSE).
+[MIT License](LICENSE) and follows the [Code of Conduct](CODE_OF_CONDUCT.md).

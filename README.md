@@ -1,6 +1,7 @@
 # saikai
 
 [![CI](https://github.com/m-morino/saikai/actions/workflows/ci.yml/badge.svg)](https://github.com/m-morino/saikai/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/m-morino/saikai)](https://github.com/m-morino/saikai/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
@@ -55,7 +56,7 @@ Requires **Python ≥ 3.11**. The easiest path is
 header, no manual venv:
 
 ```bash
-uv tool install git+https://github.com/m-morino/saikai   # no clone needed → `saikai` on PATH
+uv tool install git+https://github.com/m-morino/saikai@v0.2.0   # stable release → `saikai` on PATH
 ```
 
 From a clone:
@@ -68,7 +69,7 @@ uv tool install .        # install the `saikai` command on your PATH, then: saik
 Prefer pip / pipx? Both work (deps come from `pyproject.toml`):
 
 ```bash
-pipx install git+https://github.com/m-morino/saikai   # isolated + on PATH
+pipx install git+https://github.com/m-morino/saikai@v0.2.0   # isolated + on PATH
 pip install .                                         # into the active environment
 ```
 
