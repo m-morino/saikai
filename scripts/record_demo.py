@@ -1,0 +1,220 @@
+"""Record a saikai demo as an asciinema cast → convert to GIF with agg.
+
+Sets up the same fictional demo data as make_screenshots.py so nothing private
+can appear in the recording.
+
+Prerequisites
+─────────────
+  pip install asciinema          (or: uv add asciinema)
+  cargo install agg              (converts .cast → .gif)
+    OR: npm install -g svg-term-cli   (alternative: .cast → .svg)
+
+Usage
+─────
+  uv run scripts/record_demo.py          # auto-mode: records + prints convert cmd
+  uv run scripts/record_demo.py --guide  # print manual-recording instructions only
+
+The output is  docs/assets/saikai-demo.cast  (and a ready-to-run agg command).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+ASSETS = REPO / "docs" / "assets"
+CAST_OUT = ASSETS / "saikai-demo.cast"
+GIF_OUT  = ASSETS / "saikai-demo.gif"
+
+# ── fictional demo data (identical to make_screenshots.py so the sessions look
+#    the same whether you're capturing a static SVG or a live recording) ──────
+
+def _build_demo_home() -> Path:
+    demo_home = Path(tempfile.mkdtemp(prefix="saikai-demo-home-"))
+    for var in ("USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME"):
+        os.environ[var] = str(demo_home)
+    os.environ.pop("SAIKAI_CONFIG", None)
+    os.environ["SAIKAI_SUMMARIZE_ENABLED"] = "0"
+    os.environ["SAIKAI_AUTO_REFRESH"]       = "0"
+    os.environ["SAIKAI_SPLIT_LIVE"]         = "0"   # list-only for a clean recording
+
+    now = datetime.now(timezone.utc)
+
+    def _enc(p: str) -> str:
+        return re.sub(r"[:/\\.]", "-", p)
+
+    def _session(project: str, title: str, msgs: list[str], age_h: float,
+                 branch: str = "main", turns_pad: int = 0) -> None:
+        cwd   = f"/home/alex/code/{project}"
+        pdir  = demo_home / ".claude" / "projects" / _enc(cwd)
+        pdir.mkdir(parents=True, exist_ok=True)
+        t0 = now - timedelta(hours=age_h)
+        recs = [{"type": "ai-title", "aiTitle": title,
+                 "timestamp": t0.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                 "cwd": cwd, "gitBranch": branch}]
+        for i, m in enumerate(msgs + ["looks good, thanks!"] * turns_pad):
+            ts = (t0 + timedelta(minutes=3*(i+1))).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            recs.append({"type": "user",      "timestamp": ts, "cwd": cwd,
+                         "gitBranch": branch, "message": {"content": m}})
+            recs.append({"type": "assistant", "timestamp": ts,
+                         "message": {"content": [{"type": "text",
+                                                  "text": f"(demo reply {i+1})"}]}})
+        out = pdir / f"{uuid.uuid4()}.jsonl"
+        out.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+        ts_epoch = (t0 + timedelta(minutes=3*max(1, len(msgs)))).timestamp()
+        os.utime(out, (ts_epoch, ts_epoch))
+
+    _session("webapp",        "Fix flaky auth token refresh test",
+             ["The auth token refresh test fails ~1 in 5 runs on CI."], 0.4,
+             branch="fix/flaky-auth-test", turns_pad=3)
+    _session("webapp",        "Add dark mode toggle to settings",
+             ["Add a dark mode toggle, persist in localStorage."], 3.1, turns_pad=5)
+    _session("webapp",        "Migrate the build from webpack to Vite",
+             ["Migrate from webpack 5 to Vite."], 27, turns_pad=11)
+    _session("api-server",    "Fix N+1 queries in /orders endpoint",
+             ["GET /orders is slow — N+1 on line-items."], 1.2,
+             branch="perf/orders-n-plus-1", turns_pad=7)
+    _session("api-server",    "Migrate models to Pydantic v2",
+             ["Upgrade to Pydantic v2."], 30, turns_pad=9)
+    _session("api-server",    "Add rate limiting middleware",
+             ["Add per-API-key rate limiting (sliding window, Redis)."], 51, turns_pad=4)
+    _session("data-pipeline", "Backfill 2025 events into warehouse",
+             ["Write an idempotent backfill job, chunked by day."], 6.5, turns_pad=6)
+    _session("data-pipeline", "Debug Airflow DAG timeout",
+             ["The nightly DAG times out on the dedup task since Tuesday."], 73, turns_pad=8)
+    _session("dotfiles",      "Set up neovim LSP for Rust",
+             ["Set up rust-analyzer with nvim-lspconfig."], 95, turns_pad=2)
+
+    return demo_home
+
+
+# ── manual-recording guide ────────────────────────────────────────────────────
+
+GUIDE = """
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  saikai demo recording guide                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+The script sets up a throwaway home with fictional demo sessions so nothing
+private appears in the recording.  Run it in a terminal that is at least
+128 columns × 35 rows.
+
+Option A — asciinema (recommended, cross-platform)
+──────────────────────────────────────────────────
+  pip install asciinema
+  uv run scripts/record_demo.py          ← sets up demo home + launches recorder
+
+  Convert to GIF afterwards:
+    cargo install agg
+    agg docs/assets/saikai-demo.cast docs/assets/saikai-demo.gif \\
+        --theme monokai --speed 1.5 --cols 128 --rows 35
+
+  Or to animated SVG (no Rust needed):
+    npx svg-term-cli --in docs/assets/saikai-demo.cast \\
+        --out docs/assets/saikai-demo.svg --width 128 --height 35
+
+Option B — WezTerm built-in (Windows/macOS/Linux, no extra deps)
+──────────────────────────────────────────────────────────────────
+  1. Open a WezTerm tab, resize to 128×35:
+       wezterm cli set-window-size --cols 128 --rows 35
+  2. Run:  uv run scripts/record_demo.py --setup-only
+     (exits after creating the demo home; prints the SAIKAI_ env vars to set)
+  3. In the same shell:  saikai --all-projects
+  4. Record with WezTerm's Ctrl+Shift+R  (or: wezterm record …)
+  5. Export via gifski or ffmpeg for a GIF.
+
+Suggested demo sequence (≈ 45 seconds)
+───────────────────────────────────────
+  1. App opens — full list visible with Date grouping (Shift+F7)
+  2. Type "auth" — live filter narrows to matching sessions
+  3. Esc — clear filter
+  4. Down arrow — move to a different session
+  5. Space f — mark favourite (★ appears)
+  6. Shift+F7 twice — cycle through Project / State grouping
+  7. ? — open help overlay, pause 2 s, Esc
+  8. Alt+→ (×3) — shrink the list, showing more of the description column
+"""
+
+
+# ── auto record mode ──────────────────────────────────────────────────────────
+
+def _find_saikai() -> list[str]:
+    """Return the command list to run saikai (uv run or direct)."""
+    saikai_py = REPO / "saikai.py"
+    if saikai_py.exists():
+        return [sys.executable, str(saikai_py)]
+    return ["saikai"]
+
+
+def _record(demo_home: Path) -> None:
+    try:
+        subprocess.run(["asciinema", "--version"], capture_output=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print("asciinema not found — install it:  pip install asciinema")
+        print("Or use --guide for manual recording instructions.")
+        sys.exit(1)
+
+    ASSETS.mkdir(parents=True, exist_ok=True)
+    cmd = _find_saikai() + ["--all-projects"]
+
+    env = {**os.environ, "HOME": str(demo_home), "USERPROFILE": str(demo_home)}
+    print(f"Recording to {CAST_OUT}")
+    print("Follow the suggested demo sequence from --guide, then press Ctrl-D or q.")
+    print()
+
+    subprocess.run(
+        ["asciinema", "rec", str(CAST_OUT),
+         "--cols", "128", "--rows", "35",
+         "--command", " ".join(cmd),
+         "--overwrite"],
+        env=env,
+        check=True,
+    )
+
+    print(f"\n✓ Saved: {CAST_OUT}")
+    print("\nConvert to GIF (requires  cargo install agg):")
+    print(f"  agg {CAST_OUT} {GIF_OUT} --theme monokai --speed 1.5")
+    print("\nConvert to animated SVG (requires  npm install -g svg-term-cli):")
+    svg = ASSETS / "saikai-demo.svg"
+    print(f"  npx svg-term-cli --in {CAST_OUT} --out {svg} --width 128 --height 35")
+
+
+# ── entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--guide",      action="store_true",
+                    help="Print manual recording instructions and exit")
+    ap.add_argument("--setup-only", action="store_true",
+                    help="Create demo home, print env vars, exit (for manual recording)")
+    args = ap.parse_args()
+
+    if args.guide:
+        print(GUIDE)
+        return
+
+    demo_home = _build_demo_home()
+
+    if args.setup_only:
+        print("Demo home created.  Set these env vars before running saikai:\n")
+        for var in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+            print(f"  export {var}={demo_home}")
+        print(f"  export SAIKAI_SUMMARIZE_ENABLED=0")
+        print(f"  export SAIKAI_AUTO_REFRESH=0")
+        print(f"\nThen run:  saikai --all-projects")
+        return
+
+    _record(demo_home)
+
+
+if __name__ == "__main__":
+    main()
