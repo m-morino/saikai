@@ -2,11 +2,12 @@
 
 ## Supported versions
 
-saikai is pre-1.0; security fixes land on the latest `0.1.x` release.
+saikai is pre-1.0; security fixes land on the latest `0.2.x` release.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | ✅        |
+| 0.2.x   | ✅        |
+| 0.1.x   | ❌        |
 | < 0.1   | ❌        |
 
 ## Reporting a vulnerability

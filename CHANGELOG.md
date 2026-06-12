@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-12
+
 ### Added
 - **Keyboard-first by default.** `Space` (in the list) is now a leader key with
   a built-in mnemonic map — `Space f` favorite, `Space h` hide, `Space s` /
@@ -117,5 +119,6 @@ variables, and the config directory.
   `CF_UNICODETEXT` API, so multibyte text (CJK / emoji) no longer garbles under a
   UTF-8 console code page.
 
-[Unreleased]: https://github.com/m-morino/saikai/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/m-morino/saikai/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/m-morino/saikai/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/m-morino/saikai/releases/tag/v0.1.0

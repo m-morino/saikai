@@ -8,10 +8,9 @@ Fixes #
 
 ## Checklist
 
-- [ ] `python -m py_compile saikai.py saikai_terminal.py` passes
-- [ ] All five test suites pass (`tests/test_config.py`, `test_sort_recency.py`,
-      `test_split_divider.py`, `test_resource_bounds.py`,
-      `test_terminal_concurrency.py`)
+- [ ] `python -m py_compile saikai.py saikai_terminal.py saikai_provider.py` passes
+- [ ] All suites listed in `CONTRIBUTING.md` pass, including the provider,
+      threading, Pilot, and real-platform PTY smoke tests
 - [ ] New pure/helper logic has a unit test; App/render-only changes were
       verified by running saikai
 - [ ] If I touched threading / locks / async in `saikai_terminal.py`, I respected

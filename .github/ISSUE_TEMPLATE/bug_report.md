@@ -23,7 +23,8 @@ A clear description of the bug, and what you expected instead.
 
 **Logs / screenshots**
 If the UI broke, the Textual debug log is helpful:
-`%LOCALAPPDATA%\…\saikai\textual-debug.log` (Windows) or the equivalent cache dir.
+`%USERPROFILE%\.cache\saikai\textual-debug.log` (Windows) or
+`~/.cache/saikai/textual-debug.log` (Linux/macOS).
 Paste any traceback. For a display glitch, a screenshot or copied text helps.
 
 **Additional context**
