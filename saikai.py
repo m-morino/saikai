@@ -516,8 +516,10 @@ LOG_FILE = CACHE_DIR / "saikai.log"
 
 # Sort columns selectable via Ctrl-1/2/3. "-" = inactive (no sort at this priority).
 SORT_COLS = ("-", "date", "last", "proj", "wt", "title", "turns", "fav", "topic")
+# Default: Recency ("last" = _last_active_dt) descending — "what was I just
+# doing" is the question saikai answers; creation time is a column click away.
 SORT_DEFAULT = [
-    {"col": "date", "dir": "desc"},
+    {"col": "last", "dir": "desc"},
     {"col": "-",    "dir": "desc"},
     {"col": "-",    "dir": "desc"},
 ]
@@ -690,16 +692,16 @@ def _toggle_cluster_mode() -> bool:
 
 
 def _get_group_by() -> str:
-    """Saved grouping axis: 'none' | 'date' | 'project' | 'state'. Mirrors
-    Claude Desktop's 'Group by' menu and matches its DEFAULT (Date): the date
-    sections are the feature's best advert and a flat several-hundred-row list
-    is harder to scan. An explicit user choice — including 'none' — is
-    persisted by _set_group_by and wins from then on."""
+    """Saved grouping axis: 'none' | 'date' | 'project' | 'state'. Default is
+    State: with split-live the question is "who needs me / what's running",
+    and the State sections (Needs input / Running / Open / Recent / Idle /
+    Archived) answer it at a glance — Date is one ␣g away. An explicit choice —
+    including 'none' — is persisted by _set_group_by and wins from then on."""
     try:
         v = GROUP_BY_FILE.read_text(encoding="utf-8").strip()
-        return v if v in ("none", "date", "project", "state") else "date"
+        return v if v in ("none", "date", "project", "state") else "state"
     except Exception:
-        return "date"
+        return "state"
 
 
 def _set_group_by(value: str) -> None:
