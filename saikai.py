@@ -4463,6 +4463,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self._open_search()
                     event.stop()
                     return
+                if event.character == "?":
+                    # '?' opens the help screen. Guard here so Linux terminals that
+                    # don't fire the priority `question_mark` binding before on_key
+                    # don't swallow '?' into type-to-search instead.
+                    self.action_help()
+                    event.stop()
+                    return
                 char = event.character
                 if char and len(char) == 1 and char.isprintable():
                     self._open_search(char)
