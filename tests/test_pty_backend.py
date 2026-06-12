@@ -12,7 +12,16 @@ import saikai_terminal as rt
 
 
 def test_real_pty_spawn_resize_and_eof():
-    assert rt.PtyProcess is not None, rt.unavailable_reason()
+    # The other suites run with plain python and NO deps (textual/pyte/PTY
+    # backends are soft-imported) — this one needs the real backend. Keep the
+    # no-deps contract locally by SKIPPING when it is absent; CI installs the
+    # built package, so a missing backend there is a real failure, not a skip.
+    if rt.PtyProcess is None:
+        if os.environ.get("CI"):
+            raise AssertionError(
+                f"PTY backend missing on CI: {rt.unavailable_reason()}")
+        print(f"SKIP test_real_pty_spawn_resize_and_eof ({rt.unavailable_reason()})")
+        return
     pty = rt.PtyProcess.spawn(
         [sys.executable, "-c",
          "import time; print('SAIKAI_PTY_SMOKE', flush=True); time.sleep(0.2)"],
