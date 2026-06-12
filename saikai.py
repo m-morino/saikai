@@ -4264,8 +4264,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     search_str = f"{sep}[dim]/ search[/dim]"
             # Standing keyboard breadcrumb — the footer is trimmed to the core
             # four keys, so this is where leader/help discoverability lives.
-            _kb = ("[dim]␣ menu · ? keys[/dim]" if self._leader_key
-                   else "[dim]? keys[/dim]")
+            # When panes are open, prepend the release-key hint: the pane
+            # swallows every key, so "how do I get back to the list" is the
+            # single thing a new user must see without opening ? help.
+            _kb_parts = []
+            if self._live is not None and self._live.count > 0:
+                _rk = _release_focus_key()   # e.g. "ctrl+]"
+                _rk_disp = "+".join(
+                    p.capitalize() if len(p) > 1 else p
+                    for p in _rk.split("+"))  # "ctrl+]" → "Ctrl+]"
+                _kb_parts.append(f"[bold]{_rk_disp}[/bold] [dim]list[/dim]")
+            if self._leader_key:
+                _kb_parts.append("[dim]␣ menu · ? keys[/dim]")
+            else:
+                _kb_parts.append("[dim]? keys[/dim]")
+            _kb = " · ".join(_kb_parts)
             text = (f"  {n} sessions{search_str}{sep}{sort_str}{sep}"
                     f"{scope}{sep}{group_str}{filt_str}{tree_str}{cluster_str}"
                     f"{live_str}{sep}{_kb}")
