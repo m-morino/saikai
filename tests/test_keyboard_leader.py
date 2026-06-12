@@ -46,6 +46,7 @@ def test_resolve_leader_defaults_on():
     assert m[" "] == "toggle_mark"                     # double-Space = mark
     assert m["["] == "prev_tab" and m["]"] == "next_tab"
     assert m[","] == "settings"                        # ␣, = Settings modal
+    assert m["/"] == "toggle_search_bar"               # ␣/ = filter bar toggle
 
 
 def test_resolve_leader_disable_and_custom_key():
@@ -101,6 +102,7 @@ def test_leader_groups_by_family():
     assert ("f", "fav") in by_fam["Session"]
     assert ("s", "sort") in by_fam["View"] and ("g", "group") in by_fam["View"]
     assert (",", "settings") in by_fam["View"]
+    assert ("/", "bar") in by_fam["View"]
     assert (" ", "mark") in by_fam["Panes"] and ("[", "tab◀") in by_fam["Panes"]
     # unknown action -> last family, not dropped
     g2 = saikai._leader_groups({"q": "made_up_action"})
@@ -237,6 +239,64 @@ def test_pilot_settings_screen():
     assert facts.get("closed") != "SettingsScreen", facts
 
 
+def test_pilot_esc_quits_and_bar_toggle():
+    """The Esc contract with the default-visible bar: a single Esc from the
+    LIST quits (the bar no longer swallows the first Esc); ␣/ is the deliberate
+    bar toggle and persists; Esc from the search box returns to the list
+    WITHOUT hiding the bar (it's a fixture, not chrome)."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_esc_quits_and_bar_toggle (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                bar = self.query_one("#searchrow")
+                facts["visible_at_start"] = bool(bar.display)
+                await pilot.press("slash")            # jump into the search box
+                await pilot.pause(0.1)
+                await pilot.press("escape")           # Esc: search → list…
+                await pilot.pause(0.1)
+                facts["bar_kept_after_esc"] = bool(bar.display)   # …bar STAYS
+                facts["table_refocused"] = self.focused is self.query_one("#table")
+                await pilot.press("space")            # ␣/ hides the bar…
+                await pilot.press("slash")
+                await pilot.pause(0.2)
+                facts["bar_after_toggle"] = bool(bar.display)
+                facts["persisted"] = (saikai._read_json(
+                    saikai.OPTIONS_FILE, {}) or {}).get("search_bar")
+                await pilot.press("escape")           # single Esc from the list = quit
+                await pilot.pause(0.3)
+                facts["running_after_esc"] = self.is_running
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("visible_at_start"), facts
+    assert facts.get("bar_kept_after_esc"), f"Esc from search must NOT hide the bar: {facts}"
+    assert facts.get("table_refocused"), facts
+    assert facts.get("bar_after_toggle") is False, f"leader / must hide the bar: {facts}"
+    assert facts.get("persisted") is False, facts
+    assert facts.get("running_after_esc") is False, \
+        f"a single Esc from the list must quit: {facts}"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -256,4 +316,6 @@ if __name__ == "__main__":
     print("PASS test_pilot_space_leader_and_divider")
     test_pilot_settings_screen()
     print("PASS test_pilot_settings_screen")
+    test_pilot_esc_quits_and_bar_toggle()
+    print("PASS test_pilot_esc_quits_and_bar_toggle")
     print("ALL PASS")

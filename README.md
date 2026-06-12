@@ -90,47 +90,38 @@ saikai --table         # static, non-interactive table
 saikai --help
 ```
 
-### Keys
+### Keys — learn three things
 
-| Key | Action |
-|-----|--------|
-| `↑` `↓` / `Enter` | move / resume the selected session |
-| `/` or just type | open the search & filter bar (`Esc` closes it, keeps the filter) |
-| `F5` | refresh · `F6` ★ favorite · `F7` hide · `F8` changes (diff) · `F9` copy opening prompt |
-| `Shift+F2` | rename the session — type your own name (empty clears it → back to auto title) |
-| `Shift+F5/F6/F7` | tree / cluster / cycle grouping |
-| `Tab` | preview: full ↔ summary · `?` help · `Esc` quit |
+Everything else is on screen (the footer, the dropdowns, and the `␣` menu
+that pops up when you pause).
+
+1. **Keys you already know.** `↑` `↓` move · `Enter` resumes · `/` or just
+   typing searches · `Tab` toggles the preview · `?` full key list · `Esc`
+   leaves the current context (search → list → quit).
+2. **`Space` is the menu.** Press `Space` in the list, then one mnemonic
+   letter. Hesitate after `Space` and the whole menu appears in place,
+   grouped by family (which-key style) — nothing to memorise:
+
+   | Session | View | Panes |
+   |---|---|---|
+   | `f` ★ favorite | `s` cycle **s**ort column | `n` new session |
+   | `h` hide | `o` flip sort **o**rder | `p` restore panes |
+   | `e` rename (edit) | `g` cycle grouping | `z` freeze pane |
+   | `y` copy prompt (yank) | `t` tree · `c` cluster | `a` next attention |
+   | `d` diff (changes) | `l` hide/show list | `x` close tab · `[` `]` tabs |
+   | `r` refresh | `,` settings · `/` hide/show bar | `Space` mark for batch launch |
+
+3. **`Ctrl+]` returns focus** from a live claude pane to the list (the pane
+   owns every other key, so claude works normally inside it).
 
 **Search tokens** (combine with text and each other): `:fav` `:hidden` `:open`
-`:active` `:recent`. Group / Sort / Status / Age also have top-bar dropdowns.
+`:active` `:recent`. The filter bar — search box plus the Group / Sort /
+Status / Age dropdowns — is visible by default: `Tab`/`Shift+Tab` walk into
+the dropdowns, `Enter` opens one, `␣/` reclaims the rows (persists).
 
-### Keyboard-first: the Space leader
-
-saikai is fully usable without a mouse — the mouse is a bonus, never a
-requirement. Press **`Space`** in the list (the *leader*), then one mnemonic
-letter. Hesitate after `Space` and the full map pops up, grouped by family
-(which-key style); `?` shows the same grouped map any time:
-
-| Session | View | Panes |
-|---|---|---|
-| `f` ★ favorite | `s` cycle **s**ort column | `n` new session |
-| `h` hide | `o` flip sort **o**rder | `p` restore panes |
-| `e` rename (edit) | `g` cycle grouping | `z` freeze pane |
-| `y` copy prompt (yank) | `t` tree · `c` cluster | `a` next attention |
-| `d` diff (changes) | `l` hide/show list | `x` close tab · `[` `]` tabs |
-| `r` refresh | `,` settings | `Space` mark for batch launch |
-
-The leader fires **only while the session list is focused** — a live claude
-pane or the search box always receives its own keys. More keyboard parity:
-
-- **Resize the split**: `Alt+←` / `Alt+→` nudge the list/pane divider (the
-  position persists, exactly like dragging it).
-- **Dropdowns**: the filter bar — search box plus the Group / Sort / Status /
-  Age dropdowns — is visible by default; `Tab` / `Shift+Tab` walk into the
-  dropdowns, `Enter` opens one. `Esc` hides the bar to reclaim the rows (the
-  choice persists); `/` or just typing brings it back.
-- **Everything** else already has an F-key (tables above) and `?` lists the
-  live bindings, including your remaps.
+More keyboard parity: `Alt+←/→` nudges the list/pane divider (persists, like
+dragging it). Every menu action also has a legacy F-key alias — `?` lists
+them all, including your `[keys]` remaps.
 
 Don't like the defaults? In `config.toml`: `[keys] leader = "none"` turns the
 mode off (Space then marks directly, as before), `leader = "ctrl+g"` moves it,

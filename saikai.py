@@ -312,11 +312,12 @@ DEFAULT_LEADER_LETTERS = {           # action id -> letter (config orientation)
     "group": "g", "tree": "t", "cluster": "c", "new": "n",
     "restore": "p", "freeze": "z", "attention": "a", "toggle_list": "l",
     "close": "x", "prev_tab": "[", "next_tab": "]", "mark": " ",
-    "settings": ",",
+    "settings": ",", "search_bar": "/",
 }
 # Leader-only action ids (no Binding / F-key behind them): id -> action name.
 LEADER_VIRTUAL_ACTIONS = {"sort": "sort", "order": "order", "mark": "toggle_mark",
-                          "settings": "settings"}
+                          "settings": "settings",
+                          "search_bar": "toggle_search_bar"}
 
 # Leader families: action name -> family, in display order. The which-key hint
 # and the ? help render the map grouped this way (Session / View / Panes)
@@ -329,7 +330,7 @@ LEADER_FAMILY_OF = {
     "copy_prompt": "Session", "preview_changes": "Session", "refresh": "Session",
     "sort": "View", "order": "View", "cycle_group": "View",
     "toggle_tree": "View", "toggle_cluster": "View", "toggle_list": "View",
-    "settings": "View",
+    "settings": "View", "toggle_search_bar": "View",
     "new_session": "Panes", "restore_panes": "Panes", "freeze_pane": "Panes",
     "next_attention": "Panes", "close_live": "Panes", "prev_tab": "Panes",
     "next_tab": "Panes", "toggle_mark": "Panes",
@@ -385,7 +386,8 @@ def _leader_label(action: str) -> str:
                "new_session": "new", "restore_panes": "restore",
                "freeze_pane": "freeze", "close_live": "close",
                "prev_tab": "tab◀", "next_tab": "tab▶",
-               "toggle_list": "list", "toggle_mark": "mark"}
+               "toggle_list": "list", "toggle_mark": "mark",
+               "toggle_search_bar": "bar"}
     if action in special:
         return special[action]
     for pre in ("toggle_", "cycle_"):
@@ -3087,11 +3089,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             _hue = ("no title tint" if _cby == "none"
                     else f"Title hue = {_cby}")
             body = (
+                "[bold]Learn THREE things — the rest is on screen:[/bold]  "
+                "keys you already know ([yellow]↑↓ ⏎ / Esc ?[/yellow])  ·  "
+                "[yellow]␣[/yellow] = the menu (pause to see it)  ·  "
+                "[yellow]Ctrl-][/yellow] = pane → list\n\n"
                 "[bold cyan]Navigation[/bold cyan]\n"
                 "  [yellow]↑[/yellow] [yellow]↓[/yellow]         Move rows\n"
                 "  [yellow]Enter[/yellow]       Resume session\n"
-                "  [yellow]/[/yellow]           Open search & filter (or just start typing)\n"
-                "  [yellow]Esc[/yellow]         Close the search bar if open · else quit\n"
+                "  [yellow]/[/yellow]           Jump to search (or just start typing) · [yellow]␣/[/yellow] hides/shows the bar\n"
+                "  [yellow]Esc[/yellow]         Leave the current context: search/dropdown → list · list → quit\n"
                 "  [yellow]?[/yellow]           Help (this screen)\n\n"
                 "[bold cyan]Session ops[/bold cyan]  [dim](␣x = Space then x — the leader; F-keys are the aliases)[/dim]\n"
                 "  [yellow]␣f[/yellow] [dim]F6[/dim]     Toggle ★ favorite   ([dim]:fav[/dim] in search to filter)\n"
@@ -3389,6 +3395,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # focus — without it, focus on the Search Input swallows Enter
             # into Input.Submitted and the picker never exits.
             Binding("enter", "resume", "Resume", priority=True),
+            # ␣ Menu in the footer — THE one entry point to every command. The
+            # on_key fast path arms the leader when the table is focused; this
+            # (non-priority) binding catches the key when it bubbles unconsumed
+            # from any other non-typing widget (Tabs, the grip…), so "Space did
+            # nothing" can't happen outside an input/terminal. A focused Input
+            # or claude pane consumes space first, exactly as designed.
+            Binding("space", "arm_leader", "Menu", key_display="␣"),
             # App shortcuts live on FUNCTION KEYS, never readline Ctrl+letters.
             # Ctrl+W/K/R/D/Y/P/G/T/O/L/X are all readline editing keys the user
             # types constantly — and claude itself binds Ctrl+R (history search),
@@ -4204,7 +4217,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     search_str = f"{sep}[dim]/ search[/dim]"
             # Standing keyboard breadcrumb — the footer is trimmed to the core
             # four keys, so this is where leader/help discoverability lives.
-            _kb = ("[dim]␣ leader · ? keys[/dim]" if self._leader_key
+            _kb = ("[dim]␣ menu · ? keys[/dim]" if self._leader_key
                    else "[dim]? keys[/dim]")
             text = (f"  {n} sessions{search_str}{sep}{sort_str}{sep}"
                     f"{scope}{sep}{group_str}{filt_str}{tree_str}{cluster_str}"
@@ -4420,6 +4433,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             """Leader timed out / cancelled — drop the pending state (the next key
             types normally again)."""
             self._leader_pending = False
+
+        def action_arm_leader(self) -> None:
+            """The footer's ␣ Menu binding: arm the leader from any non-typing
+            context. Fires only when space bubbled UNCONSUMED to the App (an
+            Input or terminal keeps its space; the table fast path in on_key
+            already stopped the event), so no double-arm and no stolen keys."""
+            if not self._leader_key or self._leader_pending:
+                return
+            if (self._focused_terminal() is not None
+                    or isinstance(self.focused, (Input, Select))):
+                return
+            self._leader_pending = True
+            self.set_timer(0.6, self._show_leader_hint)
+            self.set_timer(2.5, self._cancel_leader)
 
         def _show_leader_hint(self) -> None:
             """Deferred which-key hint: fires 0.6 s after the leader press, and
@@ -5775,10 +5802,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # (Single-pane close is F10; Ctrl-C also routes here via action_quit_all.)
             # When a terminal is focused Esc belongs to claude — this branch just
             # returns focus to the list (the terminal usually eats Esc first).
-            # First: if the on-demand search bar is open, Esc just dismisses it
-            # (keeping the filter, shown in the statusbar) — never quits mid-search.
-            if self._search_visible():
-                self._hide_search()
+            # Esc = "leave the current context": search box → list, dropdown →
+            # list, list → quit. The bar is a FIXTURE now (visible by default),
+            # so Esc no longer hides it — a single Esc from the list quits, and
+            # the filter/query stays applied + visible. ␣/ toggles the bar.
+            if isinstance(self.focused, Input):
+                try:
+                    self.query_one("#table", DataTable).focus()
+                except Exception:
+                    pass
+                return
+            if isinstance(self.focused, Select):
+                try:
+                    self.query_one("#table", DataTable).focus()
+                except Exception:
+                    pass
                 return
             if self._focused_terminal() is not None:
                 self.query_one("#table", DataTable).focus()
@@ -5818,6 +5856,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 raise SkipAction()
             self.preview_mode = "summary" if self.preview_mode == "full" else "full"
             self._update_preview(self._cursor_sid())
+
+        def action_toggle_search_bar(self) -> None:
+            """␣/ — show/hide the filter bar (search box + dropdowns). The bar
+            is a default-visible fixture; this is the one deliberate way to
+            reclaim its rows (Esc no longer hides it). State persists."""
+            if self._search_visible():
+                self._hide_search()
+            else:
+                self._open_search()
 
         def action_settings(self) -> None:
             """␣, — the Settings modal (list options + resolved config). Leader
