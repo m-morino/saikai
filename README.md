@@ -108,15 +108,17 @@ saikai --help
 
 saikai is fully usable without a mouse — the mouse is a bonus, never a
 requirement. Press **`Space`** in the list (the *leader*), then one mnemonic
-letter (the first few presses pop up the full map as a hint; `?` shows it too):
+letter. Hesitate after `Space` and the full map pops up, grouped by family
+(which-key style); `?` shows the same grouped map any time:
 
-| | | | |
-|---|---|---|---|
-| `f` ★ favorite | `h` hide | `e` rename (edit) | `r` refresh |
-| `d` diff (changes) | `y` copy prompt (yank) | `s` cycle **s**ort column | `o` flip sort **o**rder |
-| `g` cycle grouping | `t` tree | `c` cluster | `n` new session |
-| `p` restore panes | `z` freeze pane | `a` next attention | `l` hide/show list |
-| `x` close tab | `[` / `]` prev / next tab | `Space` mark for batch launch | |
+| Session | View | Panes |
+|---|---|---|
+| `f` ★ favorite | `s` cycle **s**ort column | `n` new session |
+| `h` hide | `o` flip sort **o**rder | `p` restore panes |
+| `e` rename (edit) | `g` cycle grouping | `z` freeze pane |
+| `y` copy prompt (yank) | `t` tree · `c` cluster | `a` next attention |
+| `d` diff (changes) | `l` hide/show list | `x` close tab · `[` `]` tabs |
+| `r` refresh | `,` settings | `Space` mark for batch launch |
 
 The leader fires **only while the session list is focused** — a live claude
 pane or the search box always receives its own keys. More keyboard parity:
@@ -184,7 +186,9 @@ Markers in the list: `~` busy · `?` waiting for input · `!` finished (unanswer
 saikai also reads an optional **TOML config file** for these same knobs (with
 `env > config > default` precedence) plus `[keys]` rebinds. Run `saikai
 --init-config` to write a documented template, `saikai --print-config` to see the
-resolved location and values.
+resolved location and values — or press **`Space ,`** inside the app: the
+Settings screen edits the list options in place and shows every config knob
+with its resolved value and source (`e` there opens config.toml in your editor).
 
 ## Platform support
 
