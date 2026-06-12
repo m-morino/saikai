@@ -14,10 +14,11 @@ saikai は `~/.claude/projects` の履歴全体を検索可能な 1 つの表に
 
 名前は「**再開**」と「**再会**」から。
 
-![saikai のセッションブラウザ: 全 Claude Code セッションのソート可能な一覧とプレビューペイン](docs/assets/saikai-browse.svg)
+![saikai demo](docs/assets/saikai-demo.gif)
 
-<sub>スクリーンショットは架空のデモデータです — `uv run scripts/make_screenshots.py`
-でいつでも再生成できます。</sub>
+<sub>デモは漏洩チェック済みの架空データです。`uv run scripts/make_demo_gif.py`
+でheadless再生成でき、実terminal録画の手順は
+`uv run scripts/record_demo.py --guide`で確認できます。</sub>
 
 ## ハイライト
 
