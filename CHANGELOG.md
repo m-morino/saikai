@@ -23,6 +23,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   config.toml in your editor (created from the template when absent).
 
 ### Changed
+- **The key system is now "learn three things":** (1) keys you already know
+  (`↑↓ ⏎ / Tab ? Esc`), (2) `Space` = the menu — shown in the footer as
+  `␣ Menu`, arms from any non-typing widget, and pops up the family-grouped
+  map when you pause, (3) `Ctrl+]` = pane → list. `Esc` now means "leave the
+  current context" (search/dropdown → list, list → quit) — with the bar
+  visible by default a single `Esc` quits again; `␣/` is the deliberate bar
+  toggle. F-keys remain as compatibility aliases, listed only in `?`.
 - **The filter bar (search + Group/Sort/Status/Age dropdowns) is visible by
   default** — the dropdowns are how the grouping/sorting features get
   discovered, and hidden-until-`/` meant nobody found them. `Esc` hides the
