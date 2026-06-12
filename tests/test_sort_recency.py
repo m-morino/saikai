@@ -329,6 +329,35 @@ def test_build_new_invocation_starts_fresh_session_with_id():
         _sh.rmtree(d, ignore_errors=True)
 
 
+def test_claude_launch_wrappers_delegate_to_active_provider():
+    from saikai_provider import LaunchSpec
+
+    calls = []
+
+    class _Provider:
+        id = "spy"
+        status_profile = "generic"
+
+        def build_resume(self, session_id, *, cwd, env, extra_args=(), executable=None):
+            calls.append(("resume", session_id, list(extra_args)))
+            return LaunchSpec(["spy", "resume", session_id, *extra_args], cwd, dict(env), session_id)
+
+        def build_new(self, *, cwd, requested_id, env, extra_args=(), executable=None):
+            calls.append(("new", requested_id, list(extra_args)))
+            return LaunchSpec(["spy", "new", requested_id, *extra_args], cwd, dict(env), requested_id)
+
+    old = saikai._ACTIVE_PROVIDER
+    saikai._ACTIVE_PROVIDER = _Provider()
+    try:
+        argv, _, _ = saikai._build_claude_invocation(["--resume", "sid-r"], None, [])
+        assert argv == ["spy", "resume", "sid-r"]
+        argv, _, _ = saikai._build_claude_invocation(["--session-id", "sid-n"], None, [])
+        assert argv == ["spy", "new", "sid-n"]
+        assert calls == [("resume", "sid-r", []), ("new", "sid-n", [])]
+    finally:
+        saikai._ACTIVE_PROVIDER = old
+
+
 def test_auto_permission_requires_explicit_opt_in():
     """A frequently-used cwd is not a trust boundary; auto permission is opt-in."""
     import shutil as _sh
@@ -737,6 +766,8 @@ if __name__ == "__main__":
     print("PASS test_no_app_binding_steals_a_readline_ctrl_key")
     test_build_new_invocation_starts_fresh_session_with_id()
     print("PASS test_build_new_invocation_starts_fresh_session_with_id")
+    test_claude_launch_wrappers_delegate_to_active_provider()
+    print("PASS test_claude_launch_wrappers_delegate_to_active_provider")
     test_auto_permission_requires_explicit_opt_in()
     print("PASS test_auto_permission_requires_explicit_opt_in")
     test_current_defaults_are_state_and_recency()
