@@ -23,6 +23,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   config.toml in your editor (created from the template when absent).
 
 ### Changed
+- **The filter bar (search + Group/Sort/Status/Age dropdowns) is visible by
+  default** — the dropdowns are how the grouping/sorting features get
+  discovered, and hidden-until-`/` meant nobody found them. `Esc` hides the
+  bar and that choice persists; `/` or typing brings it back. The table still
+  owns focus on launch, so the leader and search-as-you-type are unchanged.
 - **Grouping defaults to Date** (was: flat list), matching Claude Desktop. An
   explicit choice — including None — is persisted and wins as before.
 - **The leader hint is now which-key style:** it fires only when you hesitate
