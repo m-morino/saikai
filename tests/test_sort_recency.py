@@ -559,13 +559,18 @@ def test_no_internal_identifiers_in_source():
     codenames = ("chat" + "agc", "work" + "-tools", "edge" + "-auth")
     email_re = _re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", _re.I)
     self_name = _P(__file__).name
+    # Only scan git-tracked files — untracked/ignored working files (e.g. active
+    # plan docs, local scratch) are not shipped and must not trip this guard.
+    import subprocess as _sp
+    _ls = _sp.run(["git", "ls-files"], capture_output=True, text=True, cwd=root)
+    _tracked = {(root / p.strip()).resolve() for p in _ls.stdout.splitlines() if p.strip()}
     targets = (list(root.glob("*.py")) + list((root / "tests").glob("*.py"))
                + list((root / "scripts").glob("*.py"))
                + list((root / "docs").rglob("*.md"))     # docs ship publicly too
                + list((root / "docs").rglob("*.svg"))    # README screenshots too
                + [root / "README.md", root / "CLAUDE.md", root / "THIRD-PARTY-NOTICES.md"])
     for f in targets:
-        if not f.exists() or f.name == self_name:
+        if not f.exists() or f.name == self_name or f.resolve() not in _tracked:
             continue
         src = f.read_text(encoding="utf-8")
         low = src.lower()
