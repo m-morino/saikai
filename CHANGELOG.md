@@ -17,7 +17,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Japanese documentation**: full `README.ja.md`, cross-linked from the
   English README.
 
+- **In-app Settings** on `Space ,`: list options (Group / Sort / Status / Age /
+  Tree / Cluster) editable in place and applied instantly; every config.toml /
+  env knob shown read-only with its resolved value and source; `e` opens
+  config.toml in your editor (created from the template when absent).
+
 ### Changed
+- **Grouping defaults to Date** (was: flat list), matching Claude Desktop. An
+  explicit choice — including None — is persisted and wins as before.
+- **The leader hint is now which-key style:** it fires only when you hesitate
+  (0.6 s after `Space`), every time, and shows the map grouped into
+  Session / View / Panes families instead of one alphabetical line. `?` help
+  renders the same grouped map, leads with the leader letters (`␣f`, `␣h`, …)
+  and compacts the aliases to `⇧F7`-style notation.
 - **Calmer chrome, lower learning load:** the footer shows only the four core
   keys (`⏎` `Tab` `?` `Esc`) — everything else lives in `?` help and the
   leader hint; the status bar drops the OFF-state noise, keeps Sort/Group
