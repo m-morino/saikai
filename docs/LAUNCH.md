@@ -98,7 +98,7 @@ Full key map at ?: [screenshot]
 
 **タイトル案**:
 ```
-Claude Code のセッションが増えすぎた人へ — saikai でターミナルから全部管理する
+Claude Code のセッションが増えすぎた人へ。saikai でターミナルから全部管理する
 ```
 
 **本文の軸**:
