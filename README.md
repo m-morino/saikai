@@ -6,18 +6,22 @@
 
 **English** | [日本語](README.ja.md)
 
-A terminal session browser for [Claude Code](https://claude.com/claude-code).
-saikai scans `~/.claude/projects`, shows your past sessions in a searchable,
-sortable, groupable table with an AI-generated one-line summary per session, and
-resumes any of them. By default (**split-live**) it also hosts live `claude`
-panes side-by-side so you can run and watch several sessions at once.
-The name is the Japanese *saikai* (再開, "resume" — and 再会, "reunion"):
-you reopen past sessions and pick up where you left off.
+Dozens of Claude Code sessions, one searchable table. saikai scans your entire
+`~/.claude/projects` history, lets you filter and group by date / project /
+topic, and resumes any session with `Enter`. By default (**split-live**) it keeps
+several sessions running live in tabs beside the list — jump between conversations
+without closing anything or losing scrollback.
+
+*saikai* = 再開 "resume" + 再会 "reunion" (Japanese). Complements
+[ccmanager](https://github.com/kbwo/ccmanager), which manages a live multi-agent
+roster; saikai is for navigating and resuming the history.
 
 ![The saikai session browser: a sortable table of every Claude Code session with a live preview pane](docs/assets/saikai-browse.svg)
 
-<sub>Screenshots show fictional demo data — regenerate them any time with
-`uv run scripts/make_screenshots.py`.</sub>
+<sub>Screenshots show fictional demo data — regenerate with
+`uv run scripts/make_screenshots.py`. For an animated demo, run
+`uv run scripts/record_demo.py` (needs [asciinema](https://asciinema.org/))
+then convert with [agg](https://github.com/asciinema/agg).</sub>
 
 ## Highlights
 
