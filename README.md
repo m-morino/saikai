@@ -125,8 +125,10 @@ pane or the search box always receives its own keys. More keyboard parity:
 
 - **Resize the split**: `Alt+←` / `Alt+→` nudge the list/pane divider (the
   position persists, exactly like dragging it).
-- **Dropdowns**: `/` shows the filter bar; `Tab` / `Shift+Tab` walk into the
-  Group / Sort / Status / Age dropdowns, `Enter` opens one.
+- **Dropdowns**: the filter bar — search box plus the Group / Sort / Status /
+  Age dropdowns — is visible by default; `Tab` / `Shift+Tab` walk into the
+  dropdowns, `Enter` opens one. `Esc` hides the bar to reclaim the rows (the
+  choice persists); `/` or just typing brings it back.
 - **Everything** else already has an F-key (tables above) and `?` lists the
   live bindings, including your remaps.
 

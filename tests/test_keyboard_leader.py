@@ -144,6 +144,12 @@ def test_pilot_space_leader_and_divider():
         async def go():
             async with self.run_test(size=(110, 30)) as pilot:
                 await pilot.pause(0.4)
+                # The search/filter bar (and its Group/Sort/Status/Age
+                # dropdowns) is VISIBLE by default — the dropdowns are the
+                # features' discoverability. The table still owns focus, so
+                # the leader and search-as-you-type work unchanged.
+                facts["bar_default"] = bool(self.query_one("#searchrow").display)
+                facts["table_focused"] = self.focused is self.query_one("#table")
                 await pilot.press("space")          # arm the leader…
                 await pilot.press("f")              # …then f = favorite
                 await pilot.pause(0.2)
@@ -171,6 +177,8 @@ def test_pilot_space_leader_and_divider():
         App.run = orig_run
         sys.argv = orig_argv
 
+    assert facts.get("bar_default"), f"search bar must be visible on launch: {facts}"
+    assert facts.get("table_focused"), f"table must own focus on launch: {facts}"
     assert facts.get("favorited"), f"leader Space→f did not favorite: {facts}"
     assert facts["ratio_after"] > facts["ratio_before"], facts
     assert abs(facts["ratio_saved"] - facts["ratio_after"]) < 1e-6, facts

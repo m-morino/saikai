@@ -3442,7 +3442,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         MAX_LIVE = _cfg("limits", "max_live", "SAIKAI_MAX_LIVE", 64, int)
         CSS = """
         Screen { layout: vertical; }
-        #searchrow { dock: top; height: 3; display: none; }   /* on-demand: shown by '/' or typing, hidden by Esc */
+        #searchrow { dock: top; height: 3; }   /* visible by default (the dropdowns ARE the discoverability); Esc hides, '/' or typing reopens — last state persists */
         #search { width: 1fr; border: tall $accent; }
         #groupsel { width: 15; }
         #sortsel { width: 17; }
@@ -3546,6 +3546,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Restore the persisted list/pane divider position (drag → options.json).
             self._split_ratio = _get_split_ratio()
             self._apply_split_ratio(self._split_ratio)
+            # Search/filter bar: VISIBLE by default — the Group/Sort/Status/Age
+            # dropdowns living in it are the features' discoverability; hiding
+            # them until '/' meant nobody found grouping. Esc hides the bar and
+            # that choice persists (options.json) for the next launch.
+            if _load_options().get("search_bar") is False:
+                try:
+                    self.query_one("#searchrow").display = False
+                except Exception:
+                    pass
             # Keybindings from [keys]: F-key/combo values are DIRECT rebinds
             # (set_keymap); single-letter values are LEADER sequences. The leader is
             # ON BY DEFAULT (Space + DEFAULT_LEADER_LETTERS) and is handled in
@@ -4294,13 +4303,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return False
 
         def _open_search(self, prefill: str | None = None) -> None:
-            """Show the on-demand search/filter bar (docked top) and focus the box.
-            prefill appends a just-typed char (search-as-you-type)."""
+            """Show the search/filter bar (docked top) and focus the box.
+            prefill appends a just-typed char (search-as-you-type). The shown
+            state persists so the next launch matches the user's last choice."""
             try:
                 self.query_one("#searchrow").display = True
                 search = self.query_one("#search", Input)
             except Exception:
                 return
+            _save_options({"search_bar": True})
             search.focus()
             if prefill:
                 search.value = search.value + prefill
@@ -4309,11 +4320,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def _hide_search(self) -> None:
             """Hide the bar so the table reclaims the rows. The query is KEPT (the
             list stays filtered; the statusbar shows it), so Esc dismisses the
-            chrome, not the filter."""
+            chrome, not the filter. The hidden state persists across launches."""
             try:
                 self.query_one("#searchrow").display = False
             except Exception:
                 pass
+            _save_options({"search_bar": False})
             try:
                 self.query_one("#table", DataTable).focus()
             except Exception:
