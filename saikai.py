@@ -316,6 +316,34 @@ DEFAULT_LEADER_LETTERS = {           # action id -> letter (config orientation)
 # Leader-only action ids (no Binding / F-key behind them): id -> action name.
 LEADER_VIRTUAL_ACTIONS = {"sort": "sort", "order": "order", "mark": "toggle_mark"}
 
+# Leader families: action name -> family, in display order. The which-key hint
+# and the ? help render the map grouped this way (Session / View / Panes)
+# instead of an alphabetical soup — the LETTERS stay flat (two keystrokes),
+# only the presentation is systematic. Unknown actions (user remaps of new ids)
+# fall into the last family rather than vanishing from the hint.
+LEADER_FAMILY_ORDER = ("Session", "View", "Panes")
+LEADER_FAMILY_OF = {
+    "toggle_fav": "Session", "toggle_hide": "Session", "rename": "Session",
+    "copy_prompt": "Session", "preview_changes": "Session", "refresh": "Session",
+    "sort": "View", "order": "View", "cycle_group": "View",
+    "toggle_tree": "View", "toggle_cluster": "View", "toggle_list": "View",
+    "new_session": "Panes", "restore_panes": "Panes", "freeze_pane": "Panes",
+    "next_attention": "Panes", "close_live": "Panes", "prev_tab": "Panes",
+    "next_tab": "Panes", "toggle_mark": "Panes",
+}
+
+
+def _leader_groups(actions: dict) -> list:
+    """Group a resolved {letter: action_name} leader map by family for the
+    which-key hint / help: returns [(family, [(letter, label), …]), …] in
+    LEADER_FAMILY_ORDER, families with no letters omitted, letters within a
+    family sorted. Pure — unit-tested."""
+    fams: dict = {f: [] for f in LEADER_FAMILY_ORDER}
+    for letter, act in sorted((actions or {}).items()):
+        fam = LEADER_FAMILY_OF.get(act, LEADER_FAMILY_ORDER[-1])
+        fams[fam].append((letter, _leader_label(act)))
+    return [(f, fams[f]) for f in LEADER_FAMILY_ORDER if fams[f]]
+
 
 def _resolve_leader(keys_cfg, id_to_action):
     """Resolve the leader key + letter map: built-in defaults, then the user's
@@ -3047,34 +3075,32 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]/[/yellow]           Open search & filter (or just start typing)\n"
                 "  [yellow]Esc[/yellow]         Close the search bar if open · else quit\n"
                 "  [yellow]?[/yellow]           Help (this screen)\n\n"
-                "[bold cyan]Session ops[/bold cyan]  [dim](function keys — every Ctrl+letter stays with the search box / claude)[/dim]\n"
-                "  [yellow]F7[/yellow]          Toggle hide/unhide"
-                "  ([dim]:hidden[/dim] in search to find them)\n"
-                "  [yellow]F6[/yellow]          Toggle ★ favorite "
-                "  ([dim]:fav[/dim] in search to filter)\n"
-                "  [yellow]F5[/yellow]          Refresh list  (auto: SAIKAI_AUTO_REFRESH=secs)\n"
-                "  [yellow]F9[/yellow]          Copy this session's opening prompt\n"
-                "  [yellow]F8[/yellow]          Show what this session changed (transcript diff)\n"
-                "  [yellow]Shift-F2[/yellow]    Rename — type your own name (empty clears → auto-title)\n\n"
-                "[bold cyan]Display modes[/bold cyan]\n"
-                "  [yellow]Shift-F6[/yellow]    Cluster (topic) mode\n"
-                "  [yellow]Shift-F5[/yellow]    Tree (parent/child) mode\n"
-                "  [yellow]Shift-F7[/yellow]    Cycle grouping: none / Date / Project\n"
-                "  [yellow]Tab[/yellow]         Preview: full ↔ summary\n\n"
+                "[bold cyan]Session ops[/bold cyan]  [dim](␣x = Space then x — the leader; F-keys are the aliases)[/dim]\n"
+                "  [yellow]␣f[/yellow] [dim]F6[/dim]     Toggle ★ favorite   ([dim]:fav[/dim] in search to filter)\n"
+                "  [yellow]␣h[/yellow] [dim]F7[/dim]     Toggle hide/unhide  ([dim]:hidden[/dim] in search to find them)\n"
+                "  [yellow]␣e[/yellow] [dim]⇧F2[/dim]    Rename — type your own name (empty clears → auto-title)\n"
+                "  [yellow]␣y[/yellow] [dim]F9[/dim]     Copy this session's opening prompt\n"
+                "  [yellow]␣d[/yellow] [dim]F8[/dim]     Show what this session changed (transcript diff)\n"
+                "  [yellow]␣r[/yellow] [dim]F5[/dim]     Refresh list  (auto: SAIKAI_AUTO_REFRESH=secs)\n\n"
+                "[bold cyan]View[/bold cyan]\n"
+                "  [yellow]␣g[/yellow] [dim]⇧F7[/dim]    Cycle grouping: Date / Project / State / none\n"
+                "  [yellow]␣s[/yellow] / [yellow]␣o[/yellow]    Cycle the sort column / flip its direction\n"
+                "  [yellow]␣t[/yellow] [dim]⇧F5[/dim]    Tree (parent/child) mode   ·   [yellow]␣c[/yellow] [dim]⇧F6[/dim]  Cluster (topic) mode\n"
+                "  [yellow]Tab[/yellow]        Preview: full ↔ summary\n\n"
                 "[bold cyan]Split-live (default · SAIKAI_SPLIT_LIVE=0 to disable)[/bold cyan]\n"
-                "  [yellow]Enter[/yellow]       Open / focus the live claude pane\n"
-                "  [yellow]Shift-F8[/yellow]    New claude session in a folder / git worktree\n"
-                "  [yellow]Shift-F4[/yellow]    Reopen the panes from your last session (resume) — anytime\n"
-                "  [yellow]F2/F3[/yellow]       Prev / next live tab   ·   [yellow]Shift-F3[/yellow]  Next pane needing attention (?/!)\n"
-                "  [yellow]F4[/yellow]          Hide / show the session list\n"
-                "  [yellow]Alt-←/→[/yellow]     Resize the list/pane split — or drag the divider (persists)\n"
-                "  [yellow]Ctrl-][/yellow]      Return focus: pane → list  (SAIKAI_RELEASE_KEY to change)\n"
-                "  [yellow]F10[/yellow]         Close the active tab   ·   [yellow]Shift-F10[/yellow]  Close ALL tabs\n"
-                "  [yellow]Esc[/yellow]         pane → list, then quit-all (snapshots panes; Shift-F4 reopens)   ·   [yellow]Ctrl-C[/yellow]  quit-all\n"
-                "  [yellow]Shift-F9[/yellow]    Freeze the pane in place (copy mode): Shift+drag selects while\n"
-                "              claude streams · scroll up also freezes · Shift+F9 / typing resumes\n\n"
+                "  [yellow]Enter[/yellow]      Open / focus the live claude pane\n"
+                "  [yellow]␣n[/yellow] [dim]⇧F8[/dim]    New claude session in a folder / git worktree\n"
+                "  [yellow]␣p[/yellow] [dim]⇧F4[/dim]    Reopen the panes from your last session (resume) — anytime\n"
+                "  [yellow]␣\\[ ␣][/yellow] [dim]F2/F3[/dim] Prev / next live tab   ·   [yellow]␣a[/yellow] [dim]⇧F3[/dim]  Next pane needing attention (?/!)\n"
+                "  [yellow]␣l[/yellow] [dim]F4[/dim]     Hide / show the session list\n"
+                "  [yellow]Alt-←/→[/yellow]    Resize the list/pane split — or drag the divider (persists)\n"
+                "  [yellow]Ctrl-][/yellow]     Return focus: pane → list  (SAIKAI_RELEASE_KEY to change)\n"
+                "  [yellow]␣x[/yellow] [dim]F10[/dim]    Close the active tab   ·   [dim]⇧F10[/dim]  Close ALL tabs\n"
+                "  [yellow]Esc[/yellow]        pane → list, then quit-all (snapshots panes; ␣p reopens)   ·   [yellow]Ctrl-C[/yellow]  quit-all\n"
+                "  [yellow]␣z[/yellow] [dim]⇧F9[/dim]    Freeze the pane in place (copy mode): Shift+drag selects while\n"
+                "             claude streams · scroll up also freezes · ␣z / typing resumes\n\n"
                 "[bold cyan]Filter / Group / Sort (top-right dropdowns, Desktop-style)[/bold cyan]\n"
-                "  Group by  Date / Project / State / None   (Shift-F7 cycles)\n"
+                "  Group by  Date / Project / State / None   (␣g cycles)\n"
                 "  Sort by   Recency / Created time / Alphabetically\n"
                 "  Status    Active / Archived / All\n"
                 "  Age       last 1d / 3d / 7d / 30d / All time\n"
@@ -3096,12 +3122,18 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         f"{a}→[yellow]{k}[/yellow]" for a, k in list(_rm.items())[:12]) + "\n")
                 if getattr(app, "_leader_key", ""):
                     _lk = "Space" if app._leader_key == "space" else app._leader_key
-                    _seq = "  ".join(
-                        f"[yellow]{'␣' if k == ' ' else k}[/yellow]{_leader_label(a)}"
-                        for k, a in sorted(getattr(app, "_leader_actions", {}).items()))
-                    body += (f"[bold cyan]Leader[/bold cyan]  [yellow]{_lk}[/yellow] in the list, then:"
-                             f"  {_seq or '(no letters mapped)'}\n"
-                             "  [dim]([keys] in config: leader = \"none\" disables · "
+                    body += (f"[bold cyan]Leader[/bold cyan]  [yellow]{_lk}[/yellow] "
+                             "in the list, then one letter (pause to see this map in place):\n")
+                    _groups = _leader_groups(getattr(app, "_leader_actions", {}))
+                    for _fam, _pairs in _groups:
+                        _seq = "  ".join(
+                            f"[yellow]{'␣' if k == ' ' else k.replace('[', chr(92) + '[')}"
+                            f"[/yellow]{lbl}"
+                            for k, lbl in _pairs)
+                        body += f"  {_fam:<8} {_seq}\n"
+                    if not _groups:
+                        body += "  (no letters mapped)\n"
+                    body += ("  [dim]([keys] in config: leader = \"none\" disables · "
                              "leader_defaults = false clears · any  action = \"x\"  remaps)[/dim]\n")
                 if _rm or getattr(app, "_leader_key", ""):
                     body += "\n"
@@ -3378,7 +3410,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._leader_key = ""          # resolved leader key; "" = off
             self._leader_actions = {}      # {letter: action_name} reached via the leader
             self._leader_pending = False   # waiting for the post-leader key
-            self._leader_hints_shown = 0   # auto-hint the map the first few times only
             self._applied_keymap = {}      # direct rebinds applied (shown in ? help)
             try:
                 _kc = _load_config().get("keys", {})
@@ -4178,15 +4209,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _tbl = None
                 if event.key == self._leader_key and self.focused is _tbl:
                     self._leader_pending = True
-                    # Auto-hint the full map the first few presses, then stay
-                    # quiet (a double-Space mark spree must not spam toasts).
-                    if self._leader_actions and self._leader_hints_shown < 3:
-                        self._leader_hints_shown += 1
-                        _hint = "  ".join(
-                            f"{'␣' if k == ' ' else k}:{_leader_label(a)}"
-                            for k, a in sorted(self._leader_actions.items()))
-                        self.notify(f"leader → {_hint}", timeout=4)
-                    self.set_timer(1.5, self._cancel_leader)
+                    # which-key style: hint only on HESITATION (no second key
+                    # within 0.6 s). Fast fingers (Space-f, double-Space mark
+                    # sprees) never see a toast; a user who pauses gets the map,
+                    # grouped by family — every time, not just the first three.
+                    self.set_timer(0.6, self._show_leader_hint)
+                    self.set_timer(2.5, self._cancel_leader)
                     event.stop()
                     return
             # search-as-you-type: typing while the table is focused redirects into the
@@ -4236,6 +4264,23 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             """Leader timed out / cancelled — drop the pending state (the next key
             types normally again)."""
             self._leader_pending = False
+
+        def _show_leader_hint(self) -> None:
+            """Deferred which-key hint: fires 0.6 s after the leader press, and
+            only if the sequence is STILL pending — the user hesitated, so show
+            the map grouped by family. Completed / cancelled sequences (and a
+            double-Space mark spree) never see a toast."""
+            if not self._leader_pending or not self._leader_actions:
+                return
+            lines = []
+            for fam, pairs in _leader_groups(self._leader_actions):
+                # escape '[' for Rich markup (the prev_tab letter)
+                seq = "  ".join(
+                    f"[yellow]{'␣' if k == ' ' else k.replace('[', chr(92) + '[')}"
+                    f"[/yellow]{lbl}"
+                    for k, lbl in pairs)
+                lines.append(f"[bold cyan]{fam:<7}[/bold cyan] {seq}")
+            self.notify("\n".join(lines), timeout=4)
 
         def _over_tab_bar(self, event) -> bool:
             """True when the mouse is over the split-live tab bar. Textual's Tabs

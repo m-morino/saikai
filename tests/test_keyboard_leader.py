@@ -86,6 +86,27 @@ def test_leader_label_short_names():
     assert saikai._leader_label("sort") == "sort"
 
 
+def test_leader_groups_by_family():
+    """The which-key hint / ? help render the leader map grouped Session →
+    View → Panes (not an alphabetical soup). Every default letter must appear
+    in exactly one family; unknown actions land in the last family."""
+    _, m, _ = saikai._resolve_leader({}, ID2ACT)
+    groups = saikai._leader_groups(m)
+    fams = [f for f, _ in groups]
+    assert fams == list(saikai.LEADER_FAMILY_ORDER), fams
+    flat = [(k, lbl) for _, pairs in groups for k, lbl in pairs]
+    assert len(flat) == len(m), "a letter vanished from the grouped view"
+    by_fam = dict(groups)
+    assert ("f", "fav") in by_fam["Session"]
+    assert ("s", "sort") in by_fam["View"] and ("g", "group") in by_fam["View"]
+    assert (" ", "mark") in by_fam["Panes"] and ("[", "tab◀") in by_fam["Panes"]
+    # unknown action -> last family, not dropped
+    g2 = saikai._leader_groups({"q": "made_up_action"})
+    assert g2 and g2[-1][0] == saikai.LEADER_FAMILY_ORDER[-1]
+    assert ("q", "made_up_action") in g2[-1][1]
+    assert saikai._leader_groups({}) == []
+
+
 def _write_demo_session() -> str:
     sid = str(uuid.uuid4())
     pdir = _FAKE_HOME / ".claude" / "projects" / "-home-alex-code-demo"
@@ -167,6 +188,8 @@ if __name__ == "__main__":
     print("PASS test_nudge_split_ratio_clamps")
     test_leader_label_short_names()
     print("PASS test_leader_label_short_names")
+    test_leader_groups_by_family()
+    print("PASS test_leader_groups_by_family")
     test_pilot_space_leader_and_divider()
     print("PASS test_pilot_space_leader_and_divider")
     print("ALL PASS")
