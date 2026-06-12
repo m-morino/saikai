@@ -643,14 +643,16 @@ def _toggle_cluster_mode() -> bool:
 
 
 def _get_group_by() -> str:
-    """Saved grouping axis: 'none' | 'date' | 'project'. Mirrors Claude
-    Desktop's 'Group by' menu (Desktop defaults to Date; saikai defaults to
-    'none' to keep the plain list unless the user opts in)."""
+    """Saved grouping axis: 'none' | 'date' | 'project' | 'state'. Mirrors
+    Claude Desktop's 'Group by' menu and matches its DEFAULT (Date): the date
+    sections are the feature's best advert and a flat several-hundred-row list
+    is harder to scan. An explicit user choice — including 'none' — is
+    persisted by _set_group_by and wins from then on."""
     try:
         v = GROUP_BY_FILE.read_text(encoding="utf-8").strip()
-        return v if v in ("none", "date", "project", "state") else "none"
+        return v if v in ("none", "date", "project", "state") else "date"
     except Exception:
-        return "none"
+        return "date"
 
 
 def _set_group_by(value: str) -> None:
