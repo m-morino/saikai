@@ -148,10 +148,37 @@ def test_init_config_writes_parseable_template():
         with open(f, "rb") as fh:
             cfg = tomllib.load(fh)                       # template is valid TOML
         assert cfg["summary"]["enabled"] is False        # documented defaults
+        assert cfg["launch"]["auto_permission"] is False
         assert cfg["limits"]["max_live"] == 64
         assert cfg["limits"]["scrollback_lines"] == 2000  # the memory lever ships in the template
         assert saikai._init_config(force=False) == 1      # refuse overwrite
         assert saikai._init_config(force=True) == 0       # --force overwrites
+    finally:
+        os.environ.pop("SAIKAI_CONFIG", None)
+        saikai._reset_config_cache()
+
+
+def test_resolved_settings_covers_and_applies_runtime_knobs():
+    """Settings/--print-config must list the same knobs the runtime consumes."""
+    d = Path(tempfile.mkdtemp())
+    f = d / "config.toml"
+    f.write_text(
+        '[summary]\nmodel = "sonnet"\n'
+        '[display]\nsplit_ratio = 0.5\n'
+        '[limits]\nscrollback_lines = 1234\n'
+        '[keys]\nrelease = "ctrl+g"\n',
+        encoding="utf-8",
+    )
+    os.environ["SAIKAI_CONFIG"] = str(f)
+    try:
+        saikai._reset_config_cache()
+        shown = {(sec, key): val for sec, key, val, _src in saikai._resolved_settings()}
+        assert shown[("summary", "model")] == "sonnet"
+        assert shown[("display", "split_ratio")] == 0.5
+        assert shown[("limits", "scrollback_lines")] == 1234
+        assert shown[("keys", "release")] == "ctrl+g"
+        assert saikai._summary_model() == "sonnet"
+        assert saikai._release_focus_key() == "ctrl+g"
     finally:
         os.environ.pop("SAIKAI_CONFIG", None)
         saikai._reset_config_cache()
@@ -206,6 +233,8 @@ if __name__ == "__main__":
     print("PASS test_leader_map")
     test_init_config_writes_parseable_template()
     print("PASS test_init_config_writes_parseable_template")
+    test_resolved_settings_covers_and_applies_runtime_knobs()
+    print("PASS test_resolved_settings_covers_and_applies_runtime_knobs")
     test_reset_terminal_modes_guarded_and_emits()
     print("PASS test_reset_terminal_modes_guarded_and_emits")
     print("ALL PASS")

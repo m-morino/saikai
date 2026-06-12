@@ -74,6 +74,16 @@ def test_resolve_leader_no_defaults():
     assert m2 == {}
 
 
+def test_resolve_leader_ignores_release_key():
+    """The live-pane release key is not a leader action, even when one character."""
+    leader, actions, errors = saikai._resolve_leader(
+        {"release": "g"}, ID2ACT,
+    )
+    assert leader == "space"
+    assert actions["g"] == "cycle_group"
+    assert errors == []
+
+
 def test_nudge_split_ratio_clamps():
     lo, hi = saikai._SPLIT_RATIO_LO, saikai._SPLIT_RATIO_HI
     assert saikai._nudge_split_ratio(0.34, +0.04) == 0.38
@@ -185,6 +195,51 @@ def test_pilot_space_leader_and_divider():
     assert facts["ratio_after"] > facts["ratio_before"], facts
     assert abs(facts["ratio_saved"] - facts["ratio_after"]) < 1e-6, facts
     assert facts.get("bar_shown"), facts
+
+
+def test_pilot_custom_leader_does_not_leave_space_as_menu():
+    """When leader moves to Ctrl+G, Space must retain its normal table action."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_custom_leader_does_not_leave_space_as_menu (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+
+    sid = _write_demo_session()
+    cfg = _FAKE_HOME / "custom-leader.toml"
+    cfg.write_text('[keys]\nleader = "ctrl+g"\n', encoding="utf-8")
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                facts["leader"] = self._leader_key
+                await pilot.press("space")
+                await pilot.press("f")
+                await pilot.pause(0.2)
+                facts["favorited"] = sid in (saikai._read_json(
+                    saikai.FAVORITE_FILE, []) or [])
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    os.environ["SAIKAI_CONFIG"] = str(cfg)
+    saikai._reset_config_cache()
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+        os.environ.pop("SAIKAI_CONFIG", None)
+        saikai._reset_config_cache()
+
+    assert facts.get("leader") == "ctrl+g", facts
+    assert not facts.get("favorited"), f"Space incorrectly armed custom leader: {facts}"
 
 
 def test_pilot_settings_screen():
@@ -306,6 +361,8 @@ if __name__ == "__main__":
     print("PASS test_resolve_leader_user_letter_wins")
     test_resolve_leader_no_defaults()
     print("PASS test_resolve_leader_no_defaults")
+    test_resolve_leader_ignores_release_key()
+    print("PASS test_resolve_leader_ignores_release_key")
     test_nudge_split_ratio_clamps()
     print("PASS test_nudge_split_ratio_clamps")
     test_leader_label_short_names()
@@ -314,6 +371,8 @@ if __name__ == "__main__":
     print("PASS test_leader_groups_by_family")
     test_pilot_space_leader_and_divider()
     print("PASS test_pilot_space_leader_and_divider")
+    test_pilot_custom_leader_does_not_leave_space_as_menu()
+    print("PASS test_pilot_custom_leader_does_not_leave_space_as_menu")
     test_pilot_settings_screen()
     print("PASS test_pilot_settings_screen")
     test_pilot_esc_quits_and_bar_toggle()

@@ -158,6 +158,7 @@ SAIKAI_SPLIT_LIVE=0 saikai     # false / no / off も可
 | `SAIKAI_SPLIT_LIVE` | on | ライブペインモード。`0`/`false`/`no`/`off` で無効化 → 一覧専用 + 全画面再開 |
 | `SAIKAI_AUTO_REFRESH` | off | バックグラウンド再スキャンの間隔（秒） |
 | `SAIKAI_SUMMARIZE_CMD` | — | `claude -p` の代わりに使うサマリ生成コマンド（stdin にプロンプト → stdout にサマリ） |
+| `SAIKAI_AUTO_PERMISSION` | off | 常用ワークスペースで `--permission-mode auto` を付ける動作を明示的に有効化 |
 | `SAIKAI_MAX_MEM_LOAD` | 85 | このメモリ負荷 % を超えたらペインを開くのを拒否/警告（Win は `dwMemoryLoad`、Linux/macOS は導出値） |
 | `SAIKAI_MIN_COMMIT_MB` | 2048 | **コミット余裕**をこれだけ確保 — システムフリーズ対策（Win/Linux） |
 | `SAIKAI_MIN_FREE_PHYS_PCT` | 8 | 物理 RAM の空きをこの % 以上確保（スラッシング防止フロア、マシン相対） |
@@ -168,6 +169,7 @@ SAIKAI_SPLIT_LIVE=0 saikai     # false / no / off も可
 | `SAIKAI_SCROLLBACK` | 2000 | ペインごとにメモリへ保持するスクロールバック行数。**ライブプロセスの RAM への最大の効きどころ**（満杯のペイン ≈ 列×行の pyte セル）。メモリが厳しいマシンでは下げ（例 1000）、履歴を深くしたければ上げる |
 | `SAIKAI_COLOR_BY` | project | セッションタイトルの色分け基準: `project` / `worktree` / `topic` / `none` |
 | `SAIKAI_SPLIT_RATIO` | 0.34 | 一覧/ペインの初期分割比（境界のドラッグや `Alt+←/→` で変更でき、その値が保存される） |
+| `SAIKAI_RELEASE_KEY` | `ctrl+]` | ライブペインから一覧へフォーカスを戻すキー |
 
 同じ項目は任意の **TOML 設定ファイル**でも指定できます（優先順位は
 `環境変数 > 設定ファイル > 既定値`）。`[keys]` でのキー再割当も可能です。

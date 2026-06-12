@@ -165,6 +165,7 @@ Markers in the list: `~` busy · `?` waiting for input · `!` finished (unanswer
 | `SAIKAI_SPLIT_LIVE` | on | live-pane mode; set `0`/`false`/`no`/`off` to disable → list-only browser + full-takeover resume |
 | `SAIKAI_AUTO_REFRESH` | off | seconds between background re-scans |
 | `SAIKAI_SUMMARIZE_CMD` | — | command to summarize with (prompt on stdin → summary on stdout) instead of `claude -p` |
+| `SAIKAI_AUTO_PERMISSION` | off | opt in to adding `--permission-mode auto` for frequently used workspaces |
 | `SAIKAI_MAX_MEM_LOAD` | 85 | refuse/warn opening a pane above this memory-load % (Win `dwMemoryLoad`; Linux/macOS derived) |
 | `SAIKAI_MIN_COMMIT_MB` | 2048 | keep this much **commit headroom** free — the system-freeze guard (Win/Linux) |
 | `SAIKAI_MIN_FREE_PHYS_PCT` | 8 | keep ≥ this % of physical RAM available (anti-thrash floor, machine-relative) |
@@ -175,6 +176,7 @@ Markers in the list: `~` busy · `?` waiting for input · `!` finished (unanswer
 | `SAIKAI_SCROLLBACK` | 2000 | per-pane scrollback lines kept in memory. **Biggest lever on the live process's RAM** (a full pane ≈ cols×lines pyte cells); lower it (e.g. 1000) on a memory-tight machine, raise for deeper history |
 | `SAIKAI_COLOR_BY` | project | what tints the session title: `project` / `worktree` / `topic` / `none` |
 | `SAIKAI_SPLIT_RATIO` | 0.34 | initial list/pane split (drag the divider to change; the dragged value persists) |
+| `SAIKAI_RELEASE_KEY` | `ctrl+]` | key that returns focus from a live pane to the list |
 
 saikai also reads an optional **TOML config file** for these same knobs (with
 `env > config > default` precedence) plus `[keys]` rebinds. Run `saikai

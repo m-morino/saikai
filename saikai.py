@@ -224,7 +224,10 @@ _CONFIG_TEMPLATE = (
     "[display]\n"
     "auto_refresh = 0          # seconds between background re-scans (0 = off)\n"
     "split_live   = true       # false = list-only browser (Enter = full-takeover resume)\n"
-    'color_by     = "project"  # title hue: project | worktree | topic | none\n\n'
+    'color_by     = "project"  # title hue: project | worktree | topic | none\n'
+    "split_ratio  = 0.34       # initial list share; dragging / Alt+arrows persists over it\n\n"
+    "[launch]\n"
+    "auto_permission = false   # true = add --permission-mode auto in frequent workspaces\n\n"
     "[limits]                       # live-pane memory gate (Windows-principled)\n"
     "max_memory_load        = 85    # refuse/warn above this % memory load\n"
     "min_commit_headroom_mb = 2048  # keep this much commit headroom free\n"
@@ -241,6 +244,7 @@ _CONFIG_TEMPLATE = (
     "# app for the live map. Everything below is optional fine-tuning:\n"
     '# leader          = "ctrl+g"  # use another leader ("none" disables the mode)\n'
     "# leader_defaults = false     # start from an EMPTY letter map\n"
+    '# release         = "ctrl+]"  # return focus from a live pane to the session list\n'
     '# favorite        = "v"       # single letter = leader sequence remap\n'
     '# refresh         = "f5"      # multi-char    = direct key rebind\n'
 )
@@ -365,7 +369,7 @@ def _resolve_leader(keys_cfg, id_to_action):
     letters = (dict(DEFAULT_LEADER_LETTERS)
                if _cfg_bool(kc.get("leader_defaults"), True) else {})
     for act_id, key in kc.items():
-        if act_id in ("leader", "leader_defaults"):
+        if act_id in ("leader", "leader_defaults", "release"):
             continue
         k = str(key or "").lower()
         if k != " ":
@@ -423,6 +427,8 @@ _CONFIG_SPECS = [
     ("display", "auto_refresh", "SAIKAI_AUTO_REFRESH", 0),
     ("display", "split_live", "SAIKAI_SPLIT_LIVE", True),
     ("display", "color_by", "SAIKAI_COLOR_BY", "project"),
+    ("display", "split_ratio", "SAIKAI_SPLIT_RATIO", 0.34),
+    ("launch", "auto_permission", "SAIKAI_AUTO_PERMISSION", False),
     ("limits", "max_memory_load", "SAIKAI_MAX_MEM_LOAD", 85),
     ("limits", "min_commit_headroom_mb", "SAIKAI_MIN_COMMIT_MB", 2048),
     ("limits", "min_free_phys_pct", "SAIKAI_MIN_FREE_PHYS_PCT", 8),
@@ -430,6 +436,7 @@ _CONFIG_SPECS = [
     ("limits", "min_free_mb", "SAIKAI_MIN_FREE_MB", 0),
     ("limits", "hard_ram_gate", "SAIKAI_HARD_RAM_GATE", False),
     ("limits", "max_live", "SAIKAI_MAX_LIVE", 64),
+    ("limits", "scrollback_lines", "SAIKAI_SCROLLBACK", 2000),
     ("keys", "release", "SAIKAI_RELEASE_KEY", "ctrl+]"),
 ]
 
@@ -467,6 +474,16 @@ def _split_live_disabled_by_env(env_value) -> bool:
     resume. Split-live still also requires its PTY deps; this only governs the
     user opt-out, not the dependency fallback."""
     return (env_value or "").strip().lower() in ("0", "false", "no", "off")
+
+
+def _summary_model() -> str:
+    """Configured model for ordinary one-session summaries."""
+    return _cfg("summary", "model", "SAIKAI_SUMMARIZE_MODEL", SUMMARY_MODEL, str)
+
+
+def _release_focus_key() -> str:
+    """Configured human-form key that releases a focused live pane."""
+    return _cfg("keys", "release", "SAIKAI_RELEASE_KEY", "ctrl+]", str)
 
 
 def _at_live_capacity(live_count: int, pending: int, max_live: int) -> bool:
@@ -557,6 +574,22 @@ def _save_options(opts: dict) -> None:
     merged = _load_options()
     merged.update(opts)
     _write_json(OPTIONS_FILE, merged)
+
+
+def _reset_saved_cli_options() -> None:
+    """Forget only saved CLI scope filters, preserving unrelated UI preferences."""
+    opts = _load_options()
+    if not isinstance(opts, dict):
+        opts = {}
+    opts.pop("days", None)
+    opts.pop("scope", None)
+    if opts:
+        _write_json(OPTIONS_FILE, opts)
+    else:
+        try:
+            OPTIONS_FILE.unlink()
+        except FileNotFoundError:
+            pass
 
 
 # Custom session titles (Shift+F2): a saikai-side overlay keyed by sid. Cached
@@ -1138,7 +1171,7 @@ def _save_cache(sid: str, mtime: float, summary: str, last_ts: str = ""):
         "summary": summary,
         "mtime": mtime,
         "last_ts": last_ts or "",
-        "model": SUMMARY_MODEL,
+        "model": _summary_model(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     })
 
@@ -1649,7 +1682,7 @@ def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
     _ext = _cfg("summary", "command", "SAIKAI_SUMMARIZE_CMD", "", str)
     if _ext:
         return call_external_summarizer(_ext, prompt, timeout=timeout, raw=raw)
-    cmd = ["claude", "-p", "--model", model or SUMMARY_MODEL,
+    cmd = ["claude", "-p", "--model", model or _summary_model(),
            "--setting-sources", "",
            "--strict-mcp-config",
            "--disable-slash-commands",
@@ -2519,11 +2552,12 @@ def _reset_terminal_modes() -> None:
         pass
 
 
-# Threshold for "frequent cwd": a directory must have hosted at least this many
-# sessions before saikai auto-applies --permission-mode auto on resume. Tuned by
-# eye on a working history of ~hundreds of sessions; a handful of long-lived
-# repos comfortably clear it while one-off cwds (downloaded folders, temp
-# experiments) don't. Override with SAIKAI_FREQ_CWD_MIN env var.
+# Threshold for "frequent cwd": when auto-permission is explicitly enabled, a
+# directory must have hosted at least this many sessions before saikai adds
+# --permission-mode auto on resume. Tuned by eye on a working history of
+# ~hundreds of sessions; a handful of long-lived repos comfortably clear it
+# while one-off cwds (downloaded folders, temp experiments) don't. Override
+# with SAIKAI_FREQ_CWD_MIN env var.
 FREQ_CWD_MIN_DEFAULT = 5
 
 
@@ -2546,12 +2580,9 @@ def _canonical_workspace(cwd: str) -> str:
 def _frequent_cwds(sessions: list[dict]) -> set[str]:
     """Return the set of normalised workspaces that appear in >= N sessions.
 
-    Used to identify "trusted" working directories (the user's own repos they
-    return to repeatedly) so that resuming a session there can auto-apply
-    --permission-mode auto, avoiding the per-tool-use approval prompts that
-    interrupt flow in well-known projects. Worktrees are folded into their
-    parent repo via `_canonical_workspace` so branch-switching doesn't split
-    the count."""
+    Used to identify candidate working directories when auto-permission is
+    explicitly enabled. Worktrees are folded into their parent repo via
+    `_canonical_workspace` so branch-switching doesn't split the count."""
     try:
         min_count = max(2, int(os.environ.get("SAIKAI_FREQ_CWD_MIN") or FREQ_CWD_MIN_DEFAULT))
     except ValueError:
@@ -3006,6 +3037,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     except Exception as _lte:  # pragma: no cover - missing sibling / dep
         _LIVE_TERM_REASON = repr(_lte)
         _LIVE_TERM = None
+    if _LIVE_TERM is not None:
+        _LIVE_TERM.configure_release_focus_key(_release_focus_key())
     # Split-live is now the DEFAULT whenever its PTY deps are present. The legacy
     # full-takeover path is NOT removed — it survives as three things: (a) the
     # automatic fallback ABOVE when pyte/pywinpty/ptyprocess are missing, (b) an
@@ -3457,7 +3490,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         MAX_LIVE = _cfg("limits", "max_live", "SAIKAI_MAX_LIVE", 64, int)
         CSS = """
         Screen { layout: vertical; }
-        #searchrow { dock: top; height: 3; }   /* visible by default (the dropdowns ARE the discoverability); Esc hides, '/' or typing reopens — last state persists */
+        #searchrow { dock: top; height: 3; }   /* visible by default (the dropdowns ARE the discoverability); Space / toggles it and the last state persists */
         #search { width: 1fr; border: tall $accent; }
         #groupsel { width: 15; }
         #sortsel { width: 17; }
@@ -3563,8 +3596,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._apply_split_ratio(self._split_ratio)
             # Search/filter bar: VISIBLE by default — the Group/Sort/Status/Age
             # dropdowns living in it are the features' discoverability; hiding
-            # them until '/' meant nobody found grouping. Esc hides the bar and
-            # that choice persists (options.json) for the next launch.
+            # them until '/' meant nobody found grouping. Space / toggles the
+            # bar and that choice persists (options.json) for the next launch.
             if _load_options().get("search_bar") is False:
                 try:
                     self.query_one("#searchrow").display = False
@@ -3586,7 +3619,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _id2act = {b.id: b.action for b in type(self).BINDINGS
                            if getattr(b, "id", None)}
                 _direct = {k: v for k, v in _kc.items()
-                           if k not in ("leader", "leader_defaults")
+                           if k not in ("leader", "leader_defaults", "release")
                            and len(str(v).strip()) != 1}
                 _applied, _errs = _validate_keymap(_direct, _ids)
                 if _applied:
@@ -4441,7 +4474,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             context. Fires only when space bubbled UNCONSUMED to the App (an
             Input or terminal keeps its space; the table fast path in on_key
             already stopped the event), so no double-arm and no stolen keys."""
-            if not self._leader_key or self._leader_pending:
+            if self._leader_key != "space":
+                raise SkipAction()
+            if self._leader_pending:
                 return
             if (self._focused_terminal() is not None
                     or isinstance(self.focused, (Input, Select))):
@@ -6052,9 +6087,12 @@ def _build_claude_invocation(
     Shared by resume (_build_resume_invocation) and new (_build_new_invocation) so
     cwd / auto-permission / venv-strip logic can never drift between them.
     """
-    # Auto --permission-mode auto for frequent (= trusted) workspaces.
+    # Optional --permission-mode auto for frequent workspaces. Frequency alone
+    # is not a trust boundary, so this is disabled unless explicitly opted in.
     extra_args: list[str] = []
-    if (target_cwd
+    if (_cfg("launch", "auto_permission", "SAIKAI_AUTO_PERMISSION",
+             False, _cfg_bool)
+            and target_cwd
             and not os.environ.get("SAIKAI_NO_AUTO_PERMISSION")
             and _canonical_workspace(target_cwd) in _frequent_cwds(sessions)):
         extra_args = ["--permission-mode", "auto"]
@@ -6842,8 +6880,9 @@ def main():
                "  SAIKAI_RESUME=1            set on the resumed `claude` child so your own\n"
                "                            hooks can tell saikai-resumed sessions apart\n"
                "                            (e.g. suppress idle notifications).\n"
-               "  SAIKAI_NO_AUTO_PERMISSION  if set, do NOT auto-apply --permission-mode auto\n"
-               "                            on resume even when the target cwd is frequent.\n"
+               "  SAIKAI_AUTO_PERMISSION=1   opt in to adding --permission-mode auto when\n"
+               "                            the target cwd is frequent.\n"
+               "  SAIKAI_NO_AUTO_PERMISSION  hard-disable auto-permission even if enabled.\n"
                "  SAIKAI_FREQ_CWD_MIN=N      minimum session count to flag a cwd as\n"
                "                            \"frequent\" for auto-permission (default 5).\n"
                "  SAIKAI_CLUSTER_MIN_SIZE=N  (legacy, no longer used by the textual picker —\n"
@@ -6884,7 +6923,8 @@ def main():
                    default=None, dest="all_scope",
                    help="Show sessions across all projects")
     p.add_argument("--reset-options", action="store_true",
-                   help="Forget saved --days/--here/--all defaults. Does NOT clear "
+                   help="Forget saved --days/--here/--all defaults. Preserves "
+                        "split ratio and filter-bar visibility. Does NOT clear "
                         "hidden/favorite/view-mode/tree-mode/cluster-mode/sort — "
                         "toggle those via F7 / F6 / Shift-F5 / Shift-F6 in the "
                         "picker, ':hidden' in search for hidden rows, a column-header "
@@ -6935,7 +6975,7 @@ def main():
                    help="Toggle the Nth sort priority's direction (asc/desc). Persistent. "
                         "In the picker, click a sorted column header again to reverse.")
     p.add_argument("--reset-sort", action="store_true",
-                   help="Reset all sort priorities to defaults (date desc, then none).")
+                   help="Reset all sort priorities to defaults (recency desc, then none).")
     p.add_argument("--sync-desktop", action="store_true",
                    help="Create Claude Desktop session-list entries for Terminal/VS Code "
                         "sessions missing from it. Additive + idempotent; never modifies "
@@ -7031,7 +7071,7 @@ def main():
         return
     if args.reset_sort:
         _reset_sort()
-        print(_c("  sort: reset to defaults (date desc)", GREEN), file=sys.stderr)
+        print(_c("  sort: reset to defaults (recency desc)", GREEN), file=sys.stderr)
         return
     if args.refresh_clusters:
         # Need sessions loaded for the classifier. Reuse the same scope the
@@ -7061,8 +7101,7 @@ def main():
         return
 
     if args.reset_options:
-        if OPTIONS_FILE.exists():
-            OPTIONS_FILE.unlink()
+        _reset_saved_cli_options()
         print("Saved options cleared.", file=sys.stderr)
         return
 

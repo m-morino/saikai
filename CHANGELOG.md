@@ -32,11 +32,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   toggle. F-keys remain as compatibility aliases, listed only in `?`.
 - **The filter bar (search + Group/Sort/Status/Age dropdowns) is visible by
   default** — the dropdowns are how the grouping/sorting features get
-  discovered, and hidden-until-`/` meant nobody found them. `Esc` hides the
-  bar and that choice persists; `/` or typing brings it back. The table still
-  owns focus on launch, so the leader and search-as-you-type are unchanged.
-- **Grouping defaults to Date** (was: flat list), matching Claude Desktop. An
-  explicit choice — including None — is persisted and wins as before.
+  discovered, and hidden-until-`/` meant nobody found them. `Space /` toggles
+  the bar and that choice persists. The table still owns focus on launch, so
+  the leader and search-as-you-type are unchanged.
+- **Grouping defaults to State and sorting defaults to Recency descending.**
+  The initial view prioritizes sessions needing input / running now, then what
+  was touched most recently. Explicit persisted choices still win.
 - **The leader hint is now which-key style:** it fires only when you hesitate
   (0.6 s after `Space`), every time, and shows the map grouped into
   Session / View / Panes families instead of one alphabetical line. `?` help
@@ -48,10 +49,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   visible, and gains a standing `␣ leader · ? keys` breadcrumb.
 - Date group headers are locale-neutral English (`Jun 11`, `2025-12-03`)
   instead of Japanese (`6月11日`).
-- README screenshots now show Date grouping, the sort indicator, and a pinned
-  favorite, so the table features are visible at a glance.
+- README screenshots show grouping, the sort indicator, and a pinned favorite,
+  so the table features are visible at a glance.
 
 ### Fixed
+- Config values shown by Settings / `--print-config` now match runtime:
+  `summary.model` and `keys.release` are applied, while `split_ratio` and
+  `scrollback_lines` are included in the resolved-settings list.
+- A custom leader key no longer leaves `Space` acting as a second hidden leader.
+- `--reset-options` now forgets only saved CLI scope defaults and preserves the
+  split ratio and filter-bar visibility.
+- Automatic `--permission-mode auto` is now disabled by default and requires
+  explicit `[launch] auto_permission=true` / `SAIKAI_AUTO_PERMISSION=1`.
 - **Linux/macOS: quitting (`Esc` / `Ctrl+C`) or closing a tab (`F10`) with a
   live pane open hard-froze saikai.** ptyprocess buffers the PTY master fd in an
   `io.BufferedRWPair`: the background reader blocks in `read()` holding the
