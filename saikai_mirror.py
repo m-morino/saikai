@@ -222,7 +222,9 @@ class MirrorHub:
         self._repaint_request = fn
 
     def url(self) -> str:
-        host = "127.0.0.1" if self._host in ("0.0.0.0", "") else self._host
+        # 0.0.0.0/"" is a bind wildcard, not browsable — resolve a reachable host
+        # (the primary LAN/egress IP) so the URL works from another device.
+        host = _lan_ip() if self._host in ("0.0.0.0", "") else self._host
         return f"http://{host}:{self._port}/?token={self._token}"
 
 
@@ -232,6 +234,21 @@ def mirror_config(env: dict) -> tuple[bool, str]:
     enabled = val in ("1", "true", "yes", "on")
     host = str(env.get("SAIKAI_MIRROR_HOST", "")).strip() or "127.0.0.1"
     return enabled, host
+
+
+def _lan_ip() -> str:
+    """Best-effort primary LAN/egress IPv4 (the interface used to reach the
+    network), so a 0.0.0.0-bound mirror prints a URL reachable from another
+    device. No packet is sent; falls back to 127.0.0.1 when offline."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 def _base_driver_class():

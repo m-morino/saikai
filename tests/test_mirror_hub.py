@@ -74,8 +74,17 @@ def test_env_gate_default_off():
     assert _m.mirror_config({"SAIKAI_MIRROR": "1", "SAIKAI_MIRROR_HOST": "0.0.0.0"}) == (True, "0.0.0.0")
 
 
+def test_url_includes_token_and_resolves_wildcard_host():
+    h = m.MirrorHub(token="tok", host="127.0.0.1", port=9999)
+    assert "127.0.0.1:9999" in h.url() and "token=tok" in h.url()
+    # 0.0.0.0 is a bind wildcard, not browsable: url() must resolve it away.
+    h2 = m.MirrorHub(token="tok", host="0.0.0.0", port=9999)
+    assert "0.0.0.0" not in h2.url() and ":9999" in h2.url() and "token=tok" in h2.url()
+
+
 if __name__ == "__main__":
     test_broadcast_is_nonblocking_and_drops_oldest()
     test_server_rejects_bad_token_and_streams_with_good_token()
     test_env_gate_default_off()
+    test_url_includes_token_and_resolves_wildcard_host()
     print("OK test_mirror_hub")
