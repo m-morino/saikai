@@ -343,7 +343,7 @@ def test_page_contains_input_listeners_and_sender():
         assert "term.onData" in page, page
         assert "/input" in page and "X-Mirror-Write-Key" in page, page
         # Coalescing + flush on control bytes (ESC / CR / <0x20).
-        assert "0x20" in page or "charCodeAt(0) < 32" in page, page
+        assert "< 32" in page, page
         # CONTROL banner + target + disabled-until-on.
         assert "CONTROL ON" in page and "CONTROL OFF" in page, page
         assert "typing into" in page, page
