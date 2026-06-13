@@ -18,22 +18,32 @@ import pyte
 from typing import Optional
 
 
-# pyte stores fg/bg as names or 6-hex strings; map names -> SGR base codes.
-_FG = {"black": 30, "red": 31, "green": 32, "brown": 33, "blue": 34,
-       "magenta": 35, "cyan": 36, "white": 37, "default": 39}
-_BG = {k: v + 10 for k, v in _FG.items()}
+# pyte stores a colour as: a basic name, a "bright"+name, a 6-hex string
+# (256-colour and truecolor both collapse to hex), or "default".
+_BASIC = {"black": 0, "red": 1, "green": 2, "brown": 3, "blue": 4,
+          "magenta": 5, "cyan": 6, "white": 7}
 
 
-def _color_sgr(value: str, table: dict, truecolor_lead: int) -> list[int]:
-    if value in table:
-        return [table[value]]
+def _color_sgr(value: str, fg: bool) -> list[int]:
+    """SGR params for a pyte colour string, for foreground (fg=True) or bg.
+
+    Handles basic names (30-37/40-47), bright names (90-97/100-107), and
+    6-hex 256/truecolor (38;2;r;g;b / 48;2;r;g;b). Earlier this only knew the 8
+    basic names, so Textual's bright/accent colours fell back to default and
+    coloured borders rendered wrong."""
+    if not value or value == "default":
+        return [39 if fg else 49]
+    if value in _BASIC:
+        return [(30 if fg else 40) + _BASIC[value]]
+    if value.startswith("bright") and value[6:] in _BASIC:
+        return [(90 if fg else 100) + _BASIC[value[6:]]]
     if len(value) == 6:
         try:
             r, g, b = (int(value[i:i + 2], 16) for i in (0, 2, 4))
-            return [truecolor_lead, 2, r, g, b]   # 38;2;r;g;b or 48;2;r;g;b
+            return [(38 if fg else 48), 2, r, g, b]
         except ValueError:
             pass
-    return [table["default"]]
+    return [39 if fg else 49]
 
 
 def _cell_attrs(ch: "pyte.screens.Char") -> tuple:
@@ -57,11 +67,11 @@ def _attrs_to_sgr(attrs: tuple) -> str:
         parts.append("\x1b[4m")
     if reverse:
         parts.append("\x1b[7m")
-    fg_codes = _color_sgr(fg, _FG, 38)
-    if fg_codes != [_FG["default"]]:   # skip ESC[39m (already covered by reset)
+    fg_codes = _color_sgr(fg, True)
+    if fg_codes != [39]:               # 39 already covered by the reset
         parts.append("\x1b[" + ";".join(str(c) for c in fg_codes) + "m")
-    bg_codes = _color_sgr(bg, _BG, 48)
-    if bg_codes != [_BG["default"]]:   # skip ESC[49m
+    bg_codes = _color_sgr(bg, False)
+    if bg_codes != [49]:
         parts.append("\x1b[" + ";".join(str(c) for c in bg_codes) + "m")
     return "".join(parts)
 
