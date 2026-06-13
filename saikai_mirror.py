@@ -302,7 +302,7 @@ _PAGE_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <body><div id="t"></div>
 <script src="/xterm.min.js"></script>
 <script>
-const term = new Terminal({scrollback:0, convertEol:false});
+const term = new Terminal({cols: __COLS__, rows: __ROWS__, scrollback:0, convertEol:false});
 term.open(document.getElementById('t'));
 const token = new URLSearchParams(location.search).get('token');
 const es = new EventSource('/stream?token=' + encodeURIComponent(token));
@@ -337,7 +337,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(403, "forbidden")
             return
         if path == "/":
-            body = _PAGE_HTML.encode("utf-8")
+            hub = self.server.hub
+            body = (_PAGE_HTML
+                    .replace("__COLS__", str(hub._cols))
+                    .replace("__ROWS__", str(hub._rows))
+                    .encode("utf-8"))
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
