@@ -15,27 +15,27 @@ with Pillow (per-frame durations). The same leak guard as the screenshots
 aborts if anything private would ship.
 
 Usage:  uv run scripts/make_demo_gif.py
-Output: docs/assets/saikai-demo.gif
+Output: docs/assets/saikai-demo-headless.gif
 """
 import asyncio
-import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import uuid
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from demo_fixture import build_demo_fixture
 
 REPO = Path(__file__).resolve().parent.parent
 ASSETS = REPO / "docs" / "assets"
 MOCK_CLAUDE = Path(__file__).resolve().parent / "mock_claude.py"
-GIF_OUT = ASSETS / "saikai-demo.gif"
+GIF_OUT = ASSETS / "saikai-demo-headless.gif"
 
 # ---- 1. fake home, BEFORE importing saikai (it derives paths at import) ----
-demo_home = Path(tempfile.mkdtemp(prefix="saikai-demo-home-"))
+fixture = build_demo_fixture(Path(tempfile.mkdtemp(prefix="saikai-demo-")))
+demo_home = fixture.home
 for var in ("USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME"):
     os.environ[var] = str(demo_home)
 os.environ.pop("SAIKAI_CONFIG", None)
@@ -44,74 +44,12 @@ os.environ["SAIKAI_AUTO_REFRESH"] = "0"
 
 FRAMES_DIR = Path(tempfile.mkdtemp(prefix="saikai-demo-frames-"))
 
-# ---- 2. fictional sessions (same set as make_screenshots.py) ---------------
-now = datetime.now(timezone.utc)
-
-
-def _enc(p: str) -> str:
-    return re.sub(r"[:/\\.]", "-", p)
-
-
-def demo_session(project: str, title: str, msgs: list[str], age_h: float,
-                 branch: str = "main", turns_pad: int = 0) -> None:
-    cwd = f"/home/alex/code/{project}"
-    pdir = demo_home / ".claude" / "projects" / _enc(cwd)
-    pdir.mkdir(parents=True, exist_ok=True)
-    t0 = now - timedelta(hours=age_h)
-    recs = [{"type": "ai-title", "aiTitle": title,
-             "timestamp": t0.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-             "cwd": cwd, "gitBranch": branch}]
-    for i, m in enumerate(msgs + ["looks good, thanks!"] * turns_pad):
-        ts = (t0 + timedelta(minutes=3 * (i + 1))).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        recs.append({"type": "user", "timestamp": ts, "cwd": cwd,
-                     "gitBranch": branch, "message": {"content": m}})
-        recs.append({"type": "assistant", "timestamp": ts,
-                     "message": {"content": [{"type": "text",
-                                              "text": f"(demo reply {i + 1})"}]}})
-    out = pdir / f"{uuid.uuid4()}.jsonl"
-    out.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
-    ts_epoch = (t0 + timedelta(minutes=3 * max(1, len(msgs)))).timestamp()
-    os.utime(out, (ts_epoch, ts_epoch))
-
-
-demo_session("webapp", "Fix flaky auth token refresh test",
-             ["The auth token refresh test fails about 1 in 5 runs on CI — "
-              "looks like a race between the clock mock and the refresh path.",
-              "Can you pin both code paths to the same fake clock?"], 0.4,
-             branch="fix/flaky-auth-test", turns_pad=3)
-demo_session("webapp", "Add dark mode toggle to settings",
-             ["Add a dark mode toggle to the settings page; persist the choice "
-              "in localStorage and respect prefers-color-scheme by default."],
-             3.1, turns_pad=5)
-demo_session("webapp", "Migrate the build from webpack to Vite",
-             ["Migrate this app from webpack 5 to Vite — keep the bundle "
-              "analyzer and the existing env handling."], 27, turns_pad=11)
-demo_session("api-server", "Fix N+1 queries in /orders endpoint",
-             ["GET /orders is slow in production. I suspect N+1 queries on the "
-              "line-items relation — profile it and fix what you find."], 1.2,
-             branch="perf/orders-n-plus-1", turns_pad=7)
-demo_session("api-server", "Migrate models to Pydantic v2",
-             ["Upgrade the API models to Pydantic v2 and fix every deprecation "
-              "warning the test suite prints."], 30, turns_pad=9)
-demo_session("api-server", "Add rate limiting middleware",
-             ["Add per-API-key rate limiting (sliding window, Redis) and return "
-              "proper 429s with Retry-After."], 51, turns_pad=4)
-demo_session("data-pipeline", "Backfill 2025 events into warehouse",
-             ["Write a backfill job for the 2025 events into the warehouse — "
-              "idempotent, resumable, and chunked by day."], 6.5, turns_pad=6)
-demo_session("data-pipeline", "Debug Airflow DAG timeout",
-             ["The nightly DAG times out on the dedup task since Tuesday. Find "
-              "out what changed and fix it."], 73, turns_pad=8)
-demo_session("dotfiles", "Set up neovim LSP for Rust",
-             ["Set up rust-analyzer with nvim-lspconfig in my dotfiles, "
-              "including inlay hints and format-on-save."], 95, turns_pad=2)
-
-# ---- 3. drive the app, saving one SVG per story beat -----------------------
+# ---- 2. drive the app, saving one SVG per story beat -----------------------
 sys.path.insert(0, str(REPO))
 import saikai  # noqa: E402
 
 saikai._build_resume_invocation = lambda full_id, sessions: (
-    [sys.executable, str(MOCK_CLAUDE)], str(demo_home), dict(os.environ))
+    [sys.executable, str(MOCK_CLAUDE)], str(fixture.hero_repo), dict(os.environ))
 
 from textual.app import App  # noqa: E402
 
@@ -168,7 +106,7 @@ sys.argv = ["saikai", "--all"]
 saikai.main()
 
 # ---- 4. leak guard (same contract as make_screenshots.py) ------------------
-suspicious = {demo_home.name.lower(), "temp", "appdata"}
+suspicious = {fixture.root.name.lower(), "temp", "appdata"}
 try:
     suspicious.add(os.getlogin().lower())
 except OSError:

@@ -8,5 +8,8 @@ dist/
 *.egg-info/
 uv.lock
 docs/assets/saikai-demo.mp4
+docs/assets/*.cast
+docs/assets/*-raw.mp4
+.demo-work/
 .superpowers/
 .serena/

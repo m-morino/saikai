@@ -1,4 +1,4 @@
-"""A stand-in for `claude` used ONLY by scripts/make_screenshots.py.
+"""A stand-in for `claude` used by the deterministic screenshot/GIF scripts.
 
 Paints a Claude-Code-like welcome + transcript into the PTY so the split-live
 pane screenshot shows realistic content without launching (or leaking) a real
@@ -23,7 +23,7 @@ LINES = [
     f"{ORANGE}│{RESET}{' ' * 58}{ORANGE}│{RESET}",
     f"{ORANGE}│{RESET}   {DIM}/help for help, /status for your current setup{RESET}{' ' * 8}{ORANGE}│{RESET}",
     f"{ORANGE}│{RESET}{' ' * 58}{ORANGE}│{RESET}",
-    f"{ORANGE}│{RESET}   {DIM}cwd: ~/code/webapp{RESET}{' ' * 37}{ORANGE}│{RESET}",
+    f"{ORANGE}│{RESET}   {DIM}cwd: /home/demo/work/webapp{RESET}{' ' * 26}{ORANGE}│{RESET}",
     f"{ORANGE}╰{'─' * 58}╯{RESET}",
     "",
     f"{DIM}>{RESET} Fix the flaky auth token refresh test",
