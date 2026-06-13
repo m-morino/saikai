@@ -251,6 +251,15 @@ def _lan_ip() -> str:
         s.close()
 
 
+def qr_matrix(url: str, border: int = 2) -> list:
+    """QR code of `url` as a list of rows of bool (True = dark module), with a
+    light quiet-zone `border`. Used to render a scannable QR in the terminal so a
+    phone can join the mirror without typing the tokened URL."""
+    import segno
+    qr = segno.make(url, error="m")
+    return [[bool(v) for v in row] for row in qr.matrix_iter(border=border)]
+
+
 def _base_driver_class():
     """The console driver Textual would auto-select for this platform."""
     if sys.platform == "win32":
