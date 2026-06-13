@@ -134,6 +134,14 @@ class MirrorHub:
         self._drain: Optional[threading.Thread] = None
         self._stopped = threading.Event()
         self._repaint_request = None
+        # ── Phase B: interactive control (default OFF; app is the authority) ──
+        import secrets as _secrets
+        self._control_enabled = False          # advisory cache of the app's gate
+        self._input_handler = None             # _marshal-shaped, set at app mount
+        self._control_target = None            # focused-pane title (advisory)
+        # Write-key: NEVER placed in any URL/file/QR/log; delivered only over the
+        # authenticated SSE stream and required as the X-Mirror-Write-Key header.
+        self._write_key = _secrets.token_urlsafe(32)
 
     def _feed(self, data: str) -> None:
         with self._mirror_lock:
@@ -235,6 +243,24 @@ class MirrorHub:
         # Written from the UI thread (on_mount), read from the HTTP server thread
         # (_add_client). A single attribute assignment/read is atomic under the GIL.
         self._repaint_request = fn
+
+    def set_input_handler(self, fn) -> None:
+        # Written from the UI thread (on_mount), read from the input-drain thread.
+        # A single attribute assignment/read is atomic under the GIL (same
+        # rationale as set_repaint_request).
+        self._input_handler = fn
+
+    def inject(self, data: str) -> bool:
+        """Accept browser input IFF control is on AND a handler is wired.
+
+        Returns True when accepted (delivered to the handler), False when the
+        gate is closed. The advisory _control_enabled here is a fast-reject; the
+        app re-checks its authoritative gate on the UI thread."""
+        if self._input_handler is None or not self._control_enabled:
+            return False
+        # Task 2 replaces this direct call with a FIFO single-drain enqueue.
+        self._input_handler(data)
+        return True
 
     def url(self) -> str:
         # 0.0.0.0/"" is a bind wildcard, not browsable — resolve a reachable host
