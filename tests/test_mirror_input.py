@@ -55,6 +55,67 @@ def test_inject_is_fifo_via_single_drain():
         hub.stop()
 
 
+def test_typed_inject_dispatches_by_tag_in_order():
+    """One FIFO drain dispatches keyboard/mouse/key items to the matching
+    handler in global submission order. Bare-str keyboard items (Phase B) and
+    tagged tuples interleave; ordering across handlers is preserved."""
+    hub = m.MirrorHub(token="t")
+    seen = []
+    ev = threading.Event()
+
+    def on_input(d): seen.append(("input", d))
+    def on_mouse(col, row, button, kind):
+        seen.append(("mouse", col, row, button, kind))
+    def on_key(key):
+        seen.append(("key", key))
+        if len(seen) == 4:
+            ev.set()
+
+    hub.set_input_handler(on_input)
+    hub.set_mouse_handler(on_mouse)
+    hub.set_key_handler(on_key)
+    hub._control_enabled = True
+    hub.serve()
+    try:
+        assert hub.inject("a") is True                       # keyboard (bare str)
+        assert hub.inject_mouse(5, 9, 0, "down") is True     # mouse
+        assert hub.inject_mouse(5, 9, 0, "up") is True       # mouse
+        assert hub.inject_key("escape") is True              # key
+        assert ev.wait(timeout=3.0), f"drain did not deliver 4 items: {seen}"
+        assert seen == [
+            ("input", "a"),
+            ("mouse", 5, 9, 0, "down"),
+            ("mouse", 5, 9, 0, "up"),
+            ("key", "escape"),
+        ], seen
+    finally:
+        hub.stop()
+
+
+def test_mouse_and_key_inject_gate_on_control_and_handler():
+    """inject_mouse/inject_key refuse when control is OFF or no matching handler
+    is wired, and accept (enqueue) when control is ON with the handler set."""
+    hub = m.MirrorHub(token="t")
+    # No handlers yet -> refuse even if enabled.
+    hub._control_enabled = True
+    assert hub.inject_mouse(1, 1, 0, "down") is False, "no mouse handler must refuse"
+    assert hub.inject_key("tab") is False, "no key handler must refuse"
+    assert hub._inject_q.empty(), "refused input must not be queued"
+    hub.set_mouse_handler(lambda *a: None)
+    hub.set_key_handler(lambda *a: None)
+    # Control OFF -> refuse.
+    hub._control_enabled = False
+    assert hub.inject_mouse(1, 1, 0, "down") is False, "control OFF must refuse mouse"
+    assert hub.inject_key("tab") is False, "control OFF must refuse key"
+    assert hub._inject_q.empty()
+    # Control ON + handlers -> accept (tagged tuple enqueued).
+    hub._control_enabled = True
+    assert hub.inject_mouse(2, 3, 0, "up") is True
+    assert hub._inject_q.get_nowait() == ("mouse", 2, 3, 0, "up")
+    assert hub.inject_key("f12") is True
+    assert hub._inject_q.get_nowait() == ("key", "f12")
+
+
 def _post(port, path, body=None, headers=None, raw=None):
     """POST helper returning (status, body_text). Uses a same-origin Host+Origin
     so this test isolates the write-key/body checks (Host/Origin get their own
@@ -399,6 +460,8 @@ def test_wildcard_bind_allows_lan_ip_host():
 if __name__ == "__main__":
     test_inject_gate_off_by_default_and_requires_handler()
     test_inject_is_fifo_via_single_drain()
+    test_typed_inject_dispatches_by_tag_in_order()
+    test_mouse_and_key_inject_gate_on_control_and_handler()
     test_post_input_write_key_and_body_matrix()
     test_host_allow_list_and_origin_matrix()
     test_sse_emits_writekey_and_control_without_colliding_output()

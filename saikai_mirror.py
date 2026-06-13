@@ -146,6 +146,8 @@ class MirrorHub:
         import secrets as _secrets
         self._control_enabled = False          # advisory cache of the app's gate
         self._input_handler = None             # _marshal-shaped, set at app mount
+        self._mouse_handler = None             # _marshal-shaped, set at app mount
+        self._key_handler = None               # _marshal-shaped, set at app mount
         self._control_target = None            # focused-pane title (advisory)
         # Write-key: NEVER placed in any URL/file/QR/log; delivered only over the
         # authenticated SSE stream and required as the X-Mirror-Write-Key header.
@@ -273,6 +275,16 @@ class MirrorHub:
         # rationale as set_repaint_request).
         self._input_handler = fn
 
+    def set_mouse_handler(self, fn) -> None:
+        # Written from the UI thread (on_mount), read from the inject-drain
+        # thread. Single attribute assignment/read is atomic under the GIL
+        # (same rationale as set_input_handler).
+        self._mouse_handler = fn
+
+    def set_key_handler(self, fn) -> None:
+        # Same GIL-atomic single-attribute pattern as set_input_handler.
+        self._key_handler = fn
+
     def set_control_state(self, enabled: bool, target=None) -> None:
         """Store the advisory control state + focused-pane title and broadcast a
         control frame to every connected browser. The app's UI-thread gate is the
@@ -323,19 +335,40 @@ class MirrorHub:
             self.set_control_state(False, None)
 
     def inject(self, data: str) -> bool:
-        """Accept browser input IFF control is on AND a handler is wired.
+        """Accept browser keyboard input IFF control is on AND a handler is wired.
 
-        Enqueues onto a single FIFO queue drained by one worker, so input
-        reaches the PTY in submission order even though ThreadingMixIn
-        dispatches POSTs on independent threads. Non-blocking."""
+        Phase B keyboard path: enqueues the bare `str` so the single FIFO drain
+        delivers it to the input handler in submission order. Non-blocking."""
         if self._input_handler is None or not self._control_enabled:
             return False
+        return self._enqueue(data)
+
+    def inject_mouse(self, col: int, row: int, button: int, kind: str) -> bool:
+        """Accept a browser tap/scroll IFF control is on AND a mouse handler is
+        wired. Enqueues a tagged ("mouse", col, row, button, kind) tuple onto the
+        SAME FIFO so order is preserved across keyboard/mouse/key. Non-blocking."""
+        if self._mouse_handler is None or not self._control_enabled:
+            return False
+        return self._enqueue(("mouse", col, row, button, kind))
+
+    def inject_key(self, key: str) -> bool:
+        """Accept a browser key-bar press IFF control is on AND a key handler is
+        wired. Enqueues a tagged ("key", key) tuple onto the SAME FIFO.
+        Non-blocking."""
+        if self._key_handler is None or not self._control_enabled:
+            return False
+        return self._enqueue(("key", key))
+
+    def _enqueue(self, item) -> bool:
+        """Shared tail of inject/inject_mouse/inject_key: accepted-input rate cap,
+        bounded put, idle-timer rearm. `item` is a bare str (keyboard) or a tagged
+        tuple. Never blocks a handler thread."""
         import time as _t
         now = _t.monotonic()
         if self._min_accept_gap and (now - self._last_accept_t) < self._min_accept_gap:
             return False                       # accepted-input rate cap
         try:
-            self._inject_q.put_nowait(data)
+            self._inject_q.put_nowait(item)
         except queue.Full:
             return False           # bounded; refuse rather than block a handler
         self._last_accept_t = now
@@ -343,19 +376,35 @@ class MirrorHub:
         return True
 
     def _inject_loop(self):
-        """Single drain worker: pop FIFO and call the (advisory) handler. The
-        handler is _marshal-shaped (captures the app, bails if gone, swallows
+        """Single drain worker: pop FIFO and dispatch by tag to the matching
+        (advisory) handler. A bare str is the Phase B keyboard payload. The
+        handlers are _marshal-shaped (capture the app, bail if gone, swallow
         exceptions), so this thread never blocks on future.result()."""
         while not self._stopped.is_set():
             try:
-                data = self._inject_q.get(timeout=0.25)
+                item = self._inject_q.get(timeout=0.25)
             except queue.Empty:
                 continue
-            fn = self._input_handler
-            if fn is None:
-                continue
             try:
-                fn(data)
+                if isinstance(item, tuple) and item:
+                    tag = item[0]
+                    if tag == "mouse":
+                        fn = self._mouse_handler
+                        if fn is not None:
+                            _, col, row, button, kind = item
+                            fn(col, row, button, kind)
+                    elif tag == "key":
+                        fn = self._key_handler
+                        if fn is not None:
+                            fn(item[1])
+                    elif tag == "input":
+                        fn = self._input_handler
+                        if fn is not None:
+                            fn(item[1])
+                else:                                  # bare str = Phase B keyboard
+                    fn = self._input_handler
+                    if fn is not None:
+                        fn(item)
             except Exception:
                 pass               # never let one bad inject kill the drain
 
