@@ -400,4 +400,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # POSIX: SO_REUSEADDR lets a restart rebind a port still in TIME_WAIT.
+    # Windows: SO_REUSEADDR instead lets a SECOND process bind the same port
+    # (hijack/share) — two saikai instances would then both "listen" on the
+    # mirror port and connections land nondeterministically (the browser sees a
+    # dead/"server stopped responding" socket). Refuse the reuse on Windows so a
+    # second instance's bind fails cleanly and its mirror just stays off.
+    allow_reuse_address = (sys.platform != "win32")
