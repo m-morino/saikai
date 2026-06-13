@@ -105,6 +105,17 @@ def _color_key_for(s: dict, mode: str) -> str:
     return project_short(s.get("project_name") or "")   # default: project
 
 
+def _color_legend(color_by: str) -> str:
+    """Plain-language explanation shared by help and Settings."""
+    labels = {
+        "project": "Same title color = same project.",
+        "worktree": "Same title color = same worktree.",
+        "topic": "Same title color = same topic.",
+        "none": "Title colors are disabled.",
+    }
+    return labels.get(color_by, labels["project"]) + " Symbols show state."
+
+
 def _first_selectable_row(table, start: int, step: int):
     """Index of the nearest non-header (selectable) row from `start`
     (exclusive), walking by `step` (+1 down / -1 up). Header rows carry a
@@ -245,7 +256,7 @@ _CONFIG_TEMPLATE = (
     "[keys]\n"
     "# Keyboard-first: Space (in the list) is a LEADER key by default — press it,\n"
     "# then a mnemonic letter: f=favorite h=hide e=rename r=refresh d=diff y=copy\n"
-    "# s=sort o=order g=group t=tree c=cluster n=new p=restore z=freeze\n"
+    "# s=sort o=order g=group t=tree n=new p=restore z=freeze\n"
     "# a=attention l=list x=close [=prev-tab ]=next-tab Space=mark. Press ? in the\n"
     "# app for the live map. Everything below is optional fine-tuning:\n"
     '# leader          = "ctrl+g"  # use another leader ("none" disables the mode)\n'
@@ -319,7 +330,7 @@ DEFAULT_LEADER_KEY = "space"
 DEFAULT_LEADER_LETTERS = {           # action id -> letter (config orientation)
     "favorite": "f", "hide": "h", "rename": "e", "refresh": "r",
     "diff": "d", "copy": "y", "sort": "s", "order": "o",
-    "group": "g", "tree": "t", "cluster": "c", "new": "n",
+    "group": "g", "tree": "t", "new": "n",
     "restore": "p", "freeze": "z", "attention": "a", "toggle_list": "l",
     "close": "x", "prev_tab": "[", "next_tab": "]", "mark": " ",
     "settings": ",", "search_bar": "/",
@@ -339,7 +350,7 @@ LEADER_FAMILY_OF = {
     "toggle_fav": "Session", "toggle_hide": "Session", "rename": "Session",
     "copy_prompt": "Session", "preview_changes": "Session", "refresh": "Session",
     "sort": "View", "order": "View", "cycle_group": "View",
-    "toggle_tree": "View", "toggle_cluster": "View", "toggle_list": "View",
+    "toggle_tree": "View", "toggle_list": "View",
     "settings": "View", "toggle_search_bar": "View",
     "new_session": "Panes", "restore_panes": "Panes", "freeze_pane": "Panes",
     "next_attention": "Panes", "close_live": "Panes", "prev_tab": "Panes",
@@ -533,12 +544,10 @@ CUSTOM_TITLES_FILE = CACHE_DIR / "custom-titles.json"   # sid -> user-typed name
 OPEN_PANES_FILE = CACHE_DIR / "open-panes.json"   # split-live: sids open last session (restore)
 VIEW_MODE_FILE = CACHE_DIR / "view-mode.txt"
 TREE_MODE_FILE = CACHE_DIR / "tree-mode.txt"
-CLUSTER_MODE_FILE = CACHE_DIR / "cluster-mode.txt"
 GROUP_BY_FILE = CACHE_DIR / "group-by.txt"
 STATUS_FILTER_FILE = CACHE_DIR / "status-filter.txt"
 LASTACT_FILTER_FILE = CACHE_DIR / "lastact-filter.txt"
 SORT_FILE = CACHE_DIR / "sort.json"
-GLOBAL_CLUSTERS_FILE = CACHE_DIR / "global-clusters.json"
 OPTIONS_FILE = CACHE_DIR / "options.json"
 RESUME_HISTORY_FILE = CACHE_DIR / "resume-history.tsv"
 LOG_FILE = CACHE_DIR / "saikai.log"
@@ -718,21 +727,6 @@ def _toggle_tree_mode() -> bool:
     new = not _get_tree_mode()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     TREE_MODE_FILE.write_text("on" if new else "off", encoding="utf-8")
-    return new
-
-
-def _get_cluster_mode() -> bool:
-    """Saved topic-cluster display preference. False (no cluster) by default."""
-    try:
-        return CLUSTER_MODE_FILE.read_text(encoding="utf-8").strip() == "on"
-    except Exception:
-        return False
-
-
-def _toggle_cluster_mode() -> bool:
-    new = not _get_cluster_mode()
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    CLUSTER_MODE_FILE.write_text("on" if new else "off", encoding="utf-8")
     return new
 
 
@@ -1681,12 +1675,11 @@ def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
     span multiple lines.
 
     `model` overrides SUMMARY_MODEL when reasoning quality matters more than
-    cost (e.g. one-shot clustering across the full session list).
+    cost.
 
     The prompt is delivered over STDIN, not as a command-line argument —
-    Windows' CreateProcess caps argv at 32,767 chars total, which a
-    cluster-classification prompt (170+ sessions × ~150 chars) bumps right
-    up against. Stdin has no such limit.
+    Windows' CreateProcess caps argv at 32,767 chars total, which a large
+    multi-session prompt bumps right up against. Stdin has no such limit.
 
     Set SAIKAI_SUMMARIZE_CMD to a shell command to use a different summarizer
     backend (any LLM CLI / proxy) instead of `claude -p` — e.g. to avoid your
@@ -2365,9 +2358,9 @@ def _write_preview_cache(s: dict) -> None:
 def _preview_impl(session_id: str, cache_dir: Path, render) -> None:
     sid = _trim_sid(session_id)
     if not sid:
-        # Cluster-mode group-header / separator rows carry an empty SID column.
-        # Returning silently avoids the caller spinning a "loading" indicator while
-        # it waits for the preview command to do nothing useful.
+        # Group-header / separator rows carry an empty SID column. Returning
+        # silently avoids the caller spinning a "loading" indicator while it
+        # waits for the preview command to do nothing useful.
         return
     # Exact cache hit (full UUID — fast path)
     cache_file = cache_dir / f"{sid}.txt"
@@ -2609,10 +2602,13 @@ def _assign_primary_topic(sessions: list[dict]) -> None:
     """Pick the most widely-shared topic for each session in place.
 
     'Primary' = the topic from this session's topics list that the maximum
-    number of OTHER sessions also have. This produces clusters around common-
-    interest topics (e.g. 'email', 'backend') rather than singleton groups
-    around session-unique topics. Sets s["primary_topic"] (lowercase) or ""
-    when the session has no cached topics yet."""
+    number of OTHER sessions also have. This groups rows around common-
+    interest topics (e.g. 'email', 'backend') rather than singleton labels
+    from session-unique topics. Sets s["primary_topic"] (lowercase) or ""
+    when the session has no cached topics yet. Feeds the Topic sort column
+    and `display.color_by = topic` title tinting; topics themselves come
+    from the (opt-in) summary pipeline's cache, so with summaries off every
+    session simply stays ""."""
     topic_count: Counter = Counter()
     for s in sessions:
         for t in (s.get("topics") or []):
@@ -2620,180 +2616,6 @@ def _assign_primary_topic(sessions: list[dict]) -> None:
     for s in sessions:
         topics = [t.lower() for t in (s.get("topics") or [])]
         s["primary_topic"] = max(topics, key=lambda t: topic_count[t]) if topics else ""
-
-
-def _global_cluster_assign(sessions: list[dict], force_refresh: bool = False) -> None:
-    """One-shot Haiku call to bucket every session into one of ~6-10 themes.
-
-    Unlike _assign_primary_topic (which picks a per-session keyword from each
-    session's own cached topics), this asks Haiku to look across the whole
-    history and propose a small set of coherent themes, then assign every
-    session to exactly one of them. Result is cached in
-    ~/.cache/saikai/global-clusters.json keyed by SID. Sessions added since
-    the last classification fall back to the per-session primary topic until
-    the next --refresh-clusters.
-
-    Writes the resulting theme name to s["primary_topic"] in place."""
-    cache = _read_json(GLOBAL_CLUSTERS_FILE, {})
-    assignments: dict[str, str] = cache.get("assignments") or {}
-
-    # Find sessions still missing a cluster assignment.
-    missing = [s for s in sessions if s["id"] not in assignments]
-
-    if force_refresh or (assignments == {} and sessions):
-        # Refresh: classify ALL sessions in one call.
-        targets = sessions
-    elif missing:
-        # Incremental: classify only the new sessions, reusing the existing
-        # theme list so cache stays coherent. If we don't have a theme list
-        # yet (corrupt cache), fall through to a full refresh.
-        if cache.get("clusters"):
-            targets = missing
-        else:
-            targets = sessions
-    else:
-        # Nothing to do — just write the cached assignments back into the
-        # session dicts.
-        for s in sessions:
-            s["primary_topic"] = assignments.get(s["id"], "")
-        return
-
-    # Each input line gets the title PLUS the per-session topic keywords
-    # the earlier Haiku extraction produced. The classifier sees concrete
-    # vocabulary already attached to each session and can group on those
-    # keywords directly — gives noticeably more specific themes than title
-    # alone (which buries the topic in narrative prose).
-    items: list[str] = []
-    for s in targets:
-        sid = s["id"][:8]
-        title = (s.get("ai_title") or _first_msg(s) or "").replace("\n", " ")[:120]
-        topics = ", ".join((s.get("topics") or [])[:5])
-        items.append(f"[{sid}] {title} | topics: {topics}" if topics
-                     else f"[{sid}] {title}")
-
-    existing_themes = cache.get("clusters") or []
-    theme_hint = ""
-    if existing_themes and not force_refresh:
-        theme_hint = (
-            "\n\nExisting theme list (assign new sessions to these whenever "
-            f"reasonable; only introduce a new theme if none fit):\n"
-            f"{', '.join(existing_themes)}"
-        )
-
-    # Theme-count bounds inspired by Miller (1956) "Magical Number 7 ± 2": the
-    # human limit for at-a-glance absolute judgement across categories. 5 keeps
-    # each theme meaningful (avoids 2-3 mega-buckets); 9 keeps the picker
-    # scannable. Sweet spot ~7. SAIKAI_CLUSTER_TARGET_N tunes the suggestion
-    # (Haiku still picks the actual count); SAIKAI_CLUSTER_MAX caps it hard.
-    try:
-        target_n = max(3, min(12, int(os.environ.get("SAIKAI_CLUSTER_TARGET_N") or 7)))
-    except ValueError:
-        target_n = 7
-    lo = max(3, target_n - 2)
-    hi = min(12, target_n + 2)
-    prompt = (
-        f"Group {len(items)} Claude Code sessions into about {target_n} "
-        f"(between {lo} and {hi}) coherent themes describing the WORK done.\n\n"
-        "RULES:\n"
-        "1. Theme names are SPECIFIC work areas — pick the most concrete\n"
-        "   label that still covers ~10-30 sessions.\n"
-        "     GOOD: 'saikai CLI development', 'meeting-room booking',\n"
-        "           'patent classification (Salesforce)', 'email drafting'.\n"
-        "     BAD : 'tool development' (too generic), 'personal\n"
-        "           productivity' (vague), 'general work', 'misc'.\n"
-        "2. Every session must land in exactly one theme. No 'other' or\n"
-        "   catch-all bucket. If a theme would only contain 1-2 sessions,\n"
-        "   merge those into the nearest larger theme instead.\n"
-        "3. Themes must be semantically distinct from each other — avoid\n"
-        "   pairs like 'backend development' + 'tool development'.\n"
-        "4. Use the 'topics:' keywords on each line as your primary signal;\n"
-        "   the title is supporting context.\n\n"
-        "Reply with ONLY valid JSON, no prose:\n"
-        '{"clusters": ["theme1", "theme2", ...], '
-        '"assignments": {"<8-char-sid>": "<theme>", ...}}'
-        f"{theme_hint}\n\nSessions:\n" + "\n".join(items)
-    )
-
-    # Haiku is the default classifier: ~30s for the user's full history,
-    # and with the keyword-augmented prompt (each session line carries its
-    # extracted topics) the output quality is workable. Sonnet does give
-    # cleaner partitions but on 170+ sessions it can take 2-3 minutes —
-    # not interactive. Opt into Sonnet with SAIKAI_CLUSTER_MODEL=sonnet when
-    # quality matters more than latency.
-    cluster_model = os.environ.get("SAIKAI_CLUSTER_MODEL") or "haiku"
-    # Haiku usually finishes in 30-60s for ~200 sessions, but the API
-    # latency tail is long — give it 4 minutes before giving up.
-    timeout_s = 600 if cluster_model == "sonnet" else 240
-    eta = "1-3 min" if cluster_model == "sonnet" else "30-60 s"
-    print(_c(f"  classifying {len(targets)} session(s) via {cluster_model} "
-            f"({eta}; cached afterwards)...", DIM), file=sys.stderr)
-    raw = call_claude_haiku(prompt, timeout=timeout_s, raw=True, model=cluster_model)
-    if not raw:
-        print(_c(f"  warn: {cluster_model} returned no output "
-                f"(likely timeout after {timeout_s}s or claude error).",
-                YELLOW), file=sys.stderr)
-    parsed = None
-    if raw:
-        try:
-            # Tolerate ```json fences if Haiku wrapped its output.
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", cleaned).strip()
-            parsed = json.loads(cleaned)
-        except Exception:
-            parsed = None
-
-    valid_parsed = (isinstance(parsed, dict)
-                    and isinstance(parsed.get("assignments"), dict))
-    if raw and not valid_parsed:
-        # Help debug malformed LLM output — dump structure clues so we can
-        # see whether the model prefaced the JSON with prose, returned a
-        # different shape, hit a length cap, etc.
-        snippet = raw.strip()[:400].replace("\n", " ")
-        kind = type(parsed).__name__ if parsed is not None else "None"
-        keys = list(parsed.keys())[:8] if isinstance(parsed, dict) else "(not a dict)"
-        print(_c(f"  debug: parsed type={kind} keys={keys}", DIM), file=sys.stderr)
-        print(_c(f"  debug: raw[0:400] = {snippet!r}", DIM), file=sys.stderr)
-
-    if valid_parsed:
-        new_clusters = parsed.get("clusters") or list(set(parsed["assignments"].values()))
-        new_assigns = {}
-        # Map back 8-char SIDs the LLM returned to full SIDs — over `targets` ONLY
-        # (the sessions actually classified this round), so an over-eager reply
-        # that echoes a sid OUTSIDE its task set can't overwrite a good assignment.
-        sid_lookup = {s["id"][:8]: s["id"] for s in targets}
-        for short, theme in parsed["assignments"].items():
-            full = sid_lookup.get(short)
-            if full and isinstance(theme, str):
-                new_assigns[full] = theme.lower().strip()
-
-        if force_refresh or not cache.get("assignments"):
-            # Merge over any prior assignments even on a full refresh: a partial
-            # Haiku reply (it omitted some sids — common at scale) then keeps the
-            # clusters it didn't re-mention instead of dropping them to "". new wins.
-            assignments = {**(cache.get("assignments") or {}), **new_assigns}
-            cluster_set = {c.lower() for c in new_clusters} | set(assignments.values())
-            cache = {"clusters": sorted(cluster_set), "assignments": assignments}
-        else:
-            assignments.update(new_assigns)
-            cluster_set = set(cache.get("clusters") or []) | {c.lower() for c in new_clusters}
-            cache = {"clusters": sorted(cluster_set), "assignments": assignments}
-        _write_json(GLOBAL_CLUSTERS_FILE, cache)
-    else:
-        print(_c(f"  warn: {cluster_model} did not return parseable JSON — "
-                "falling back to per-session primary topic.", YELLOW),
-              file=sys.stderr)
-
-    # Apply assignments; sessions still missing fall back to per-session topic.
-    # Populate primary_topic first (it was otherwise never set, so the fallback
-    # was always "" on a Haiku miss despite the message promising a per-session topic).
-    _assign_primary_topic(sessions)
-    fallback = {s["id"]: s.get("primary_topic", "") for s in sessions}
-    for s in sessions:
-        s["primary_topic"] = assignments.get(s["id"], fallback.get(s["id"], ""))
-
-
-_CLUSTER_TOPIC_W = 14   # fixed width for the `[topic]` prefix column
 
 
 # Colour palettes for Textual cell tinting. Distinct values inside a column
@@ -2992,8 +2814,7 @@ def _ram_per_pane_mb() -> float:
 
 
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
-                 flat: bool = False, cluster_mode: bool = False,
-                 reload_fn=None, no_summary: bool = False) -> None:
+                 flat: bool = False, reload_fn=None) -> None:
     """Textual-based picker (status bar, mouse-click column sort, ? help overlay).
 
     Layout:
@@ -3008,7 +2829,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     All toggles reflect in-app (no restart required):
       Enter        resume                Esc / Ctrl-C  cancel
       F7           hide/unhide row       F6            favorite toggle
-      Shift-F5     toggle tree display   Shift-F6      toggle cluster
+      Shift-F5     toggle tree display
       Tab          preview full/summary  ?             help overlay
       (saikai uses FUNCTION keys only — every Ctrl+letter is left to the
        search box / live claude, e.g. Ctrl-W word-delete, Ctrl-R history)
@@ -3135,8 +2956,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             _cby = _cfg("display", "color_by", "SAIKAI_COLOR_BY", "project")
             if _cby not in ("project", "worktree", "topic", "none"):
                 _cby = "project"
-            _hue = ("no title tint" if _cby == "none"
-                    else f"Title hue = {_cby}")
             body = (
                 "[bold]Learn THREE things — the rest is on screen:[/bold]  "
                 "keys you already know ([yellow]↑↓ ⏎ / Esc ?[/yellow])  ·  "
@@ -3158,7 +2977,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "[bold cyan]View[/bold cyan]\n"
                 "  [yellow]␣g[/yellow] [dim]⇧F7[/dim]    Cycle grouping: Date / Project / State / none\n"
                 "  [yellow]␣s[/yellow] / [yellow]␣o[/yellow]    Cycle the sort column / flip its direction\n"
-                "  [yellow]␣t[/yellow] [dim]⇧F5[/dim]    Tree (parent/child) mode   ·   [yellow]␣c[/yellow] [dim]⇧F6[/dim]  Cluster (topic) mode\n"
+                "  [yellow]␣t[/yellow] [dim]⇧F5[/dim]    Tree (parent/child) mode\n"
                 "  [yellow]␣,[/yellow]         Settings — list options + the resolved config\n"
                 "  [yellow]Tab[/yellow]        Preview: full ↔ summary\n\n"
                 "[bold cyan]Split-live (default · SAIKAI_SPLIT_LIVE=0 to disable)[/bold cyan]\n"
@@ -3184,9 +3003,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]/[/yellow] shows the bar with the dropdowns; [yellow]Tab[/yellow]/[yellow]Shift-Tab[/yellow] walk into them, [yellow]Enter[/yellow]\n"
                 "  opens one. Leader [yellow]s[/yellow]/[yellow]o[/yellow] cycles the sort column / direction without the bar\n"
                 "  (a column-header click still sorts too)\n\n"
-                f"[bold cyan]Colours[/bold cyan]  {_hue} ([dim]display.color_by = "
-                "project/worktree/topic/none[/dim]) · Last column: "
-                "[green]green[/green] active(<5m) / [yellow]yellow[/yellow] recent(<30m) / dim older\n\n")
+                f"[bold cyan]Colours[/bold cyan]  {_color_legend(_cby)} "
+                "([dim]display.color_by = project/worktree/topic/none[/dim])\n\n")
             # Reflect live remaps + leader so the help can't drift from [keys] config.
             try:
                 app = self.app
@@ -3217,7 +3035,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
     class SettingsScreen(ModalScreen):
         """␣, — Settings, hybrid by design. TOP: the list options saikai itself
-        persists (Group / Sort / Status / Age / Tree / Cluster) are editable in
+        persists (Group / Sort / Status / Age / Tree) are editable in
         place and apply instantly — the Selects forward into the top-bar
         dropdowns, so there is exactly ONE apply/persist path. BOTTOM: the
         config.toml / env knobs, read-only with their resolved value + source
@@ -3273,8 +3091,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 with Horizontal(id="set-toggles"):
                     yield Static("Tree")
                     yield Switch(value=_get_tree_mode(), id="set-tree")
-                    yield Static("Cluster")
-                    yield Switch(value=_get_cluster_mode(), id="set-cluster")
+                _cby = _cfg("display", "color_by", "SAIKAI_COLOR_BY", "project")
+                yield Static(f"[dim]{_color_legend(_cby)}[/dim]")
                 _p = _config_path()
                 _state = ("exists" if _p.is_file()
                           else "absent — e creates it from the template")
@@ -3305,9 +3123,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if event.switch.id == "set-tree":
                     if _get_tree_mode() != bool(event.value):
                         self.app.action_toggle_tree()
-                elif event.switch.id == "set-cluster":
-                    if _get_cluster_mode() != bool(event.value):
-                        self.app.action_toggle_cluster()
             except Exception:
                 pass
 
@@ -3469,7 +3284,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("f8", "preview_changes", "Changes", id="diff", show=False, priority=True),
             Binding("f9", "copy_prompt", "Copy", id="copy", show=False, priority=True),
             Binding("shift+f5", "toggle_tree", "Tree", id="tree", show=False, priority=True),
-            Binding("shift+f6", "toggle_cluster", "Cluster", id="cluster", show=False, priority=True),
             Binding("shift+f7", "cycle_group", "Group", id="group", show=False, priority=True),
             Binding("shift+f8", "new_session", "New", id="new", show=False, priority=True),
             Binding("shift+f9", "freeze_pane", "Freeze", id="freeze", show=False, priority=True),
@@ -3840,11 +3654,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # is added, so we need to know it before defining columns.
             query = self.query_one("#search", Input).value
             visible = list(self._filter(query))   # copy: _filter may return the shared all_sessions; we sort/tag it in place
-            # Re-stamp recency from the CURRENT time so the +/. markers, the Last
-            # column colour and the State "Recent" bucket agree with the :active /
-            # :recent search tokens (which recompute live). The load-time is_active/
-            # is_recent snapshot otherwise drifts as the picker stays open, so a row
-            # shows "+"/"." that the :active/:recent filter would drop.
+            # Re-stamp recency from the CURRENT time so the +/. markers and the
+            # State "Recent" bucket agree with the :active / :recent search
+            # tokens (which recompute live). The load-time is_active/is_recent
+            # snapshot otherwise drifts as the picker stays open, so a row shows
+            # "+"/"." that the :active/:recent filter would drop.
             _now_recency = time.time()
             for _s in visible:
                 _s["is_active"] = _is_active_now(_s, _now_recency)
@@ -3863,11 +3677,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                            or (_last_active_dt(s) or datetime.min) >= _cut]
             view_mode = _get_view_mode()
             tree_mode = _get_tree_mode() and len(all_sessions) <= 1000
-            cluster_mode = _get_cluster_mode()
             group_by = _get_group_by()
-            # Cluster / tree are their own layouts and take precedence; otherwise
-            # apply the Claude-Desktop-style grouping (Pinned + date/project).
-            grouping = "none" if (cluster_mode or tree_mode) else group_by
+            # Tree is its own layout and takes precedence; otherwise apply the
+            # Claude-Desktop-style grouping (Pinned + date/project/state).
+            grouping = "none" if tree_mode else group_by
             show_proj_col = show_project or (grouping == "project")
             # The split-live list pane is narrow (~34%): use a Desktop-style
             # minimal column set (status + relative-Last + title) and convey the
@@ -3875,36 +3688,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             narrow = _LIVE_TERM is not None
             tree_prefixes: dict[str, str] = {}
 
+            _assign_primary_topic(visible)
             if not tree_mode:
-                # Flat, grouped and cluster layouts all honour the live Sort spec
-                # (tree is structural and walks itself). visible is a COPY, so this
-                # never mutates all_sessions; _build_groups and the cluster pass
-                # below only partition, preserving this order via a stable sort.
+                # Flat and grouped layouts honour the live Sort spec (tree is
+                # structural and walks itself). visible is a COPY, so this never
+                # mutates all_sessions; _build_groups only partitions while
+                # preserving this order.
                 # (Flat previously relied on main()'s one-time sort, so changing the
                 # Sort dropdown re-ordered nothing until the next launch.)
                 _apply_sort(visible, _load_sort())
-            if cluster_mode:
-                if no_summary:
-                    # --no-summary means "no LLM calls"; global clustering would
-                    # spawn `claude -p` (up to minutes, surprise network use under
-                    # the alt-screen). Degrade to cache-only per-session topics.
-                    _assign_primary_topic(visible)
-                else:
-                    # Global Haiku-based clustering: every session gets assigned
-                    # to one of ~5-9 themes by a single one-shot LLM call. Cached
-                    # in ~/.cache/saikai/global-clusters.json so the LLM only runs
-                    # for new sessions (or on `--refresh-clusters`).
-                    _global_cluster_assign(visible)
-                topic_count = Counter(s["primary_topic"] for s in visible)
-                # Sort buckets:
-                #   0 = named cluster (sorted by size desc, then name asc)
-                #   1 = "" (sessions the classifier couldn't place; rare)
-                visible.sort(key=lambda s: (
-                    1 if not s["primary_topic"] else 0,
-                    -topic_count[s["primary_topic"]] if s["primary_topic"] else 0,
-                    s["primary_topic"],
-                ))
-            elif tree_mode:
+            if tree_mode:
                 walked = _tree_walk(visible)
                 tree_prefixes = {s["id"]: p for s, p in walked}
                 visible = [s for s, _ in walked]
@@ -3947,8 +3740,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     specs.append((col_label("proj", "Project"), "proj", 17))
                 if has_worktrees:
                     specs.append((col_label("wt", "Wt"), "wt", 12))
-                if cluster_mode:
-                    specs.append((col_label("topic", "Topic"), "topic", 16))
                 specs.append((col_label("title", "Title"), "title", 80))
             for label, key, width in specs:
                 table.add_column(label, key=key, width=width)
@@ -3956,7 +3747,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Precompute one colour-mapping per column so a given project /
             # topic / worktree gets the same colour everywhere it appears.
             project_color: dict[str, str] = {}
-            topic_color: dict[str, str] = {}
             wt_color: dict[str, str] = {}
             if show_proj_col or narrow:
                 project_color = _build_color_map(
@@ -3968,11 +3758,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     (s.get("worktree_label") or "" for s in visible
                      if s.get("worktree_label")),
                     _PROJECT_PALETTE,
-                )
-            if cluster_mode:
-                topic_color = _build_color_map(
-                    (s.get("primary_topic") or "(none)" for s in visible),
-                    _TOPIC_PALETTE,
                 )
             # Title hue follows [display] color_by (project | worktree | topic | none).
             _color_by = _cfg("display", "color_by", "SAIKAI_COLOR_BY", "project")
@@ -4109,9 +3894,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if has_worktrees:
                     wt = s.get("worktree_label") or ""
                     row.append(Text(wt[:11], style=wt_color.get(wt, "") if wt else ""))
-                if cluster_mode:
-                    topic_full = s.get("primary_topic") or "(none)"
-                    row.append(Text(topic_full[:14], style=topic_color.get(topic_full, "")))
                 row.append(Text(raw_title, style=_tstyle) if _tstyle else raw_title)
                 table.add_row(*row, key=s["id"])
                 if first_session_row is None:
@@ -4193,12 +3975,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             scope = "All projects" if show_project else (repo.name if repo else "All projects")
 
             sep = "  [dim]·[/dim]  "
-            # Mode toggles: show Tree/Cluster only when ON (a row of OFFs is
-            # noise); Group stays visible — dimmed when off — so the feature
-            # advertises itself.
+            # Show Tree only when ON (a row of OFFs is noise); Group stays
+            # visible — dimmed when off — so the feature advertises itself.
             tree_str = f"{sep}Tree: [green]ON[/green]" if _get_tree_mode() else ""
-            cluster_str = (f"{sep}Cluster: [green]ON[/green]"
-                           if _get_cluster_mode() else "")
             _GROUP_LABEL = {"date": "[green]Date[/green]",
                             "project": "[green]Project[/green]",
                             "state": "[green]State[/green]"}
@@ -4280,7 +4059,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _kb_parts.append("[dim]? keys[/dim]")
             _kb = " · ".join(_kb_parts)
             text = (f"  {n} sessions{search_str}{sep}{sort_str}{sep}"
-                    f"{scope}{sep}{group_str}{filt_str}{tree_str}{cluster_str}"
+                    f"{scope}{sep}{group_str}{filt_str}{tree_str}"
                     f"{live_str}{sep}{_kb}")
             self.query_one("#statusbar", Static).update(text)
 
@@ -5454,8 +5233,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     if v != "none":   # grouping needs the flat display modes off
                         if _get_tree_mode():
                             _toggle_tree_mode()
-                        if _get_cluster_mode():
-                            _toggle_cluster_mode()
                     _set_group_by(v)
                     self._refresh_table()
             elif sel_id == "sortsel":
@@ -5560,19 +5337,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def action_toggle_tree(self) -> None:
             new_on = _toggle_tree_mode()
-            # Tree / cluster / grouping are mutually exclusive layouts — turn
-            # the others off to keep the saved state consistent.
+            # Tree and grouping are mutually exclusive layouts.
             if new_on:
-                if _get_cluster_mode():
-                    _toggle_cluster_mode()
-                _set_group_by("none")
-            self._refresh_table()
-
-        def action_toggle_cluster(self) -> None:
-            new_on = _toggle_cluster_mode()
-            if new_on:
-                if _get_tree_mode():
-                    _toggle_tree_mode()
                 _set_group_by("none")
             self._refresh_table()
 
@@ -5843,8 +5609,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if new != "none":
                 if _get_tree_mode():
                     _toggle_tree_mode()
-                if _get_cluster_mode():
-                    _toggle_cluster_mode()
             _set_group_by(new)
             try:   # keep the dropdown's shown value in sync
                 self.query_one("#groupsel").value = new
@@ -6933,19 +6697,7 @@ def main():
                "                            the target cwd is frequent.\n"
                "  SAIKAI_NO_AUTO_PERMISSION  hard-disable auto-permission even if enabled.\n"
                "  SAIKAI_FREQ_CWD_MIN=N      minimum session count to flag a cwd as\n"
-               "                            \"frequent\" for auto-permission (default 5).\n"
-               "  SAIKAI_CLUSTER_MIN_SIZE=N  (legacy, no longer used by the textual picker —\n"
-               "                            cluster mode is now driven by a one-shot\n"
-               "                            Haiku classification cached in\n"
-               "                            ~/.cache/saikai/global-clusters.json; run\n"
-               "                            `saikai --refresh-clusters` to regenerate).\n"
-               "  SAIKAI_CLUSTER_TARGET_N=N  target theme count for the global classifier\n"
-               "                            (clamped to [3,12]; the LLM is asked for\n"
-               "                            N±2). Default 7 — Miller (1956)'s '7 ± 2'\n"
-               "                            for at-a-glance absolute judgement.\n"
-               "  SAIKAI_CLUSTER_MODEL=...   model used by --refresh-clusters:\n"
-               "                            'haiku' (default, ~30 s on ~200 sessions),\n"
-               "                            'sonnet' (cleaner partitions, 1-3 min).",
+               "                            \"frequent\" for auto-permission (default 5).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--version", action="version", version=f"saikai {__version__}")
@@ -6974,8 +6726,8 @@ def main():
     p.add_argument("--reset-options", action="store_true",
                    help="Forget saved --days/--here/--all defaults. Preserves "
                         "split ratio and filter-bar visibility. Does NOT clear "
-                        "hidden/favorite/view-mode/tree-mode/cluster-mode/sort — "
-                        "toggle those via F7 / F6 / Shift-F5 / Shift-F6 in the "
+                        "hidden/favorite/view-mode/tree-mode/sort — "
+                        "toggle those via F7 / F6 / Shift-F5 in the "
                         "picker, ':hidden' in search for hidden rows, a column-header "
                         "click to sort (or the matching "
                         "--toggle-* / --cycle-sort / --reset-sort flags).")
@@ -7012,11 +6764,6 @@ def main():
     p.add_argument("--toggle-tree", action="store_true",
                    help="Toggle saved flat/nested tree-display mode (persistent). "
                         "Same effect as Shift-F5 inside the picker.")
-    p.add_argument("--toggle-cluster", action="store_true",
-                   help="Toggle saved topic-cluster view (persistent). When on, "
-                        "sessions are grouped by their most widely-shared cached "
-                        "topic keyword. Same effect as Shift-F6 inside the picker. "
-                        "Mutually exclusive with tree display.")
     p.add_argument("--cycle-sort", type=int, metavar="N", choices=[1, 2, 3],
                    help="Advance the Nth sort priority to the next column. Persistent. "
                         "In the picker, click a column header instead.")
@@ -7029,11 +6776,6 @@ def main():
                    help="Create Claude Desktop session-list entries for Terminal/VS Code "
                         "sessions missing from it. Additive + idempotent; never modifies "
                         "~/.claude/projects. Restart Desktop afterwards to see them.")
-    p.add_argument("--refresh-clusters", action="store_true",
-                   help="Re-run the global Haiku classification used by cluster mode. "
-                        "One LLM call buckets every session into 6-10 coherent themes; "
-                        "result is cached. Run after a flurry of new sessions or when "
-                        "the existing themes feel stale.")
     p.add_argument("--related", metavar="SESSION_ID",
                    help="Show sessions related to SESSION_ID with confidence scores and reasons")
     p.add_argument("--tree", action="store_true",
@@ -7103,11 +6845,6 @@ def main():
         label = "nested (tree)" if new_on else "flat"
         print(f"  tree-mode: {_c(label, YELLOW if new_on else GREEN)}", file=sys.stderr)
         return
-    if args.toggle_cluster:
-        new_on = _toggle_cluster_mode()
-        label = "on (group by topic)" if new_on else "off"
-        print(f"  cluster-mode: {_c(label, YELLOW if new_on else GREEN)}", file=sys.stderr)
-        return
     if args.cycle_sort is not None:
         entry = _cycle_sort_col(args.cycle_sort)
         print(f"  sort[{args.cycle_sort}]: {_c(entry['col'], CYAN)} {entry['dir']}",
@@ -7121,23 +6858,6 @@ def main():
     if args.reset_sort:
         _reset_sort()
         print(_c("  sort: reset to defaults (recency desc)", GREEN), file=sys.stderr)
-        return
-    if args.refresh_clusters:
-        # Need sessions loaded for the classifier. Reuse the same scope the
-        # picker uses (defaults to all projects so the cache covers everything).
-        since = None if args.days in (None, 0) else datetime.now(tz=timezone.utc) - timedelta(days=args.days)
-        projects_root = PROJECTS_ROOT
-        sessions = []
-        for d in _project_dirs(projects_root):
-            sessions.extend(load_sessions_in_dir(d, since))
-        _global_cluster_assign(sessions, force_refresh=True)
-        cache = _read_json(GLOBAL_CLUSTERS_FILE, {})
-        clusters = cache.get("clusters") or []
-        print(_c(f"  clusters refreshed: {len(clusters)} themes for "
-                f"{len(cache.get('assignments') or {})} sessions", GREEN),
-              file=sys.stderr)
-        if clusters:
-            print(_c("  " + ", ".join(clusters), DIM), file=sys.stderr)
         return
     if args.sync_desktop:
         cmd_sync_desktop()
@@ -7196,8 +6916,7 @@ def main():
 
     if args.refresh_summary and CACHE_DIR.exists():
         # Delete ONLY the per-session summary caches (named <session-uuid>.json).
-        # The old allowlist missed sort.json and global-clusters.json (expensive
-        # Haiku output) and would erase them; match the UUID instead so EVERY
+        # Match UUID cache names instead of maintaining an allowlist so every
         # settings file — current or future — is safe.
         for f in CACHE_DIR.glob("*.json"):
             if _UUID_RE.fullmatch(f.stem):
@@ -7248,8 +6967,8 @@ def main():
                     sessions.extend(extra)
 
     # Initial chronological sort gives _build_forest a deterministic order; the
-    # user-configurable sort spec is applied AFTER forest building / clustering
-    # so it controls only the displayed order.
+    # user-configurable sort spec is applied AFTER forest building so it controls
+    # only the displayed order.
     sessions.sort(key=lambda s: s["first_ts"], reverse=True)
     _log(f"start: loaded {len(sessions)} sessions "
          f"(all_projects={args.all_projects}, project={args.project}, days={args.days})")
@@ -7306,19 +7025,14 @@ def main():
             s["parent_score"] = 0.0
             s["parent_reasons"] = []
 
-    # Display mode (flat / nested-tree / topic-cluster). Saved modes are the
-    # source of truth so Shift-F5 / Shift-F6 inside the picker can toggle between
-    # them in place. CLI --tree is a one-shot override for the initial
-    # invocation only — the saved mode stays the source of truth, so a Ctrl-* toggle
-    # wins. tree and cluster are mutually exclusive in display: cluster wins
-    # when both happen to be on (e.g. saved cluster + CLI --tree).
-    cluster_mode = _get_cluster_mode()
-    use_tree = (not cluster_mode) and (args.tree or _get_tree_mode()) and len(sessions) <= 1000
+    # Display mode (flat / nested-tree). The saved mode is the source of truth
+    # so Shift-F5 inside the picker can toggle it in place. CLI --tree is a
+    # one-shot override for the initial invocation only.
+    use_tree = (args.tree or _get_tree_mode()) and len(sessions) <= 1000
     flat = not use_tree
-    # Apply user-configurable sort (Ctrl-1/2/3 / Alt-1/2/3 from the picker)
-    # only in flat mode. Tree mode is structural (forest topology) and cluster
-    # mode is topic-bucketed, so a free-form sort would override their layout.
-    if flat and not cluster_mode:
+    # Apply user-configurable sort only in flat mode. Tree mode is structural,
+    # so a free-form sort would override its layout.
+    if flat:
         _apply_sort(sessions, _load_sort())
     if args.table:
         # Static table display (opt-in with --table)
@@ -7368,8 +7082,7 @@ def main():
             return fresh
 
         textual_pick(sessions, repo, args.all_projects, flat=flat,
-                     cluster_mode=cluster_mode, reload_fn=_reload,
-                     no_summary=args.no_summary)
+                     reload_fn=_reload)
 
 
 if __name__ == "__main__":

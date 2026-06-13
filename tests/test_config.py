@@ -184,6 +184,30 @@ def test_resolved_settings_covers_and_applies_runtime_knobs():
         saikai._reset_config_cache()
 
 
+def test_color_legend_explains_context_without_false_last_color_claim():
+    project = saikai._color_legend("project")
+    assert "same project" in project.lower()
+    assert "symbols show state" in project.lower()
+    assert "last column" not in project.lower()
+
+    assert "same worktree" in saikai._color_legend("worktree").lower()
+    assert "same topic" in saikai._color_legend("topic").lower()
+    assert "title colors are disabled" in saikai._color_legend("none").lower()
+
+
+def test_removed_cluster_mode_has_no_dangling_runtime_references():
+    src = Path(saikai.__file__).read_text(encoding="utf-8")
+    for stale in (
+        "_get_cluster_mode(",
+        "_toggle_cluster_mode(",
+        "_global_cluster_assign(",
+        '"--toggle-cluster"',
+        '"--refresh-clusters"',
+        '"toggle_cluster"',
+    ):
+        assert stale not in src, f"removed cluster mode still referenced: {stale}"
+
+
 def test_reset_terminal_modes_guarded_and_emits():
     """atexit/crash terminal restore: silent on a non-tty stderr (never pollutes
     a redirected stream), emits the mouse/focus disable + show-cursor sequence on
@@ -235,6 +259,10 @@ if __name__ == "__main__":
     print("PASS test_init_config_writes_parseable_template")
     test_resolved_settings_covers_and_applies_runtime_knobs()
     print("PASS test_resolved_settings_covers_and_applies_runtime_knobs")
+    test_color_legend_explains_context_without_false_last_color_claim()
+    print("PASS test_color_legend_explains_context_without_false_last_color_claim")
+    test_removed_cluster_mode_has_no_dangling_runtime_references()
+    print("PASS test_removed_cluster_mode_has_no_dangling_runtime_references")
     test_reset_terminal_modes_guarded_and_emits()
     print("PASS test_reset_terminal_modes_guarded_and_emits")
     print("ALL PASS")

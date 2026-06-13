@@ -27,6 +27,17 @@ directory, and see which live session needs attention.
 deterministic UI recording; see [the recording guide](https://github.com/m-morino/saikai/blob/master/docs/demo-recording.md)
 for how public recordings are isolated and audited.</sub>
 
+### How to read the list
+
+**Color shows context; symbols show state.** By default, sessions from the same
+project share a title color. This keeps related work recognizable when the
+project column is hidden in the narrow split view. Set `display.color_by` to
+`worktree`, `topic`, or `none` to change the grouping.
+
+`~` working · `?` waiting for you · `!` finished, not yet answered · `=` live
+and viewed · `@` open elsewhere · `+` active · `.` recent · `*` favorite ·
+`x` hidden
+
 ## What it changes
 
 - **Find across every cwd.** Search Claude Code history across repositories and
@@ -39,10 +50,6 @@ for how public recordings are isolated and audited.</sub>
   changes, reuse prompts, and follow inferred parent/child session branches.
 - **Stay local and unobtrusive.** saikai reads Claude's own transcript files.
   It adds no daemon or database, and optional AI summaries are opt-in.
-
-Title colors group related context; symbols report session state. In the
-default view, the same title color means the same project. Press `?` for the
-live legend.
 
 The implementation is three small Python modules on
 [Textual](https://github.com/Textualize/textual), with a RAM gate that warns
@@ -162,8 +169,7 @@ SAIKAI_SPLIT_LIVE=0 saikai     # also: false / no / off
 | `Esc` / `Ctrl+C` | quit: snapshot the open panes, then kill them all (`Shift+F4` reopens them next launch) |
 | scroll up | freeze the pane (copy mode): select/copy while claude keeps running |
 
-Markers in the list: `~` busy · `?` waiting for input · `!` finished (unanswered)
-· `@` open · `+` active · `.` recent · `*` favorite · `x` hidden.
+Press `?` inside saikai for the active color rule and marker legend.
 
 ## Configuration (environment variables)
 
