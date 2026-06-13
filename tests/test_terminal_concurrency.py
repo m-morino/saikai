@@ -10,6 +10,7 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import saikai_terminal as rt
+import saikai
 
 
 def test_update_status_marshals_outside_lock():
@@ -556,6 +557,90 @@ def test_reopen_after_exit_requires_awaited_pane_removal():
     assert awaited_raise is None, f"awaited remove+add must mount cleanly, got {awaited_raise}"
 
 
+def test_mirror_inject_input_writes_only_when_app_gate_on():
+    """_mirror_inject_input re-checks the AUTHORITATIVE PickerApp._control_enabled
+    on the UI thread; the hub's advisory copy being stale-ON must NOT inject.
+
+    PickerApp is defined inside textual_pick() (needs textual, unreachable
+    headless), so the guard lives on the module-level _MirrorControl mixin that
+    PickerApp inherits — that is what we build here, the same __new__ + FakePty
+    style as the ClaudeTerminal guards above."""
+    writes = []
+
+    class _FakePty:
+        def write(self, data):
+            writes.append(data)
+
+    class _Term:
+        def __init__(self):
+            self._pty = _FakePty()
+            self.is_dead = False
+
+    app = saikai._MirrorControl.__new__(saikai._MirrorControl)
+    term = _Term()
+    app._focused_terminal = lambda: term
+
+    # App gate OFF -> no write, even though a focused live pane exists.
+    app._control_enabled = False
+    app._mirror_inject_input("rm -rf /\r")
+    assert writes == [], "app gate OFF must not inject (authority re-check)"
+
+    # App gate ON + alive pane -> exact bytes written.
+    app._control_enabled = True
+    app._mirror_inject_input("ls\r")
+    assert writes == ["ls\r"], writes
+
+
+def test_mirror_inject_input_noops_without_pane_or_when_dead():
+    """No focused pane, a dead pane, or _pty is None -> no-op (mirrors on_key)."""
+    writes = []
+
+    class _FakePty:
+        def write(self, data):
+            writes.append(data)
+
+    app = saikai._MirrorControl.__new__(saikai._MirrorControl)
+    app._control_enabled = True
+
+    # No focused pane.
+    app._focused_terminal = lambda: None
+    app._mirror_inject_input("a")
+    assert writes == [], "no pane must no-op"
+
+    # Dead pane.
+    class _Dead:
+        _pty = _FakePty()
+        is_dead = True
+    app._focused_terminal = lambda: _Dead()
+    app._mirror_inject_input("b")
+    assert writes == [], "dead pane must no-op"
+
+    # _pty is None.
+    class _NoPty:
+        _pty = None
+        is_dead = False
+    app._focused_terminal = lambda: _NoPty()
+    app._mirror_inject_input("c")
+    assert writes == [], "_pty None must no-op"
+
+
+def test_mirror_inject_input_swallows_pty_write_errors():
+    """A hostile/torn write (UnicodeEncodeError, child gone) is contained, exactly
+    like on_key's try/except — no exception escapes to the UI thread."""
+    class _BoomPty:
+        def write(self, data):
+            raise RuntimeError("child went away")
+
+    class _Term:
+        _pty = _BoomPty()
+        is_dead = False
+
+    app = saikai._MirrorControl.__new__(saikai._MirrorControl)
+    app._control_enabled = True
+    app._focused_terminal = lambda: _Term()
+    app._mirror_inject_input("x")     # must not raise
+
+
 if __name__ == "__main__":
     test_update_status_marshals_outside_lock()
     print("PASS test_update_status_marshals_outside_lock")
@@ -607,3 +692,9 @@ if __name__ == "__main__":
     print("PASS test_toggle_freeze_flips_and_resumes")
     test_bracketed_paste_mode_tracking()
     print("PASS test_bracketed_paste_mode_tracking")
+    test_mirror_inject_input_writes_only_when_app_gate_on()
+    print("PASS test_mirror_inject_input_writes_only_when_app_gate_on")
+    test_mirror_inject_input_noops_without_pane_or_when_dead()
+    print("PASS test_mirror_inject_input_noops_without_pane_or_when_dead")
+    test_mirror_inject_input_swallows_pty_write_errors()
+    print("PASS test_mirror_inject_input_swallows_pty_write_errors")
