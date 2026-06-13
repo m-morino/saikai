@@ -118,6 +118,7 @@ class MirrorHub:
         self._httpd: Optional["_Server"] = None
         self._drain: Optional[threading.Thread] = None
         self._stopped = threading.Event()
+        self._repaint_request = None
 
     def _feed(self, data: str) -> None:
         with self._mirror_lock:
@@ -154,6 +155,11 @@ class MirrorHub:
             snapshot = _synth_full_frame(self._screen, self._cols, self._rows)
             with self._clients_lock:
                 self._clients.add(cq)
+        if self._repaint_request is not None:
+            try:
+                self._repaint_request()
+            except Exception:
+                pass
         return cq, snapshot
 
     def _remove_client(self, cq):
@@ -210,9 +216,20 @@ class MirrorHub:
             self._cols, self._rows = cols, rows
             self._screen.resize(rows, cols)   # pyte: (lines, columns)
 
+    def set_repaint_request(self, fn) -> None:
+        self._repaint_request = fn
+
     def url(self) -> str:
         host = "127.0.0.1" if self._host in ("0.0.0.0", "") else self._host
         return f"http://{host}:{self._port}/?token={self._token}"
+
+
+def mirror_config(env: dict) -> tuple[bool, str]:
+    """(enabled, host) from the environment. OFF unless SAIKAI_MIRROR is truthy."""
+    val = str(env.get("SAIKAI_MIRROR", "")).strip().lower()
+    enabled = val in ("1", "true", "yes", "on")
+    host = str(env.get("SAIKAI_MIRROR_HOST", "")).strip() or "127.0.0.1"
+    return enabled, host
 
 
 def _base_driver_class():

@@ -3617,6 +3617,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 )
                 import threading as _thr
                 _thr.Thread(target=self._join_bg_summarize, daemon=True).start()
+            _hub = getattr(self, "_mirror_hub", None)
+            if _hub is not None:
+                _hub.set_size(self.size.width, self.size.height)
+                _hub.set_repaint_request(
+                    lambda: self.call_from_thread(self.refresh, layout=True))
 
         def _build_forest_bg(self) -> None:
             """Daemon: compute the cross-session forest off the pre-paint path,
@@ -5865,7 +5870,26 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     # actually see what blew up (the prior failure was 'screen disappears
     # and doesn't come back' = unrecoverable terminal state).
     try:
-        chosen = PickerApp().run()
+        import secrets as _secrets
+        import saikai_mirror as _mirror
+        _mir_on, _mir_host = _mirror.mirror_config(os.environ)
+        _hub = None
+        _app_kwargs = {}
+        if _mir_on:
+            _hub = _mirror.MirrorHub(token=_secrets.token_urlsafe(32), host=_mir_host)
+            _port = _hub.serve()
+            atexit.register(_hub.stop)
+            _Drv = _mirror.make_mirror_driver(_mirror._base_driver_class(), _hub)
+            _app_kwargs["driver_class"] = _Drv
+            _host_disp = "127.0.0.1" if _mir_host in ("0.0.0.0", "") else _mir_host
+            print(_c(f"  ⚠ saikai mirror LIVE (read-only): "
+                     f"http://{_host_disp}:{_port}/?token=... — "
+                     f"{'LAN-exposed' if _mir_host not in ('127.0.0.1', '') else 'loopback only'}",
+                     YELLOW), file=sys.stderr)
+            print(_c(f"    open: {_hub.url()}", YELLOW), file=sys.stderr)
+        _app = PickerApp(**_app_kwargs)
+        _app._mirror_hub = _hub
+        chosen = _app.run()
     except KeyboardInterrupt:
         chosen = None
     except Exception:

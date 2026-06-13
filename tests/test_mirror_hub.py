@@ -66,7 +66,16 @@ def test_server_rejects_bad_token_and_streams_with_good_token():
         hub.stop()
 
 
+def test_env_gate_default_off():
+    import saikai_mirror as _m
+    assert _m.mirror_config({}) == (False, "127.0.0.1")
+    assert _m.mirror_config({"SAIKAI_MIRROR": "1"}) == (True, "127.0.0.1")
+    assert _m.mirror_config({"SAIKAI_MIRROR": "0", "SAIKAI_MIRROR_HOST": "0.0.0.0"}) == (False, "0.0.0.0")
+    assert _m.mirror_config({"SAIKAI_MIRROR": "1", "SAIKAI_MIRROR_HOST": "0.0.0.0"}) == (True, "0.0.0.0")
+
+
 if __name__ == "__main__":
     test_broadcast_is_nonblocking_and_drops_oldest()
     test_server_rejects_bad_token_and_streams_with_good_token()
+    test_env_gate_default_off()
     print("OK test_mirror_hub")
