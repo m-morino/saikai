@@ -46,13 +46,14 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 # saikai.py imports both sibling modules — all three must ship.
-only-include = ["saikai.py", "saikai_terminal.py", "saikai_provider.py"]
+only-include = ["saikai.py", "saikai_terminal.py", "saikai_provider.py", "saikai_mirror.py"]
 
 [tool.hatch.build.targets.sdist]
 include = [
     "saikai.py",
     "saikai_terminal.py",
     "saikai_provider.py",
+    "saikai_mirror.py",
     "pyproject.toml",
     "README.md",
     "LICENSE",
