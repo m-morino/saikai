@@ -276,6 +276,11 @@ class MirrorHub:
         """Store the advisory control state + focused-pane title and broadcast a
         control frame to every connected browser. The app's UI-thread gate is the
         authority; this copy is what do_POST fast-rejects against."""
+        # LAN input is opt-in: a non-loopback bind cannot ENABLE control unless
+        # allow_lan_input was set at launch. Disabling is always honored.
+        if enabled and not self._host_is_loopback() and not self.allow_lan_input:
+            enabled = False
+            target = None
         self._control_enabled = bool(enabled)
         self._control_target = target if enabled else None
         frame = _Control(json.dumps(
@@ -352,6 +357,9 @@ class MirrorHub:
                 fn(data)
             except Exception:
                 pass               # never let one bad inject kill the drain
+
+    def _host_is_loopback(self) -> bool:
+        return self._host in ("127.0.0.1", "localhost", "::1", "")
 
     def url(self) -> str:
         # 0.0.0.0/"" is a bind wildcard, not browsable — resolve a reachable host

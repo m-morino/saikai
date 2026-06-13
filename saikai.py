@@ -6056,11 +6056,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _hub = _mirror.MirrorHub(
                         token=_secrets.token_urlsafe(32), host=_mir_host,
                         port=_mirror.mirror_port(os.environ))
+                    # LAN input is its own opt-in: a LAN-exposed mirror stays
+                    # read-only unless SAIKAI_MIRROR_ALLOW_LAN_INPUT=1. Loopback
+                    # always permits input.
+                    _allow_lan_in = str(os.environ.get(
+                        "SAIKAI_MIRROR_ALLOW_LAN_INPUT", "")).strip().lower() in (
+                        "1", "true", "yes", "on")
+                    _hub.allow_lan_input = _allow_lan_in
                     _hub.serve()
                     atexit.register(_hub.stop)
                     _Drv = _mirror.make_mirror_driver(_mirror._base_driver_class(), _hub)
                     _app_kwargs["driver_class"] = _Drv
                     _mode = "LAN-exposed" if _mir_host != "127.0.0.1" else "loopback only"
+                    _in_mode = ("input ON" if (_mir_host == "127.0.0.1" or _allow_lan_in)
+                                else "input OFF (set SAIKAI_MIRROR_ALLOW_LAN_INPUT=1)")
                     # Persist the URL so it's reachable even though the Textual alt
                     # screen hides this banner during the session; cleaned up at exit.
                     _url_file = CACHE_DIR / "mirror-url.txt"
@@ -6075,7 +6084,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         atexit.register(lambda f=_url_file: f.unlink(missing_ok=True))
                     except OSError:
                         _url_file = None
-                    print(_c(f"  ⚠ saikai mirror LIVE (read-only, {_mode}): {_hub.url()}",
+                    print(_c(f"  ⚠ saikai mirror LIVE ({_mode}, {_in_mode}; "
+                             f"control default OFF, Shift+F12): {_hub.url()}",
                              YELLOW), file=sys.stderr)
                     if _url_file is not None:
                         print(_c(f"    (also saved to {_url_file})", YELLOW), file=sys.stderr)
