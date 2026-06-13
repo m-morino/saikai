@@ -81,6 +81,11 @@ def _synth_full_frame(screen: "pyte.Screen", cols: int, rows: int) -> str:
         run_text: list[str] = []
         for x in range(cols):
             ch = line[x]
+            if ch.data == "":
+                continue            # wide-char (CJK) continuation cell: the
+                                    # preceding 2-wide glyph already covers this
+                                    # column. Emitting a space here would shift
+                                    # the rest of the line right (garbled JP rows).
             attrs = _cell_attrs(ch)
             glyph = ch.data or " "
             if attrs != run_attrs:
