@@ -8,43 +8,45 @@
 
 **English** | [日本語](https://github.com/m-morino/saikai/blob/master/README.ja.md)
 
-Dozens of Claude Code sessions, one searchable table. saikai scans your entire
-`~/.claude/projects` history, lets you filter and group by date / project /
-topic, and resumes any session with `Enter`. By default (**split-live**) it keeps
-several sessions running live in tabs beside the list — jump between conversations
-without closing anything or losing scrollback.
+Claude Code remembers every conversation. Finding the right one again gets
+harder once work spreads across repositories and worktrees, because its resume
+flow starts from the current working directory.
 
-*saikai* = 再開 "resume" + 再会 "reunion" (Japanese). Complements
-[ccmanager](https://github.com/kbwo/ccmanager), which manages a live multi-agent
-roster; saikai is for navigating and resuming the history.
+I liked Claude Desktop's at-a-glance conversation experience, but wanted it
+inside a Linux terminal without keeping a desktop app open. So I built saikai:
+one place to find old sessions, resume them from their original working
+directory, and see which live session needs attention.
+
+**Find it. Resume it. Know what needs you.**
+
+*saikai* = 再開 "resume" + 再会 "reunion" (Japanese).
 
 ![saikai demo](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-demo.gif)
 
-<sub>The demo uses fictional, leak-checked data. Regenerate the animated GIF
-headlessly with `uv run scripts/make_demo_gif.py`; use
-`uv run scripts/record_demo.py --guide` for a native-terminal recording.</sub>
+<sub>The demo uses fictional, leak-checked data. The current GIF is a
+deterministic UI recording; see [the recording guide](https://github.com/m-morino/saikai/blob/master/docs/demo-recording.md)
+for how public recordings are isolated and audited.</sub>
 
-## Highlights
+## What it changes
 
-- **Every session, one table** — every Claude Code conversation on your
-  machine, sorted by real last activity, grouped by date / project / topic,
-  filtered as you type.
-- **Resume in place** — `Enter` reopens a session with `claude --resume` in the
-  working directory it was started from (worktree-aware).
-- **Split-live panes** — host several live `claude` sessions in tabs beside the
-  list; markers show at a glance who is busy `~`, waiting for your input `?`,
-  or finished `!`. Quit and `Shift+F4` restores the whole pane set later.
-- **Session hygiene** — favorite `★`, hide, rename; AI one-line titles; an
-  inferred parent/child tree and LLM topic clusters for big histories.
-- **RAM-aware** — a memory gate (commit headroom + load + physical floor)
-  warns before a new pane would push the machine into thrashing.
-- **Keyboard-first** — everything works without a mouse: `Space` opens a
-  mnemonic command menu (`Space f` = favorite, `Space s` = sort …),
-  `Alt+←/→` resizes the split, `?` shows the live key map. The mouse is a
-  bonus (click to sort, drag the divider), never a requirement.
-- **Unintrusive by design** — read-only over claude's own transcript files; no
-  daemon, no database. Two Python files on top of
-  [Textual](https://github.com/Textualize/textual), MIT-licensed.
+- **Find across every cwd.** Search Claude Code history across repositories and
+  worktrees, then resume from the cwd where the session started.
+- **Know what needs you.** Keep several real `claude` sessions in split-live
+  tabs; `~`, `?`, and `!` distinguish working, waiting, and finished sessions.
+- **Restore a working set.** Quit without losing the set of panes you had open,
+  then reopen it later with `Shift+F4`.
+- **Inspect the work, not just the title.** Preview transcripts, compare
+  changes, reuse prompts, and follow inferred parent/child session branches.
+- **Stay local and unobtrusive.** saikai reads Claude's own transcript files.
+  It adds no daemon or database, and optional AI summaries are opt-in.
+
+Title colors group related context; symbols report session state. In the
+default view, the same title color means the same project. Press `?` for the
+live legend.
+
+The implementation is three small Python modules on
+[Textual](https://github.com/Textualize/textual), with a RAM gate that warns
+before another live pane would push the machine into thrashing.
 
 > The live pane uses ConPTY on Windows and a POSIX PTY elsewhere — see
 > [Platform support](#platform-support) for the per-OS verification status
@@ -105,7 +107,7 @@ that pops up when you pause).
    | `f` ★ favorite | `s` cycle **s**ort column | `n` new session |
    | `h` hide | `o` flip sort **o**rder | `p` restore panes |
    | `e` rename (edit) | `g` cycle grouping | `z` freeze pane |
-   | `y` copy prompt (yank) | `t` tree · `c` cluster | `a` next attention |
+   | `y` copy prompt (yank) | `t` tree | `a` next attention |
    | `d` diff (changes) | `l` hide/show list | `x` close tab · `[` `]` tabs |
    | `r` refresh | `,` settings · `/` hide/show bar | `Space` mark for batch launch |
 
@@ -195,6 +197,13 @@ status contracts live in `saikai_provider.py`; a Codex contract validates the
 extension boundary, but Codex is not selectable until its history discovery and
 live-state integration are complete. Claude history discovery respects
 `CLAUDE_CONFIG_DIR`.
+
+## Ecosystem
+
+saikai focuses on finding, resuming, and supervising sessions over time.
+[ccmanager](https://github.com/kbwo/ccmanager) focuses on coordinating a live
+multi-agent roster. The two solve adjacent problems rather than competing for
+the same workflow.
 
 ## Platform support
 

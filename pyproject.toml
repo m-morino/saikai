@@ -1,7 +1,7 @@
 [project]
 name = "saikai"
 dynamic = ["version"]   # read from saikai.py __version__ (regex source — no import at build)
-description = "A terminal session browser for Claude Code — browse, search, group, and resume past sessions, with a built-in split-live pane."
+description = "Find, resume, and supervise Claude Code sessions across repositories and worktrees."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
