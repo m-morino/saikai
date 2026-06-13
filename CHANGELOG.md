@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- A shared fictional demo fixture now generates the public screenshots,
+  deterministic headless GIF, and recording workspace without reading the
+  caller's real HOME or Claude history.
+- An isolated real-Claude recording guide and asciinema cast auditor reject
+  private paths, credentials, identities, and unapproved demo projects before
+  conversion.
+- `docs/ARCHITECTURE.md` is now the canonical contributor reference for module
+  boundaries, history semantics, PTY lifecycle, and concurrency invariants.
+
+### Changed
+- The public story now starts with the cross-repository session-discovery and
+  human-attention problem that motivated saikai.
+- Help, Settings, and the READMEs explain the visual grammar consistently:
+  title color groups context and ASCII symbols report state.
+- Contributor-facing agent files are concise entrypoints instead of duplicate
+  copies of the concurrency manual.
+
+### Removed
+- The incomplete global LLM cluster mode and its dangling UI/CLI controls.
+- Internal launch-marketing notes and completed implementation plans from the
+  public repository surface.
+
+### Fixed
+- Help no longer claims that the Textual Last column is color-coded when it is
+  rendered as plain text.
+
 ## [0.2.2] — 2026-06-13
 
 ### Fixed
