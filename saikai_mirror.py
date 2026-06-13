@@ -19,11 +19,15 @@ class MirrorHub:
         self._port = port
         self._cols = cols
         self._rows = rows
-        self._ingest: "queue.Queue[str]" = queue.Queue(ingest_cap)
+        self._ingest: queue.Queue[str] = queue.Queue(ingest_cap)
 
     def broadcast(self, data: str) -> None:
         """Called from Textual's UI thread (MirrorDriver.write). MUST NOT block.
-        Drop the oldest frame when the ingest queue is full."""
+        Drop the oldest frame when the ingest queue is full. Best-effort: under
+        concurrent producers strict FIFO is not guaranteed and the new frame may
+        itself be dropped — never blocking the UI thread is the only invariant.
+        In practice there is a single producer (the driver runs on the UI
+        thread), so the queue stays FIFO."""
         try:
             self._ingest.put_nowait(data)
         except queue.Full:
