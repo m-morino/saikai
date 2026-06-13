@@ -257,6 +257,49 @@ def test_set_control_state_pushes_control_frame():
         hub.stop()
 
 
+def test_idle_auto_disable_flips_control_off():
+    """With a short idle window and no accepted input, control auto-disables and
+    an OFF control frame is broadcast."""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, idle_secs=0.3)
+    hub.set_input_handler(lambda d: None)
+    port = hub.serve()
+    try:
+        hub.set_control_state(True, "S")        # arms the idle timer
+        assert hub._control_enabled is True
+        time.sleep(0.7)                          # no input within the window
+        assert hub._control_enabled is False, "idle window must auto-disable"
+    finally:
+        hub.stop()
+
+
+def test_accepted_input_resets_idle_timer():
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, idle_secs=0.4)
+    hub.set_input_handler(lambda d: None)
+    port = hub.serve()
+    try:
+        hub.set_control_state(True, "S")
+        for _ in range(3):                       # keep poking before the window
+            time.sleep(0.2)
+            assert hub.inject("x") is True
+        assert hub._control_enabled is True, "activity must keep control alive"
+    finally:
+        hub.stop()
+
+
+def test_bad_write_key_increments_failure_counter():
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0)
+    hub.set_input_handler(lambda d: None)
+    hub._control_enabled = True
+    port = hub.serve()
+    try:
+        before = hub._bad_key_count
+        _post(port, "/input", {"data": "x"},
+              headers={"X-Mirror-Write-Key": "wrong"})
+        assert hub._bad_key_count == before + 1, hub._bad_key_count
+    finally:
+        hub.stop()
+
+
 if __name__ == "__main__":
     test_inject_gate_off_by_default_and_requires_handler()
     test_inject_is_fifo_via_single_drain()
@@ -264,4 +307,7 @@ if __name__ == "__main__":
     test_host_allow_list_and_origin_matrix()
     test_sse_emits_writekey_and_control_without_colliding_output()
     test_set_control_state_pushes_control_frame()
+    test_idle_auto_disable_flips_control_off()
+    test_accepted_input_resets_idle_timer()
+    test_bad_write_key_increments_failure_counter()
     print("OK test_mirror_input")
