@@ -2983,6 +2983,28 @@ class _MirrorControl:
         except Exception:
             pass                               # app tearing down between gate + post
 
+    def _mirror_inject_key(self, key: str) -> None:
+        """Post a synthesized events.Key into the App so it routes to priority
+        bindings / the focused widget (the same path Pilot.press uses) -> saikai's
+        leader, F-keys, arrows, Esc/Tab all dispatch natively.
+
+        Runs on the Textual UI thread (the key handler marshals here via
+        call_from_thread). Re-checks the AUTHORITATIVE _control_enabled. A single
+        printable char carries itself as the Key.character; a named/modified key
+        ('escape', 'tab', 'up', 'ctrl+c', 'f12') carries character=None (Textual's
+        Key.__init__ leaves it None for len != 1). events imported in-body to keep
+        the mixin textual-free at import."""
+        if not self._control_enabled:
+            return
+        if not isinstance(key, str) or key == "":
+            return                             # never post a garbage Key
+        from textual import events
+        character = key if len(key) == 1 else None
+        try:
+            self.post_message(events.Key(key, character))
+        except Exception:
+            pass                               # app tearing down between gate + post
+
 
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                  flat: bool = False, reload_fn=None) -> None:

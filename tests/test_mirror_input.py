@@ -633,6 +633,49 @@ def test_mirror_inject_mouse_double_gate_and_events():
     assert posted == [], "unknown kind must post nothing"
 
 
+def test_mirror_inject_key_double_gate_and_event():
+    """_mirror_inject_key no-ops when control is OFF; when ON posts events.Key
+    with the right key/character (printable char carries itself; a named key
+    carries character=None). Built via __new__ + a post_message recorder."""
+    try:
+        from textual import events
+    except Exception:
+        print("SKIP test_mirror_inject_key_double_gate_and_event (textual unavailable)")
+        return
+    import saikai
+    app = saikai._MirrorControl.__new__(saikai._MirrorControl)
+    posted = []
+    app.post_message = lambda ev: posted.append(ev)
+
+    # Control OFF -> no-op.
+    app._control_enabled = False
+    app._mirror_inject_key("escape")
+    assert posted == [], "control OFF must post nothing"
+
+    # Control ON: a named key -> Key(key="escape"), non-printable (character None).
+    app._control_enabled = True
+    app._mirror_inject_key("escape")
+    assert len(posted) == 1 and isinstance(posted[0], events.Key), posted
+    assert posted[0].key == "escape", posted[0].key
+    assert posted[0].is_printable is False, "named key must be non-printable"
+
+    # A single printable char -> Key carries itself as character.
+    posted.clear()
+    app._mirror_inject_key(" ")               # space (the leader)
+    assert posted[0].key == " " and posted[0].character == " ", posted[0]
+
+    # A modified key -> Key(key="ctrl+c"), non-printable.
+    posted.clear()
+    app._mirror_inject_key("ctrl+c")
+    assert posted[0].key == "ctrl+c" and posted[0].is_printable is False, posted[0]
+
+    # Empty / non-str -> ignored (never post a garbage Key).
+    posted.clear()
+    app._mirror_inject_key("")
+    app._mirror_inject_key(None)
+    assert posted == [], "empty/None key must post nothing"
+
+
 if __name__ == "__main__":
     test_inject_gate_off_by_default_and_requires_handler()
     test_inject_is_fifo_via_single_drain()
@@ -653,4 +696,5 @@ if __name__ == "__main__":
     test_page_has_no_js_breaking_control_bytes()
     test_wildcard_bind_allows_lan_ip_host()
     test_mirror_inject_mouse_double_gate_and_events()
+    test_mirror_inject_key_double_gate_and_event()
     print("OK test_mirror_input")
