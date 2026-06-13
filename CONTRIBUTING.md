@@ -26,15 +26,17 @@ Dependencies: `textual`, `pyte`, `platformdirs`, and a PTY backend
 
 ```bash
 python -m py_compile saikai.py saikai_terminal.py saikai_provider.py
-python tests/test_config.py
-python tests/test_providers.py
-python tests/test_sort_recency.py
-python tests/test_split_divider.py
-python tests/test_resource_bounds.py
-python tests/test_terminal_concurrency.py
-python tests/test_terminal_watchdog.py
-python tests/test_keyboard_leader.py
-python tests/test_pty_backend.py
+uv run python tests/test_config.py
+uv run python tests/test_demo_audit.py
+uv run python tests/test_demo_fixture.py
+uv run python tests/test_keyboard_leader.py
+uv run python tests/test_providers.py
+uv run python tests/test_pty_backend.py
+uv run python tests/test_resource_bounds.py
+uv run python tests/test_sort_recency.py
+uv run python tests/test_split_divider.py
+uv run python tests/test_terminal_concurrency.py
+uv run python tests/test_terminal_watchdog.py
 ```
 
 Most suites also run without textual / pyte / a PTY backend through soft
@@ -71,8 +73,9 @@ batch, and don't "fix" a cosmetic race with a lock that can deadlock.
 - Match the surrounding code: comment density, naming, idiom.
 - Be meticulous about UX: terminal-width responsiveness, empty states,
   focus/cursor, and keeping a single source of truth for concurrent surfaces.
-- App shortcuts use **function keys**, never bare `Ctrl+letter` (readline /
-  claude own those).
+- Session and pane actions use **function keys**. Ordinary bare `Ctrl+letter`
+  editing keys belong to readline / claude; the configurable pane-release key
+  and app-level quit handling are deliberate exceptions.
 - Small, individually-tested commits over a big batch.
 
 ## Pull requests

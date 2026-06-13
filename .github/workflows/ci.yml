@@ -35,7 +35,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m py_compile saikai.py saikai_terminal.py saikai_provider.py
-          for t in test_config test_providers test_sort_recency test_split_divider test_resource_bounds test_terminal_concurrency test_terminal_watchdog test_keyboard_leader test_pty_backend; do
-            echo "== $t =="
-            python "tests/$t.py"
+          for test in tests/test_*.py; do
+            echo "== $test =="
+            python "$test"
           done

@@ -239,7 +239,7 @@ _CONFIG_TEMPLATE = (
     'command = ""      # custom backend: prompt on stdin -> summary on stdout ("" = claude -p)\n'
     'model   = "haiku"\n\n'
     "[display]\n"
-    "auto_refresh = 0          # seconds between background re-scans (0 = off)\n"
+    "auto_refresh = 0          # seconds between background re-scans (0 = off; minimum active value = 2)\n"
     "split_live   = true       # false = list-only browser (Enter = full-takeover resume)\n"
     'color_by     = "project"  # title hue: project | worktree | topic | none\n'
     "split_ratio  = 0.34       # initial list share; dragging / Alt+arrows persists over it\n\n"
@@ -323,10 +323,11 @@ def _leader_map(letters_cfg, id_to_action):
     return out, errs
 
 
-# Keyboard-first defaults: the leader fires ONLY while the session table is
-# focused, so Space can never steal a key from a claude pane or the search box.
-# Everything here is overridable from [keys]; leader = "none" turns the mode
-# off, leader_defaults = false starts from an empty letter map.
+# Keyboard-first defaults: the table fast path handles the leader while the
+# session table is focused; the App binding also allows it in other non-input,
+# non-dropdown saikai controls. A claude pane, Input, or Select keeps Space.
+# Everything here is overridable from [keys]; leader = "none" turns the mode off,
+# leader_defaults = false starts from an empty letter map.
 DEFAULT_LEADER_KEY = "space"
 DEFAULT_LEADER_LETTERS = {           # action id -> letter (config orientation)
     "favorite": "f", "hide": "h", "rename": "e", "refresh": "r",
@@ -2918,12 +2919,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
       Footer (key bindings)
 
     All toggles reflect in-app (no restart required):
-      Enter        resume                Esc / Ctrl-C  cancel
+      Enter        resume                Esc (saikai controls) leave / quit
+      Ctrl-]       pane → list           Ctrl-C        pane interrupt / app quit
       F7           hide/unhide row       F6            favorite toggle
       Shift-F5     toggle tree display
       Tab          preview full/summary  ?             help overlay
-      (saikai uses FUNCTION keys only — every Ctrl+letter is left to the
-       search box / live claude, e.g. Ctrl-W word-delete, Ctrl-R history)
+      (ordinary Ctrl+letter editing keys stay with the search box / live
+       claude; app shortcuts use function keys plus the configurable release key)
       (":hidden" in the search box reveals hidden rows;
        click a column header to sort, click again to reverse)
 
@@ -3080,7 +3082,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Alt-←/→[/yellow]    Resize the list/pane split — or drag the divider (persists)\n"
                 "  [yellow]Ctrl-][/yellow]     Return focus: pane → list  (SAIKAI_RELEASE_KEY to change)\n"
                 "  [yellow]␣x[/yellow] [dim]F10[/dim]    Close the active tab   ·   [dim]⇧F10[/dim]  Close ALL tabs\n"
-                "  [yellow]Esc[/yellow]        pane → list, then quit-all (snapshots panes; ␣p reopens)   ·   [yellow]Ctrl-C[/yellow]  quit-all\n"
+                "  [yellow]Esc[/yellow]        from the list: quit + snapshot panes (␣p reopens)\n"
+                "  [yellow]Ctrl-C[/yellow]     interrupt claude in a focused pane; from saikai controls, quit-all\n"
                 "  [yellow]␣z[/yellow] [dim]⇧F9[/dim]    Freeze the pane in place (copy mode): Shift+drag selects while\n"
                 "             claude streams · scroll up also freezes · ␣z / typing resumes\n\n"
                 "[bold cyan]Filter / Group / Sort (top-right dropdowns, Desktop-style)[/bold cyan]\n"
@@ -3090,7 +3093,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  Age       last 1d / 3d / 7d / 30d / All time\n"
                 "  Search    [yellow]/[/yellow] or type to open the bar; tokens AND with text + each other —\n"
                 "            :fav  :hidden  :open  :active  :recent   (Esc clears)\n"
-                "  Markers   @ open · + active · . recent · live ~ busy · ? waiting · ! unread · = viewed · * fav · x hidden\n"
+                "  Markers   @ open elsewhere · + active · . recent · live ~ busy · ? waiting · ! reply due · = idle · * fav · x hidden\n"
                 "  [yellow]/[/yellow] shows the bar with the dropdowns; [yellow]Tab[/yellow]/[yellow]Shift-Tab[/yellow] walk into them, [yellow]Enter[/yellow]\n"
                 "  opens one. Leader [yellow]s[/yellow]/[yellow]o[/yellow] cycles the sort column / direction without the bar\n"
                 "  (a column-header click still sorts too)\n\n"
@@ -3332,9 +3335,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
     class PickerApp(App):
         TITLE = "saikai"
-        # Textual's built-in command palette binds Ctrl+P. saikai deliberately
-        # leaves every Ctrl+letter to the search box / live claude (Ctrl+P =
-        # readline previous-history), so disable the palette to keep Ctrl+P free.
+        # Textual's built-in command palette binds Ctrl+P. saikai leaves ordinary
+        # editing keys to the search box / live claude (Ctrl+P = readline
+        # previous-history), so disable the palette to keep Ctrl+P free.
         ENABLE_COMMAND_PALETTE = False
         BINDINGS = [
             Binding("escape", "quit", "Quit"),
@@ -3351,18 +3354,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # ␣ Menu in the footer — THE one entry point to every command. The
             # on_key fast path arms the leader when the table is focused; this
             # (non-priority) binding catches the key when it bubbles unconsumed
-            # from any other non-typing widget (Tabs, the grip…), so "Space did
-            # nothing" can't happen outside an input/terminal. A focused Input
+            # from other non-input, non-dropdown widgets (Tabs, the grip…), so
+            # "Space did nothing" can't happen there. A focused Input, Select,
             # or claude pane consumes space first, exactly as designed.
             Binding("space", "arm_leader", "Menu", key_display="␣"),
-            # App shortcuts live on FUNCTION KEYS, never readline Ctrl+letters.
+            # Session/pane actions live on FUNCTION KEYS. Ordinary readline
+            # Ctrl+letters pass through; release and app-level quit handling are
+            # deliberate exceptions.
             # Ctrl+W/K/R/D/Y/P/G/T/O/L/X are all readline editing keys the user
             # types constantly — and claude itself binds Ctrl+R (history search),
             # Ctrl+T (todos), Ctrl+L (clear). Stealing them broke editing in the
             # search box and inside live panes, and Ctrl+K once nuked every pane.
             # Claude Code binds NO F-keys (verified), so F5-F10 / Shift+F5-7 are
             # safe to capture (priority) even while a claude pane is focused; the
-            # freed Ctrl+letters now pass straight through to the Input / claude.
+            # ordinary Ctrl+letters now pass straight through to Input / claude.
             # id= makes each remappable via [keys] in config (App.set_keymap in
             # on_mount). The id is the user-facing name typed in [keys]. quit /
             # quit_all / resume / preview have NO id (core nav, not remappable).
@@ -3383,8 +3388,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("question_mark", "help", "Help", id="help", priority=True),
             # Split-live tab management (opt-in). F10 closes the ACTIVE tab;
             # Shift+F10 closes ALL — two keys apart so a single stray press can't
-            # wipe every pane (that was the accidental "全件終了"). Esc also closes
-            # /returns one pane at a time; Ctrl+] returns focus pane → list.
+            # wipe every pane (that was the accidental "全件終了"). Esc from the
+            # list snapshots + quits; Ctrl+] returns focus pane → list.
             Binding("f10", "close_live", "Close tab", id="close", show=False, priority=True),
             Binding("shift+f10", "close_all_live", "Close all", id="close_all", show=False, priority=True),
             Binding("f2", "prev_tab", "◀Tab", id="prev_tab", show=False, priority=True),
@@ -3522,9 +3527,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     pass
             # Keybindings from [keys]: F-key/combo values are DIRECT rebinds
             # (set_keymap); single-letter values are LEADER sequences. The leader is
-            # ON BY DEFAULT (Space + DEFAULT_LEADER_LETTERS) and is handled in
-            # on_key, LIST-FOCUS only, so it can never steal a key from a focused
-            # claude pane or the search box. [keys] leader = "none" disables it.
+            # ON BY DEFAULT (Space + DEFAULT_LEADER_LETTERS). The table fast path
+            # and App binding allow it only in non-input, non-dropdown saikai
+            # controls, so it cannot steal Space from a claude pane or input.
+            # [keys] leader = "none" disables it.
             self._leader_key = ""          # resolved leader key; "" = off
             self._leader_actions = {}      # {letter: action_name} reached via the leader
             self._leader_pending = False   # waiting for the post-leader key
@@ -3945,8 +3951,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 elif live_status == "busy":
                     marker_a = "~"
                 elif live_status == "idle":
-                    # ! = answered but not yet viewed (unread); = = viewed / left
-                    # as-is. ASCII so the 2-char marker column stays 1-cell-aligned.
+                    # ! = claude finished and the user has not responded yet;
+                    # = = idle live pane with no response due. Merely viewing a tab
+                    # does not clear !. ASCII keeps the marker column aligned.
                     marker_a = "!" if s["id"] in getattr(self, "_unread", ()) else "="
                 else:
                     marker_a = ("@" if s.get("is_open") else "+" if s.get("is_active")
@@ -4286,9 +4293,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             # Leader/prefix (opt-in, [keys] leader). The leader arms a pending state;
             # the next key runs the mapped action. A focused claude pane consumes its
-            # own keys, so the leader only reaches here from the LIST (gated below) —
-            # it can't steal a REPL key. Handled BEFORE search-as-you-type so the
-            # post-leader letter doesn't fall through and open the search box.
+            # own keys, while the App binding may arm Space from other non-input,
+            # non-dropdown saikai controls. Handled BEFORE search-as-you-type so
+            # the post-leader letter doesn't fall through and open the search box.
             if self._leader_key:
                 if self._leader_pending:
                     self._leader_pending = False
@@ -5069,8 +5076,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def _close_live_sid(self, sid) -> None:
             """Kill + remove one live session's tab. Afterwards show the next
-            remaining live pane (so Esc steps through them) or the preview, and
-            return focus to the list."""
+            remaining live pane or the preview, and return focus to the list."""
             if self._live is None or sid is None:
                 return
             _log(f"live close: {sid[:8]}")
@@ -5729,8 +5735,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # and Shift+F4 had nothing to reopen. The snapshot + Shift+F4 restore IS
             # the safety net now: an accidental Esc is fully recoverable next launch.
             # (Single-pane close is F10; Ctrl-C also routes here via action_quit_all.)
-            # When a terminal is focused Esc belongs to claude — this branch just
-            # returns focus to the list (the terminal usually eats Esc first).
+            # A live terminal normally consumes Esc. If it bubbles (for example
+            # from a dead pane), return focus to the list.
             # Esc = "leave the current context": search box → list, dropdown →
             # list, list → quit. The bar is a FIXTURE now (visible by default),
             # so Esc no longer hides it — a single Esc from the list quits, and
@@ -6817,7 +6823,7 @@ def cmd_sync_desktop() -> None:
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     p = argparse.ArgumentParser(
-        description="Claude Code session history viewer. Shows all history by default; "
+        description="Claude Code session history viewer. Shows all history by factory default; "
                     "use --days N to limit. Filters (--days/--here/--all) are one-shot "
                     "unless --save-defaults is also passed.",
         epilog="Environment variables:\n"
