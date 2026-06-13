@@ -501,6 +501,13 @@ try {
   const _CA = (window.CanvasAddon && window.CanvasAddon.CanvasAddon) || window.CanvasAddon;
   term.loadAddon(new _CA());     // crisp box/block borders; falls back to DOM
 } catch (e) {}
+// ESC built at runtime (never a literal ESC byte in this served string — a lone
+// CR/ESC once broke the page; the no-control-byte test guards it).
+const ESC = String.fromCharCode(27);
+// Turn on mouse tracking (VT200 button + SGR encoding) by writing the DECSET
+// enable into the terminal: xterm's core mouse service then attaches its own
+// DOM listeners and reports taps/scrolls as ESC[<b;col;row(M|m) via onData.
+try { term.write(ESC + '[?1000;1006h'); } catch (e) {}
 const token = new URLSearchParams(location.search).get('token');
 const es = new EventSource('/stream?token=' + encodeURIComponent(token));
 
@@ -577,11 +584,116 @@ async function pump() {
   }
 }
 
+// ── Phase C: single-flight senders for /mouse and /key ──────────────────────
+//    Each mirrors pump()'s gate (controlOn/fatal/writeKey) + the write-key
+//    header + the 409->banner-off / 403->fatal reactions. One in-flight POST
+//    PER ENDPOINT (a separate latch each) so a swipe spamming /mouse never
+//    blocks a keystroke on /input.
+function reactStatus(status) {
+  if (status === 409) { setBanner(false, null); }
+  else if (status === 403) { fatal = true; banner.style.background='#a33';
+    banner.textContent = 'CONTROL LOST (auth) — reload'; }
+}
+let keySending = false, keyPending = null;
+async function postKey(key) {
+  if (fatal || !controlOn || writeKey === null || !key) return;
+  if (keySending) { keyPending = key; return; }      // coalesce: last key wins
+  keySending = true;
+  try {
+    const resp = await fetch('/key', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json','X-Mirror-Write-Key':writeKey},
+      body: JSON.stringify({key: key})
+    });
+    reactStatus(resp.status);
+  } catch (_) { /* transient; drop */ }
+  finally {
+    keySending = false;
+    if (keyPending !== null) { const k = keyPending; keyPending = null; postKey(k); }
+  }
+}
+let mouseSending = false, mousePending = null;
+async function postMouse(col, row, button, kind) {
+  if (fatal || !controlOn || writeKey === null) return;
+  const msg = {col: col, row: row, button: button, kind: kind};
+  if (mouseSending) { mousePending = msg; return; }  // coalesce: last report wins
+  mouseSending = true;
+  try {
+    const resp = await fetch('/mouse', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json','X-Mirror-Write-Key':writeKey},
+      body: JSON.stringify(msg)
+    });
+    reactStatus(resp.status);
+  } catch (_) { /* transient; drop */ }
+  finally {
+    mouseSending = false;
+    if (mousePending !== null) { const p = mousePending; mousePending = null;
+      postMouse(p.col, p.row, p.button, p.kind); }
+  }
+}
+
+// ── Input split: SGR mouse -> /mouse, everything else -> Phase B /input ─────
+// SGR report: ESC [ < b ; col ; row (M=press, m=release). Built from a string
+// so the source carries the two-char \\x1b (no literal ESC byte in this page).
+const sgrMouseRe = new RegExp('\\x1b\\[<(\\d+);(\\d+);(\\d+)([Mm])');
 term.onData((d) => {
   if (!controlOn || fatal) return;      // disabled until a control on-frame
-  pending += d;
+  const mm = d.match(sgrMouseRe);
+  if (mm) {
+    const b = parseInt(mm[1], 10);
+    const col = parseInt(mm[2], 10) - 1;     // 1-based xterm -> 0-based cell
+    const row = parseInt(mm[3], 10) - 1;
+    const press = mm[4] === 'M';
+    let kind, button;
+    if (b === 64) { kind = 'scrollup'; button = 0; }
+    else if (b === 65) { kind = 'scrolldown'; button = 0; }
+    else { kind = press ? 'down' : 'up'; button = b & 3; }
+    postMouse(col, row, button, kind);
+    return;
+  }
+  pending += d;                         // keyboard: the unchanged Phase B pump
   if (isControlByte(d)) { if (flushTimer) { clearTimeout(flushTimer); flushTimer=null; } pump(); }
   else if (!flushTimer) { flushTimer = setTimeout(() => { flushTimer=null; pump(); }, 25); }
+});
+
+// ── On-screen key bar: fixed-position buttons -> POST /key. Ctrl is a STICKY
+//    modifier: tap Ctrl to arm it; the next key is sent ctrl-combined
+//    (e.g. "ctrl+c"), then Ctrl disarms. ──────────────────────────────────────
+let ctrlSticky = false;
+const kbBar = document.createElement('div');
+kbBar.id = 'kb';
+kbBar.style.cssText =
+  'position:fixed;bottom:0;left:0;right:0;display:flex;flex-wrap:wrap;gap:4px;'+
+  'padding:4px;background:#222;z-index:9;font:bold 14px monospace';
+kbBar.innerHTML =
+  '<button data-k="space">Leader</button>'+
+  '<button data-k="escape">Esc</button>'+
+  '<button data-k="tab">Tab</button>'+
+  '<button data-k="up">&#8593;</button>'+
+  '<button data-k="down">&#8595;</button>'+
+  '<button data-k="left">&#8592;</button>'+
+  '<button data-k="right">&#8594;</button>'+
+  '<button id="kb-ctrl" data-k="">Ctrl</button>'+
+  '<button data-k="f12">F12</button>';
+document.body.appendChild(kbBar);
+const kbCtrl = document.getElementById('kb-ctrl');
+kbBar.querySelectorAll('button').forEach((b) => {
+  b.addEventListener('click', (e) => {
+    e.preventDefault();
+    if (b.id === 'kb-ctrl') {                 // arm/disarm the sticky modifier
+      ctrlSticky = !ctrlSticky;
+      kbCtrl.style.background = ctrlSticky ? '#3a3' : '';
+      return;
+    }
+    let k = b.getAttribute('data-k');
+    if (ctrlSticky) {                         // next key goes ctrl-combined, then disarm
+      k = 'ctrl+' + k;
+      ctrlSticky = false;
+      kbCtrl.style.background = '';
+    }
+    postKey(k);
+  });
 });
 </script></body></html>"""
 

@@ -676,6 +676,45 @@ def test_mirror_inject_key_double_gate_and_event():
     assert posted == [], "empty/None key must post nothing"
 
 
+def test_page_routes_mouse_and_has_key_bar():
+    """No browser in CI: assert the served page (a) routes SGR mouse in onData to
+    POST /mouse (parsing b;col;row, 1-based -> 0-based, M/m -> kind) while keeping
+    keyboard on /input, (b) has a postKey single-flight to /key with the write-key
+    header, and (c) renders the on-screen key bar buttons (Leader/Esc/Tab/arrows/
+    Ctrl/F12). Manual phone verification covers real tap/scroll fidelity."""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=80, rows=24)
+    hub.set_input_handler(lambda d: None)
+    hub.set_mouse_handler(lambda *a: None)
+    hub.set_key_handler(lambda *a: None)
+    port = hub.serve()
+    try:
+        page = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/?token=secret", timeout=3.0
+        ).read().decode("utf-8")
+        # (a) SGR mouse routing in onData: the parser + the /mouse endpoint.
+        assert "/mouse" in page, page
+        assert "[<" in page, "page must detect the SGR mouse prefix ESC[<"   # \x1b[<
+        # 1-based -> 0-based conversion is present (a subtraction by 1).
+        assert "- 1" in page, page
+        # press/release distinguished (M vs m).
+        assert "'M'" in page or '"M"' in page, page
+        # keyboard still routes to /input (unchanged Phase B path).
+        assert "/input" in page, page
+        # (b) postKey single-flight to /key with the write-key header.
+        assert "/key" in page and "X-Mirror-Write-Key" in page, page
+        # (c) the on-screen key bar buttons.
+        for label in ("Leader", "Esc", "Tab", "Ctrl", "F12"):
+            assert label in page, f"key bar missing {label}: {page[:200]}"
+        # arrows present (any of the glyphs or names).
+        assert ("↑" in page or "up" in page), page    # up arrow / "up"
+        # the gate reactions are still wired for the new senders.
+        assert "409" in page and "403" in page, page
+        # output path untouched.
+        assert "es.onmessage" in page and "atob" in page, page
+    finally:
+        hub.stop()
+
+
 if __name__ == "__main__":
     test_inject_gate_off_by_default_and_requires_handler()
     test_inject_is_fifo_via_single_drain()
@@ -697,4 +736,5 @@ if __name__ == "__main__":
     test_wildcard_bind_allows_lan_ip_host()
     test_mirror_inject_mouse_double_gate_and_events()
     test_mirror_inject_key_double_gate_and_event()
+    test_page_routes_mouse_and_has_key_bar()
     print("OK test_mirror_input")
