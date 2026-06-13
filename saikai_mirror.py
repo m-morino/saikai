@@ -125,7 +125,8 @@ def _synth_full_frame(screen: "pyte.Screen", cols: int, rows: int) -> str:
 
 class MirrorHub:
     def __init__(self, token: str, host: str = "127.0.0.1", port: int = 0,
-                 cols: int = 80, rows: int = 24, ingest_cap: int = 256) -> None:
+                 cols: int = 80, rows: int = 24, ingest_cap: int = 256,
+                 idle_secs: float = 600.0) -> None:
         self._token = token
         self._host = host
         self._port = port
@@ -151,6 +152,14 @@ class MirrorHub:
         self._write_key = _secrets.token_urlsafe(32)
         self._inject_q: queue.Queue[str] = queue.Queue(1024)
         self._inject_drain = None
+        # Idle auto-disable + abuse counters.
+        self._idle_secs = idle_secs
+        self._idle_timer = None
+        self._idle_lock = threading.Lock()
+        self._bad_key_count = 0
+        self._last_accept_t = 0.0
+        self._min_accept_gap = 0.0    # accepted-input rate cap (seconds between)
+        self.allow_lan_input = False  # set True only via the launch opt-in
 
     def _feed(self, data: str) -> None:
         with self._mirror_lock:
@@ -282,6 +291,30 @@ class MirrorHub:
                     cq.put_nowait(frame)
                 except (queue.Empty, queue.Full):
                     pass
+        if self._control_enabled:
+            self._arm_idle_timer()
+        else:
+            self._cancel_idle_timer()
+
+    def _arm_idle_timer(self) -> None:
+        with self._idle_lock:
+            if self._idle_timer is not None:
+                self._idle_timer.cancel()
+            self._idle_timer = threading.Timer(self._idle_secs,
+                                               self._on_idle_timeout)
+            self._idle_timer.daemon = True
+            self._idle_timer.start()
+
+    def _cancel_idle_timer(self) -> None:
+        with self._idle_lock:
+            if self._idle_timer is not None:
+                self._idle_timer.cancel()
+                self._idle_timer = None
+
+    def _on_idle_timeout(self) -> None:
+        # No accepted input within the window: disable control + tell the browser.
+        if self._control_enabled:
+            self.set_control_state(False, None)
 
     def inject(self, data: str) -> bool:
         """Accept browser input IFF control is on AND a handler is wired.
@@ -291,10 +324,16 @@ class MirrorHub:
         dispatches POSTs on independent threads. Non-blocking."""
         if self._input_handler is None or not self._control_enabled:
             return False
+        import time as _t
+        now = _t.monotonic()
+        if self._min_accept_gap and (now - self._last_accept_t) < self._min_accept_gap:
+            return False                       # accepted-input rate cap
         try:
             self._inject_q.put_nowait(data)
         except queue.Full:
             return False           # bounded; refuse rather than block a handler
+        self._last_accept_t = now
+        self._arm_idle_timer()                 # activity keeps control alive
         return True
 
     def _inject_loop(self):
@@ -430,7 +469,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _write_key_ok(self) -> bool:
         got = self.headers.get("X-Mirror-Write-Key", "")
-        return hmac.compare_digest(got, self.server.hub._write_key)
+        ok = hmac.compare_digest(got, self.server.hub._write_key)
+        if not ok:
+            self.server.hub._bad_key_count += 1     # GIL-atomic increment
+        return ok
 
     def _allowed_hosts(self) -> set:
         """The exact Host header values we accept: loopback names + the bound
