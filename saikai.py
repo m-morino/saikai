@@ -3797,6 +3797,29 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     except Exception:
                         pass            # app tearing down between the guard + call
                 _hub.set_input_handler(_inject_handler)
+                # Phase C: deliver browser taps + key-bar presses into the App as
+                # synthesized Textual events. Same _marshal shape as the input
+                # handler — capture the app, bail if it's gone, marshal onto the
+                # UI thread, swallow shutdown errors. NEVER a bare call_from_thread
+                # (whose future.result() could block the inject-drain thread).
+                def _mouse_handler(col, row, button, kind, _app=_app_ref):
+                    if not getattr(_app, "is_running", False):
+                        return
+                    try:
+                        _app.call_from_thread(
+                            _app._mirror_inject_mouse, col, row, button, kind)
+                    except Exception:
+                        pass
+                _hub.set_mouse_handler(_mouse_handler)
+
+                def _key_handler(key, _app=_app_ref):
+                    if not getattr(_app, "is_running", False):
+                        return
+                    try:
+                        _app.call_from_thread(_app._mirror_inject_key, key)
+                    except Exception:
+                        pass
+                _hub.set_key_handler(_key_handler)
                 # Copy the URL to the clipboard (host) so it pastes cleanly without
                 # selecting a wrapped line, then show the QR so a phone can join
                 # without typing the tokened URL (the stderr banner is alt-screen
