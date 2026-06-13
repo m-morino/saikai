@@ -3622,6 +3622,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _hub.set_size(self.size.width, self.size.height)
                 _hub.set_repaint_request(
                     lambda: self.call_from_thread(self.refresh, layout=True))
+                # Surface the URL inside the UI (the stderr banner is hidden by the
+                # alt screen). Also persisted to CACHE_DIR/mirror-url.txt at launch.
+                self.notify(f"Web mirror (read-only): {_hub.url()}",
+                            title="saikai mirror", timeout=12)
 
         def _build_forest_bg(self) -> None:
             """Daemon: compute the cross-session forest off the pre-paint path,
@@ -5883,16 +5887,23 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _mir_on, _mir_host = _mirror.mirror_config(os.environ)
                 if _mir_on:
                     _hub = _mirror.MirrorHub(token=_secrets.token_urlsafe(32), host=_mir_host)
-                    _port = _hub.serve()
+                    _hub.serve()
                     atexit.register(_hub.stop)
                     _Drv = _mirror.make_mirror_driver(_mirror._base_driver_class(), _hub)
                     _app_kwargs["driver_class"] = _Drv
-                    _host_disp = "127.0.0.1" if _mir_host == "0.0.0.0" else _mir_host
-                    print(_c(f"  ⚠ saikai mirror LIVE (read-only): "
-                             f"http://{_host_disp}:{_port}/?token=... — "
-                             f"{'LAN-exposed' if _mir_host != '127.0.0.1' else 'loopback only'}",
+                    _mode = "LAN-exposed" if _mir_host != "127.0.0.1" else "loopback only"
+                    # Persist the URL so it's reachable even though the Textual alt
+                    # screen hides this banner during the session; cleaned up at exit.
+                    _url_file = CACHE_DIR / "mirror-url.txt"
+                    try:
+                        _url_file.write_text(_hub.url() + "\n", encoding="utf-8")
+                        atexit.register(lambda f=_url_file: f.unlink(missing_ok=True))
+                    except OSError:
+                        _url_file = None
+                    print(_c(f"  ⚠ saikai mirror LIVE (read-only, {_mode}): {_hub.url()}",
                              YELLOW), file=sys.stderr)
-                    print(_c(f"    open: {_hub.url()}", YELLOW), file=sys.stderr)
+                    if _url_file is not None:
+                        print(_c(f"    (also saved to {_url_file})", YELLOW), file=sys.stderr)
             except Exception as _mir_err:   # mirror is best-effort; never block launch
                 _hub = None
                 _app_kwargs = {}
