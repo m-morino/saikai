@@ -106,3 +106,29 @@ After terminal, threading, lock, async, or teardown changes, at minimum run
 `tests/test_terminal_concurrency.py`, `tests/test_resource_bounds.py`, and the
 real-backend `tests/test_pty_backend.py`. Use Textual `App.run_test()` and
 `Pilot` for focus, key, and layout behavior.
+
+## Web mirror (opt-in, read-only)
+
+`saikai_mirror.py` (app layer) can mirror the running UI to a browser. It is
+OFF unless `SAIKAI_MIRROR` is truthy, binds `127.0.0.1` unless
+`SAIKAI_MIRROR_HOST` is set, and authenticates with a per-run token.
+
+Contract:
+
+- A `MirrorDriver` subclass of the platform console driver copies each
+  composited frame to the hub (non-blocking, drop-oldest) then calls
+  `super().write()`. The local console is byte-identical and untouched.
+- `broadcast()` runs on the UI thread and only enqueues — it never takes the
+  mirror lock, never marshals, never touches `self._lock` or the PTY. pyte
+  feeding and fan-out happen on a separate drain thread.
+- A server-side pyte mirror lets a late-joining browser receive a full styled
+  snapshot before the live diff stream; client registration and snapshot are
+  atomic with respect to the drain feed.
+- It is ephemeral: a daemon HTTP thread that dies with the App. No daemon
+  outlives the process, no database, no transcript writes.
+- It does NOT cover the post-resume foreground Claude: full-takeover resume
+  (`action_resume_detached`, or Enter when split-live is disabled) exits the App
+  and `subprocess.run(claude_argv)` — Textual/driver/pyte are gone, so the
+  mirror goes dark until the App returns. Work in split-live panes to stay
+  mirrored.
+- Read-only: no browser input path exists in this phase (no input arbitration).
