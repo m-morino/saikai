@@ -320,8 +320,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 try:
                     data = cq.get(timeout=30.0)
                 except queue.Empty:
-                    # Send SSE keepalive comment so browsers know the connection
-                    # is alive and urllib.request.read(n) does not block forever.
+                    # Periodic SSE keepalive comment so idle connections (and any
+                    # intermediaries) stay open between live frames.
                     self.wfile.write(b":\n\n")
                     self.wfile.flush()
                     continue
@@ -335,14 +335,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _send_frame(self, data: str):
         payload = base64.b64encode(data.encode("utf-8")).decode("ascii")
-        frame = b"data: " + payload.encode("ascii") + b"\n\n"
-        # Pad short frames to ≥128 bytes with an SSE comment so that
-        # urllib.request.read(n) does not block waiting for a second recv
-        # on keep-alive connections (a single TCP segment carries all bytes).
-        if len(frame) < 128:
-            pad = max(0, 128 - len(frame) - 3)
-            frame += b":" + b" " * pad + b"\n\n"
-        self.wfile.write(frame)
+        self.wfile.write(b"data: " + payload.encode("ascii") + b"\n\n")
         self.wfile.flush()
 
 

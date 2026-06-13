@@ -54,7 +54,7 @@ def test_server_rejects_bad_token_and_streams_with_good_token():
         deadline = time.time() + 3.0
         seen = b""
         while time.time() < deadline and b"\n\n" not in seen[1:]:
-            seen += resp.read(64)
+            seen += resp.read1(64)   # read1: return buffered bytes, don't block for a full 64
         text = seen.decode("utf-8", "replace")
         assert text.startswith("data: ")
         payloads = [base64.b64decode(ln[6:]).decode("utf-8", "replace")

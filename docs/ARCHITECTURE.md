@@ -132,3 +132,10 @@ Contract:
   mirror goes dark until the App returns. Work in split-live panes to stay
   mirrored.
 - Read-only: no browser input path exists in this phase (no input arbitration).
+- Geometry is fixed at mount: the mirror's pyte screen is sized once from the
+  host terminal. Resizing the real terminal mid-session is NOT yet propagated,
+  so late-joiner snapshots and connected browsers keep the mount-time size
+  (stale margins) until restart. Resize propagation is a Phase B item.
+- Over LAN (`SAIKAI_MIRROR_HOST`), the per-run token travels in the URL query
+  (`EventSource` cannot set headers), so it can surface in proxy logs and
+  browser history. Acceptable for a trusted home/tethering network only.
