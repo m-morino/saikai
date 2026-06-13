@@ -82,9 +82,18 @@ def test_url_includes_token_and_resolves_wildcard_host():
     assert "0.0.0.0" not in h2.url() and ":9999" in h2.url() and "token=tok" in h2.url()
 
 
+def test_mirror_port_parsing():
+    import saikai_mirror as _m
+    assert _m.mirror_port({}) == 0                                  # default ephemeral
+    assert _m.mirror_port({"SAIKAI_MIRROR_PORT": "8771"}) == 8771
+    assert _m.mirror_port({"SAIKAI_MIRROR_PORT": "bogus"}) == 0
+    assert _m.mirror_port({"SAIKAI_MIRROR_PORT": "99999"}) == 0     # out of range
+
+
 if __name__ == "__main__":
     test_broadcast_is_nonblocking_and_drops_oldest()
     test_server_rejects_bad_token_and_streams_with_good_token()
     test_env_gate_default_off()
     test_url_includes_token_and_resolves_wildcard_host()
+    test_mirror_port_parsing()
     print("OK test_mirror_hub")
