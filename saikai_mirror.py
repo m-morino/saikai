@@ -297,10 +297,10 @@ def make_mirror_driver(base_cls, hub: "MirrorHub"):
 # own URL and opens the SSE stream with it.
 _PAGE_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <title>saikai mirror</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<link rel="stylesheet" href="/xterm.min.css">
 <style>html,body{margin:0;height:100%;background:#000}#t{height:100%}</style></head>
 <body><div id="t"></div>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="/xterm.min.js"></script>
 <script>
 const term = new Terminal({scrollback:0, convertEol:false});
 term.open(document.getElementById('t'));
@@ -325,8 +325,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         got = (q.get("token") or [""])[0]
         return hmac.compare_digest(got, self.server.hub._token)
 
+    _STATIC = {"/xterm.min.js": "application/javascript",
+               "/xterm.min.css": "text/css"}
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        if path in self._STATIC:               # public library asset; no token
+            self._serve_static(path, self._STATIC[path])
+            return
         if not self._token_ok():
             self.send_error(403, "forbidden")
             return
@@ -341,6 +347,23 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._stream()
         else:
             self.send_error(404)
+
+    def _serve_static(self, path, ctype):
+        import os
+        fpath = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "saikai_mirror_static", path.lstrip("/"))
+        try:
+            with open(fpath, "rb") as f:
+                body = f.read()
+        except OSError:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _stream(self):
         hub = self.server.hub

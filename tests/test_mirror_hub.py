@@ -90,10 +90,26 @@ def test_mirror_port_parsing():
     assert _m.mirror_port({"SAIKAI_MIRROR_PORT": "99999"}) == 0     # out of range
 
 
+def test_static_assets_served_locally_without_token():
+    """xterm.js/css are vendored and served from this origin (no CDN, works on
+    locked-down/offline networks); the library asset needs no token, and the
+    page must reference the local path, not a CDN."""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0)
+    port = hub.serve()
+    try:
+        r = _get(f"http://127.0.0.1:{port}/xterm.min.js")   # no token
+        assert r.status == 200 and len(r.read(64)) > 0
+        page = _get(f"http://127.0.0.1:{port}/?token=secret").read().decode("utf-8")
+        assert "/xterm.min.js" in page and "cdn.jsdelivr" not in page
+    finally:
+        hub.stop()
+
+
 if __name__ == "__main__":
     test_broadcast_is_nonblocking_and_drops_oldest()
     test_server_rejects_bad_token_and_streams_with_good_token()
     test_env_gate_default_off()
     test_url_includes_token_and_resolves_wildcard_host()
     test_mirror_port_parsing()
+    test_static_assets_served_locally_without_token()
     print("OK test_mirror_hub")
