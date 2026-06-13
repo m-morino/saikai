@@ -355,6 +355,47 @@ def test_page_contains_input_listeners_and_sender():
         hub.stop()
 
 
+def test_page_has_no_js_breaking_control_bytes():
+    """Regression: the served page (HTML + inline JS) must contain no raw C0
+    control byte except TAB/LF. A literal CR baked into the JS by a non-raw
+    Python string once ended a // comment early (CR is a JS line terminator),
+    turning the rest of the line into code -> 'Unexpected token' -> blank page.
+    A string-only content check missed it; this catches the byte itself."""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=80, rows=24)
+    hub.set_input_handler(lambda d: None)
+    port = hub.serve()
+    try:
+        page = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/?token=secret", timeout=3.0
+        ).read().decode("utf-8")
+        norm = page.replace("\r\n", "\n")           # legit CRLF line endings are fine
+        stray = sorted({ord(c) for c in norm if ord(c) < 32 and c not in "\t\n"})
+        assert stray == [], f"stray control bytes in served page (lone CR=13): {stray}"
+    finally:
+        hub.stop()
+
+
+def test_wildcard_bind_allows_lan_ip_host():
+    """Regression: a 0.0.0.0 (wildcard) bind must accept the LAN IP that url()
+    advertises as a Host header -- otherwise a phone using that IP gets 403 on
+    every request. _allowed_hosts must include _lan_ip() for a wildcard bind,
+    while still rejecting a foreign host (anti-rebinding intact)."""
+    hub = m.MirrorHub(token="secret", host="0.0.0.0", port=0)
+    hub.set_input_handler(lambda d: None)
+    port = hub.serve()
+    lan = m._lan_ip()
+    try:
+        assert _raw_request(port, "GET", "/?token=secret",
+                            {"Host": f"{lan}:{port}"}) == 200, \
+            "wildcard bind rejected its own advertised LAN IP host (403)"
+        assert _raw_request(port, "GET", "/?token=secret",
+                            {"Host": f"127.0.0.1:{port}"}) == 200
+        assert _raw_request(port, "GET", "/?token=secret",
+                            {"Host": "evil.example.com"}) == 403
+    finally:
+        hub.stop()
+
+
 if __name__ == "__main__":
     test_inject_gate_off_by_default_and_requires_handler()
     test_inject_is_fifo_via_single_drain()
@@ -367,4 +408,6 @@ if __name__ == "__main__":
     test_bad_write_key_increments_failure_counter()
     test_lan_input_requires_opt_in()
     test_page_contains_input_listeners_and_sender()
+    test_page_has_no_js_breaking_control_bytes()
+    test_wildcard_bind_allows_lan_ip_host()
     print("OK test_mirror_input")

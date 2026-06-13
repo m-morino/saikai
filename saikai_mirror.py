@@ -501,7 +501,7 @@ let fatal = false;
 
 function isControlByte(d) {
   // Flush immediately on ESC, CR, or any C0 control byte so interactive keys
-  // (Ctrl-C = \x03, Enter = \r, arrows = ESC[…) are never batching-delayed.
+  // (Ctrl-C, Enter, arrow escape sequences) are never batching-delayed.
   for (let i=0;i<d.length;i++) { if (d.charCodeAt(i) < 32) return true; }
   return false;
 }
@@ -558,13 +558,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         return ok
 
     def _allowed_hosts(self) -> set:
-        """The exact Host header values we accept: loopback names + the bound
-        LAN IP, each with the actual served port. Anything else is a rebinding
-        attempt and is refused on EVERY route."""
+        """The exact Host header values we accept: loopback names + the LAN IP
+        the mirror is reachable at, each with the actual served port. Anything
+        else is a rebinding attempt and is refused on EVERY route."""
         port = self.server.hub._port
         hub_host = self.server.hub._host
         names = {"127.0.0.1", "localhost", "[::1]", "::1"}
-        if hub_host not in ("0.0.0.0", "", "127.0.0.1", "localhost"):
+        if hub_host in ("0.0.0.0", ""):
+            names.add(_lan_ip())             # wildcard bind: allow the LAN IP url() advertises
+        elif hub_host not in ("127.0.0.1", "localhost"):
             names.add(hub_host)              # the specific bound LAN IP
         allowed = set()
         for n in names:
