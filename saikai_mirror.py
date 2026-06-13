@@ -406,11 +406,52 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         got = self.headers.get("X-Mirror-Write-Key", "")
         return hmac.compare_digest(got, self.server.hub._write_key)
 
+    def _allowed_hosts(self) -> set:
+        """The exact Host header values we accept: loopback names + the bound
+        LAN IP, each with the actual served port. Anything else is a rebinding
+        attempt and is refused on EVERY route."""
+        port = self.server.hub._port
+        hub_host = self.server.hub._host
+        names = {"127.0.0.1", "localhost", "[::1]", "::1"}
+        if hub_host not in ("0.0.0.0", "", "127.0.0.1", "localhost"):
+            names.add(hub_host)              # the specific bound LAN IP
+        allowed = set()
+        for n in names:
+            allowed.add(n)
+            allowed.add(f"{n}:{port}")
+        return allowed
+
+    def _host_ok(self) -> bool:
+        host = self.headers.get("Host", "")
+        return host in self._allowed_hosts()
+
+    def _server_origins(self) -> set:
+        """The exact Origin/Referer-host values that count as same-origin."""
+        return {f"http://{h}" for h in self._allowed_hosts()}
+
+    def _origin_ok(self) -> bool:
+        """Fail-closed CSRF defense-in-depth: require an Origin (or, absent that,
+        a Referer) whose scheme+host+port exactly equal this server's origin.
+        Reject absent-both, literal 'null', cross-origin, and port mismatches."""
+        from urllib.parse import urlparse
+        allowed = self._server_origins()
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            return origin in allowed        # 'null' and mismatches fall through
+        ref = self.headers.get("Referer")
+        if ref:
+            p = urlparse(ref)
+            return f"{p.scheme}://{p.netloc}" in allowed
+        return False                        # absent both -> reject
+
     _STATIC = {"/xterm.min.js": "application/javascript",
                "/addon-canvas.js": "application/javascript",
                "/xterm.min.css": "text/css"}
 
     def do_GET(self):
+        if not self._host_ok():
+            self.send_error(403, "forbidden")
+            return
         path = self.path.split("?", 1)[0]
         if path in self._STATIC:               # public library asset; no token
             self._serve_static(path, self._STATIC[path])
@@ -514,8 +555,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if path != "/input":
             self._reject(405, "method not allowed")
             return
-        # (Host + Origin gates are added in the next task; for now write-key only.)
+        if not self._host_ok():
+            self._reject(403, "forbidden")
+            return
         if not self._write_key_ok():
+            self._reject(403, "forbidden")
+            return
+        if not self._origin_ok():
             self._reject(403, "forbidden")
             return
         hub = self.server.hub

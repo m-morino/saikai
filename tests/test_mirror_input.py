@@ -126,8 +126,83 @@ def test_post_input_write_key_and_body_matrix():
         hub.stop()
 
 
+def _raw_request(port, method, path, headers):
+    """Send a raw HTTP/1.1 request with EXACT headers (so we can forge Host or
+    omit Origin); return the numeric status from the response line."""
+    import socket
+    body = b""
+    if headers.get("_body") is not None:
+        body = headers.pop("_body")
+        headers["Content-Length"] = str(len(body))
+    lines = [f"{method} {path} HTTP/1.1"]
+    lines += [f"{k}: {v}" for k, v in headers.items() if not k.startswith("_")]
+    lines += ["Connection: close", "", ""]
+    raw = ("\r\n".join(lines)).encode("ascii") + body
+    s = socket.create_connection(("127.0.0.1", port), timeout=3.0)
+    try:
+        s.sendall(raw)
+        resp = b""
+        while b"\r\n" not in resp:
+            chunk = s.recv(256)
+            if not chunk:
+                break
+            resp += chunk
+        first = resp.split(b"\r\n", 1)[0].decode("ascii", "replace")
+        return int(first.split(" ")[1])     # "HTTP/1.1 <code> <reason>"
+    finally:
+        s.close()
+
+
+def test_host_allow_list_and_origin_matrix():
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0)
+    hub.set_input_handler(lambda d: None)
+    hub._control_enabled = True
+    port = hub.serve()
+    key = hub._write_key
+    good_host = f"127.0.0.1:{port}"
+    body = json.dumps({"data": "x"}).encode("utf-8")
+    try:
+        base = {"X-Mirror-Write-Key": key, "Content-Type": "application/json"}
+
+        def H(**extra):
+            h = dict(base); h["_body"] = body; h.update(extra); return h
+
+        # Foreign Host on the PAGE route -> 403 (anti DNS-rebinding, all routes).
+        assert _raw_request(port, "GET", "/?token=secret",
+                            {"Host": "evil.example.com"}) == 403
+        # Foreign Host on POST -> 403 even with a valid key + Origin.
+        assert _raw_request(port, "POST", "/input",
+                            H(Host="evil.example.com",
+                              Origin="http://evil.example.com")) == 403
+        # Matching Host + matching Origin -> 204.
+        assert _raw_request(port, "POST", "/input",
+                            H(Host=good_host,
+                              Origin=f"http://{good_host}")) == 204
+        # Cross-origin (Origin != server origin) -> 403.
+        assert _raw_request(port, "POST", "/input",
+                            H(Host=good_host,
+                              Origin="http://attacker.test")) == 403
+        # Absent Origin AND absent Referer -> 403 (fail-closed).
+        assert _raw_request(port, "POST", "/input",
+                            H(Host=good_host)) == 403
+        # Absent Origin but matching Referer host -> 204 (Referer fallback).
+        assert _raw_request(port, "POST", "/input",
+                            H(Host=good_host,
+                              Referer=f"http://{good_host}/")) == 204
+        # Origin host matches but PORT differs -> 403 (exact origin equality).
+        assert _raw_request(port, "POST", "/input",
+                            H(Host=good_host,
+                              Origin="http://127.0.0.1:1")) == 403
+        # Literal "null" Origin -> 403.
+        assert _raw_request(port, "POST", "/input",
+                            H(Host=good_host, Origin="null")) == 403
+    finally:
+        hub.stop()
+
+
 if __name__ == "__main__":
     test_inject_gate_off_by_default_and_requires_handler()
     test_inject_is_fifo_via_single_drain()
     test_post_input_write_key_and_body_matrix()
+    test_host_allow_list_and_origin_matrix()
     print("OK test_mirror_input")
