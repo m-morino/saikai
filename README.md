@@ -21,6 +21,11 @@ directory, and see which live session needs attention.
 
 *saikai* = 再開 "resume" + 再会 "reunion" (Japanese).
 
+```bash
+uv tool install saikai
+saikai
+```
+
 ![saikai demo](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-demo.gif)
 
 <sub>The demo uses fictional, leak-checked data. The current GIF is a
