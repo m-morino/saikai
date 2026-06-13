@@ -19,80 +19,28 @@ The output is  docs/assets/saikai-demo.cast  (and a ready-to-run agg command).
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
-import uuid
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from demo_fixture import build_demo_fixture
 
 REPO = Path(__file__).resolve().parent.parent
 ASSETS = REPO / "docs" / "assets"
 CAST_OUT = ASSETS / "saikai-demo.cast"
 GIF_OUT  = ASSETS / "saikai-demo.gif"
 
-# ── fictional demo data (identical to make_screenshots.py so the sessions look
-#    the same whether you're capturing a static SVG or a live recording) ──────
-
 def _build_demo_home() -> Path:
-    demo_home = Path(tempfile.mkdtemp(prefix="saikai-demo-home-"))
+    fixture = build_demo_fixture(Path(tempfile.mkdtemp(prefix="saikai-demo-")))
+    demo_home = fixture.home
     for var in ("USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME"):
         os.environ[var] = str(demo_home)
     os.environ.pop("SAIKAI_CONFIG", None)
     os.environ["SAIKAI_SUMMARIZE_ENABLED"] = "0"
     os.environ["SAIKAI_AUTO_REFRESH"]       = "0"
     os.environ["SAIKAI_SPLIT_LIVE"]         = "0"   # list-only for a clean recording
-
-    now = datetime.now(timezone.utc)
-
-    def _enc(p: str) -> str:
-        return re.sub(r"[:/\\.]", "-", p)
-
-    def _session(project: str, title: str, msgs: list[str], age_h: float,
-                 branch: str = "main", turns_pad: int = 0) -> None:
-        cwd   = f"/home/alex/code/{project}"
-        pdir  = demo_home / ".claude" / "projects" / _enc(cwd)
-        pdir.mkdir(parents=True, exist_ok=True)
-        t0 = now - timedelta(hours=age_h)
-        recs = [{"type": "ai-title", "aiTitle": title,
-                 "timestamp": t0.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                 "cwd": cwd, "gitBranch": branch}]
-        for i, m in enumerate(msgs + ["looks good, thanks!"] * turns_pad):
-            ts = (t0 + timedelta(minutes=3*(i+1))).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            recs.append({"type": "user",      "timestamp": ts, "cwd": cwd,
-                         "gitBranch": branch, "message": {"content": m}})
-            recs.append({"type": "assistant", "timestamp": ts,
-                         "message": {"content": [{"type": "text",
-                                                  "text": f"(demo reply {i+1})"}]}})
-        out = pdir / f"{uuid.uuid4()}.jsonl"
-        out.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
-        ts_epoch = (t0 + timedelta(minutes=3*max(1, len(msgs)))).timestamp()
-        os.utime(out, (ts_epoch, ts_epoch))
-
-    _session("webapp",        "Fix flaky auth token refresh test",
-             ["The auth token refresh test fails ~1 in 5 runs on CI."], 0.4,
-             branch="fix/flaky-auth-test", turns_pad=3)
-    _session("webapp",        "Add dark mode toggle to settings",
-             ["Add a dark mode toggle, persist in localStorage."], 3.1, turns_pad=5)
-    _session("webapp",        "Migrate the build from webpack to Vite",
-             ["Migrate from webpack 5 to Vite."], 27, turns_pad=11)
-    _session("api-server",    "Fix N+1 queries in /orders endpoint",
-             ["GET /orders is slow — N+1 on line-items."], 1.2,
-             branch="perf/orders-n-plus-1", turns_pad=7)
-    _session("api-server",    "Migrate models to Pydantic v2",
-             ["Upgrade to Pydantic v2."], 30, turns_pad=9)
-    _session("api-server",    "Add rate limiting middleware",
-             ["Add per-API-key rate limiting (sliding window, Redis)."], 51, turns_pad=4)
-    _session("data-pipeline", "Backfill 2025 events into warehouse",
-             ["Write an idempotent backfill job, chunked by day."], 6.5, turns_pad=6)
-    _session("data-pipeline", "Debug Airflow DAG timeout",
-             ["The nightly DAG times out on the dedup task since Tuesday."], 73, turns_pad=8)
-    _session("dotfiles",      "Set up neovim LSP for Rust",
-             ["Set up rust-analyzer with nvim-lspconfig."], 95, turns_pad=2)
-
     return demo_home
 
 
