@@ -300,6 +300,30 @@ def test_bad_write_key_increments_failure_counter():
         hub.stop()
 
 
+def test_lan_input_requires_opt_in():
+    """A LAN-exposed mirror (non-loopback host) refuses to ENABLE control unless
+    allow_lan_input was opted in; loopback always allows it."""
+    # Loopback: control may enable freely.
+    lo = m.MirrorHub(token="t", host="127.0.0.1", port=0)
+    lo.set_input_handler(lambda d: None)
+    lo.set_control_state(True, "S")
+    assert lo._control_enabled is True, "loopback control must enable"
+
+    # LAN bind, NOT opted in: enabling control is refused (stays OFF).
+    lan = m.MirrorHub(token="t", host="192.168.1.50", port=0)
+    lan.set_input_handler(lambda d: None)
+    lan.allow_lan_input = False
+    lan.set_control_state(True, "S")
+    assert lan._control_enabled is False, "LAN input must require opt-in"
+
+    # LAN bind, opted in: enabling control is allowed.
+    lan2 = m.MirrorHub(token="t", host="192.168.1.50", port=0)
+    lan2.set_input_handler(lambda d: None)
+    lan2.allow_lan_input = True
+    lan2.set_control_state(True, "S")
+    assert lan2._control_enabled is True, "opted-in LAN control must enable"
+
+
 if __name__ == "__main__":
     test_inject_gate_off_by_default_and_requires_handler()
     test_inject_is_fifo_via_single_drain()
@@ -310,4 +334,5 @@ if __name__ == "__main__":
     test_idle_auto_disable_flips_control_off()
     test_accepted_input_resets_idle_timer()
     test_bad_write_key_increments_failure_counter()
+    test_lan_input_requires_opt_in()
     print("OK test_mirror_input")
