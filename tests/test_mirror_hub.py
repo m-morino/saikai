@@ -97,10 +97,12 @@ def test_static_assets_served_locally_without_token():
     hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0)
     port = hub.serve()
     try:
-        r = _get(f"http://127.0.0.1:{port}/xterm.min.js")   # no token
-        assert r.status == 200 and len(r.read(64)) > 0
+        for asset in ("/xterm.min.js", "/addon-canvas.js", "/xterm.min.css"):
+            r = _get(f"http://127.0.0.1:{port}{asset}")     # no token needed
+            assert r.status == 200 and len(r.read(64)) > 0
         page = _get(f"http://127.0.0.1:{port}/?token=secret").read().decode("utf-8")
         assert "/xterm.min.js" in page and "cdn.jsdelivr" not in page
+        assert "/addon-canvas.js" in page and "loadAddon" in page   # crisp borders
     finally:
         hub.stop()
 
