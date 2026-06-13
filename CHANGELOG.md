@@ -44,6 +44,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   public repository surface.
 
 ### Fixed
+- Public docs, in-app marker help, contributor test commands, and CI now agree
+  with the current marker semantics, terminal-support boundaries, and complete
+  `tests/test_*.py` suite.
 - **Tree mode no longer chains unrelated same-repo sessions into one long
   list.** Parent assignment treated "same cwd + recent" as kinship and scored
   a `main`↔`main` branch match as strong evidence, so in a single-repository
@@ -74,9 +77,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - User-facing documentation calls the Space prefix a command menu rather than
   presenting editor-specific "leader" terminology as a general TUI convention.
-- The README documents why Space is used only while the session list owns focus,
-  its `Space Space` marking trade-off, and how to restore conventional
-  Space-to-mark behavior.
+- The README documents why Space does not steal input from search fields,
+  dropdowns, or live panes, its `Space Space` marking trade-off, and how to
+  restore conventional Space-to-mark behavior.
 
 ### Fixed
 - Command-menu choices now render with an explicit separator (`f → fav`) in
@@ -91,7 +94,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Keyboard-first by default.** `Space` (in the list) is now a leader key with
   a built-in mnemonic map — `Space f` favorite, `Space h` hide, `Space s` /
   `Space o` cycle the sort column / direction (previously mouse-only),
-  `Space Space` batch-mark, and more; the first presses hint the full map and
+  `Space Space` batch-mark, and more; pausing after Space hints the full map and
   `?` always shows it live. `Alt+←/→` resizes the list/pane split from the
   keyboard (persisted like a drag). Configure via `[keys]`: `leader = "none"`
   disables, `leader_defaults = false` empties the map, single letters remap.

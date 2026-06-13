@@ -7,7 +7,7 @@ daemon or database.
 
 ## Runtime modules
 
-- `saikai.py` owns history discovery, transcript parsing, read-only overlays,
+- `saikai.py` owns history discovery, transcript parsing, saikai-side overlays,
   sorting/filtering/grouping, the Textual application, configuration, and CLI.
 - `saikai_terminal.py` owns provider-neutral PTY spawn, rendering, input,
   resize, status delivery, clipboard behavior, and teardown.
@@ -73,8 +73,9 @@ proved and covered by a regression test.
 
 ## UI contracts
 
-- Function keys are the application shortcuts. Bare `Ctrl+letter` combinations
-  belong to readline and the hosted agent.
+- Session and pane actions use function keys. Ordinary bare `Ctrl+letter`
+  editing keys belong to readline and the hosted agent. The configurable
+  pane-release key and app-level quit handling are deliberate exceptions.
 - `Select.BLANK` is `False` in supported Textual versions. Omit `value=` when a
   Select must start without a selection.
 - Title color groups context; ASCII markers report state. Help and Settings use
@@ -89,14 +90,16 @@ Run the full suite with project dependencies before release:
 ```bash
 python -m compileall -q saikai.py saikai_terminal.py saikai_provider.py scripts
 uv run python tests/test_config.py
+uv run python tests/test_demo_audit.py
+uv run python tests/test_demo_fixture.py
+uv run python tests/test_keyboard_leader.py
 uv run python tests/test_providers.py
+uv run python tests/test_pty_backend.py
+uv run python tests/test_resource_bounds.py
 uv run python tests/test_sort_recency.py
 uv run python tests/test_split_divider.py
-uv run python tests/test_resource_bounds.py
 uv run python tests/test_terminal_concurrency.py
 uv run python tests/test_terminal_watchdog.py
-uv run python tests/test_keyboard_leader.py
-uv run python tests/test_pty_backend.py
 ```
 
 After terminal, threading, lock, async, or teardown changes, at minimum run
