@@ -8,6 +8,7 @@ neutral terminal code (saikai_terminal.py) gains ZERO network code.
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import pyte
 from typing import Optional
@@ -135,3 +136,25 @@ class MirrorHub:
                 self._ingest.put_nowait(data)
             except queue.Full:
                 pass   # never block the UI thread
+
+
+def _base_driver_class():
+    """The console driver Textual would auto-select for this platform."""
+    if sys.platform == "win32":
+        from textual.drivers.windows_driver import WindowsDriver
+        return WindowsDriver
+    from textual.drivers.linux_driver import LinuxDriver
+    return LinuxDriver
+
+
+def make_mirror_driver(base_cls, hub: "MirrorHub"):
+    """Build a Driver subclass that copies every composited frame to `hub`
+    (best-effort, non-blocking) then writes it to the real console unchanged."""
+    class MirrorDriver(base_cls):
+        def write(self, data: str) -> None:
+            try:
+                hub.broadcast(data)
+            except Exception:
+                pass            # mirror is best effort; never degrade local UI
+            super().write(data)
+    return MirrorDriver
