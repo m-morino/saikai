@@ -200,9 +200,68 @@ def test_host_allow_list_and_origin_matrix():
         hub.stop()
 
 
+def _read_sse(resp, deadline_s=3.0, until=b"event: control"):
+    """Read SSE bytes until `until` has appeared (after the snapshot), or time out."""
+    import time as _t
+    end = _t.time() + deadline_s
+    seen = b""
+    while _t.time() < end and until not in seen:
+        seen += resp.read1(128)
+    return seen.decode("utf-8", "replace")
+
+
+def test_sse_emits_writekey_and_control_without_colliding_output():
+    import base64
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=10, rows=2)
+    hub.set_input_handler(lambda d: None)
+    port = hub.serve()
+    try:
+        resp = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/stream?token=secret", timeout=3.0)
+        # Read through the control frame's DATA line, not just its event header:
+        # the `"on"/"target"` assertions below live on the data line, which can
+        # arrive in a later TCP segment than `event: control` itself.
+        text = _read_sse(resp, until=b'"target"')
+        # On connect: a writekey event (raw JSON, NOT base64) and a control event
+        # reflecting the default OFF state with a null target.
+        assert "event: writekey" in text, text
+        assert hub._write_key in text, "write-key must arrive over SSE"
+        assert "event: control" in text, text
+        assert '"on": false' in text or '"on":false' in text, text
+        assert '"target": null' in text or '"target":null' in text, text
+        # A normal output frame still arrives as a base64 default-event.
+        hub.broadcast("\x1b[32mGO\x1b[0m")
+        out = _read_sse(resp, until=b"data: ")
+        payloads = [ln[6:] for ln in out.splitlines() if ln.startswith("data: ")]
+        joined = "".join(base64.b64decode(p).decode("utf-8", "replace")
+                         for p in payloads)
+        assert "GO" in joined, joined        # output path intact, not collided
+    finally:
+        hub.stop()
+
+
+def test_set_control_state_pushes_control_frame():
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=10, rows=2)
+    hub.set_input_handler(lambda d: None)
+    port = hub.serve()
+    try:
+        resp = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/stream?token=secret", timeout=3.0)
+        _read_sse(resp, until=b"event: control")        # drain the on-connect frames
+        hub.set_control_state(True, "Session S")
+        text = _read_sse(resp, until=b'"on": true')
+        assert "event: control" in text, text
+        assert '"on": true' in text or '"on":true' in text, text
+        assert "Session S" in text, text
+    finally:
+        hub.stop()
+
+
 if __name__ == "__main__":
     test_inject_gate_off_by_default_and_requires_handler()
     test_inject_is_fifo_via_single_drain()
     test_post_input_write_key_and_body_matrix()
     test_host_allow_list_and_origin_matrix()
+    test_sse_emits_writekey_and_control_without_colliding_output()
+    test_set_control_state_pushes_control_frame()
     print("OK test_mirror_input")

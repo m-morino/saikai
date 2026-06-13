@@ -8,6 +8,7 @@ neutral terminal code (saikai_terminal.py) gains ZERO network code.
 from __future__ import annotations
 
 import base64
+import collections
 import hmac
 import http.server
 import json
@@ -17,6 +18,11 @@ import sys
 import threading
 import pyte
 from typing import Optional
+
+
+# A control frame travels over the SAME per-client queue as output frames, but
+# wrapped so _stream can send it as a named SSE event instead of base64 output.
+_Control = collections.namedtuple("_Control", ["json"])
 
 
 # pyte stores a colour as: a basic name, a "bright"+name, a 6-hex string
@@ -256,6 +262,26 @@ class MirrorHub:
         # A single attribute assignment/read is atomic under the GIL (same
         # rationale as set_repaint_request).
         self._input_handler = fn
+
+    def set_control_state(self, enabled: bool, target=None) -> None:
+        """Store the advisory control state + focused-pane title and broadcast a
+        control frame to every connected browser. The app's UI-thread gate is the
+        authority; this copy is what do_POST fast-rejects against."""
+        self._control_enabled = bool(enabled)
+        self._control_target = target if enabled else None
+        frame = _Control(json.dumps(
+            {"on": self._control_enabled, "target": self._control_target}))
+        with self._clients_lock:
+            targets = list(self._clients)
+        for cq in targets:
+            try:
+                cq.put_nowait(frame)
+            except queue.Full:
+                try:
+                    cq.get_nowait()
+                    cq.put_nowait(frame)
+                except (queue.Empty, queue.Full):
+                    pass
 
     def inject(self, data: str) -> bool:
         """Accept browser input IFF control is on AND a handler is wired.
@@ -502,6 +528,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         cq, snapshot = hub._add_client()
         try:
             self._send_frame(snapshot)
+            # Write-key (only ever over this authenticated channel) + current
+            # control state, both as named raw-JSON events.
+            self._send_event("writekey", json.dumps({"key": hub._write_key}))
+            self._send_event("control", json.dumps(
+                {"on": hub._control_enabled, "target": hub._control_target}))
             while True:
                 try:
                     data = cq.get(timeout=30.0)
@@ -513,6 +544,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     continue
                 if data is None:             # stop sentinel
                     break
+                if isinstance(data, _Control):   # named control event, not output
+                    self._send_event("control", data.json)
+                    continue
                 self._send_frame(data)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -522,6 +556,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _send_frame(self, data: str):
         payload = base64.b64encode(data.encode("utf-8")).decode("ascii")
         self.wfile.write(b"data: " + payload.encode("ascii") + b"\n\n")
+        self.wfile.flush()
+
+    def _send_event(self, event: str, raw_json: str):
+        """Emit a NAMED SSE event carrying raw JSON (consumed by the browser's
+        addEventListener, NOT onmessage — so it never hits the base64 atob path)."""
+        self.wfile.write(b"event: " + event.encode("ascii") + b"\n")
+        self.wfile.write(b"data: " + raw_json.encode("utf-8") + b"\n\n")
         self.wfile.flush()
 
     _INPUT_CAP = 65536   # 64 KB paste cap; reject larger before reading
