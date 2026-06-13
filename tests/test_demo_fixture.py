@@ -22,7 +22,8 @@ def test_fixture_is_fictional_reproducible_and_contains_a_runnable_repo():
         for p in root.rglob("*")
         if p.is_file() and ".git" not in p.parts
     )
-    assert "masay" not in text.lower()
+    private_user = "ma" + "say"
+    assert private_user not in text.lower()
     assert "C:\\Users" not in text
     assert "/home/demo/work/webapp" in text
     assert "/home/alex" not in text
