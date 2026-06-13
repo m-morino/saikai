@@ -217,6 +217,8 @@ class MirrorHub:
             self._screen.resize(rows, cols)   # pyte: (lines, columns)
 
     def set_repaint_request(self, fn) -> None:
+        # Written from the UI thread (on_mount), read from the HTTP server thread
+        # (_add_client). A single attribute assignment/read is atomic under the GIL.
         self._repaint_request = fn
 
     def url(self) -> str:

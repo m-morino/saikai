@@ -5870,23 +5870,34 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     # actually see what blew up (the prior failure was 'screen disappears
     # and doesn't come back' = unrecoverable terminal state).
     try:
-        import secrets as _secrets
-        import saikai_mirror as _mirror
-        _mir_on, _mir_host = _mirror.mirror_config(os.environ)
+        # Web mirror (opt-in, default OFF). Isolated in its own try so that a
+        # broken mirror module or a serve() failure (e.g. port already in use)
+        # NEVER blocks normal launch — it degrades to "no mirror". The import is
+        # guarded by the env flag so users who never opt in don't even load it.
         _hub = None
         _app_kwargs = {}
-        if _mir_on:
-            _hub = _mirror.MirrorHub(token=_secrets.token_urlsafe(32), host=_mir_host)
-            _port = _hub.serve()
-            atexit.register(_hub.stop)
-            _Drv = _mirror.make_mirror_driver(_mirror._base_driver_class(), _hub)
-            _app_kwargs["driver_class"] = _Drv
-            _host_disp = "127.0.0.1" if _mir_host in ("0.0.0.0", "") else _mir_host
-            print(_c(f"  ⚠ saikai mirror LIVE (read-only): "
-                     f"http://{_host_disp}:{_port}/?token=... — "
-                     f"{'LAN-exposed' if _mir_host not in ('127.0.0.1', '') else 'loopback only'}",
-                     YELLOW), file=sys.stderr)
-            print(_c(f"    open: {_hub.url()}", YELLOW), file=sys.stderr)
+        if os.environ.get("SAIKAI_MIRROR"):
+            try:
+                import secrets as _secrets
+                import saikai_mirror as _mirror
+                _mir_on, _mir_host = _mirror.mirror_config(os.environ)
+                if _mir_on:
+                    _hub = _mirror.MirrorHub(token=_secrets.token_urlsafe(32), host=_mir_host)
+                    _port = _hub.serve()
+                    atexit.register(_hub.stop)
+                    _Drv = _mirror.make_mirror_driver(_mirror._base_driver_class(), _hub)
+                    _app_kwargs["driver_class"] = _Drv
+                    _host_disp = "127.0.0.1" if _mir_host == "0.0.0.0" else _mir_host
+                    print(_c(f"  ⚠ saikai mirror LIVE (read-only): "
+                             f"http://{_host_disp}:{_port}/?token=... — "
+                             f"{'LAN-exposed' if _mir_host != '127.0.0.1' else 'loopback only'}",
+                             YELLOW), file=sys.stderr)
+                    print(_c(f"    open: {_hub.url()}", YELLOW), file=sys.stderr)
+            except Exception as _mir_err:   # mirror is best-effort; never block launch
+                _hub = None
+                _app_kwargs = {}
+                print(_c(f"  saikai mirror disabled (setup failed: {_mir_err})",
+                         YELLOW), file=sys.stderr)
         _app = PickerApp(**_app_kwargs)
         _app._mirror_hub = _hub
         chosen = _app.run()
