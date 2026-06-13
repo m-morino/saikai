@@ -17,6 +17,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   boundaries, history semantics, PTY lifecycle, and concurrency invariants.
 
 ### Changed
+- **The live-pane memory gate now reasons per-OS instead of projecting
+  Windows' commit-charge model onto Linux/macOS.** Linux: commit headroom
+  (`CommitLimit − Committed_AS`) is consulted only under strict overcommit
+  (`vm.overcommit_memory=2`) — under the default heuristic mode the limit is
+  not enforced and `Committed_AS` routinely exceeds it on a healthy machine,
+  which read as negative headroom and falsely closed the gate. A new
+  pressure check (`SAIKAI_MAX_MEM_PRESSURE`, default 10) reads Linux PSI
+  (`/proc/pressure/memory` `some avg10`, the stall-time metric systemd-oomd
+  acts on) and macOS's kernel pressure level (gates on *critical*), refusing
+  a new pane when tasks are measurably stalling regardless of occupancy
+  numbers. The memory-load high-water default is now 95 on Linux/macOS
+  (85 stays on Windows): the POSIX load % is derived from the same
+  availability figure as the physical floor, so the old shared default
+  closed the gate while ~15% of RAM was still genuinely available.
 - The public story now starts with the cross-repository session-discovery and
   human-attention problem that motivated saikai.
 - Help, Settings, and the READMEs explain the visual grammar consistently:

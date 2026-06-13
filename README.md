@@ -184,8 +184,9 @@ Press `?` inside saikai for the active color rule and marker legend.
 | `SAIKAI_AUTO_REFRESH` | off | seconds between background re-scans |
 | `SAIKAI_SUMMARIZE_CMD` | — | command to summarize with (prompt on stdin → summary on stdout) instead of `claude -p` |
 | `SAIKAI_AUTO_PERMISSION` | off | opt in to adding `--permission-mode auto` for frequently used workspaces |
-| `SAIKAI_MAX_MEM_LOAD` | 85 | refuse/warn opening a pane above this memory-load % (Win `dwMemoryLoad`; Linux/macOS derived) |
-| `SAIKAI_MIN_COMMIT_MB` | 2048 | keep this much **commit headroom** free — the system-freeze guard (Win/Linux) |
+| `SAIKAI_MAX_MEM_LOAD` | 85 Win / 95 POSIX | refuse/warn opening a pane above this memory-load %. On Windows `dwMemoryLoad` is an independent kernel signal; on Linux/macOS the load is *derived from the same availability number as the floor*, so it defaults higher and acts as a backstop |
+| `SAIKAI_MAX_MEM_PRESSURE` | 10 | Linux/macOS: refuse a new pane when measured memory **pressure** crosses this (Linux PSI `some avg10` % — the stall-time metric systemd-oomd acts on; macOS gates on the kernel's *critical* pressure level). No effect on Windows |
+| `SAIKAI_MIN_COMMIT_MB` | 2048 | keep this much **commit headroom** free — the system-freeze guard. Windows always; Linux **only under strict overcommit** (`vm.overcommit_memory=2`) — in the default heuristic mode CommitLimit isn't enforced and is skipped |
 | `SAIKAI_MIN_FREE_PHYS_PCT` | 8 | keep ≥ this % of physical RAM available (anti-thrash floor, machine-relative) |
 | `SAIKAI_CLAUDE_MB` | 600 | estimated RAM per live pane |
 | `SAIKAI_MIN_FREE_MB` | 0 | optional absolute physical floor (legacy; max'd with the % floor) |
