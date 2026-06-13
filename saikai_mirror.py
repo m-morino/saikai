@@ -236,6 +236,16 @@ def mirror_config(env: dict) -> tuple[bool, str]:
     return enabled, host
 
 
+def mirror_port(env: dict) -> int:
+    """Fixed mirror port from SAIKAI_MIRROR_PORT so a firewall rule can target a
+    stable port; 0 (default) lets the OS pick a free ephemeral port."""
+    try:
+        p = int(str(env.get("SAIKAI_MIRROR_PORT", "")).strip())
+    except ValueError:
+        return 0
+    return p if 0 < p < 65536 else 0
+
+
 def _lan_ip() -> str:
     """Best-effort primary LAN/egress IPv4 (the interface used to reach the
     network), so a 0.0.0.0-bound mirror prints a URL reachable from another

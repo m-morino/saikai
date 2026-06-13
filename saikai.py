@@ -5960,7 +5960,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 import saikai_mirror as _mirror
                 _mir_on, _mir_host = _mirror.mirror_config(os.environ)
                 if _mir_on:
-                    _hub = _mirror.MirrorHub(token=_secrets.token_urlsafe(32), host=_mir_host)
+                    _hub = _mirror.MirrorHub(
+                        token=_secrets.token_urlsafe(32), host=_mir_host,
+                        port=_mirror.mirror_port(os.environ))
                     _hub.serve()
                     atexit.register(_hub.stop)
                     _Drv = _mirror.make_mirror_driver(_mirror._base_driver_class(), _hub)
