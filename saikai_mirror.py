@@ -453,12 +453,86 @@ try {
 } catch (e) {}
 const token = new URLSearchParams(location.search).get('token');
 const es = new EventSource('/stream?token=' + encodeURIComponent(token));
+
+// ── Output (unchanged): default-event base64 frames -> xterm ────────────────
 es.onmessage = (e) => {
   const bin = atob(e.data);
   const bytes = new Uint8Array(bin.length);
   for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
   term.write(bytes);
 };
+
+// ── Phase B: write-key + control state over named SSE events ────────────────
+let writeKey = null;
+let controlOn = false;
+let banner = document.createElement('div');
+banner.style.cssText =
+  'position:fixed;top:0;left:0;right:0;font:bold 14px monospace;'+
+  'padding:4px;text-align:center;z-index:9;color:#000;background:#555';
+banner.textContent = 'CONTROL OFF (read-only)';
+document.body.appendChild(banner);
+
+function setBanner(on, target) {
+  controlOn = on;
+  if (on) {
+    banner.style.background = '#3a3';
+    banner.textContent = 'CONTROL ON — typing into: ' + (target || '(no pane focused)');
+  } else {
+    banner.style.background = '#555';
+    banner.textContent = 'CONTROL OFF (read-only)';
+  }
+}
+
+es.addEventListener('writekey', (e) => {
+  try { writeKey = JSON.parse(e.data).key; } catch (_) {}
+});
+es.addEventListener('control', (e) => {
+  let s = {}; try { s = JSON.parse(e.data); } catch (_) {}
+  setBanner(!!s.on, s.target);
+});
+
+// ── Input: onData -> coalesce (~25ms, flush on control bytes) -> single-flight
+//    FIFO POST /input with the write-key header. One POST in flight at a time. ──
+let pending = '';
+let flushTimer = null;
+let sending = false;
+let fatal = false;
+
+function isControlByte(d) {
+  // Flush immediately on ESC, CR, or any C0 control byte so interactive keys
+  // (Ctrl-C = \x03, Enter = \r, arrows = ESC[…) are never batching-delayed.
+  for (let i=0;i<d.length;i++) { if (d.charCodeAt(0) < 32 || d.charCodeAt(i) === 0x1b) return true; }
+  return false;
+}
+
+async function pump() {
+  if (sending || fatal || !controlOn || writeKey === null) return;
+  if (pending.length === 0) return;
+  sending = true;
+  const batch = pending; pending = '';
+  try {
+    const resp = await fetch('/input', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Mirror-Write-Key': writeKey},
+      body: JSON.stringify({data: batch})
+    });
+    if (resp.status === 409) { setBanner(false, null); pending=''; }   // control off server-side
+    else if (resp.status === 403) { fatal = true; banner.style.background='#a33';
+      banner.textContent = 'CONTROL LOST (auth) — reload'; pending=''; }
+    else if (resp.status === 400 || resp.status === 413) { /* drop this batch, continue */ }
+  } catch (_) { /* transient; drop the batch, keep going */ }
+  finally {
+    sending = false;
+    if (pending.length > 0) pump();     // drain anything queued while in flight
+  }
+}
+
+term.onData((d) => {
+  if (!controlOn || fatal) return;      // disabled until a control on-frame
+  pending += d;
+  if (isControlByte(d)) { if (flushTimer) { clearTimeout(flushTimer); flushTimer=null; } pump(); }
+  else if (!flushTimer) { flushTimer = setTimeout(() => { flushTimer=null; pump(); }, 25); }
+});
 </script></body></html>"""
 
 

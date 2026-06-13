@@ -324,6 +324,37 @@ def test_lan_input_requires_opt_in():
     assert lan2._control_enabled is True, "opted-in LAN control must enable"
 
 
+def test_page_contains_input_listeners_and_sender():
+    """No browser in CI: assert the served page wires the writekey/control SSE
+    listeners, the onData single-flight POST sender (with the write-key header),
+    coalescing/flush-on-control-byte, the CONTROL banner, and the 409/403
+    reactions. Manual phone verification covers actual keystroke fidelity."""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=80, rows=24)
+    hub.set_input_handler(lambda d: None)
+    port = hub.serve()
+    try:
+        page = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/?token=secret", timeout=3.0
+        ).read().decode("utf-8")
+        # SSE named-event listeners (NOT onmessage) for writekey + control.
+        assert "addEventListener('writekey'" in page, page
+        assert "addEventListener('control'" in page, page
+        # Input capture + single-flight POST to /input with the write-key header.
+        assert "term.onData" in page, page
+        assert "/input" in page and "X-Mirror-Write-Key" in page, page
+        # Coalescing + flush on control bytes (ESC / CR / <0x20).
+        assert "0x20" in page or "charCodeAt(0) < 32" in page, page
+        # CONTROL banner + target + disabled-until-on.
+        assert "CONTROL ON" in page and "CONTROL OFF" in page, page
+        assert "typing into" in page, page
+        # Client reactions to the server gate.
+        assert "409" in page and "403" in page, page
+        # The output path is untouched (still base64 via onmessage).
+        assert "es.onmessage" in page and "atob" in page, page
+    finally:
+        hub.stop()
+
+
 if __name__ == "__main__":
     test_inject_gate_off_by_default_and_requires_handler()
     test_inject_is_fifo_via_single_drain()
@@ -335,4 +366,5 @@ if __name__ == "__main__":
     test_accepted_input_resets_idle_timer()
     test_bad_write_key_increments_failure_counter()
     test_lan_input_requires_opt_in()
+    test_page_contains_input_listeners_and_sender()
     print("OK test_mirror_input")
