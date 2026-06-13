@@ -2949,6 +2949,40 @@ class _MirrorControl:
         except Exception:
             pass
 
+    def _mirror_inject_mouse(self, col: int, row: int, button: int, kind: str) -> None:
+        """Post a synthesized Textual mouse event into the App so it routes
+        natively (App.on_event hit-tests get_widget_at and synthesizes the Click
+        for a down+up pair -> DataTable sort / row cursor / pane focus).
+
+        Runs on the Textual UI thread (the mouse handler marshals here via
+        call_from_thread). Re-checks the AUTHORITATIVE _control_enabled (the hub's
+        copy is advisory). Coords are 0-based screen cells (the browser already
+        converted xterm's 1-based report). events is imported here, not at module
+        scope, so this mixin stays importable without textual."""
+        if not self._control_enabled:
+            return
+        if col < 0 or row < 0:                 # out-of-range cell: ignore
+            return
+        from textual import events
+        if kind == "down":
+            cls = events.MouseDown
+        elif kind == "up":
+            cls = events.MouseUp
+        elif kind == "scrollup":
+            cls = events.MouseScrollUp
+        elif kind == "scrolldown":
+            cls = events.MouseScrollDown
+        else:
+            return                             # unknown kind: never post garbage
+        # Scroll has no pressed button (0); a click carries the SGR button index.
+        btn = button if kind in ("down", "up") else 0
+        ev = cls(None, col, row, 0, 0, btn, False, False, False,
+                 screen_x=col, screen_y=row)
+        try:
+            self.post_message(ev)
+        except Exception:
+            pass                               # app tearing down between gate + post
+
 
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                  flat: bool = False, reload_fn=None) -> None:
