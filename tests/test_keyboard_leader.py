@@ -29,7 +29,7 @@ import saikai
 ID2ACT = {
     "refresh": "refresh", "favorite": "toggle_fav", "hide": "toggle_hide",
     "diff": "preview_changes", "copy": "copy_prompt", "tree": "toggle_tree",
-    "cluster": "toggle_cluster", "group": "cycle_group", "new": "new_session",
+    "group": "cycle_group", "new": "new_session",
     "freeze": "freeze_pane", "restore": "restore_panes", "close": "close_live",
     "prev_tab": "prev_tab", "next_tab": "next_tab", "attention": "next_attention",
     "toggle_list": "toggle_list", "rename": "rename",
