@@ -769,41 +769,53 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path != "/input":
+        if path == "/input":
+            self._do_input()
+        elif path == "/mouse":
+            self._do_mouse()
+        elif path == "/key":
+            self._do_key()
+        else:
             self._reject(405, "method not allowed")
-            return
+
+    def _post_gate_and_json(self):
+        """Shared POST prelude for /input, /mouse, /key: Host allow-list ->
+        write-key -> Origin/Referer -> chunked/length/cap -> JSON parse. Returns
+        the parsed object (dict) on success, or None AFTER having sent the error
+        response (the caller just returns). Does NOT check control-on -- each
+        route checks the hub's advisory gate itself so an empty keyboard batch
+        can 204 without it (matches Phase B do_POST)."""
         if not self._host_ok():
-            self._reject(403, "forbidden")
-            return
+            self._reject(403, "forbidden"); return None
         if not self._write_key_ok():
-            self._reject(403, "forbidden")
-            return
+            self._reject(403, "forbidden"); return None
         if not self._origin_ok():
-            self._reject(403, "forbidden")
-            return
-        hub = self.server.hub
-        # Body hygiene: chunked unsupported (require Content-Length); cap size.
+            self._reject(403, "forbidden"); return None
         if "chunked" in (self.headers.get("Transfer-Encoding", "") or "").lower():
-            self._reject(411, "length required")
-            return
+            self._reject(411, "length required"); return None
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
-            self._reject(400, "bad length")
-            return
+            self._reject(400, "bad length"); return None
         if length < 0:
-            self._reject(400, "bad length")
-            return
+            self._reject(400, "bad length"); return None
         if length > self._INPUT_CAP:
-            self._reject(413, "payload too large", drain=False)  # reject BEFORE reading
-            return
+            self._reject(413, "payload too large", drain=False); return None
         raw = self.rfile.read(length) if length else b""
         try:
             obj = json.loads(raw.decode("utf-8")) if raw else {}
         except (ValueError, UnicodeDecodeError):
-            self.send_error(400, "bad json")            # body already fully read
+            self.send_error(400, "bad json"); return None
+        if not isinstance(obj, dict):
+            self.send_error(400, "bad json"); return None
+        return obj
+
+    def _do_input(self):
+        obj = self._post_gate_and_json()
+        if obj is None:
             return
-        data = obj.get("data") if isinstance(obj, dict) else None
+        hub = self.server.hub
+        data = obj.get("data")
         if data is None or not isinstance(data, str):
             self.send_error(400, "missing data")
             return
@@ -815,6 +827,33 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         hub.inject(data)
         self._send_status(204)
+
+    _MOUSE_KINDS = {"down", "up", "scrollup", "scrolldown"}
+
+    def _do_mouse(self):
+        obj = self._post_gate_and_json()
+        if obj is None:
+            return
+        hub = self.server.hub
+        col, row, button, kind = (obj.get("col"), obj.get("row"),
+                                  obj.get("button"), obj.get("kind"))
+        # bool is an int subclass; reject it so {"col": true} can't pass as 1.
+        if (not isinstance(col, int) or isinstance(col, bool)
+                or not isinstance(row, int) or isinstance(row, bool)
+                or not isinstance(button, int) or isinstance(button, bool)
+                or kind not in self._MOUSE_KINDS):
+            self.send_error(400, "bad mouse")
+            return
+        if not hub._control_enabled:
+            self.send_error(409, "control off")
+            return
+        hub.inject_mouse(col, row, button, kind)
+        self._send_status(204)
+
+    def _do_key(self):
+        # TEMPORARY stub: the real /key body lands in Task 3. The dispatcher
+        # references this so it is written once; until then /key is 405.
+        self._reject(405, "method not allowed")
 
     def _send_status(self, code):
         self.send_response(code)

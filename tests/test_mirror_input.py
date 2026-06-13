@@ -261,6 +261,82 @@ def test_host_allow_list_and_origin_matrix():
         hub.stop()
 
 
+def test_post_mouse_gate_and_body_matrix():
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0)
+    got = []
+    hub.set_mouse_handler(lambda col, row, button, kind: got.append((col, row, button, kind)))
+    hub._control_enabled = True
+    port = hub.serve()
+    key = hub._write_key
+    try:
+        WK = {"X-Mirror-Write-Key": key}
+        # Good key + good body -> 204; handler gets the exact 0-based coords.
+        st, _ = _post(port, "/mouse", {"col": 5, "row": 9, "button": 0, "kind": "down"}, headers=WK)
+        assert st == 204, st
+        st, _ = _post(port, "/mouse", {"col": 5, "row": 9, "button": 0, "kind": "up"}, headers=WK)
+        assert st == 204, st
+        st, _ = _post(port, "/mouse", {"col": 2, "row": 3, "button": 0, "kind": "scrollup"}, headers=WK)
+        assert st == 204, st
+        # Bad key -> 403, not delivered.
+        st, _ = _post(port, "/mouse", {"col": 1, "row": 1, "button": 0, "kind": "down"},
+                      headers={"X-Mirror-Write-Key": "wrong"})
+        assert st == 403, st
+        # Missing field -> 400.
+        st, _ = _post(port, "/mouse", {"col": 1, "row": 1, "button": 0}, headers=WK)
+        assert st == 400, st
+        # Non-int coord -> 400.
+        st, _ = _post(port, "/mouse", {"col": "x", "row": 1, "button": 0, "kind": "down"}, headers=WK)
+        assert st == 400, st
+        # Unknown kind -> 400.
+        st, _ = _post(port, "/mouse", {"col": 1, "row": 1, "button": 0, "kind": "wiggle"}, headers=WK)
+        assert st == 400, st
+        # Non-JSON -> 400.
+        st, _ = _post(port, "/mouse", raw=b"not json", headers=WK)
+        assert st == 400, st
+        # Control OFF -> 409.
+        hub._control_enabled = False
+        st, _ = _post(port, "/mouse", {"col": 1, "row": 1, "button": 0, "kind": "down"}, headers=WK)
+        assert st == 409, st
+        hub._control_enabled = True
+        # Only the three good taps reached the handler, in order.
+        assert got == [(5, 9, 0, "down"), (5, 9, 0, "up"), (2, 3, 0, "scrollup")], got
+        # Phase B regression: /input still 204 with a wired input handler.
+        hub.set_input_handler(lambda d: None)
+        st, _ = _post(port, "/input", {"data": "x"}, headers=WK)
+        assert st == 204, st
+    finally:
+        hub.stop()
+
+
+def test_post_mouse_host_and_origin_matrix():
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0)
+    hub.set_mouse_handler(lambda *a: None)
+    hub._control_enabled = True
+    port = hub.serve()
+    key = hub._write_key
+    good_host = f"127.0.0.1:{port}"
+    body = json.dumps({"col": 1, "row": 1, "button": 0, "kind": "down"}).encode("utf-8")
+    try:
+        base = {"X-Mirror-Write-Key": key, "Content-Type": "application/json"}
+
+        def H(**extra):
+            h = dict(base); h["_body"] = body; h.update(extra); return h
+
+        # Foreign Host -> 403.
+        assert _raw_request(port, "POST", "/mouse",
+                            H(Host="evil.example.com", Origin="http://evil.example.com")) == 403
+        # Matching Host + Origin -> 204.
+        assert _raw_request(port, "POST", "/mouse",
+                            H(Host=good_host, Origin=f"http://{good_host}")) == 204
+        # Cross-origin -> 403.
+        assert _raw_request(port, "POST", "/mouse",
+                            H(Host=good_host, Origin="http://attacker.test")) == 403
+        # Absent Origin AND Referer -> 403 (fail-closed).
+        assert _raw_request(port, "POST", "/mouse", H(Host=good_host)) == 403
+    finally:
+        hub.stop()
+
+
 def _read_sse(resp, deadline_s=3.0, until=b"event: control"):
     """Read SSE bytes until `until` has appeared (after the snapshot), or time out."""
     import time as _t
@@ -464,6 +540,8 @@ if __name__ == "__main__":
     test_mouse_and_key_inject_gate_on_control_and_handler()
     test_post_input_write_key_and_body_matrix()
     test_host_allow_list_and_origin_matrix()
+    test_post_mouse_gate_and_body_matrix()
+    test_post_mouse_host_and_origin_matrix()
     test_sse_emits_writekey_and_control_without_colliding_output()
     test_set_control_state_pushes_control_frame()
     test_idle_auto_disable_flips_control_off()
