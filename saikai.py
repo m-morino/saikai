@@ -6326,14 +6326,20 @@ def _fmt_gap(gap_min: float) -> str | None:
     return f"{int(gap_min/(60*24))}d gap"
 
 
+# Branch names that identify NO particular strand of work: every repo has a
+# main/master, and detached HEAD records the literal string "HEAD" — two
+# unrelated sessions matching on any of these is the base rate, not evidence.
+# A shared FEATURE branch, by contrast, is the strongest structural signal
+# saikai has that one session continues another's work.
+_NO_INFO_BRANCHES = frozenset({"", "HEAD", "main", "master"})
+
+
 def _structural_components(a: dict, b: dict) -> dict:
     """Cheap pairwise similarity components (no Haiku required for topic_s=0).
-    Reused by _score_relation and cmd_related's prefilter so the formula lives
-    in one place."""
-    # Detached HEAD records git_branch == "HEAD" — unrelated detached sessions
-    # would falsely match. Treat "HEAD" as no-info so it never contributes 1.0.
+    Reused by _score_relation / _build_forest and cmd_related's prefilter so
+    the formula lives in one place."""
     ab, bb = a.get("git_branch", ""), b.get("git_branch", "")
-    branch_s = 1.0 if (ab and ab != "HEAD" and ab == bb) else 0.0
+    branch_s = 1.0 if (ab not in _NO_INFO_BRANCHES and ab == bb) else 0.0
     return {
         "cwd_s":    _cwd_similarity(a.get("cwd", ""), b.get("cwd", "")),
         "branch_s": branch_s,
@@ -6342,31 +6348,57 @@ def _structural_components(a: dict, b: dict) -> dict:
     }
 
 
-def _score_relation(target: dict, other: dict) -> tuple[float, list[str]]:
+def _relation_metrics(target: dict, other: dict) -> dict:
+    """Full pairwise metrics: structural components + topic similarity +
+    time-damped combined score. Single source for _score_relation (--related)
+    and _build_forest (--tree) so the two features can't disagree."""
     c = _structural_components(target, other)
-    time_s   = math.exp(-c["gap_min"] / _TIME_TAU_MIN) if c["gap_min"] != float("inf") else 0.0
-    topic_s  = _topic_similarity(target, other)
+    c["topic_s"] = _topic_similarity(target, other)
+    time_s = (math.exp(-c["gap_min"] / _TIME_TAU_MIN)
+              if c["gap_min"] != float("inf") else 0.0)
     structural = (_W_CWD*c["cwd_s"] + _W_BRANCH*c["branch_s"]
-                  + _W_TITLE*c["title_s"] + _W_TOPIC*topic_s)
+                  + _W_TITLE*c["title_s"] + _W_TOPIC*c["topic_s"])
     # Time factor: small floor keeps far-past matches discoverable but heavily damped
-    time_factor = 0.10 + 0.90 * time_s
-    score = structural * time_factor
+    c["time_factor"] = 0.10 + 0.90 * time_s
+    c["score"] = structural * c["time_factor"]
+    return c
 
+
+# Content-evidence gate for PARENT assignment (tree mode only — --related has
+# no gate because "same repo, recently" IS a useful related-list entry).
+# Same-cwd + recency alone must never imply parentage: in a single-repo
+# history every session matches every earlier one on cwd, and the time decay
+# then picks the nearest predecessor — the "tree" degenerates into one long
+# bogus chain of unrelated sessions. Require at least one signal that the
+# WORK is continuous: a shared feature branch, or textual/topical overlap.
+_PARENT_MIN_TITLE_S = 0.25
+_PARENT_MIN_TOPIC_S = 0.25
+
+
+def _qualifies_as_parent(m: dict) -> bool:
+    """True iff the metrics carry continuation evidence beyond location+time."""
+    return (m["branch_s"] >= 1.0
+            or m["title_s"] >= _PARENT_MIN_TITLE_S
+            or m["topic_s"] >= _PARENT_MIN_TOPIC_S)
+
+
+def _score_relation(target: dict, other: dict) -> tuple[float, list[str]]:
+    m = _relation_metrics(target, other)
     reasons: list[str] = []
-    if c["cwd_s"] == 1.0:
+    if m["cwd_s"] == 1.0:
         reasons.append("same cwd")
-    elif c["cwd_s"] >= 0.7:
+    elif m["cwd_s"] >= 0.7:
         reasons.append("same project")
-    if c["branch_s"] == 1.0:
+    if m["branch_s"] == 1.0:
         reasons.append(f"branch {other.get('git_branch','')}")
-    gap_label = _fmt_gap(c["gap_min"])
+    gap_label = _fmt_gap(m["gap_min"])
     if gap_label:
         reasons.append(gap_label)
-    if c["title_s"] >= 0.3:
-        reasons.append(f"title sim {c['title_s']:.0%}")
-    if topic_s >= 0.3:
-        reasons.append(f"topic sim {topic_s:.0%}")
-    return (score, reasons)
+    if m["title_s"] >= 0.3:
+        reasons.append(f"title sim {m['title_s']:.0%}")
+    if m["topic_s"] >= 0.3:
+        reasons.append(f"topic sim {m['topic_s']:.0%}")
+    return (m["score"], reasons)
 
 
 def _confidence_marker(score: float) -> str:
@@ -6542,6 +6574,13 @@ def _build_forest(sessions: list[dict], floor: float = 0.20) -> None:
     """Mutates sessions in place: assigns each its highest-scoring earlier session as parent.
     Adds keys: parent_id (or None), parent_score (0.0 if root), parent_reasons (list).
 
+    A candidate must pass _qualifies_as_parent (shared feature branch, or
+    title/topic overlap) BEFORE its score counts: same-cwd + recency alone
+    matches every earlier session in a single-repo history and would chain
+    them all into one bogus linked list. Sessions without continuation
+    evidence stay roots — a mostly-flat tree is the truthful answer for a
+    history of independent tasks.
+
     Topics are NOT batch-extracted here — for N up to 1000 sessions that would
     be a 30+ minute Haiku call. _topic_similarity returns 0 for missing topics,
     so the forest still builds on cwd/branch/title. Run --related <sid> to get
@@ -6549,7 +6588,7 @@ def _build_forest(sessions: list[dict], floor: float = 0.20) -> None:
     by_time = sorted(sessions, key=lambda s: s["first_ts"])
     max_struct = _W_CWD + _W_BRANCH + _W_TITLE + _W_TOPIC   # ceiling of `structural`
     for i, s in enumerate(by_time):
-        best_score, best_parent, best_reasons = floor, None, []
+        best_score, best_parent = floor, None
         for j in range(i):
             p = by_time[j]
             # Exact prune: score = structural * time_factor, and structural is
@@ -6562,12 +6601,13 @@ def _build_forest(sessions: list[dict], floor: float = 0.20) -> None:
                                 if gap != float("inf") else 0.0)
             if max_struct * tf <= best_score:
                 continue
-            score, reasons = _score_relation(s, p)
-            if score > best_score:
-                best_score, best_parent, best_reasons = score, p, reasons
+            m = _relation_metrics(s, p)
+            if m["score"] > best_score and _qualifies_as_parent(m):
+                best_score, best_parent = m["score"], p
         s["parent_id"] = best_parent["id"] if best_parent else None
         s["parent_score"] = best_score if best_parent else 0.0
-        s["parent_reasons"] = best_reasons
+        s["parent_reasons"] = (_score_relation(s, best_parent)[1]
+                               if best_parent else [])
 
 
 def _tree_walk(sessions: list[dict]) -> list[tuple[dict, str]]:

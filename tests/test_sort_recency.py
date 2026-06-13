@@ -204,24 +204,64 @@ def test_build_groups_project_order_by_recency():
 
 def test_build_forest_windowed_parent_assignment():
     """The O(1) gap-prune in _build_forest must not change parent assignment:
-    a recent same-cwd session still wins over a closer-in-time different-cwd one,
-    and the oldest is a root."""
+    a same-cwd session WITH content evidence (shared title text) wins over a
+    closer-in-time different-cwd one, and the oldest is a root."""
     from datetime import timedelta
     base = datetime(2026, 1, 10, 12, 0, 0)
 
-    def _s(sid, cwd, minutes_ago):
+    def _s(sid, cwd, minutes_ago, title=""):
         t = (base - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         return {"id": sid, "cwd": cwd, "git_branch": "", "first_ts": t, "last_ts": t,
-                "ai_title": "", "real_msgs": []}
+                "ai_title": title, "real_msgs": []}
 
-    a = _s("A", "/proj/x", 60)      # oldest, same cwd as C
-    b = _s("B", "/other", 30)       # closer in time, different cwd
-    c = _s("C", "/proj/x", 0)       # newest
+    a = _s("A", "/proj/x", 60, "fix the auth token refresh race")   # oldest, same cwd+topic as C
+    b = _s("B", "/other", 30, "write release notes")                # closer in time, different cwd
+    c = _s("C", "/proj/x", 0, "auth token refresh race follow-up")  # newest, continues A
     sessions = [c, a, b]
     saikai._build_forest(sessions)
     by = {s["id"]: s for s in sessions}
-    assert by["C"]["parent_id"] == "A", by["C"]   # cwd weight beats time proximity
+    assert by["C"]["parent_id"] == "A", by["C"]   # cwd+title evidence beats time proximity
     assert by["A"]["parent_id"] is None           # oldest → root
+
+
+def test_build_forest_same_repo_does_not_chain_without_evidence():
+    """The degenerate-chain regression: in a single-repo history every session
+    matches every earlier one on cwd (and everyone is on main), so location +
+    recency alone used to link each session to its nearest predecessor — a
+    50-deep bogus linked list. Parentage now requires CONTINUATION evidence
+    (shared feature branch / title / topic overlap); independent same-repo
+    sessions must all stay roots, and main/master must count as no-info just
+    like detached HEAD."""
+    from datetime import timedelta
+    base = datetime(2026, 1, 10, 12, 0, 0)
+
+    def _s(sid, minutes_ago, title, branch="main", cwd="/proj/x"):
+        t = (base - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        return {"id": sid, "cwd": cwd, "git_branch": branch, "first_ts": t,
+                "last_ts": t, "ai_title": title, "real_msgs": []}
+
+    # Five unrelated tasks in the same repo, all on main, minutes apart.
+    sessions = [
+        _s("S1", 240, "migrate database schema to v2"),
+        _s("S2", 180, "add dark mode toggle widget"),
+        _s("S3", 120, "profile slow csv export"),
+        _s("S4",  60, "upgrade dependency lockfile pins"),
+        _s("S5",   0, "write onboarding documentation"),
+    ]
+    saikai._build_forest(sessions)
+    assert all(s["parent_id"] is None for s in sessions), \
+        [(s["id"], s["parent_id"]) for s in sessions]
+    # A shared FEATURE branch is real continuation evidence — those two link.
+    f1 = _s("F1", 50, "start the payments integration", branch="feat/payments")
+    f2 = _s("F2", 10, "wire webhook retries", branch="feat/payments")
+    sessions2 = sessions + [f1, f2]
+    saikai._build_forest(sessions2)
+    by = {s["id"]: s for s in sessions2}
+    assert by["F2"]["parent_id"] == "F1", by["F2"]
+    assert by["F1"]["parent_id"] is None
+    # main↔main never contributes branch evidence (it's the base rate).
+    m = saikai._relation_metrics(by["S1"], by["S2"])
+    assert m["branch_s"] == 0.0
 
 
 def test_render_header_includes_worktree_and_model():
@@ -853,6 +893,8 @@ if __name__ == "__main__":
     print("PASS test_build_groups_project_order_by_recency")
     test_build_forest_windowed_parent_assignment()
     print("PASS test_build_forest_windowed_parent_assignment")
+    test_build_forest_same_repo_does_not_chain_without_evidence()
+    print("PASS test_build_forest_same_repo_does_not_chain_without_evidence")
     test_render_header_includes_worktree_and_model()
     print("PASS test_render_header_includes_worktree_and_model")
     test_toggle_in_set_refuses_to_clobber_unreadable_file()
