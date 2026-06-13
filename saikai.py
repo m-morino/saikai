@@ -3501,6 +3501,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("alt+right", "grow_list", "▶List", id="grow_list",
                     show=False, priority=True),
             Binding("f12", "mirror_info", "Mirror QR", id="mirror_info", show=False),
+            # Phase B: toggle web-mirror INTERACTIVE control. priority=True so it
+            # fires even while a live pane is focused (a leader letter would be
+            # swallowed by the focused pane — unreachable exactly when control is
+            # used). Default OFF; Shift+F12 because F12 is the QR. Local only —
+            # never a browser button.
+            Binding("shift+f12", "toggle_mirror_control", "Mirror control",
+                    id="mirror_control", show=False, priority=True),
         ]
         # The practical limit on concurrent live claude panes is MEMORY — each
         # is a full node process tree that sits CPU-idle waiting for input — so
@@ -3720,6 +3727,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _hub.set_size(self.size.width, self.size.height)
                 _hub.set_repaint_request(
                     lambda: self.call_from_thread(self.refresh, layout=True))
+                # Phase B: deliver browser input to the focused pane. The handler
+                # is _marshal-shaped — capture the app, bail if it's gone, marshal
+                # onto the UI thread, and swallow shutdown errors. NEVER a bare
+                # call_from_thread (whose future.result() could block the
+                # input-drain/HTTP thread forever during teardown).
+                _app_ref = self
+                def _inject_handler(d, _app=_app_ref):
+                    if not getattr(_app, "is_running", False):
+                        return
+                    try:
+                        _app.call_from_thread(_app._mirror_inject_input, d)
+                    except Exception:
+                        pass            # app tearing down between the guard + call
+                _hub.set_input_handler(_inject_handler)
                 # Copy the URL to the clipboard (host) so it pastes cleanly without
                 # selecting a wrapped line, then show the QR so a phone can join
                 # without typing the tokened URL (the stderr banner is alt-screen
@@ -5936,6 +5957,33 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 self.notify(f"Web mirror: {_hub.url()}", title="saikai mirror",
                             timeout=12)
+
+        def action_toggle_mirror_control(self) -> None:
+            """Shift+F12 — flip web-mirror interactive control (default OFF). The
+            app's _control_enabled is the authority; push the new state + the
+            focused-pane title (read HERE on the UI thread) into the hub, which
+            keeps an advisory copy and broadcasts a control frame. No-op when the
+            mirror is off."""
+            _hub = getattr(self, "_mirror_hub", None)
+            if _hub is None:
+                return
+            self._control_enabled = not self._control_enabled
+            # Designate a control target only while enabling; disabling clears it
+            # (matches the hub's own `target if enabled else None` normalisation).
+            t = self._focused_terminal() if self._control_enabled else None
+            target = (getattr(t, "title", None) if t is not None else None)
+            try:
+                _hub.set_control_state(self._control_enabled, target)
+            except Exception:
+                pass
+            if self._control_enabled:
+                msg = (f"Mirror control ON — typing into: {target}" if target
+                       else "Mirror control ON — no pane focused")
+                self.notify(msg, title="saikai mirror", severity="warning",
+                            timeout=6)
+            else:
+                self.notify("Mirror control OFF (read-only)",
+                            title="saikai mirror", timeout=4)
 
         def action_help(self) -> None:
             # '?' is a priority binding; don't pop the help modal over a focused

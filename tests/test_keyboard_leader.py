@@ -365,6 +365,76 @@ def test_pilot_esc_quits_and_bar_toggle():
         f"a single Esc from the list must quit: {facts}"
 
 
+def test_pilot_mirror_control_toggle():
+    """A focus-independent priority binding toggles _control_enabled and pushes
+    the new state into the hub EVEN WHILE A PANE IS FOCUSED. This catches the
+    'leader letter is unreachable over a focused pane' bug: the toggle must be a
+    priority Binding, not a leader letter."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_mirror_control_toggle (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    class _StubHub:
+        def __init__(self):
+            self.calls = []
+        def set_control_state(self, enabled, target=None):
+            self.calls.append((enabled, target))
+        # on_mount also wires these; provide no-op stand-ins.
+        def set_size(self, *a):
+            pass
+        def set_repaint_request(self, *a):
+            pass
+        def set_input_handler(self, *a):
+            pass
+        def url(self):
+            return "http://127.0.0.1:0/?token=x"
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            self._mirror_hub = _StubHub()
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                facts["start_enabled"] = self._control_enabled
+                # Simulate a focused live pane: a stub the binding will read for
+                # its target title. (_focused_terminal is overridden so we don't
+                # need a real PTY.)
+                class _T:
+                    title = "Demo session"
+                self._focused_terminal = lambda: _T()
+                await pilot.press("shift+f12")        # the priority toggle
+                await pilot.pause(0.2)
+                facts["after_enabled"] = self._control_enabled
+                facts["hub_calls"] = list(self._mirror_hub.calls)
+                await pilot.press("shift+f12")        # toggle back off
+                await pilot.pause(0.2)
+                facts["after_off"] = self._control_enabled
+                facts["hub_calls2"] = list(self._mirror_hub.calls)
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("start_enabled") is False, facts
+    assert facts.get("after_enabled") is True, f"toggle did not enable: {facts}"
+    assert facts.get("hub_calls") == [(True, "Demo session")], facts
+    assert facts.get("after_off") is False, f"toggle did not disable: {facts}"
+    assert facts.get("hub_calls2")[-1] == (False, None), facts
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -392,4 +462,6 @@ if __name__ == "__main__":
     print("PASS test_pilot_settings_screen")
     test_pilot_esc_quits_and_bar_toggle()
     print("PASS test_pilot_esc_quits_and_bar_toggle")
+    test_pilot_mirror_control_toggle()
+    print("PASS test_pilot_mirror_control_toggle")
     print("ALL PASS")
