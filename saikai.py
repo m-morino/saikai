@@ -3033,8 +3033,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             background: $panel;
             border: solid $accent;
             padding: 1 2;
-            width: auto;
-            max-width: 92%;
+            /* width:auto collapses a VerticalScroll to 0 in Textual 8.x (the box
+               showed as a bare vertical bar with no content) — use a definite
+               width like SettingsScreen does. */
+            width: 92%;
             max-height: 90%;
         }
         """
@@ -3358,11 +3360,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             background: $panel;
             border: solid $accent;
             padding: 1 2;
-            width: auto;
+            /* definite width (auto collapses a scroll container to 0 in Textual
+               8.x); 60 comfortably fits a QR (<=45 cells) + the wrapped URL. */
+            width: 60;
+            height: auto;
             max-width: 98%;
             max-height: 98%;
         }
-        #mirror-qr { width: auto; }
         """
         BINDINGS = [
             Binding("escape", "dismiss", show=False),
