@@ -2917,6 +2917,39 @@ def _ram_per_pane_mb() -> float:
     return _cfg("limits", "per_pane_mb", "SAIKAI_CLAUDE_MB", 600.0, float)
 
 
+class _MirrorControl:
+    """Phase B web-mirror interactive control, mixed into PickerApp.
+
+    Lives at module scope (PickerApp itself is defined inside textual_pick, so it
+    needs textual and is unreachable headless) so the UI-thread/PTY-guard invariant
+    can be tested without textual via __new__ + a FakePty, exactly like the
+    ClaudeTerminal guards in tests/test_terminal_concurrency.py.
+    """
+
+    # AUTHORITATIVE gate, default OFF, in-memory, re-checked on the UI thread in
+    # _mirror_inject_input. The hub keeps only an advisory copy for do_POST's
+    # fast-reject.
+    _control_enabled: bool = False
+
+    def _mirror_inject_input(self, data: str) -> None:
+        """Write browser-injected bytes into the focused live pane's PTY.
+
+        Runs on the Textual UI thread (the input handler marshals here via
+        call_from_thread). Re-checks the AUTHORITATIVE _control_enabled (the
+        hub's copy is advisory), then mirrors on_key's guard EXACTLY: bail on
+        no pane / dead pane / _pty is None, and contain any write error. The
+        PTY backend takes str — do NOT .encode()."""
+        if not self._control_enabled:
+            return
+        t = self._focused_terminal()
+        if t is None or getattr(t, "_pty", None) is None or getattr(t, "is_dead", False):
+            return
+        try:
+            t._pty.write(data)
+        except Exception:
+            pass
+
+
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                  flat: bool = False, reload_fn=None) -> None:
     """Textual-based picker (status bar, mouse-click column sort, ? help overlay).
@@ -3397,7 +3430,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 yield Static(f"or open: [cyan]{self._url}[/cyan]\n"
                              "[dim]URL copied to clipboard · Esc / F12 to close[/dim]")
 
-    class PickerApp(App):
+    class PickerApp(App, _MirrorControl):
         TITLE = "saikai"
         # Textual's built-in command palette binds Ctrl+P. saikai leaves ordinary
         # editing keys to the search box / live claude (Ctrl+P = readline
