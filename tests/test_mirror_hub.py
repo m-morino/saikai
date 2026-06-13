@@ -1,6 +1,11 @@
 import os, sys, threading
+import urllib.request, urllib.error, base64, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import saikai_mirror as m
+
+
+def _get(url):
+    return urllib.request.urlopen(url, timeout=3.0)
 
 
 def test_broadcast_is_nonblocking_and_drops_oldest():
@@ -30,6 +35,38 @@ def test_broadcast_is_nonblocking_and_drops_oldest():
     assert drained == ["frame-996", "frame-997", "frame-998", "frame-999"]
 
 
+def test_server_rejects_bad_token_and_streams_with_good_token():
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=10, rows=2)
+    port = hub.serve()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        # Wrong token on the page and the stream -> 403.
+        for path in ("/", "/stream"):
+            try:
+                _get(f"{base}{path}?token=nope")
+                assert False, f"{path} accepted a bad token"
+            except urllib.error.HTTPError as e:
+                assert e.code == 403
+        # Good token: a frame fed now must appear (base64) in the SSE stream,
+        # and the stream must open with the full-frame snapshot.
+        hub.broadcast("\x1b[32mGO\x1b[0m")
+        resp = _get(f"{base}/stream?token=secret")
+        deadline = time.time() + 3.0
+        seen = b""
+        while time.time() < deadline and b"\n\n" not in seen[1:]:
+            seen += resp.read(64)
+        text = seen.decode("utf-8", "replace")
+        assert text.startswith("data: ")
+        payloads = [base64.b64decode(ln[6:]).decode("utf-8", "replace")
+                    for ln in text.splitlines() if ln.startswith("data: ")]
+        joined = "".join(payloads)
+        assert "\x1b[2J\x1b[H" in joined   # snapshot first
+        assert "GO" in joined
+    finally:
+        hub.stop()
+
+
 if __name__ == "__main__":
     test_broadcast_is_nonblocking_and_drops_oldest()
+    test_server_rejects_bad_token_and_streams_with_good_token()
     print("OK test_mirror_hub")
