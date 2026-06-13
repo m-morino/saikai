@@ -1018,12 +1018,24 @@ def _needs_attention(s: dict, cache: dict) -> bool:
             role = rec.get("type") or (rec.get("message") or {}).get("role")
             val = role == "user"
             if val:
-                # Claude Code writes tool_result turns as type:"user" too; those
-                # are auto-generated, not a human prompt pending — don't flag.
+                # type:"user" records aren't always a human prompt awaiting a
+                # reply: Claude Code writes tool_result turns as type:"user", and
+                # writes a '[Request interrupted by user...]' marker when you
+                # Esc-interrupt a turn (the user STOPPED it — not waiting on us).
+                # Neither should flag the session as needing attention.
                 content = (rec.get("message") or {}).get("content")
-                if isinstance(content, list) and any(
+                if isinstance(content, list):
+                    is_tool_result = any(
                         isinstance(b, dict) and b.get("type") == "tool_result"
-                        for b in content):
+                        for b in content)
+                    text = "".join(
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text")
+                    if is_tool_result or text.strip().startswith(
+                            "[Request interrupted by user"):
+                        val = False
+                elif isinstance(content, str) and content.strip().startswith(
+                        "[Request interrupted by user"):
                     val = False
     cache[sid] = (mt, val)
     if len(cache) > 4096:        # bound memory: drop oldest (dict is insertion-ordered)
