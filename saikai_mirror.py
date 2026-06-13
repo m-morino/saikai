@@ -142,6 +142,8 @@ class MirrorHub:
         # Write-key: NEVER placed in any URL/file/QR/log; delivered only over the
         # authenticated SSE stream and required as the X-Mirror-Write-Key header.
         self._write_key = _secrets.token_urlsafe(32)
+        self._inject_q: queue.Queue[str] = queue.Queue(1024)
+        self._inject_drain = None
 
     def _feed(self, data: str) -> None:
         with self._mirror_lock:
@@ -218,6 +220,10 @@ class MirrorHub:
         self._drain = threading.Thread(target=self._drain_loop,
                                        name="saikai-mirror-drain", daemon=True)
         self._drain.start()
+        self._inject_drain = threading.Thread(target=self._inject_loop,
+                                              name="saikai-mirror-inject",
+                                              daemon=True)
+        self._inject_drain.start()
         return self._port
 
     def stop(self) -> None:
@@ -253,14 +259,33 @@ class MirrorHub:
     def inject(self, data: str) -> bool:
         """Accept browser input IFF control is on AND a handler is wired.
 
-        Returns True when accepted (delivered to the handler), False when the
-        gate is closed. The advisory _control_enabled here is a fast-reject; the
-        app re-checks its authoritative gate on the UI thread."""
+        Enqueues onto a single FIFO queue drained by one worker, so input
+        reaches the PTY in submission order even though ThreadingMixIn
+        dispatches POSTs on independent threads. Non-blocking."""
         if self._input_handler is None or not self._control_enabled:
             return False
-        # Task 2 replaces this direct call with a FIFO single-drain enqueue.
-        self._input_handler(data)
+        try:
+            self._inject_q.put_nowait(data)
+        except queue.Full:
+            return False           # bounded; refuse rather than block a handler
         return True
+
+    def _inject_loop(self):
+        """Single drain worker: pop FIFO and call the (advisory) handler. The
+        handler is _marshal-shaped (captures the app, bails if gone, swallows
+        exceptions), so this thread never blocks on future.result()."""
+        while not self._stopped.is_set():
+            try:
+                data = self._inject_q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            fn = self._input_handler
+            if fn is None:
+                continue
+            try:
+                fn(data)
+            except Exception:
+                pass               # never let one bad inject kill the drain
 
     def url(self) -> str:
         # 0.0.0.0/"" is a bind wildcard, not browsable — resolve a reachable host
