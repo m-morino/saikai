@@ -3033,8 +3033,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             background: $panel;
             border: solid $accent;
             padding: 1 2;
-            width: auto;
-            max-width: 92%;
+            /* width:auto collapses a VerticalScroll to 0 in Textual 8.x (the box
+               showed as a bare vertical bar with no content) — use a definite
+               width like SettingsScreen does. */
+            width: 92%;
             max-height: 90%;
         }
         """
