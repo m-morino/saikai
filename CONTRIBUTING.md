@@ -1,16 +1,14 @@
 # Contributing to saikai
 
-Thanks for your interest! saikai is a small, single-file Textual TUI, so the
-contribution loop is deliberately lightweight.
+Thanks for your interest. saikai is a small Textual TUI, so the contribution
+loop is deliberately lightweight.
 
 ## Architecture in one paragraph
 
-saikai is **two files**: `saikai.py` (the session browser — scanning, the table
-UI, config, CLI) and `saikai_terminal.py` (the split-live pane widget — the PTY
-reader thread, pyte screen, status classification, clipboard). `saikai.py`
-imports `saikai_terminal` lazily and **degrades gracefully**: if the PTY deps
-are missing, the live pane is disabled and saikai still runs as a list browser.
-Keep that separation — `saikai_terminal` must not import `saikai`.
+The runtime has three modules: `saikai.py` (history, UI, config, CLI),
+`saikai_terminal.py` (provider-neutral live PTY), and `saikai_provider.py`
+(agent-specific contracts). Read [Architecture](docs/ARCHITECTURE.md) before
+changing module boundaries, transcript semantics, or split-live behavior.
 
 ## Setup
 
@@ -50,19 +48,19 @@ input, resize, and teardown stay provider-neutral in `saikai_terminal.py`.
 `test_pty_backend.py` is the exception to the headless suites: it opens the
 platform's real PTY backend and verifies spawn, resize, output, and EOF.
 
-## The concurrency invariants — DO NOT VIOLATE
+## The concurrency invariants
 
-Each split-live pane runs a background reader thread feeding pyte under a lock,
-while the UI thread also takes that lock. Get this wrong and saikai **hard-freezes**.
-The rules (with the regression that taught us each) are documented at the top of
-[`CLAUDE.md`](CLAUDE.md) — read that section before touching
-`saikai_terminal.py` or any threading / lock code. In short:
+Each split-live pane runs a background reader thread feeding pyte under
+`self._lock`, while the UI thread renders the same screen. Read the canonical
+[concurrency invariants](docs/ARCHITECTURE.md#concurrency-invariants) before
+touching `saikai_terminal.py` or any threading, lock, async, or teardown code.
+In short:
 
 1. **Never** call `call_from_thread` / marshal — or any blocking cross-thread
    call — while holding `self._lock`. Compute under the lock, marshal outside it.
-2. Never join the reader thread from the UI thread (`on_unmount` / `kill`).
-3. Every `kill()`'s `taskkill` reap must be tracked + joined at process exit.
-4. Coalesce UI work driven by PTY output (per-chunk repaint / status rebuild).
+2. Never join the reader or close a POSIX `ptyprocess` from the UI thread.
+3. Every process-tree reap must be tracked and joined at process exit.
+4. Coalesce UI work driven by PTY output.
 
 If you change threading, lock, or async behavior, **verify it yourself**
 headlessly (see `tests/test_terminal_concurrency.py`) — don't ship an untested
