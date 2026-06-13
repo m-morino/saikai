@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hmac
 import http.server
+import json
 import queue
 import socketserver
 import sys
@@ -392,11 +393,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):           # silence default stderr logging
         pass
 
+    # HTTP/1.1 so keep-alive + SSE behave; ALWAYS emit Content-Length or use 204.
+    protocol_version = "HTTP/1.1"
+
     def _token_ok(self) -> bool:
         from urllib.parse import urlparse, parse_qs
         q = parse_qs(urlparse(self.path).query)
         got = (q.get("token") or [""])[0]
         return hmac.compare_digest(got, self.server.hub._token)
+
+    def _write_key_ok(self) -> bool:
+        got = self.headers.get("X-Mirror-Write-Key", "")
+        return hmac.compare_digest(got, self.server.hub._write_key)
 
     _STATIC = {"/xterm.min.js": "application/javascript",
                "/addon-canvas.js": "application/javascript",
@@ -474,6 +482,78 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         payload = base64.b64encode(data.encode("utf-8")).decode("ascii")
         self.wfile.write(b"data: " + payload.encode("ascii") + b"\n\n")
         self.wfile.flush()
+
+    _INPUT_CAP = 65536   # 64 KB paste cap; reject larger before reading
+
+    def _drain_body(self):
+        """Consume any declared request body so keep-alive doesn't desync on a
+        rejected POST. Safe to call before sending an error."""
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            n = 0
+        remaining = n
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
+    def _reject(self, code, msg, drain=True):
+        # send_error() always emits Connection: close, so keep-alive does not
+        # survive a reject; the drain only lets the client read the response
+        # before the socket closes. Skip it for the oversized path (drain=False):
+        # a >cap Content-Length is rejected BEFORE reading, and a client that
+        # under-sends a lied-about length would otherwise block the drain.
+        if drain:
+            self._drain_body()
+        self.send_error(code, msg)
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        if path != "/input":
+            self._reject(405, "method not allowed")
+            return
+        # (Host + Origin gates are added in the next task; for now write-key only.)
+        if not self._write_key_ok():
+            self._reject(403, "forbidden")
+            return
+        hub = self.server.hub
+        # Body hygiene: chunked unsupported (require Content-Length); cap size.
+        if "chunked" in (self.headers.get("Transfer-Encoding", "") or "").lower():
+            self._reject(411, "length required")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            self._reject(400, "bad length")
+            return
+        if length > self._INPUT_CAP:
+            self._reject(413, "payload too large", drain=False)  # reject BEFORE reading
+            return
+        raw = self.rfile.read(length) if length else b""
+        try:
+            obj = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            self.send_error(400, "bad json")            # body already fully read
+            return
+        data = obj.get("data") if isinstance(obj, dict) else None
+        if data is None or not isinstance(data, str):
+            self.send_error(400, "missing data")
+            return
+        if data == "":
+            self._send_status(204)                      # no-op, but accepted
+            return
+        if not hub._control_enabled:                    # advisory fast-reject
+            self.send_error(409, "control off")
+            return
+        hub.inject(data)
+        self._send_status(204)
+
+    def _send_status(self, code):
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
 
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
