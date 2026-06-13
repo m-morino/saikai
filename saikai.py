@@ -1018,12 +1018,24 @@ def _needs_attention(s: dict, cache: dict) -> bool:
             role = rec.get("type") or (rec.get("message") or {}).get("role")
             val = role == "user"
             if val:
-                # Claude Code writes tool_result turns as type:"user" too; those
-                # are auto-generated, not a human prompt pending — don't flag.
+                # type:"user" records aren't always a human prompt awaiting a
+                # reply: Claude Code writes tool_result turns as type:"user", and
+                # writes a '[Request interrupted by user...]' marker when you
+                # Esc-interrupt a turn (the user STOPPED it — not waiting on us).
+                # Neither should flag the session as needing attention.
                 content = (rec.get("message") or {}).get("content")
-                if isinstance(content, list) and any(
+                if isinstance(content, list):
+                    is_tool_result = any(
                         isinstance(b, dict) and b.get("type") == "tool_result"
-                        for b in content):
+                        for b in content)
+                    text = "".join(
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text")
+                    if is_tool_result or text.strip().startswith(
+                            "[Request interrupted by user"):
+                        val = False
+                elif isinstance(content, str) and content.strip().startswith(
+                        "[Request interrupted by user"):
                     val = False
     cache[sid] = (mt, val)
     if len(cache) > 4096:        # bound memory: drop oldest (dict is insertion-ordered)
@@ -3335,6 +3347,56 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def on_input_submitted(self, event) -> None:
             self.dismiss(event.value or "")     # "" = clear; None only via cancel
 
+    def _render_qr(matrix):
+        """Render a QR bool-matrix as Rich Text using upper-half-block cells
+        (fg paints the top module, bg the bottom), explicit black-on-white so it
+        scans regardless of the terminal theme."""
+        from rich.text import Text
+        from rich.style import Style
+        t = Text(no_wrap=True)
+        for y in range(0, len(matrix), 2):
+            top = matrix[y]
+            bot = matrix[y + 1] if y + 1 < len(matrix) else [False] * len(top)
+            for x in range(len(top)):
+                fg = "black" if top[x] else "white"
+                bg = "black" if bot[x] else "white"
+                t.append("▀", Style(color=fg, bgcolor=bg))
+            if y + 2 < len(matrix):
+                t.append("\n")
+        return t
+
+    class MirrorScreen(ModalScreen):
+        CSS = """
+        MirrorScreen { align: center middle; }
+        #mirror-box {
+            background: $panel;
+            border: solid $accent;
+            padding: 1 2;
+            /* definite width (auto collapses a scroll container to 0 in Textual
+               8.x); 60 comfortably fits a QR (<=45 cells) + the wrapped URL. */
+            width: 60;
+            height: auto;
+            max-width: 98%;
+            max-height: 98%;
+        }
+        """
+        BINDINGS = [
+            Binding("escape", "dismiss", show=False),
+            Binding("f12", "dismiss", show=False),
+        ]
+
+        def __init__(self, url, matrix):
+            super().__init__()
+            self._url = url
+            self._matrix = matrix
+
+        def compose(self) -> ComposeResult:
+            with VerticalScroll(id="mirror-box"):
+                yield Static("[bold]Web mirror — scan to connect[/bold] [dim](read-only)[/dim]")
+                yield Static(_render_qr(self._matrix), id="mirror-qr")
+                yield Static(f"or open: [cyan]{self._url}[/cyan]\n"
+                             "[dim]URL copied to clipboard · Esc / F12 to close[/dim]")
+
     class PickerApp(App):
         TITLE = "saikai"
         # Textual's built-in command palette binds Ctrl+P. saikai leaves ordinary
@@ -3405,6 +3467,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     show=False, priority=True),
             Binding("alt+right", "grow_list", "▶List", id="grow_list",
                     show=False, priority=True),
+            Binding("f12", "mirror_info", "Mirror QR", id="mirror_info", show=False),
         ]
         # The practical limit on concurrent live claude panes is MEMORY — each
         # is a full node process tree that sits CPU-idle waiting for input — so
@@ -3619,6 +3682,24 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 )
                 import threading as _thr
                 _thr.Thread(target=self._join_bg_summarize, daemon=True).start()
+            _hub = getattr(self, "_mirror_hub", None)
+            if _hub is not None:
+                _hub.set_size(self.size.width, self.size.height)
+                _hub.set_repaint_request(
+                    lambda: self.call_from_thread(self.refresh, layout=True))
+                # Copy the URL to the clipboard (host) so it pastes cleanly without
+                # selecting a wrapped line, then show the QR so a phone can join
+                # without typing the tokened URL (the stderr banner is alt-screen
+                # hidden). F12 re-opens the QR anytime.
+                try:
+                    import subprocess as _sp
+                    _clip = (["clip"] if sys.platform == "win32"
+                             else ["pbcopy"] if sys.platform == "darwin"
+                             else ["xclip", "-selection", "clipboard"])
+                    _sp.run(_clip, input=_hub.url().encode("utf-8"), check=False)
+                except Exception:
+                    pass
+                self.call_after_refresh(self.action_mirror_info)
 
         def _build_forest_bg(self) -> None:
             """Daemon: compute the cross-session forest off the pre-paint path,
@@ -5811,6 +5892,18 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             self.push_screen(SettingsScreen())
 
+        def action_mirror_info(self) -> None:
+            # F12 — (re)show the web-mirror QR + URL. No-op when the mirror is off.
+            _hub = getattr(self, "_mirror_hub", None)
+            if _hub is None:
+                return
+            try:
+                import saikai_mirror as _m
+                self.push_screen(MirrorScreen(_hub.url(), _m.qr_matrix(_hub.url())))
+            except Exception:
+                self.notify(f"Web mirror: {_hub.url()}", title="saikai mirror",
+                            timeout=12)
+
         def action_help(self) -> None:
             # '?' is a priority binding; don't pop the help modal over a focused
             # terminal (typing into claude) or the search box (typing a '?' query).
@@ -5867,7 +5960,52 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     # actually see what blew up (the prior failure was 'screen disappears
     # and doesn't come back' = unrecoverable terminal state).
     try:
-        chosen = PickerApp().run()
+        # Web mirror (opt-in, default OFF). Isolated in its own try so that a
+        # broken mirror module or a serve() failure (e.g. port already in use)
+        # NEVER blocks normal launch — it degrades to "no mirror". The import is
+        # guarded by the env flag so users who never opt in don't even load it.
+        _hub = None
+        _app_kwargs = {}
+        if os.environ.get("SAIKAI_MIRROR"):
+            try:
+                import secrets as _secrets
+                import saikai_mirror as _mirror
+                _mir_on, _mir_host = _mirror.mirror_config(os.environ)
+                if _mir_on:
+                    _hub = _mirror.MirrorHub(
+                        token=_secrets.token_urlsafe(32), host=_mir_host,
+                        port=_mirror.mirror_port(os.environ))
+                    _hub.serve()
+                    atexit.register(_hub.stop)
+                    _Drv = _mirror.make_mirror_driver(_mirror._base_driver_class(), _hub)
+                    _app_kwargs["driver_class"] = _Drv
+                    _mode = "LAN-exposed" if _mir_host != "127.0.0.1" else "loopback only"
+                    # Persist the URL so it's reachable even though the Textual alt
+                    # screen hides this banner during the session; cleaned up at exit.
+                    _url_file = CACHE_DIR / "mirror-url.txt"
+                    try:
+                        # The URL carries the access token, so create the file
+                        # owner-only (0600) rather than at the default umask.
+                        _url_file.parent.mkdir(parents=True, exist_ok=True)
+                        _fd = os.open(str(_url_file),
+                                      os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                        with os.fdopen(_fd, "w", encoding="utf-8") as _uf:
+                            _uf.write(_hub.url() + "\n")
+                        atexit.register(lambda f=_url_file: f.unlink(missing_ok=True))
+                    except OSError:
+                        _url_file = None
+                    print(_c(f"  ⚠ saikai mirror LIVE (read-only, {_mode}): {_hub.url()}",
+                             YELLOW), file=sys.stderr)
+                    if _url_file is not None:
+                        print(_c(f"    (also saved to {_url_file})", YELLOW), file=sys.stderr)
+            except Exception as _mir_err:   # mirror is best-effort; never block launch
+                _hub = None
+                _app_kwargs = {}
+                print(_c(f"  saikai mirror disabled (setup failed: {_mir_err})",
+                         YELLOW), file=sys.stderr)
+        _app = PickerApp(**_app_kwargs)
+        _app._mirror_hub = _hub
+        chosen = _app.run()
     except KeyboardInterrupt:
         chosen = None
     except Exception:
