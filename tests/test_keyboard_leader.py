@@ -439,6 +439,85 @@ def test_pilot_mirror_control_toggle():
     assert facts.get("hub_calls2")[-1] == (False, None), facts
 
 
+def test_pilot_mirror_tap_and_key_drive_ui():
+    """End-to-end: with control ON, a synthesized events.Key fires a priority
+    binding (F6 favorite) and a synthesized click is dispatched by App.on_event
+    (mouse_position updates to the clicked cell) — proving on_mount wired the
+    handlers and the App routes injected Key + Mouse events natively. Drives the
+    REAL PickerApp."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_mirror_tap_and_key_drive_ui (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                # Turn control ON directly (the toggle is local-only; we exercise
+                # the injection path, not the keybinding).
+                self._control_enabled = True
+                # 1) A priority binding via a synthesized Key: F6 = favorite.
+                # action_toggle_fav favorites THE SELECTED ROW, so read the live
+                # cursor sid (not the just-written one — sibling demo sessions from
+                # earlier Pilot tests in this process share the fake home, and the
+                # cursor may sit on any of them). The proof is that the synthesized
+                # F6 flipped that row's favorite state via the priority binding.
+                target_sid = self._cursor_sid()
+                before = target_sid in (saikai._read_json(saikai.FAVORITE_FILE, []) or [])
+                self._mirror_inject_key("f6")
+                await pilot.pause(0.3)
+                after = target_sid in (saikai._read_json(saikai.FAVORITE_FILE, []) or [])
+                facts["cursor_sid"] = target_sid
+                facts["fav_before"] = before
+                facts["fav_after"] = after
+                # 2) A synthesized click is DISPATCHED by App.on_event, which sets
+                # self.mouse_position = Offset(event.x, event.y) on MouseDown — a
+                # side-effect-free, widget-agnostic proof the click routed.
+                table = self.query_one("#table")
+                region = table.region                 # screen region of the table
+                col_x = region.x + 2                  # a real on-screen cell
+                row_y = region.y + 2                  # a row inside the table
+                self._mirror_inject_mouse(col_x, row_y, 0, "down")
+                self._mirror_inject_mouse(col_x, row_y, 0, "up")
+                await pilot.pause(0.3)
+                mp = self.mouse_position
+                facts["mouse_xy"] = (mp.x, mp.y)
+                facts["click_target"] = (col_x, row_y)
+                facts["still_running"] = self.is_running
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    # The Key reached the favorite priority binding (focus-independent): the
+    # synthesized F6 TOGGLED the selected row's favorite state. Asserting the
+    # flip (not a fixed direction) keeps the proof robust to sibling demo
+    # sessions a prior Pilot test may have already favorited in the shared home.
+    assert facts.get("cursor_sid"), f"no row under the cursor to favorite: {facts}"
+    assert facts.get("fav_after") != facts.get("fav_before"), \
+        f"synthesized F6 did not toggle the favorite: {facts}"
+    # The synthesized click was dispatched by App.on_event: it set mouse_position
+    # to the clicked cell (proves routing, widget-agnostic, no side-effect), and
+    # the app survived (no crash).
+    assert facts.get("still_running") is True, f"app crashed on injected click: {facts}"
+    assert facts.get("mouse_xy") == facts.get("click_target"), \
+        f"injected click did not reach App.on_event (mouse_position): {facts}"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -468,4 +547,6 @@ if __name__ == "__main__":
     print("PASS test_pilot_esc_quits_and_bar_toggle")
     test_pilot_mirror_control_toggle()
     print("PASS test_pilot_mirror_control_toggle")
+    test_pilot_mirror_tap_and_key_drive_ui()
+    print("PASS test_pilot_mirror_tap_and_key_drive_ui")
     print("ALL PASS")
