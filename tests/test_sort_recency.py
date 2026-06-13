@@ -629,6 +629,82 @@ def test_parse_macos_vm_stat():
     assert 80 < st.load < 90                         # ~84% used
     assert saikai._parse_macos_vm_stat(sample, 0) is None         # bad total → None
     assert saikai._parse_macos_vm_stat("garbage", total).avail_phys_mb == 0.0  # no pages → 0 (blocks, safe)
+    # kern.memorystatus_vm_pressure_level: only CRITICAL (4) gates — warn (2)
+    # fires routinely under benign cache pressure and must not block panes.
+    assert saikai._parse_macos_vm_stat(sample, total, 1).pressure_pct is None
+    assert saikai._parse_macos_vm_stat(sample, total, 2).pressure_pct is None
+    assert saikai._parse_macos_vm_stat(sample, total, 4).pressure_pct == 100.0
+
+
+def test_ram_gate_linux_principled():
+    """Linux gate is derived from how Linux actually fails, not from Windows'
+    commit-charge model: (1) CommitLimit−Committed_AS is only meaningful under
+    STRICT overcommit (vm.overcommit_memory=2) — in the default heuristic mode
+    Committed_AS routinely EXCEEDS CommitLimit on a healthy box (V8 reserves
+    never-touched ranges), so using it would falsely zero the gate; (2)
+    MemAvailable is the kernel's own "allocatable without swapping" estimate →
+    it backs the physical floor; (3) PSI some avg10 (/proc/pressure/memory) is
+    the direct stall measurement (what systemd-oomd acts on) → pressure at/above
+    max_pressure refuses a new pane regardless of occupancy numbers."""
+    meminfo = (
+        "MemTotal:       16000000 kB\n"
+        "MemFree:         1000000 kB\n"
+        "MemAvailable:    8000000 kB\n"
+        "CommitLimit:    12000000 kB\n"
+        "Committed_AS:   20000000 kB\n"     # exceeds limit — NORMAL under heuristic overcommit
+    )
+    # Heuristic overcommit (mode 0, the default): commit must be skipped (None),
+    # otherwise headroom would read −8GB and permanently close the gate.
+    st = saikai._parse_linux_meminfo(meminfo, overcommit_mode=0)
+    assert st.avail_commit_mb is None
+    assert abs(st.total_phys_mb - 16000000 / 1024) < 1
+    assert abs(st.avail_phys_mb - 8000000 / 1024) < 1
+    assert st.load is not None and 49 < st.load < 51       # (16−8)/16 = 50%
+    kw = dict(max_load=95, min_commit_mb=2048, min_free_phys_pct=8)
+    fit, _ = saikai._ram_fit(st, 600, **kw)
+    assert fit >= 5, "healthy heuristic-overcommit box must not be gated by commit"
+    # Strict overcommit (mode 2): the limit IS enforced → commit check applies.
+    st2 = saikai._parse_linux_meminfo(meminfo, overcommit_mode=2)
+    assert st2.avail_commit_mb is not None and st2.avail_commit_mb < 0
+    assert saikai._ram_fit(st2, 600, **kw)[0] == 0
+    # Unknown mode (unreadable /proc/sys in a container) degrades to heuristic.
+    assert saikai._parse_linux_meminfo(meminfo, overcommit_mode=None).avail_commit_mb is None
+
+
+def test_ram_gate_psi_pressure():
+    """PSI parsing + gating: some avg10 ≥ max_pressure (default 10%) → 0 fit
+    even when every occupancy number looks fine — stalls are happening NOW.
+    Absent/garbled PSI (kernel < 4.20, masked /proc) skips the check."""
+    psi = ("some avg10=23.50 avg60=10.20 avg300=3.10 total=123456\n"
+           "full avg10=11.00 avg60=4.00 avg300=1.00 total=65432\n")
+    assert saikai._parse_linux_psi_some_avg10(psi) == 23.5
+    assert saikai._parse_linux_psi_some_avg10("") is None
+    assert saikai._parse_linux_psi_some_avg10(None) is None
+    assert saikai._parse_linux_psi_some_avg10("full avg10=9.0\n") is None  # no 'some' line
+    MS = saikai._MemStatus
+    kw = dict(max_load=95, min_commit_mb=2048, min_free_phys_pct=8, max_pressure=10.0)
+    stalling = MS(50, 8000, None, 16000, 23.5)      # ample RAM but tasks stalling
+    f, why = saikai._ram_fit(stalling, 600, **kw)
+    assert f == 0 and "pressure" in why
+    calm = MS(50, 8000, None, 16000, 2.0)           # mild pressure → not binding
+    assert saikai._ram_fit(calm, 600, **kw)[0] >= 5
+    legacy = MS(50, 8000, None, 16000)              # default None → check skipped
+    assert saikai._ram_fit(legacy, 600, **kw)[0] >= 5
+
+
+def test_posix_load_default_is_backstop_not_gate():
+    """On POSIX the load % is DERIVED from the same availability number as the
+    physical floor (double-counting), so its default is 95 (backstop) instead of
+    Windows' 85 — at 85 the load check trips while ~15% is still genuinely
+    available, making the 8% floor dead code and saikai stingier than the OS."""
+    assert saikai._DEFAULT_MAX_LOAD == (85.0 if sys.platform == "win32" else 95.0)
+    MS = saikai._MemStatus
+    # 16GB box, 13.8% available (load 86.2): floor (8%) still has ~1 pane of room.
+    st = MS(86.2, 2200, None, 16000)
+    kw95 = dict(max_load=95, min_commit_mb=2048, min_free_phys_pct=8)
+    kw85 = dict(max_load=85, min_commit_mb=2048, min_free_phys_pct=8)
+    assert saikai._ram_fit(st, 600, **kw95)[0] == 1   # floor governs → 1 pane fits
+    assert saikai._ram_fit(st, 600, **kw85)[0] == 0   # old Windows default starved it
 
 
 def test_color_key_for_modes():
@@ -819,6 +895,12 @@ if __name__ == "__main__":
     print("PASS test_ram_gate_windows_principled")
     test_parse_macos_vm_stat()
     print("PASS test_parse_macos_vm_stat")
+    test_ram_gate_linux_principled()
+    print("PASS test_ram_gate_linux_principled")
+    test_ram_gate_psi_pressure()
+    print("PASS test_ram_gate_psi_pressure")
+    test_posix_load_default_is_backstop_not_gate()
+    print("PASS test_posix_load_default_is_backstop_not_gate")
     test_color_key_for_modes()
     print("PASS test_color_key_for_modes")
     test_custom_title_overlay_and_precedence()

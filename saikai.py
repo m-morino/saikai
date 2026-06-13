@@ -245,10 +245,11 @@ _CONFIG_TEMPLATE = (
     "split_ratio  = 0.34       # initial list share; dragging / Alt+arrows persists over it\n\n"
     "[launch]\n"
     "auto_permission = false   # true = add --permission-mode auto in frequent workspaces\n\n"
-    "[limits]                       # live-pane memory gate (Windows-principled)\n"
-    "max_memory_load        = 85    # refuse/warn above this % memory load\n"
-    "min_commit_headroom_mb = 2048  # keep this much commit headroom free\n"
-    "min_free_phys_pct      = 8     # keep >= this % of physical RAM free\n"
+    "[limits]                       # live-pane memory gate (per-OS signals)\n"
+    "# max_memory_load      = 85    # refuse/warn above this % memory load (default 85 Win / 95 POSIX)\n"
+    "max_memory_pressure    = 10    # Linux PSI some-avg10 % / macOS critical -> refuse (no effect on Win)\n"
+    "min_commit_headroom_mb = 2048  # keep this much commit headroom free (Win; Linux only if strict overcommit)\n"
+    "min_free_phys_pct      = 8     # keep >= this % of physical RAM free/available\n"
     "per_pane_mb            = 600   # estimated RAM per live pane\n"
     "hard_ram_gate          = false # true = refuse (vs warn) when crossed\n"
     "max_live               = 64    # hard cap on concurrent live panes\n"
@@ -452,7 +453,9 @@ _CONFIG_SPECS = [
     ("display", "color_by", "SAIKAI_COLOR_BY", "project"),
     ("display", "split_ratio", "SAIKAI_SPLIT_RATIO", 0.34),
     ("launch", "auto_permission", "SAIKAI_AUTO_PERMISSION", False),
-    ("limits", "max_memory_load", "SAIKAI_MAX_MEM_LOAD", 85),
+    ("limits", "max_memory_load", "SAIKAI_MAX_MEM_LOAD",
+     85 if sys.platform == "win32" else 95),
+    ("limits", "max_memory_pressure", "SAIKAI_MAX_MEM_PRESSURE", 10),
     ("limits", "min_commit_headroom_mb", "SAIKAI_MIN_COMMIT_MB", 2048),
     ("limits", "min_free_phys_pct", "SAIKAI_MIN_FREE_PHYS_PCT", 8),
     ("limits", "per_pane_mb", "SAIKAI_CLAUDE_MB", 600),
@@ -2667,21 +2670,39 @@ def _build_color_map(values, palette) -> dict[str, str]:
 
 
 # System memory snapshot for the live-pane gate. Any field may be None on a
-# platform that can't supply it (the gate skips that constraint). Derived from
-# Windows resource management (MEMORYSTATUSEX / page-file docs): the system-wide
-# FREEZE/stall cause is the commit charge nearing the commit limit, so
-# avail_commit_mb (ullAvailPageFile) is the primary signal — NOT avail_phys_mb,
-# which is standby+free+zero (includes reclaimable cache → over-states headroom).
-_MemStatus = namedtuple("_MemStatus", "load avail_phys_mb avail_commit_mb total_phys_mb")
+# platform that can't supply it (the gate skips that constraint). The PRIMARY
+# signal is per-OS, derived from how each kernel actually fails:
+#   Windows — NO overcommit: every private allocation needs commit backing
+#     (RAM+pagefile); commit exhaustion = allocation failures = the documented
+#     system-wide freeze. avail_commit_mb (ullAvailPageFile) is the primary
+#     signal, NOT avail_phys_mb (standby+free+zero over-states headroom).
+#   Linux — heuristic overcommit by default (vm.overcommit_memory=0):
+#     CommitLimit is NOT enforced and Committed_AS routinely exceeds it (V8
+#     reserves huge never-touched ranges), so commit headroom is noise unless
+#     strict mode (=2) is on. MemAvailable is the kernel's own purpose-built
+#     "allocatable without swapping" estimate → the physical floor is the
+#     primary gate, and PSI (/proc/pressure/memory, the metric systemd-oomd
+#     kills on) directly measures stall time when thrash actually happens.
+#   macOS — dynamic swap + memory compressor, no fixed commit limit; the OS
+#     publishes its own verdict via kern.memorystatus_vm_pressure_level.
+# pressure_pct: 0-100 stall/pressure measure (Linux PSI some avg10; macOS 100
+# when the kernel reports critical), None where unsupported (Windows).
+_MemStatus = namedtuple(
+    "_MemStatus",
+    "load avail_phys_mb avail_commit_mb total_phys_mb pressure_pct",
+    defaults=(None,))
 _MB = 1024 * 1024
 
 
-def _parse_macos_vm_stat(vm_stat_text, total_bytes):
+def _parse_macos_vm_stat(vm_stat_text, total_bytes, pressure_level=None):
     """Parse `vm_stat` output + `sysctl hw.memsize` total into a _MemStatus (macOS).
     Available ≈ reclaimable pages (free + inactive + speculative + purgeable) × page
     size; load = used/total. macOS has no fixed commit limit (dynamic swap), so
-    avail_commit_mb is None and that gate check is skipped. Pure → unit-testable
-    (the subprocess call lives in _mem_status)."""
+    avail_commit_mb is None and that gate check is skipped. pressure_level is
+    kern.memorystatus_vm_pressure_level (1 normal / 2 warn / 4 critical) — the
+    kernel's own verdict, the same signal apps get via dispatch sources; only
+    CRITICAL maps to a gating pressure_pct (warn fires routinely under benign
+    cache pressure). Pure → unit-testable (subprocess calls live in _mem_status)."""
     m = re.search(r"page size of (\d+) bytes", vm_stat_text or "")
     pagesize = int(m.group(1)) if m else 4096
 
@@ -2695,15 +2716,62 @@ def _parse_macos_vm_stat(vm_stat_text, total_bytes):
         return None
     avail = max(0, min(avail_pages * pagesize, total))
     load = max(0.0, min(100.0, (total - avail) / total * 100.0))
-    return _MemStatus(load, avail / _MB, None, total / _MB)
+    pressure = 100.0 if (pressure_level is not None and pressure_level >= 4) else None
+    return _MemStatus(load, avail / _MB, None, total / _MB, pressure)
+
+
+def _parse_linux_psi_some_avg10(psi_text):
+    """`some avg10` percent out of /proc/pressure/memory (kernel >= 4.20), or
+    None when absent/unparseable (old kernel, masked /proc in a container).
+    "some avg10" = % of the last 10s in which at least one task was STALLED
+    waiting on memory — the direct observation of thrash (the same metric
+    systemd-oomd acts on), as opposed to occupancy proxies. Pure."""
+    m = re.search(r"^some\s+avg10=([0-9.]+)", psi_text or "", re.M)
+    try:
+        return float(m.group(1)) if m else None
+    except ValueError:
+        return None
+
+
+def _parse_linux_meminfo(meminfo_text, overcommit_mode=None, psi_text=None):
+    """Parse /proc/meminfo (+ optional overcommit mode and PSI text) into a
+    _MemStatus (Linux). MemAvailable is the kernel's purpose-built "allocatable
+    without swapping" estimate (reclaimable cache/slab already accounted), so
+    it feeds both the load % and the physical floor. Commit headroom
+    (CommitLimit − Committed_AS) is only meaningful under STRICT overcommit
+    (vm.overcommit_memory == 2) — in the default heuristic mode the limit is
+    not enforced and Committed_AS routinely exceeds it (V8/node reserve huge
+    never-touched ranges), which would read as negative headroom and falsely
+    zero the gate on a healthy box. Pure → unit-testable."""
+    info = {}
+    for line in (meminfo_text or "").splitlines():
+        k, _, rest = line.partition(":")
+        info[k.strip()] = rest
+
+    def _kb(key):
+        try:
+            return int(info[key].split()[0]) / 1024   # KB → MB
+        except Exception:
+            return None
+    total, availp = _kb("MemTotal"), _kb("MemAvailable")
+    load = (max(0.0, min(100.0, (total - availp) / total * 100.0))
+            if (total and availp is not None) else None)
+    commit = None
+    if overcommit_mode == 2:
+        climit, ccur = _kb("CommitLimit"), _kb("Committed_AS")
+        if climit is not None and ccur is not None:
+            commit = climit - ccur
+    return _MemStatus(load, availp, commit, total,
+                      _parse_linux_psi_some_avg10(psi_text))
 
 
 def _mem_status():
     """Return a _MemStatus (None if wholly unknown). Windows: GlobalMemoryStatusEx
-    (load=dwMemoryLoad, commit=ullAvailPageFile). Linux: /proc/meminfo (load
-    derived; commit = CommitLimit − Committed_AS). macOS: sysctl hw.memsize + vm_stat
-    (load + physical floor; no fixed commit limit → that check skipped). Any probe
-    failure → None → the gate is simply disabled (safe degradation)."""
+    (load=dwMemoryLoad, commit=ullAvailPageFile). Linux: /proc/meminfo (load from
+    MemAvailable; commit only under strict overcommit) + /proc/pressure/memory
+    (PSI). macOS: sysctl hw.memsize + vm_stat + kern.memorystatus_vm_pressure_level
+    (no fixed commit limit → that check skipped). Any probe failure → None → the
+    gate is simply disabled (safe degradation)."""
     try:
         if sys.platform == "win32":
             import ctypes
@@ -2730,25 +2798,30 @@ def _mem_status():
                 timeout=2).stdout.strip())
             vmstat = subprocess.run(
                 ["vm_stat"], capture_output=True, text=True, timeout=2).stdout
-            return _parse_macos_vm_stat(vmstat, total)
+            level = None
+            try:
+                level = int(subprocess.run(
+                    ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+                    capture_output=True, text=True, timeout=2).stdout.strip())
+            except Exception:
+                pass   # sysctl absent/denied → pressure check skipped
+            return _parse_macos_vm_stat(vmstat, total, level)
         else:
-            info = {}
             with open("/proc/meminfo", encoding="utf-8") as f:
-                for line in f:
-                    k, _, rest = line.partition(":")
-                    info[k.strip()] = rest
-
-            def _kb(key):
-                try:
-                    return int(info[key].split()[0]) / 1024   # KB → MB
-                except Exception:
-                    return None
-            total, availp = _kb("MemTotal"), _kb("MemAvailable")
-            climit, ccur = _kb("CommitLimit"), _kb("Committed_AS")
-            load = (max(0.0, min(100.0, (total - availp) / total * 100.0))
-                    if (total and availp is not None) else None)
-            commit = (climit - ccur) if (climit is not None and ccur is not None) else None
-            return _MemStatus(load, availp, commit, total)
+                meminfo = f.read()
+            overcommit = None
+            try:
+                with open("/proc/sys/vm/overcommit_memory", encoding="utf-8") as f:
+                    overcommit = int(f.read().strip())
+            except Exception:
+                pass   # unreadable (container) → treat as heuristic, skip commit
+            psi = None
+            try:
+                with open("/proc/pressure/memory", encoding="utf-8") as f:
+                    psi = f.read()
+            except Exception:
+                pass   # kernel < 4.20 or masked /proc → PSI check skipped
+            return _parse_linux_meminfo(meminfo, overcommit, psi)
     except Exception:
         return None
     return None
@@ -2762,18 +2835,25 @@ def _avail_ram_mb():
 
 
 def _ram_fit(st, per_pane_mb, *, max_load, min_commit_mb,
-             min_free_phys_pct, min_free_phys_mb=0.0):
-    """How many more ~per_pane_mb live panes fit before a Windows-resource gate
+             min_free_phys_pct, min_free_phys_mb=0.0, max_pressure=10.0):
+    """How many more ~per_pane_mb live panes fit before a resource-gate
     threshold trips, and which one binds. Returns (count, binding_reason).
 
-    Constraints (a None field skips its check): (1) memory-load high-water
-    (dwMemoryLoad) — already-pressured → 0; (2) commit headroom must stay above
-    min_commit_mb — the documented system-freeze cause, the PRIMARY check; (3) a
+    Constraints (a None field skips its check): (0) measured memory PRESSURE
+    (Linux PSI some avg10 / macOS critical level) at/above max_pressure —
+    tasks are already stalling on memory, the direct observation of thrash,
+    so no new pane regardless of occupancy numbers; (1) memory-load
+    high-water — already-pressured → 0; (2) commit headroom must stay above
+    min_commit_mb — the documented system-freeze cause, the PRIMARY check on
+    Windows (skipped on Linux unless strict overcommit; never on macOS); (3) a
     RELATIVE physical floor (min_free_phys_pct of total, but at least
-    min_free_phys_mb) — anti-thrash, machine-relative not a fixed MB. None st (e.g.
-    macOS) → unbounded."""
+    min_free_phys_mb) — anti-thrash, machine-relative not a fixed MB. None st
+    → unbounded."""
     if st is None or per_pane_mb <= 0:
         return (999, "")
+    pressure = getattr(st, "pressure_pct", None)
+    if pressure is not None and pressure >= max_pressure:
+        return (0, f"memory pressure {pressure:.0f}% ≥ {max_pressure:.0f}% (PSI)")
     if st.load is not None and st.load >= max_load:
         return (0, f"memory load {st.load:.0f}% ≥ {max_load:.0f}%")
     cand = []   # (fit_count_float, reason)
@@ -2797,14 +2877,25 @@ def _ram_gate_decision(st, per_pane_mb, **kw):
     return (fit >= 1, reason)
 
 
+# Default memory-load high-water, per OS. Windows' dwMemoryLoad is an
+# INDEPENDENT kernel signal (standby-aware) → 85 is a real early warning.
+# On Linux/macOS saikai DERIVES load from the same availability number the
+# physical floor uses, so a strict load cutoff just double-counts the floor
+# and closes the gate while ~15% is still genuinely available (the "saikai
+# is stingier than Linux actually is" effect). 95 keeps it as a backstop
+# against a misconfigured floor; the floor + PSI are the real POSIX gates.
+_DEFAULT_MAX_LOAD = 85.0 if sys.platform == "win32" else 95.0
+
+
 def _ram_gate_kwargs() -> dict:
     """Live-pane gate thresholds resolved env > config > default (spec §A.1). Shared
     by the open-gate and the statusbar 'fit' indicator so they can't disagree."""
     return dict(
-        max_load=_cfg("limits", "max_memory_load", "SAIKAI_MAX_MEM_LOAD", 85.0, float),
+        max_load=_cfg("limits", "max_memory_load", "SAIKAI_MAX_MEM_LOAD", _DEFAULT_MAX_LOAD, float),
         min_commit_mb=_cfg("limits", "min_commit_headroom_mb", "SAIKAI_MIN_COMMIT_MB", 2048.0, float),
         min_free_phys_pct=_cfg("limits", "min_free_phys_pct", "SAIKAI_MIN_FREE_PHYS_PCT", 8.0, float),
         min_free_phys_mb=_cfg("limits", "min_free_mb", "SAIKAI_MIN_FREE_MB", 0.0, float),
+        max_pressure=_cfg("limits", "max_memory_pressure", "SAIKAI_MAX_MEM_PRESSURE", 10.0, float),
     )
 
 
