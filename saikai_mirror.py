@@ -244,6 +244,7 @@ class MirrorHub:
 
     def stop(self) -> None:
         self._stopped.set()
+        self._cancel_idle_timer()
         with self._clients_lock:
             for cq in list(self._clients):
                 try:
@@ -501,7 +502,7 @@ let fatal = false;
 function isControlByte(d) {
   // Flush immediately on ESC, CR, or any C0 control byte so interactive keys
   // (Ctrl-C = \x03, Enter = \r, arrows = ESC[…) are never batching-delayed.
-  for (let i=0;i<d.length;i++) { if (d.charCodeAt(0) < 32 || d.charCodeAt(i) === 0x1b) return true; }
+  for (let i=0;i<d.length;i++) { if (d.charCodeAt(i) < 32) return true; }
   return false;
 }
 
@@ -737,6 +738,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
+            self._reject(400, "bad length")
+            return
+        if length < 0:
             self._reject(400, "bad length")
             return
         if length > self._INPUT_CAP:
