@@ -35,7 +35,23 @@ def test_mirror_driver_never_lets_broadcast_break_console():
     assert d.written == ["data"]
 
 
+def test_broadcast_does_not_touch_mirror_lock_on_ui_thread():
+    """The UI-thread path (broadcast) must only enqueue — it must NOT take the
+    mirror lock (that lock is held by the drain thread during pyte.feed and by
+    snapshot; taking it on the UI thread could stall the UI under load)."""
+    hub = m.MirrorHub(token="t", ingest_cap=8)
+    hub._mirror_lock.acquire()      # simulate drain/snapshot holding it
+    try:
+        import threading
+        done = threading.Event()
+        threading.Thread(target=lambda: (hub.broadcast("x"), done.set())).start()
+        assert done.wait(timeout=2.0), "broadcast() blocked on the mirror lock"
+    finally:
+        hub._mirror_lock.release()
+
+
 if __name__ == "__main__":
     test_mirror_driver_tees_then_delegates()
     test_mirror_driver_never_lets_broadcast_break_console()
+    test_broadcast_does_not_touch_mirror_lock_on_ui_thread()
     print("OK test_mirror_driver")
