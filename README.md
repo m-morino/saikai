@@ -49,6 +49,22 @@ live pane, no reply due · `@` open elsewhere · `+` active · `.` recent · `*`
 - Reads Claude's own transcript files directly — no daemon, no database;
   AI summaries are opt-in.
 
+## Who it is for
+
+What I wanted was a TUI session manager that could keep several Claude Code
+sessions on one screen and let me move between them. It is especially useful
+for:
+
+- finding sessions spread across repositories and worktrees without remembering
+  each original cwd;
+- running several `claude` processes in parallel and seeing which are working,
+  waiting, or finished;
+- closing the terminal and later restoring the same working set;
+- getting a Claude Desktop-style session list inside the usual terminal,
+  without keeping a desktop app running;
+- finding older work from conversation text, changes, or previous prompts
+  rather than from titles alone.
+
 The implementation is three small Python modules on
 [Textual](https://github.com/Textualize/textual), with a RAM gate that warns
 before another live pane would push the machine into thrashing.
