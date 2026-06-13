@@ -307,18 +307,25 @@ def make_mirror_driver(base_cls, hub: "MirrorHub"):
     return MirrorDriver
 
 
-# Browser page. xterm.js loaded from a pinned CDN (no SRI here; offline
-# vendoring + SRI is an optional follow-up). The page reads ?token= from its
-# own URL and opens the SSE stream with it.
+# Browser page. xterm.js + the canvas-renderer addon are vendored and served
+# from this origin (no CDN — works on locked-down/offline networks). The canvas
+# renderer draws box-drawing + block glyphs (Textual's borders) as crisp vector
+# shapes, unlike the default DOM renderer (which left borders looking thin).
+# The page reads ?token= from its own URL and opens the SSE stream with it.
 _PAGE_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <title>saikai mirror</title>
 <link rel="stylesheet" href="/xterm.min.css">
 <style>html,body{margin:0;height:100%;background:#000}#t{height:100%}</style></head>
 <body><div id="t"></div>
 <script src="/xterm.min.js"></script>
+<script src="/addon-canvas.js"></script>
 <script>
 const term = new Terminal({cols: __COLS__, rows: __ROWS__, scrollback:0, convertEol:false});
 term.open(document.getElementById('t'));
+try {
+  const _CA = (window.CanvasAddon && window.CanvasAddon.CanvasAddon) || window.CanvasAddon;
+  term.loadAddon(new _CA());     // crisp box/block borders; falls back to DOM
+} catch (e) {}
 const token = new URLSearchParams(location.search).get('token');
 const es = new EventSource('/stream?token=' + encodeURIComponent(token));
 es.onmessage = (e) => {
@@ -341,6 +348,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         return hmac.compare_digest(got, self.server.hub._token)
 
     _STATIC = {"/xterm.min.js": "application/javascript",
+               "/addon-canvas.js": "application/javascript",
                "/xterm.min.css": "text/css"}
 
     def do_GET(self):
