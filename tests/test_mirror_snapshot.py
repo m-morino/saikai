@@ -28,7 +28,20 @@ def test_snapshot_skips_wide_char_continuation():
     assert plain.startswith("あいうA")   # adjacent — no per-wide-char shift
 
 
+def test_snapshot_handles_bright_and_truecolor():
+    """pyte stores bright colours as 'brightX' and 256/truecolor as 6-hex. The
+    snapshot must emit real SGR (90-97 / 38;2;r;g;b), not fall back to default —
+    otherwise Textual's bright/accent border colours render wrong."""
+    hub = m.MirrorHub(token="t", cols=8, rows=1)
+    hub._feed("\x1b[91mB\x1b[38;5;208mC\x1b[38;2;10;20;30mD\x1b[0m")
+    frame = hub._snapshot()
+    assert "\x1b[91m" in frame                 # bright red -> 91 (was dropped)
+    assert "\x1b[38;2;255;135;0m" in frame     # 256 colour -> truecolor
+    assert "\x1b[38;2;10;20;30m" in frame      # truecolor
+
+
 if __name__ == "__main__":
     test_snapshot_reproduces_fed_text_and_color()
     test_snapshot_skips_wide_char_continuation()
+    test_snapshot_handles_bright_and_truecolor()
     print("OK test_mirror_snapshot")
