@@ -44,6 +44,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   public repository surface.
 
 ### Fixed
+- **Tree mode no longer chains unrelated same-repo sessions into one long
+  list.** Parent assignment treated "same cwd + recent" as kinship and scored
+  a `main`↔`main` branch match as strong evidence, so in a single-repository
+  history every session linked to its nearest predecessor. A parent now
+  requires continuation evidence — a shared *feature* branch (`main`/`master`/
+  detached `HEAD` count as no-information), or title/topic overlap — and
+  sessions without such evidence stay roots. Genuine continuation chains
+  (e.g. a series of sessions iterating on the same prompt) still nest.
 - Help no longer claims that the Textual Last column is color-coded when it is
   rendered as plain text.
 
