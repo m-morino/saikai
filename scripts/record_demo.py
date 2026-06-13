@@ -1,191 +1,129 @@
-"""Record a saikai demo as an asciinema cast → convert to GIF with agg.
-
-Sets up the same fictional demo data as make_screenshots.py so nothing private
-can appear in the recording.
-
-Prerequisites
-─────────────
-  pip install asciinema          (or: uv add asciinema)
-  cargo install agg              (converts .cast → .gif)
-    OR: npm install -g svg-term-cli   (alternative: .cast → .svg)
-
-Usage
-─────
-  uv run scripts/record_demo.py          # auto-mode: records + prints convert cmd
-  uv run scripts/record_demo.py --guide  # print manual-recording instructions only
-
-The output is  docs/assets/saikai-demo.cast  (and a ready-to-run agg command).
-"""
+"""Prepare, record, and audit an isolated real-Claude saikai demo."""
 from __future__ import annotations
 
 import argparse
 import os
+import shlex
+import shutil
 import subprocess
-import sys
-import tempfile
 from pathlib import Path
 
-from demo_fixture import build_demo_fixture
+from audit_demo_cast import audit_cast
+from demo_fixture import DemoFixture, build_demo_fixture
+
+if os.name != "nt":
+    import pwd
+else:
+    pwd = None
+
 
 REPO = Path(__file__).resolve().parent.parent
-ASSETS = REPO / "docs" / "assets"
-CAST_OUT = ASSETS / "saikai-demo.cast"
-GIF_OUT  = ASSETS / "saikai-demo.gif"
+DEFAULT_ROOT = (Path("/home/demo/saikai-demo")
+                if os.name != "nt" else REPO / ".demo-work")
 
-def _build_demo_home() -> Path:
-    fixture = build_demo_fixture(Path(tempfile.mkdtemp(prefix="saikai-demo-")))
-    demo_home = fixture.home
-    for var in ("USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME"):
-        os.environ[var] = str(demo_home)
-    os.environ.pop("SAIKAI_CONFIG", None)
-    os.environ["SAIKAI_SUMMARIZE_ENABLED"] = "0"
-    os.environ["SAIKAI_AUTO_REFRESH"]       = "0"
-    os.environ["SAIKAI_SPLIT_LIVE"]         = "0"   # list-only for a clean recording
-    return demo_home
+GUIDE = """\
+Public real-Claude recordings require a disposable Linux environment owned by
+the OS user `demo`. Do not record from a normal workstation or real HOME.
 
+Read docs/demo-recording.md before continuing.
 
-# ── manual-recording guide ────────────────────────────────────────────────────
-
-GUIDE = """
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  saikai demo recording guide                                                │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-The script sets up a throwaway home with fictional demo sessions so nothing
-private appears in the recording.  Run it in a terminal that is at least
-128 columns × 35 rows.
-
-Option A — asciinema (recommended, cross-platform)
-──────────────────────────────────────────────────
-  pip install asciinema
-  uv run scripts/record_demo.py          ← sets up demo home + launches recorder
-
-  Convert to GIF afterwards:
-    cargo install agg
-    agg docs/assets/saikai-demo.cast docs/assets/saikai-demo.gif \\
-        --theme monokai --speed 1.5 --cols 128 --rows 35
-
-  Or to animated SVG (no Rust needed):
-    npx svg-term-cli --in docs/assets/saikai-demo.cast \\
-        --out docs/assets/saikai-demo.svg --width 128 --height 35
-
-Option B — WezTerm built-in (Windows/macOS/Linux, no extra deps)
-──────────────────────────────────────────────────────────────────
-  1. Run:  uv run scripts/record_demo.py --setup-only
-     (exits after creating the demo home; prints the SAIKAI_ env vars to set)
-  2. Set the printed env vars in a WezTerm shell.
-  3. Start a cast:  wezterm record -o docs/assets/saikai-native.cast
-  4. In the recorded shell:  uv run saikai --all-projects
-  5. Exit the recorded shell, then replay with:
-       wezterm replay docs/assets/saikai-native.cast
-
-For an MP4 that captures terminal chrome, IME, and mouse behavior, use the OS
-screen recorder while following the same sequence.
-
-Suggested demo sequence (≈ 45 seconds)
-───────────────────────────────────────
-  1. App opens — full list visible with Date grouping (Shift+F7)
-  2. Type "auth" — live filter narrows to matching sessions
-  3. Esc — clear filter
-  4. Down arrow — move to a different session
-  5. Space f — mark favourite (★ appears)
-  6. Shift+F7 twice — cycle through Project / State grouping
-  7. ? — open help overlay, pause 2 s, Esc
-  8. Alt+→ (×3) — shrink the list, showing more of the description column
+  python scripts/record_demo.py --setup-only --root /home/demo/saikai-demo
+  python scripts/record_demo.py --record-real --root /home/demo/saikai-demo
+  python scripts/record_demo.py --audit /home/demo/saikai-demo/saikai-real.cast
 """
 
 
-# ── auto record mode ──────────────────────────────────────────────────────────
+def _setup(root: Path) -> DemoFixture:
+    fixture = build_demo_fixture(root)
+    print(f"fixture root: {fixture.root}")
+    print(f"fictional HOME: {fixture.home}")
+    print(f"hero repo: {fixture.hero_repo}")
+    print(f"synthetic sessions: {len(fixture.sessions)}")
+    print("\nBefore seeding or recording:")
+    print(f"  export HOME={shlex.quote(str(fixture.home))}")
+    print(f"  export CLAUDE_CONFIG_DIR={shlex.quote(str(fixture.home / '.claude'))}")
+    print("  export SAIKAI_DEMO_BARE_WRAPPER=1")
+    return fixture
 
-def _find_saikai() -> list[str]:
-    """Return the command list to run saikai (uv run or direct)."""
-    saikai_py = REPO / "saikai.py"
-    if saikai_py.exists():
-        return [sys.executable, str(saikai_py)]
-    return ["saikai"]
 
+def _require_real_recording_environment(root: Path) -> None:
+    failures: list[str] = []
+    if os.name == "nt":
+        failures.append("real recording must run in a dedicated Linux environment")
+    else:
+        try:
+            assert pwd is not None
+            if pwd.getpwuid(os.getuid()).pw_name != "demo":
+                failures.append("OS user must be demo")
+        except KeyError:
+            failures.append("could not verify OS user demo")
 
-def _record(demo_home: Path) -> None:
+    resolved = root.resolve()
     try:
-        subprocess.run(["asciinema", "--version"], capture_output=True, check=True)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        print("asciinema not found — install it:  pip install asciinema")
-        print("Or use --guide for manual recording instructions.")
-        sys.exit(1)
+        resolved.relative_to(Path("/home/demo"))
+    except ValueError:
+        failures.append("fixture root must be under /home/demo")
+    if Path("/mnt/c").exists():
+        failures.append("Windows drive mount /mnt/c is present")
+    if os.environ.get("SSH_AUTH_SOCK"):
+        failures.append("SSH_AUTH_SOCK must be unset")
+    if Path(os.environ.get("HOME", "")).resolve() != (resolved / "home").resolve():
+        failures.append("HOME must be the fixture home")
+    expected_config = (resolved / "home" / ".claude").resolve()
+    if Path(os.environ.get("CLAUDE_CONFIG_DIR", "")).resolve() != expected_config:
+        failures.append("CLAUDE_CONFIG_DIR must be the fixture .claude directory")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        failures.append("a recording-only ANTHROPIC_API_KEY must be injected")
+    if os.environ.get("SAIKAI_DEMO_BARE_WRAPPER") != "1":
+        failures.append("the documented bare Claude wrapper must be active")
+    for command in ("asciinema", "claude", "saikai"):
+        if not shutil.which(command):
+            failures.append(f"required command not found: {command}")
+    if failures:
+        raise SystemExit("unsafe recording environment:\n  - " + "\n  - ".join(failures))
 
-    ASSETS.mkdir(parents=True, exist_ok=True)
-    cmd = _find_saikai() + ["--all-projects"]
 
-    env = {**os.environ, "HOME": str(demo_home), "USERPROFILE": str(demo_home)}
-    print(f"Recording to {CAST_OUT}")
-    print("Follow the suggested demo sequence from --guide, then press Ctrl-D or q.")
-    print()
-
+def _record_real(root: Path, cast: Path) -> None:
+    _require_real_recording_environment(root)
+    cast.parent.mkdir(parents=True, exist_ok=True)
+    command = shlex.join(["saikai", "--all"])
     subprocess.run(
-        ["asciinema", "rec", str(CAST_OUT),
-         "--cols", "128", "--rows", "35",
-         "--command", " ".join(cmd),
-         "--overwrite"],
-        env=env,
+        [
+            "asciinema", "rec", str(cast),
+            "--cols", "128", "--rows", "35",
+            "--command", command,
+            "--overwrite",
+        ],
         check=True,
     )
-
-    print(f"\n✓ Saved: {CAST_OUT}")
-    print("\nConvert to GIF (requires  cargo install agg):")
-    print(f"  agg {CAST_OUT} {GIF_OUT} --theme monokai --speed 1.5")
-    print("\nConvert to animated SVG (requires  npm install -g svg-term-cli):")
-    svg = ASSETS / "saikai-demo.svg"
-    print(f"  npx svg-term-cli --in {CAST_OUT} --out {svg} --width 128 --height 35")
+    audit_cast(cast)
+    print(f"recorded and audited: {cast}")
+    print("Review every frame before converting or publishing.")
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--guide", action="store_true")
+    parser.add_argument("--setup-only", action="store_true")
+    parser.add_argument("--record-real", action="store_true")
+    parser.add_argument("--audit", type=Path)
+    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument("--cast", type=Path)
+    args = parser.parse_args()
 
-def main() -> None:
-    # Windows may default stdout to CP932; the guide contains box drawing and
-    # arrows. Preserve the guide where supported and degrade unsupported glyphs
-    # instead of crashing before recording starts.
-    try:
-        sys.stdout.reconfigure(errors="replace")
-    except (AttributeError, OSError):
-        pass
-
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--guide",      action="store_true",
-                    help="Print manual recording instructions and exit")
-    ap.add_argument("--setup-only", action="store_true",
-                    help="Create demo home, print env vars, exit (for manual recording)")
-    args = ap.parse_args()
-
-    if args.guide:
-        print(GUIDE)
-        return
-
-    demo_home = _build_demo_home()
-
+    if args.audit:
+        audit_cast(args.audit)
+        print(f"demo audit passed: {args.audit}")
+        return 0
     if args.setup_only:
-        print("Demo home created.  Set these env vars before running saikai:\n")
-        values = {
-            "HOME": str(demo_home),
-            "USERPROFILE": str(demo_home),
-            "APPDATA": str(demo_home),
-            "LOCALAPPDATA": str(demo_home),
-            "SAIKAI_SUMMARIZE_ENABLED": "0",
-            "SAIKAI_AUTO_REFRESH": "0",
-        }
-        if sys.platform == "win32":
-            for var, value in values.items():
-                escaped = value.replace("'", "''")
-                print(f"  $env:{var} = '{escaped}'")
-        else:
-            import shlex
-            for var, value in values.items():
-                print(f"  export {var}={shlex.quote(value)}")
-        print(f"\nThen run:  saikai --all-projects")
-        return
-
-    _record(demo_home)
+        _setup(args.root)
+        return 0
+    if args.record_real:
+        _record_real(args.root, args.cast or (args.root / "saikai-real.cast"))
+        return 0
+    print(GUIDE)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
