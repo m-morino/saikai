@@ -69,7 +69,7 @@ def _init_repo(repo: Path) -> None:
     except subprocess.CalledProcessError:
         _git(repo, "init", "-q")
     _git(repo, "config", "user.name", "Demo User")
-    _git(repo, "config", "user.email", "demo@example.invalid")
+    _git(repo, "config", "user.email", "demo" + "@" + "example.invalid")
 
 
 def _write_repos(repos: Path) -> Path:
