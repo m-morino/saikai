@@ -7,7 +7,11 @@ neutral terminal code (saikai_terminal.py) gains ZERO network code.
 """
 from __future__ import annotations
 
+import base64
+import hmac
+import http.server
 import queue
+import socketserver
 import sys
 import threading
 import pyte
@@ -109,6 +113,11 @@ class MirrorHub:
         self._mirror_lock = threading.Lock()
         self._screen = pyte.Screen(cols, rows)
         self._stream = pyte.Stream(self._screen)
+        self._clients: "set[queue.Queue]" = set()
+        self._clients_lock = threading.Lock()
+        self._httpd: Optional["_Server"] = None
+        self._drain: Optional[threading.Thread] = None
+        self._stopped = threading.Event()
 
     def _feed(self, data: str) -> None:
         with self._mirror_lock:
@@ -137,6 +146,74 @@ class MirrorHub:
             except queue.Full:
                 pass   # never block the UI thread
 
+    def _add_client(self):
+        cq: "queue.Queue[Optional[str]]" = queue.Queue(256)
+        # Snapshot + registration ATOMIC vs the drain thread's feed, so no diff
+        # is lost or applied twice across the join boundary.
+        with self._mirror_lock:
+            snapshot = _synth_full_frame(self._screen, self._cols, self._rows)
+            with self._clients_lock:
+                self._clients.add(cq)
+        return cq, snapshot
+
+    def _remove_client(self, cq):
+        with self._clients_lock:
+            self._clients.discard(cq)
+
+    def _drain_loop(self):
+        while not self._stopped.is_set():
+            try:
+                data = self._ingest.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            with self._mirror_lock:
+                self._stream.feed(data)
+                with self._clients_lock:
+                    targets = list(self._clients)
+            for cq in targets:
+                try:
+                    cq.put_nowait(data)
+                except queue.Full:
+                    try:
+                        cq.get_nowait()
+                        cq.put_nowait(data)
+                    except (queue.Empty, queue.Full):
+                        pass
+
+    def serve(self) -> int:
+        self._httpd = _Server((self._host, self._port), _Handler)
+        self._httpd.hub = self
+        self._port = self._httpd.server_address[1]
+        threading.Thread(target=self._httpd.serve_forever,
+                         name="saikai-mirror-http", daemon=True).start()
+        self._drain = threading.Thread(target=self._drain_loop,
+                                       name="saikai-mirror-drain", daemon=True)
+        self._drain.start()
+        return self._port
+
+    def stop(self) -> None:
+        self._stopped.set()
+        with self._clients_lock:
+            for cq in list(self._clients):
+                try:
+                    cq.put_nowait(None)
+                except queue.Full:
+                    pass
+        if self._httpd is not None:
+            try:
+                self._httpd.shutdown()
+            except Exception:
+                pass
+
+    def set_size(self, cols: int, rows: int) -> None:
+        with self._mirror_lock:
+            self._cols, self._rows = cols, rows
+            self._screen.resize(rows, cols)   # pyte: (lines, columns)
+
+    def url(self) -> str:
+        host = "127.0.0.1" if self._host in ("0.0.0.0", "") else self._host
+        return f"http://{host}:{self._port}/?token={self._token}"
+
 
 def _base_driver_class():
     """The console driver Textual would auto-select for this platform."""
@@ -158,3 +235,98 @@ def make_mirror_driver(base_cls, hub: "MirrorHub"):
                 pass            # mirror is best effort; never degrade local UI
             super().write(data)
     return MirrorDriver
+
+
+# Browser page. xterm.js loaded from a pinned CDN (no SRI here; offline
+# vendoring + SRI is an optional follow-up). The page reads ?token= from its
+# own URL and opens the SSE stream with it.
+_PAGE_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<title>saikai mirror</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>html,body{margin:0;height:100%;background:#000}#t{height:100%}</style></head>
+<body><div id="t"></div>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script>
+const term = new Terminal({scrollback:0, convertEol:false});
+term.open(document.getElementById('t'));
+const token = new URLSearchParams(location.search).get('token');
+const es = new EventSource('/stream?token=' + encodeURIComponent(token));
+es.onmessage = (e) => {
+  const bin = atob(e.data);
+  const bytes = new Uint8Array(bin.length);
+  for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+  term.write(bytes);
+};
+</script></body></html>"""
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):           # silence default stderr logging
+        pass
+
+    def _token_ok(self) -> bool:
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(self.path).query)
+        got = (q.get("token") or [""])[0]
+        return hmac.compare_digest(got, self.server.hub._token)
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if not self._token_ok():
+            self.send_error(403, "forbidden")
+            return
+        if path == "/":
+            body = _PAGE_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/stream":
+            self._stream()
+        else:
+            self.send_error(404)
+
+    def _stream(self):
+        hub = self.server.hub
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        cq, snapshot = hub._add_client()
+        try:
+            self._send_frame(snapshot)
+            while True:
+                try:
+                    data = cq.get(timeout=30.0)
+                except queue.Empty:
+                    # Send SSE keepalive comment so browsers know the connection
+                    # is alive and urllib.request.read(n) does not block forever.
+                    self.wfile.write(b":\n\n")
+                    self.wfile.flush()
+                    continue
+                if data is None:             # stop sentinel
+                    break
+                self._send_frame(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            hub._remove_client(cq)
+
+    def _send_frame(self, data: str):
+        payload = base64.b64encode(data.encode("utf-8")).decode("ascii")
+        frame = b"data: " + payload.encode("ascii") + b"\n\n"
+        # Pad short frames to ≥128 bytes with an SSE comment so that
+        # urllib.request.read(n) does not block waiting for a second recv
+        # on keep-alive connections (a single TCP segment carries all bytes).
+        if len(frame) < 128:
+            pad = max(0, 128 - len(frame) - 3)
+            frame += b":" + b" " * pad + b"\n\n"
+        self.wfile.write(frame)
+        self.wfile.flush()
+
+
+class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
