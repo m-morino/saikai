@@ -850,10 +850,22 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         hub.inject_mouse(col, row, button, kind)
         self._send_status(204)
 
+    _KEY_CAP = 64   # longest sensible key string ("ctrl+shift+pageup" << 64)
+
     def _do_key(self):
-        # TEMPORARY stub: the real /key body lands in Task 3. The dispatcher
-        # references this so it is written once; until then /key is 405.
-        self._reject(405, "method not allowed")
+        obj = self._post_gate_and_json()
+        if obj is None:
+            return
+        hub = self.server.hub
+        key = obj.get("key")
+        if not isinstance(key, str) or key == "" or len(key) > self._KEY_CAP:
+            self.send_error(400, "bad key")
+            return
+        if not hub._control_enabled:
+            self.send_error(409, "control off")
+            return
+        hub.inject_key(key)
+        self._send_status(204)
 
     def _send_status(self, code):
         self.send_response(code)

@@ -337,6 +337,55 @@ def test_post_mouse_host_and_origin_matrix():
         hub.stop()
 
 
+def test_post_key_gate_and_body_matrix():
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0)
+    got = []
+    hub.set_key_handler(lambda key: got.append(key))
+    hub._control_enabled = True
+    port = hub.serve()
+    key = hub._write_key
+    try:
+        WK = {"X-Mirror-Write-Key": key}
+        st, _ = _post(port, "/key", {"key": "escape"}, headers=WK)
+        assert st == 204, st
+        st, _ = _post(port, "/key", {"key": "ctrl+c"}, headers=WK)
+        assert st == 204, st
+        # Bad key header -> 403.
+        st, _ = _post(port, "/key", {"key": "tab"}, headers={"X-Mirror-Write-Key": "wrong"})
+        assert st == 403, st
+        # Missing 'key' -> 400.
+        st, _ = _post(port, "/key", {"nope": 1}, headers=WK)
+        assert st == 400, st
+        # Non-str 'key' -> 400.
+        st, _ = _post(port, "/key", {"key": 123}, headers=WK)
+        assert st == 400, st
+        # Empty 'key' -> 400 (never post a garbage Key).
+        st, _ = _post(port, "/key", {"key": ""}, headers=WK)
+        assert st == 400, st
+        # Over-long 'key' -> 400 (defensive cap).
+        st, _ = _post(port, "/key", {"key": "x" * 65}, headers=WK)
+        assert st == 400, st
+        # Control OFF -> 409.
+        hub._control_enabled = False
+        st, _ = _post(port, "/key", {"key": "up"}, headers=WK)
+        assert st == 409, st
+        hub._control_enabled = True
+        # Foreign Host -> 403.
+        assert _raw_request(port, "POST", "/key",
+                            {"X-Mirror-Write-Key": key, "Content-Type": "application/json",
+                             "Host": "evil.example.com", "Origin": "http://evil.example.com",
+                             "_body": json.dumps({"key": "up"}).encode("utf-8")}) == 403
+        # Only the two good keys reached the handler, in order.
+        assert got == ["escape", "ctrl+c"], got
+        # Unknown path is still 405.
+        assert _raw_request(port, "POST", "/nope",
+                            {"X-Mirror-Write-Key": key, "Content-Type": "application/json",
+                             "Host": f"127.0.0.1:{port}", "Origin": f"http://127.0.0.1:{port}",
+                             "_body": b"{}"}) == 405
+    finally:
+        hub.stop()
+
+
 def _read_sse(resp, deadline_s=3.0, until=b"event: control"):
     """Read SSE bytes until `until` has appeared (after the snapshot), or time out."""
     import time as _t
@@ -542,6 +591,7 @@ if __name__ == "__main__":
     test_host_allow_list_and_origin_matrix()
     test_post_mouse_gate_and_body_matrix()
     test_post_mouse_host_and_origin_matrix()
+    test_post_key_gate_and_body_matrix()
     test_sse_emits_writekey_and_control_without_colliding_output()
     test_set_control_state_pushes_control_frame()
     test_idle_auto_disable_flips_control_off()
