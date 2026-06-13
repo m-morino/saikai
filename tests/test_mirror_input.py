@@ -582,6 +582,57 @@ def test_wildcard_bind_allows_lan_ip_host():
         hub.stop()
 
 
+def test_mirror_inject_mouse_double_gate_and_events():
+    """_mirror_inject_mouse no-ops when control is OFF (UI-thread re-check), and
+    when ON posts MouseDown+MouseUp for a click / MouseScroll* for a scroll, at
+    the given 0-based coords. Built via __new__ + a post_message recorder (no
+    textual run loop)."""
+    try:
+        from textual import events
+    except Exception:
+        print("SKIP test_mirror_inject_mouse_double_gate_and_events (textual unavailable)")
+        return
+    import saikai
+    app = saikai._MirrorControl.__new__(saikai._MirrorControl)
+    posted = []
+    app.post_message = lambda ev: posted.append(ev)
+
+    # Control OFF -> no-op (double-gate).
+    app._control_enabled = False
+    app._mirror_inject_mouse(5, 9, 0, "down")
+    assert posted == [], "control OFF must post nothing"
+
+    # Control ON, click down+up -> MouseDown then MouseUp at (5,9), button 0.
+    app._control_enabled = True
+    app._mirror_inject_mouse(5, 9, 0, "down")
+    app._mirror_inject_mouse(5, 9, 0, "up")
+    assert len(posted) == 2, posted
+    assert isinstance(posted[0], events.MouseDown), posted
+    assert isinstance(posted[1], events.MouseUp), posted
+    for ev in posted:
+        assert ev.x == 5 and ev.y == 9, (ev.x, ev.y)
+        assert ev.screen_x == 5 and ev.screen_y == 9, (ev.screen_x, ev.screen_y)
+        assert ev.button == 0, ev.button
+
+    # Scroll -> MouseScrollUp / MouseScrollDown (button 0).
+    posted.clear()
+    app._mirror_inject_mouse(2, 3, 0, "scrollup")
+    app._mirror_inject_mouse(2, 3, 0, "scrolldown")
+    assert isinstance(posted[0], events.MouseScrollUp), posted
+    assert isinstance(posted[1], events.MouseScrollDown), posted
+    assert posted[0].x == 2 and posted[0].y == 3, (posted[0].x, posted[0].y)
+
+    # Negative coord -> ignored (no event).
+    posted.clear()
+    app._mirror_inject_mouse(-1, 4, 0, "down")
+    app._mirror_inject_mouse(4, -1, 0, "down")
+    assert posted == [], "out-of-range cell must be ignored"
+
+    # Unknown kind -> ignored.
+    app._mirror_inject_mouse(1, 1, 0, "wiggle")
+    assert posted == [], "unknown kind must post nothing"
+
+
 if __name__ == "__main__":
     test_inject_gate_off_by_default_and_requires_handler()
     test_inject_is_fifo_via_single_drain()
@@ -601,4 +652,5 @@ if __name__ == "__main__":
     test_page_contains_input_listeners_and_sender()
     test_page_has_no_js_breaking_control_bytes()
     test_wildcard_bind_allows_lan_ip_host()
+    test_mirror_inject_mouse_double_gate_and_events()
     print("OK test_mirror_input")
