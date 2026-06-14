@@ -23,6 +23,7 @@ import time
 ACCENT = "\x1b[38;2;215;119;87m"     # Claude "#d77757"
 DIM = "\x1b[38;2;136;136;136m"
 WHITE = "\x1b[38;2;230;230;230m"
+GOLD = "\x1b[38;2;212;170;100m"      # auto-accept / mode indicator
 BOLD = "\x1b[1m"
 RESET = "\x1b[0m"
 
@@ -31,6 +32,16 @@ RESET = "\x1b[0m"
 WIDTH = shutil.get_terminal_size((76, 24)).columns
 WIDTH = max(24, min(WIDTH, 200))
 rule = f"{DIM}{'─' * WIDTH}{RESET}"
+
+# The auto-accept indicator + effort badge below the input, the badge
+# right-aligned to the pane. The real CLI's personal statusline (username,
+# cost, custom segments) is intentionally NOT reproduced for a public demo.
+_auto = "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"
+_effort = "◈ max · /effort"
+_gap = max(3, WIDTH - 2 - len(_auto) - len(_effort))
+autoline = (f"  {GOLD}⏵⏵ auto mode on{RESET} "
+            f"{DIM}(shift+tab to cycle) · ← for agents{RESET}"
+            f"{' ' * _gap}{DIM}{_effort}{RESET}")
 
 # OSC-0 title: the leading glyph is what saikai's status probe reads (idle).
 sys.stdout.write("\x1b]0;✳ webapp\x07")
@@ -46,7 +57,7 @@ LINES = [
     f"{ACCENT}{LOGO[1]:<9}{RESET}  {WHITE}Opus 4.8 (1M context){RESET} {DIM}with max effort{RESET}",
     f"{ACCENT}{LOGO[2]:<9}{RESET}  {DIM}/home/demo/work/webapp{RESET}",
     "",
-    f"  {DIM}/help for help, /status for your current setup{RESET}",
+    f" {DIM}▎ Using Opus 4.8 (1M context) (from .claude/settings.json) · /model{RESET}",
     "",
     # ── the resumed conversation ─────────────────────────────────────────────
     f"{DIM}>{RESET} Fix the flaky auth token refresh test",
@@ -70,7 +81,7 @@ LINES = [
     rule,
     f"{WHITE}❯{RESET} {DIM}{placeholder}{RESET}",
     rule,
-    f"  {DIM}? for shortcuts{RESET}",
+    autoline,
 ]
 
 for ln in LINES:
