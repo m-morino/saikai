@@ -342,9 +342,14 @@ def test_pilot_esc_quits_and_bar_toggle():
                 facts["bar_after_toggle"] = bool(bar.display)
                 facts["persisted"] = (saikai._read_json(
                     saikai.OPTIONS_FILE, {}) or {}).get("search_bar")
-                await pilot.press("escape")           # single Esc from the list = quit
+                # A single Esc from the list now ARMS quit (does not exit) — a
+                # reflex Esc must not kill saikai. A deliberate SECOND Esc quits.
+                await pilot.press("escape")           # 1st Esc: arm, stay running
+                await pilot.pause(0.2)
+                facts["running_after_one_esc"] = self.is_running
+                await pilot.press("escape")           # 2nd Esc: quit
                 await pilot.pause(0.3)
-                facts["running_after_esc"] = self.is_running
+                facts["running_after_two_esc"] = self.is_running
         asyncio.run(go())
 
     orig_run, App.run = App.run, fake_run
@@ -361,8 +366,62 @@ def test_pilot_esc_quits_and_bar_toggle():
     assert facts.get("table_refocused"), facts
     assert facts.get("bar_after_toggle") is False, f"leader / must hide the bar: {facts}"
     assert facts.get("persisted") is False, facts
-    assert facts.get("running_after_esc") is False, \
-        f"a single Esc from the list must quit: {facts}"
+    assert facts.get("running_after_one_esc") is True, \
+        f"a single Esc from the list must NOT quit (double-press guard): {facts}"
+    assert facts.get("running_after_two_esc") is False, \
+        f"a deliberate second Esc must quit: {facts}"
+
+
+def test_ctrlc_double_press_and_disarm():
+    """Ctrl+C also requires a deliberate SECOND press to quit (claude treats a
+    single Ctrl+C as interrupt, exiting only on a second), and any other key
+    between presses disarms — so only two CONSECUTIVE quit presses exit. The
+    companion to the Esc guard above."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_ctrlc_double_press_and_disarm (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                self.query_one("#table").focus()
+                await pilot.press("ctrl+c")           # 1st Ctrl+C: arm, no quit
+                await pilot.pause(0.2)
+                facts["after_one_cc"] = self.is_running
+                await pilot.press("down")             # any other key disarms…
+                await pilot.pause(0.1)
+                await pilot.press("ctrl+c")           # …so this only re-arms
+                await pilot.pause(0.2)
+                facts["after_disarm_then_cc"] = self.is_running
+                await pilot.press("ctrl+c")           # consecutive 2nd: quit
+                await pilot.pause(0.3)
+                facts["after_two_cc"] = self.is_running
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("after_one_cc") is True, \
+        f"a single Ctrl+C must NOT quit (double-press guard): {facts}"
+    assert facts.get("after_disarm_then_cc") is True, \
+        f"a key between presses disarms, so the next single Ctrl+C must not quit: {facts}"
+    assert facts.get("after_two_cc") is False, \
+        f"two consecutive Ctrl+C must quit: {facts}"
 
 
 def test_pilot_mirror_control_toggle():
@@ -703,6 +762,8 @@ if __name__ == "__main__":
     print("PASS test_pilot_settings_screen")
     test_pilot_esc_quits_and_bar_toggle()
     print("PASS test_pilot_esc_quits_and_bar_toggle")
+    test_ctrlc_double_press_and_disarm()
+    print("PASS test_ctrlc_double_press_and_disarm")
     test_pilot_mirror_control_toggle()
     print("PASS test_pilot_mirror_control_toggle")
     test_pilot_mirror_tap_and_key_drive_ui()

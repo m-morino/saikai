@@ -3111,8 +3111,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
       Footer (key bindings)
 
     All toggles reflect in-app (no restart required):
-      Enter        resume                Esc (saikai controls) leave / quit
-      Ctrl-]       pane → list           Ctrl-C        pane interrupt / app quit
+      Enter        resume                Esc (saikai controls) leave / quit (×2)
+      Ctrl-]       pane → list           Ctrl-C        pane interrupt / quit (×2)
       F7           hide/unhide row       F6            favorite toggle
       Shift-F5     toggle tree display
       Tab          preview full/summary  ?             help overlay
@@ -3252,7 +3252,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]↑[/yellow] [yellow]↓[/yellow]         Move rows\n"
                 "  [yellow]Enter[/yellow]       Resume session\n"
                 "  [yellow]/[/yellow]           Jump to search (or just start typing) · [yellow]␣/[/yellow] hides/shows the bar\n"
-                "  [yellow]Esc[/yellow]         Leave the current context: search/dropdown → list · list → quit\n"
+                "  [yellow]Esc[/yellow]         Leave the current context: search/dropdown → list · list → quit (Esc twice)\n"
                 "  [yellow]?[/yellow]           Help (this screen)\n\n"
                 "[bold cyan]Session ops[/bold cyan]  [dim](␣x = Space then x; F-keys are the aliases)[/dim]\n"
                 "  [yellow]␣f[/yellow] [dim]F6[/dim]     Toggle ★ favorite   ([dim]:fav[/dim] in search to filter)\n"
@@ -3276,8 +3276,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Alt-←/→[/yellow]    Resize the list/pane split — or drag the divider (persists)\n"
                 "  [yellow]Ctrl-][/yellow]     Return focus: pane → list  (SAIKAI_RELEASE_KEY to change)\n"
                 "  [yellow]␣x[/yellow] [dim]F10[/dim]    Close the active tab   ·   [dim]⇧F10[/dim]  Close ALL tabs\n"
-                "  [yellow]Esc[/yellow]        from the list: quit + snapshot panes (␣p reopens)\n"
-                "  [yellow]Ctrl-C[/yellow]     interrupt claude in a focused pane; from saikai controls, quit-all\n"
+                "  [yellow]Esc[/yellow]        from the list: quit (press twice) + snapshot panes (␣p reopens)\n"
+                "  [yellow]Ctrl-C[/yellow]     interrupt claude in a focused pane; from saikai controls, quit-all (press twice)\n"
                 "  [yellow]␣z[/yellow] [dim]⇧F9[/dim]    Freeze the pane in place (copy mode): Shift+drag selects while\n"
                 "             claude streams · scroll up also freezes · ␣z / typing resumes\n\n"
                 "[bold cyan]Filter / Group / Sort (top-right dropdowns, Desktop-style)[/bold cyan]\n"
@@ -3592,7 +3592,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         ENABLE_COMMAND_PALETTE = False
         BINDINGS = [
             Binding("escape", "quit", "Quit"),
-            Binding("ctrl+c", "quit_all", show=False),
+            # Ctrl+C / Ctrl+Q quit is handled in on_key (double-press guarded).
+            # NOT a Binding: a binding fires the UNGUARDED action_quit_all and
+            # quits on the first press, defeating the guard (on_key + event.stop
+            # already shadow Textual's built-in ctrl+c, so no binding is needed).
             # Resume only on Enter. We deliberately do NOT use RowSelected, so
             # a stray mouse click on a row never triggers resume — that was
             # the "screen disappears when I click around" symptom: the click
@@ -4612,8 +4615,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Screen's default ctrl+c=quit would otherwise shadow our binding.
             if event.key in ("ctrl+c", "ctrl+q"):
                 event.stop()
-                self.action_quit_all()
+                # Double-press guard: a single reflex Ctrl+C (claude treats it as
+                # interrupt and exits only on a SECOND one) must not kill saikai.
+                # Esc shares the same arm (see _confirm_quit / action_quit).
+                if self._confirm_quit():
+                    self.action_quit_all()
                 return
+            # Any other key clears a pending quit-arm, so only two CONSECUTIVE
+            # quit presses exit (Esc reaches action_quit via its binding, so it
+            # must NOT be treated as "another key" here).
+            if getattr(self, "_quit_armed", False) and event.key != "escape":
+                self._disarm_quit()
             # Leader/prefix (opt-in, [keys] leader). The leader arms a pending state;
             # the next key runs the mapped action. A focused claude pane consumes its
             # own keys, while the App binding may arm Space from other non-input,
@@ -6050,6 +6062,36 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.preview_mode = "changes"
             self._update_preview(self._cursor_sid())
 
+        def _confirm_quit(self) -> bool:
+            """Double-press guard for app exit. The first Esc/Ctrl+C arms this and
+            shows a hint; a second press within the window returns True (proceed to
+            quit). Any other key disarms it (see on_key). This mirrors Claude
+            Code's "press Ctrl+C again to exit": a single reflex Esc/Ctrl+C — the
+            muscle memory for interrupting claude in a pane — must not kill saikai."""
+            if getattr(self, "_quit_armed", False):
+                self._quit_armed = False          # consume the arm
+                return True
+            self._quit_armed = True
+            try:
+                self.notify("Press Esc or Ctrl+C again to quit",
+                            severity="warning", timeout=2.5)
+            except Exception:
+                pass
+            old = getattr(self, "_quit_disarm_timer", None)
+            if old is not None:
+                try:
+                    old.stop()
+                except Exception:
+                    pass
+            try:
+                self._quit_disarm_timer = self.set_timer(2.5, self._disarm_quit)
+            except Exception:
+                self._quit_disarm_timer = None
+            return False
+
+        def _disarm_quit(self) -> None:
+            self._quit_armed = False
+
         def action_quit(self) -> None:
             # Esc on the list = quit. With live panes it freezes the WHOLE open set
             # and exits at once (see action_quit_all) — it does NOT close one-by-one.
@@ -6079,12 +6121,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if self._focused_terminal() is not None:
                 self.query_one("#table", DataTable).focus()
                 return
+            # Bare list → quit, but only on a DELIBERATE second Esc. A single Esc
+            # is too easy to fire by reflex (it interrupts claude in a focused
+            # pane), so the first one only arms + hints (see _confirm_quit).
+            if not self._confirm_quit():
+                return
             if self._live is not None and self._live.count > 0:
                 self.action_quit_all()
                 return
             if self._live is not None:
                 self._live.join_reaps()   # join any reaps from earlier F10 closes
-            _log("quit: Esc (no live panes)")
+            _log("quit: Esc (confirmed, no live panes)")
             self.exit(None)
 
         def action_quit_all(self) -> None:
