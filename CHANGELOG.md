@@ -6,7 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-06-15
+
 ### Added
+- **Web mirror (opt-in).** saikai can mirror its live UI to a phone or another
+  browser over the LAN — **off by default** and **token-authenticated**. It is
+  **read-only** until you arm browser control at the terminal with `Shift+F12`;
+  then the browser drives saikai by tap (select a row, sort a column), a
+  single-finger swipe to scroll, an on-screen key bar, and a
+  terminal-equivalent physical keyboard (arrows, Home/End, F-keys, Ctrl/Alt
+  combos, `Ctrl+]` to leave a pane, `Ctrl+C` to interrupt claude). Launch shows a
+  scannable QR code; press `F12` to bring it back.
+- The mirror is **safe by construction**: only the local `Shift+F12` can enable
+  control (a browser can never arm itself), control auto-disables after
+  inactivity, a LAN bind stays read-only unless you also set
+  `SAIKAI_MIRROR_ALLOW_LAN_INPUT=1`, the per-run write-key for input travels only
+  over the authenticated stream (never the URL, QR, or logs), and the status bar
+  shows a live connected-browser count with a toast on each connect. New env
+  vars: `SAIKAI_MIRROR`, `SAIKAI_MIRROR_HOST`, `SAIKAI_MIRROR_PORT`,
+  `SAIKAI_MIRROR_ALLOW_LAN_INPUT`.
 - A shared fictional demo fixture now generates the public screenshots,
   deterministic headless GIF, and recording workspace without reading the
   caller's real HOME or Claude history.
@@ -31,8 +49,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (85 stays on Windows): the POSIX load % is derived from the same
   availability figure as the physical floor, so the old shared default
   closed the gate while ~15% of RAM was still genuinely available.
-- The public story now starts with the cross-repository session-discovery and
-  human-attention problem that motivated saikai.
+- The public story now leads with a one-line "Mission control for Claude Code"
+  value statement and the hero demo — which opens on the cross-project session
+  list — with the `claude --resume` rationale moved just below.
 - Help, Settings, and the READMEs explain the visual grammar consistently:
   title color groups context and ASCII symbols report state.
 - Contributor-facing agent files are concise entrypoints instead of duplicate
@@ -44,6 +63,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   public repository surface.
 
 ### Fixed
+- The filter bar no longer mis-sizes: the Sort/Status/Age dropdowns are wide
+  enough that long labels (e.g. "Alphabetically", "All time") no longer wrap,
+  and the search box is capped so it does not expand to dwarf them.
+- Claude Desktop session sync (`--sync-desktop`) derives its store location
+  per-OS (macOS `~/Library/Application Support`, Linux XDG) instead of only the
+  Windows path, so it no longer reports "not found" on macOS where Desktop runs.
+- The mirror-URL host-clipboard copy on Linux tries `wl-copy` (Wayland), then
+  `xclip`, then `xsel`, instead of assuming `xclip` is installed.
 - Public docs, in-app marker help, contributor test commands, and CI now agree
   with the current marker semantics, terminal-support boundaries, and complete
   `tests/test_*.py` suite.

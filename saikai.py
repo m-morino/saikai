@@ -16,7 +16,7 @@ Usage:
         [--no-summary] [--refresh-summary]
 """
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 
 import argparse
 import io
@@ -2924,10 +2924,24 @@ def _copy_to_host_clipboard(text: str) -> bool:
     be absent on Linux). Bounded by a timeout: this runs on the Textual UI thread
     (F12 / startup), and `xclip` can otherwise daemonize and block the event loop
     holding the X selection — a timeout caps the worst case and reports False."""
+    import shutil as _sh
     import subprocess as _sp
-    clip = (["clip"] if sys.platform == "win32"
-            else ["pbcopy"] if sys.platform == "darwin"
-            else ["xclip", "-selection", "clipboard"])
+    if sys.platform == "win32":
+        clip = ["clip"]
+    elif sys.platform == "darwin":
+        clip = ["pbcopy"]
+    else:
+        # Linux/BSD: prefer Wayland's wl-copy, else X11 xclip, else xsel — use the
+        # first that exists rather than assuming xclip (absent on a Wayland-only
+        # or minimal box). None present -> report False (the QR is still scannable).
+        if os.environ.get("WAYLAND_DISPLAY") and _sh.which("wl-copy"):
+            clip = ["wl-copy"]
+        elif _sh.which("xclip"):
+            clip = ["xclip", "-selection", "clipboard"]
+        elif _sh.which("xsel"):
+            clip = ["xsel", "-b", "-i"]
+        else:
+            return False
     try:
         return _sp.run(clip, input=text.encode("utf-8"), timeout=2.0).returncode == 0
     except Exception:
@@ -7105,7 +7119,15 @@ def _tree_walk(sessions: list[dict]) -> list[tuple[dict, str]]:
 # started in the terminal / VS Code after Desktop's one-time import have no such
 # entry, so Desktop doesn't list them. cmd_sync_desktop ADDITIVELY creates the
 # missing entries — it never touches ~/.claude/projects canonical history.
-DESKTOP_SESSIONS_ROOT = Path.home() / "AppData" / "Roaming" / "Claude" / "claude-code-sessions"
+# The store lives under each OS's standard app-data dir (Desktop ships on Windows
+# + macOS; on Linux the path simply won't exist and sync reports "not found").
+if sys.platform == "darwin":
+    _DESKTOP_APPDATA = Path.home() / "Library" / "Application Support"
+elif sys.platform == "win32":
+    _DESKTOP_APPDATA = Path.home() / "AppData" / "Roaming"
+else:
+    _DESKTOP_APPDATA = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+DESKTOP_SESSIONS_ROOT = _DESKTOP_APPDATA / "Claude" / "claude-code-sessions"
 
 
 def _desktop_index_dir() -> Path | None:
