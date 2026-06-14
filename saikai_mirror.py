@@ -488,9 +488,15 @@ def make_mirror_driver(base_cls, hub: "MirrorHub"):
 # shapes, unlike the default DOM renderer (which left borders looking thin).
 # The page reads ?token= from its own URL and opens the SSE stream with it.
 _PAGE_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>saikai mirror</title>
 <link rel="stylesheet" href="/xterm.min.css">
-<style>html,body{margin:0;height:100%;background:#000}#t{height:100%}</style></head>
+<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}
+#t{height:100%;overflow:auto}
+#kb button{min-height:44px;min-width:44px;padding:8px 14px;margin:0;
+font:bold 16px monospace;flex:1 1 auto;border:1px solid #555;border-radius:6px;
+background:#333;color:#eee;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+#kb button:active{background:#3a3}</style></head>
 <body><div id="t"></div>
 <script src="/xterm.min.js"></script>
 <script src="/addon-canvas.js"></script>

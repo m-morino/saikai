@@ -714,6 +714,11 @@ def test_page_routes_mouse_and_has_key_bar():
         # browser can never focus a pane and typed characters go nowhere.
         assert 'data-k="enter"' in page, page
         assert 'data-k="ctrl+]"' in page, page
+        # Mobile fit: a viewport meta so phones render at device-width (not a
+        # ~980px zoomed-out layout that shrinks every control), and touch-sized
+        # key-bar buttons (>=44px target, 16px font to avoid iOS focus-zoom).
+        assert "width=device-width" in page, page
+        assert "min-height:44px" in page, page
         # arrows present (any of the glyphs or names).
         assert ("↑" in page or "up" in page), page    # up arrow / "up"
         # the gate reactions are still wired for the new senders.
