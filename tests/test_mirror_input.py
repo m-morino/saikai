@@ -705,8 +705,15 @@ def test_page_routes_mouse_and_has_key_bar():
         # (b) postKey single-flight to /key with the write-key header.
         assert "/key" in page and "X-Mirror-Write-Key" in page, page
         # (c) the on-screen key bar buttons.
-        for label in ("Leader", "Esc", "Tab", "Ctrl", "F12"):
+        for label in ("Leader", "Esc", "Tab", "Enter", "Ctrl", "F12", "List"):
             assert label in page, f"key bar missing {label}: {page[:200]}"
+        # Enter (resume + focus a pane from the list, or submit to a focused
+        # pane) and the release key (ctrl+] -> drop pane focus back to the list)
+        # MUST be tappable: typed text rides /input to the focused pane, so these
+        # app-level keys can only reach the app via the key bar. Without Enter the
+        # browser can never focus a pane and typed characters go nowhere.
+        assert 'data-k="enter"' in page, page
+        assert 'data-k="ctrl+]"' in page, page
         # arrows present (any of the glyphs or names).
         assert ("↑" in page or "up" in page), page    # up arrow / "up"
         # the gate reactions are still wired for the new senders.
