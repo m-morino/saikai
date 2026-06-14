@@ -3661,11 +3661,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         CSS = """
         Screen { layout: vertical; }
         #searchrow { dock: top; height: 3; }   /* visible by default (the dropdowns ARE the discoverability); Space / toggles it and the last state persists */
-        #search { width: 1fr; border: tall $accent; }
-        #groupsel { width: 15; }
-        #sortsel { width: 20; }   /* fit "Alphabetically" (14) + chevron without wrap */
-        #statussel { width: 14; }
-        #lastsel { width: 13; }   /* fit "All time" comfortably */
+        /* 1fr so it still shrinks on narrow terminals, but capped — without the
+           cap it swallows the whole bar and dwarfs the filter dropdowns. */
+        #search { width: 1fr; max-width: 42; border: tall $accent; }
+        /* widths sized for the LONGEST option + Select border/chevron overhead
+           (~6 cols): "Alphabetically"=14, "Archived"/"All time"=8, "Project"=7 */
+        #groupsel { width: 16; }
+        #sortsel { width: 22; }
+        #statussel { width: 16; }
+        #lastsel { width: 16; }
         #statusbar { height: 1; background: $surface; color: $warning; }
         #main { layout: horizontal; height: 1fr; }
         #table { width: 60%; }                /* default; inline style overrides on mount/drag */
