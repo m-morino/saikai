@@ -11,6 +11,10 @@ There are two different artifacts:
   audited recording made with real Claude Code in the isolated environment
   below.
 
+For a **full feature tour** (every selling point, including the web mirror) —
+the long-form counterpart to the 25–35 s hero storyboard below — follow
+[demo-script.md](demo-script.md). It uses the same isolation contract and audit.
+
 Regenerate the deterministic assets with:
 
 ```bash
