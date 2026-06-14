@@ -11,7 +11,7 @@
 > **Claude Code のミッションコントロール。** 全リポジトリのセッションを1画面に。
 > 記憶した断片で探し、その場でライブ再開し、"自分待ち"のセッションが一目でわかります。
 
-![saikai demo](docs/assets/saikai-demo.gif)
+![saikai demo](docs/assets/saikai-demo-ja.gif)
 
 <sub>デモは漏洩チェック済みの架空データです。現在の GIF は再現可能な UI
 録画です。公開録画の隔離・監査方法は

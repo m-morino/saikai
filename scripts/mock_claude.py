@@ -1,95 +1,118 @@
 """A faithful stand-in for `claude`, used only by the deterministic
 screenshot/GIF scripts.
 
-It paints the real Claude Code startup screen — the terracotta logo, the
-`Claude Code vX.Y.Z` / model / cwd header, the tool-call transcript with the
-`⎿` result connector, and the rule-bounded `❯` input — into the PTY so the
-split-live pane shows a convincing screen WITHOUT launching a real session: no
-auth, no real history, no enterprise token, no API call, nothing to leak. Then
-it blocks until the pane kills it.
+It paints the real Claude Code 2.x UI into the PTY so the split-live pane looks
+like a real session WITHOUT launching one (no auth, history, token, or API
+call). Two scenarios drive the demo:
 
-The logo glyphs and layout are transcribed from a real Claude Code 2.x startup.
-The content is the fixture's fictional task (webapp → "fix the flaky auth token
-refresh test", cwd /home/demo/work/webapp); the model line is kept neutral (no
-account plan), and the real CLI's personal statusline is intentionally omitted.
-If a glyph/color/line drifts from the current CLI, adjust the lines below.
+  argv[1] = "idle"      (default) the faithful auth-fix transcript, settles idle
+                        (OSC title "✳" -> saikai marks the pane "=").
+  argv[1] = "needs-you" works briefly with a SPINNER title (-> saikai "~ busy"),
+                        then re-titles to "✳" and prints a permission prompt
+                        (-> saikai "? waiting"), so the LIST marker animates
+                        ~ -> ? while the demo flips between panes.
+  argv[2] = the public cwd to display (the real subprocess cwd is a temp repo;
+            never shown, so no path leaks).
+
+State is driven exactly as saikai_terminal.classify_pty_status reads it: the OSC
+title's first glyph (spinner = busy, ✳ = idle) and an on-screen permission
+prompt ("Do you want…", "❯ 1."). Then it blocks until the pane kills it.
 """
 import shutil
 import sys
 import time
 
-# Claude Code palette (24-bit): the logo + action bullets use Claude's
-# terracotta accent; tips/results/rules are dim grey, headings near-white.
-ACCENT = "\x1b[38;2;215;119;87m"     # Claude "#d77757"
+scenario = sys.argv[1] if len(sys.argv) > 1 else "idle"
+cwd = sys.argv[2] if len(sys.argv) > 2 else "/home/demo/work/webapp"
+
+# Claude Code palette (24-bit).
+ACCENT = "\x1b[38;2;215;119;87m"     # terracotta "#d77757"
 DIM = "\x1b[38;2;136;136;136m"
 WHITE = "\x1b[38;2;230;230;230m"
-GOLD = "\x1b[38;2;212;170;100m"      # auto-accept / mode indicator
+GOLD = "\x1b[38;2;212;170;100m"
 BOLD = "\x1b[1m"
 RESET = "\x1b[0m"
 
-# Full-width horizontal rules frame the input, like the real CLI. Size them to
-# the pane's PTY (falls back to a sane width if the size can't be read).
-WIDTH = shutil.get_terminal_size((76, 24)).columns
-WIDTH = max(24, min(WIDTH, 200))
+WIDTH = max(24, min(shutil.get_terminal_size((76, 24)).columns, 200))
 rule = f"{DIM}{'─' * WIDTH}{RESET}"
+LOGO = [" ▐▛███▜▌", "▝▜█████▛▘", "  ▘▘ ▝▝"]      # transcribed from real Claude Code
 
-# The auto-accept indicator + effort badge below the input, the badge
-# right-aligned to the pane. The real CLI's personal statusline (username,
-# cost, custom segments) is intentionally NOT reproduced for a public demo.
-_auto = "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"
-_effort = "◈ max · /effort"
-_gap = max(3, WIDTH - 2 - len(_auto) - len(_effort))
-autoline = (f"  {GOLD}⏵⏵ auto mode on{RESET} "
-            f"{DIM}(shift+tab to cycle) · ← for agents{RESET}"
-            f"{' ' * _gap}{DIM}{_effort}{RESET}")
 
-# OSC-0 title: the leading glyph is what saikai's status probe reads (idle).
-sys.stdout.write("\x1b]0;✳ webapp\x07")
+def title(s):
+    sys.stdout.write(f"\x1b]0;{s}\x07")
+    sys.stdout.flush()
 
-# The real startup logo (terracotta), transcribed glyph-for-glyph. Left-pad
-# each row to the widest one so the three header lines align cleanly.
-# Centre each row on the widest (the 9-wide body) so the creature is symmetric:
-# head (7) gets 1 leading space, feet (5) get 2 — without them the head sits a
-# column left of the body and the mascot looks skewed.
-LOGO = [" ▐▛███▜▌", "▝▜█████▛▘", "  ▘▘ ▝▝"]
-placeholder = 'Try "run the full suite again"'
 
-LINES = [
-    # ── startup header: logo + version + model + cwd (no box — matches real) ──
-    f"{ACCENT}{LOGO[0]:<9}{RESET}  {BOLD}{WHITE}Claude Code{RESET} {DIM}v2.1.177{RESET}",
-    f"{ACCENT}{LOGO[1]:<9}{RESET}  {WHITE}Opus 4.8 (1M context){RESET} {DIM}with max effort{RESET}",
-    f"{ACCENT}{LOGO[2]:<9}{RESET}  {DIM}/home/demo/work/webapp{RESET}",
-    "",
-    f" {DIM}▎ Using Opus 4.8 (1M context) (from .claude/settings.json) · /model{RESET}",
-    "",
-    # ── the resumed conversation ─────────────────────────────────────────────
-    f"{DIM}>{RESET} Fix the flaky auth token refresh test",
-    "",
-    f"{ACCENT}●{RESET} I'll read the failing test first to understand the race.",
-    "",
-    f"{ACCENT}●{RESET} {BOLD}Read{RESET}(tests/test_auth.py)",
-    f"  {DIM}⎿  Read 214 lines{RESET}",
-    "",
-    f"{ACCENT}●{RESET} {BOLD}Bash{RESET}(pytest tests/test_auth.py -x -q)",
-    f"  {DIM}⎿  1 failed, 23 passed in 0.41s{RESET}",
-    f"  {DIM}   FAILED test_auth.py::test_refresh_at_expiry_boundary{RESET}",
-    "",
-    f"{ACCENT}●{RESET} The test froze {BOLD}time.monotonic{RESET} but the refresh path",
-    f"  reads {BOLD}datetime.now(){RESET} — pinning both to one fake clock.",
-    "",
-    f"{ACCENT}●{RESET} {BOLD}Update{RESET}(tests/test_auth.py)",
-    f"  {DIM}⎿  Updated tests/test_auth.py with 2 additions and 1 removal{RESET}",
-    "",
-    # ── input: two rules around the ❯ prompt (matches real Claude Code) ───────
-    rule,
-    f"{WHITE}❯{RESET} {DIM}{placeholder}{RESET}",
-    rule,
-    autoline,
-]
+def emit(lines):
+    for ln in lines:
+        sys.stdout.write(ln + "\r\n")
+    sys.stdout.flush()
 
-for ln in LINES:
-    sys.stdout.write(ln + "\r\n")
-sys.stdout.flush()
+
+def header(model_tail):
+    return [
+        f"{ACCENT}{LOGO[0]:<9}{RESET}  {BOLD}{WHITE}Claude Code{RESET} {DIM}v2.1.177{RESET}",
+        f"{ACCENT}{LOGO[1]:<9}{RESET}  {WHITE}Opus 4.8 (1M context){RESET}{model_tail}",
+        f"{ACCENT}{LOGO[2]:<9}{RESET}  {DIM}{cwd}{RESET}",
+        "",
+        f" {DIM}▎ Using Opus 4.8 (1M context) (from .claude/settings.json) · /model{RESET}",
+        "",
+    ]
+
+
+if scenario == "needs-you":
+    # ── Session that is WORKING, then needs your call. Spinner title => busy. ──
+    title("⠹ api-server")
+    emit(header("") + [
+        f"{DIM}>{RESET} Profile GET /orders and fix the line-item N+1 queries",
+        "",
+        f"{ACCENT}●{RESET} {BOLD}Read{RESET}(api/orders.py)",
+        f"  {DIM}⎿  Read 168 lines{RESET}",
+        "",
+        f"{ACCENT}●{RESET} Each order re-queries its line items in a loop — I'll",
+        f"  batch them into one joined load.",
+        "",
+        f"{ACCENT}●{RESET} {BOLD}Update{RESET}(api/orders.py)",
+        f"  {GOLD}Working…{RESET} {DIM}(esc to interrupt){RESET}",
+    ])
+    time.sleep(5.0)            # keep working while the demo opens/flips panes
+    # Re-title to ✳ (no longer a spinner) + show a permission prompt => waiting.
+    title("✳ api-server")
+    emit([
+        "",
+        f"{ACCENT}●{RESET} This rewrites a query on a hot path. Apply the edit?",
+        "",
+        f"  {WHITE}Do you want to apply this change to {BOLD}orders.py{RESET}{WHITE}?{RESET}",
+        f"  {ACCENT}❯ 1.{RESET} {WHITE}Yes{RESET}",
+        f"    {DIM}2. No, explain the change first{RESET}",
+    ])
+else:
+    # ── The faithful auth-fix transcript; settles idle (✳). ───────────────────
+    title("✳ webapp")
+    prompt_ph = 'Try "run the full suite again"'
+    emit(header(f" {DIM}with max effort{RESET}") + [
+        f"{DIM}>{RESET} Fix the flaky auth token refresh test",
+        "",
+        f"{ACCENT}●{RESET} I'll read the failing test first to understand the race.",
+        "",
+        f"{ACCENT}●{RESET} {BOLD}Read{RESET}(tests/test_auth.py)",
+        f"  {DIM}⎿  Read 214 lines{RESET}",
+        "",
+        f"{ACCENT}●{RESET} {BOLD}Bash{RESET}(pytest tests/test_auth.py -x -q)",
+        f"  {DIM}⎿  1 failed, 23 passed in 0.41s{RESET}",
+        f"  {DIM}   FAILED test_auth.py::test_refresh_at_expiry_boundary{RESET}",
+        "",
+        f"{ACCENT}●{RESET} The test froze {BOLD}time.monotonic{RESET} but the refresh path",
+        f"  reads {BOLD}datetime.now(){RESET} — pinning both to one fake clock.",
+        "",
+        f"{ACCENT}●{RESET} {BOLD}Update{RESET}(tests/test_auth.py)",
+        f"  {DIM}⎿  Updated tests/test_auth.py with 2 additions and 1 removal{RESET}",
+        "",
+        rule,
+        f"{WHITE}❯{RESET} {DIM}{prompt_ph}{RESET}",
+        rule,
+        f"  {GOLD}⏵⏵ auto mode on{RESET} {DIM}(shift+tab to cycle) · ← for agents{RESET}",
+    ])
 
 while True:
     time.sleep(3600)
