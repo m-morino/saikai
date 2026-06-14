@@ -148,6 +148,7 @@ class MirrorHub:
         self._input_handler = None             # _marshal-shaped, set at app mount
         self._mouse_handler = None             # _marshal-shaped, set at app mount
         self._key_handler = None               # _marshal-shaped, set at app mount
+        self._client_change_handler = None     # notified (count) on connect/disconnect
         self._control_target = None            # focused-pane title (advisory)
         # Write-key: NEVER placed in any URL/file/QR/log; delivered only over the
         # authenticated SSE stream and required as the X-Mirror-Write-Key header.
@@ -203,11 +204,33 @@ class MirrorHub:
                 self._repaint_request()
             except Exception:
                 pass
+        self._notify_client_change()
         return cq, snapshot
 
     def _remove_client(self, cq):
         with self._clients_lock:
             self._clients.discard(cq)
+        self._notify_client_change()
+
+    def client_count(self) -> int:
+        """How many browsers currently hold the SSE stream open (≈ open tabs)."""
+        with self._clients_lock:
+            return len(self._clients)
+
+    def set_client_change_handler(self, fn) -> None:
+        # Written from the UI thread (on_mount), read from the HTTP server thread.
+        # Single attribute assign/read is GIL-atomic (same as set_input_handler).
+        self._client_change_handler = fn
+
+    def _notify_client_change(self) -> None:
+        # Called from the HTTP server thread on connect/disconnect. The handler is
+        # _marshal-shaped (it bounces to the UI thread); best-effort, never raises.
+        fn = self._client_change_handler
+        if fn is not None:
+            try:
+                fn(self.client_count())
+            except Exception:
+                pass
 
     def _drain_loop(self):
         while not self._stopped.is_set():

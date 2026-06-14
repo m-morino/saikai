@@ -773,6 +773,25 @@ def test_sgr_mouse_regex_is_escaping_safe_and_correct():
     assert rx.match("plain typed text") is None, "must not match plain text"
 
 
+def test_client_count_and_change_handler():
+    """The hub tracks connected SSE clients and fires a change handler with the
+    new count on each connect/disconnect, so saikai can show how many browsers
+    are viewing and toast a newly-connected one (the user's security ask)."""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=80, rows=24)
+    seen = []
+    hub.set_client_change_handler(lambda n: seen.append(n))
+    assert hub.client_count() == 0
+    cq, _snap = hub._add_client()
+    assert hub.client_count() == 1
+    cq2, _ = hub._add_client()
+    assert hub.client_count() == 2
+    hub._remove_client(cq)
+    assert hub.client_count() == 1
+    hub._remove_client(cq2)
+    assert hub.client_count() == 0
+    assert seen == [1, 2, 1, 0], seen
+
+
 if __name__ == "__main__":
     test_inject_gate_off_by_default_and_requires_handler()
     test_inject_is_fifo_via_single_drain()
@@ -792,6 +811,7 @@ if __name__ == "__main__":
     test_page_contains_input_listeners_and_sender()
     test_page_has_no_js_breaking_control_bytes()
     test_sgr_mouse_regex_is_escaping_safe_and_correct()
+    test_client_count_and_change_handler()
     test_wildcard_bind_allows_lan_ip_host()
     test_mirror_inject_mouse_double_gate_and_events()
     test_mirror_inject_key_double_gate_and_event()
