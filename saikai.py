@@ -2932,45 +2932,27 @@ class _MirrorControl:
     _control_enabled: bool = False
 
     def _mirror_inject_input(self, data: str) -> None:
-        """Deliver browser-typed text to whatever holds focus in saikai's UI.
-
-        Runs on the Textual UI thread (the input handler marshals here via
-        call_from_thread). Re-checks the AUTHORITATIVE _control_enabled (the
-        hub's copy is advisory). Two targets:
-          * a focused LIVE pane -> raw bytes straight to its PTY (high fidelity
-            for claude: paste, control sequences; the PTY backend takes str -- do
-            NOT .encode()). Mirrors on_key's guard: dead pane / _pty None -> no-op.
-          * otherwise (the list / the search box / any Textual Input) -> replay
-            the text as synthesized Key events so the App routes them natively
-            (search-as-you-type + the focused Input's own editing). Without this,
-            typing only ever reached a pane and the search box got nothing."""
+        """Drive saikai from the browser keyboard, terminal-equivalently. Parse the
+        browser's terminal byte stream with Textual's OWN XTermParser and post the
+        resulting Key/Paste events to the App, which routes them EXACTLY as the host
+        terminal does:
+          * a focused live pane (AgentTerminal.on_key) -> encode the key to its
+            child PTY (claude), RELEASE focus on the release key (Ctrl+]), or
+            interrupt claude on Ctrl+C -- the very same on_key path as the host;
+          * the list / search box / dialogs -> navigation, search-as-you-type,
+            bindings.
+        ONE path, no pane/no-pane special-casing: every key the browser produces
+        (printables, arrows, Home/End, Page keys, Delete, F-keys, Shift+Tab,
+        Ctrl/Alt combos, Enter, Backspace, bracketed paste) behaves as if typed at
+        the host terminal. Runs on the UI thread (the input handler marshals here);
+        re-checks the AUTHORITATIVE _control_enabled first (the hub copy is
+        advisory). The parser is stateful (reassembles a sequence split across POST
+        batches), created once per app. textual + the parser import in-body so the
+        mixin stays importable headless; mouse SGR never arrives here (the browser
+        routes taps to /mouse), so only Key/Paste tokens are forwarded. If the
+        (private) parser API is ever unavailable, degrade to printable characters."""
         if not self._control_enabled:
             return
-        t = self._focused_terminal()
-        if t is not None:
-            # A live pane owns the keyboard: raw PTY write (no-op if torn down).
-            if getattr(t, "_pty", None) is None or getattr(t, "is_dead", False):
-                return
-            try:
-                t._pty.write(data)
-            except Exception:
-                pass
-            return
-        # No pane focused: route to the App as Key events (search box / list).
-        self._mirror_inject_text_as_keys(data)
-
-    def _mirror_inject_text_as_keys(self, data: str) -> None:
-        """Parse the browser's terminal byte stream into Textual Key events with
-        Textual's OWN XTermParser and post them, so the focused widget (the list,
-        the search box, dialogs) sees EXACTLY the keys a real terminal delivers --
-        arrows, Home/End, Page Up/Down, F-keys, Shift+Tab, Ctrl/Alt combos, Enter,
-        Backspace -- not just printable characters. This is what makes browser
-        keyboard control terminal-equivalent for saikai's own UI. The parser is
-        stateful (it reassembles an escape sequence split across POST batches), so
-        it is created once per app. textual + the parser are imported in-body so
-        the mixin stays importable headless; mouse SGR never arrives here (the
-        browser routes taps to /mouse), so only Key/Paste tokens are forwarded. If
-        the (private) parser API is ever unavailable, degrade to printables."""
         from textual import events
         parser = getattr(self, "_mirror_parser", None)
         if parser is None:
