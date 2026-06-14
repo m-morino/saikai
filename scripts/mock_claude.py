@@ -3,45 +3,48 @@ screenshot/GIF scripts.
 
 It paints the real Claude Code startup screen — the terracotta logo, the
 `Claude Code vX.Y.Z` / model / cwd header, the tool-call transcript with the
-`⎿` result connector, and the bottom prompt box — into the PTY so the
+`⎿` result connector, and the rule-bounded `❯` input — into the PTY so the
 split-live pane shows a convincing screen WITHOUT launching a real session: no
 auth, no real history, no enterprise token, no API call, nothing to leak. Then
 it blocks until the pane kills it.
 
+The logo glyphs and layout are transcribed from a real Claude Code 2.x startup.
 The content is the fixture's fictional task (webapp → "fix the flaky auth token
-refresh test", cwd /home/demo/work/webapp). Modeled on Claude Code 2.x; if a
-glyph/color/line drifts from the current CLI, adjust the lines below to match.
-The logo is an approximation built from block glyphs — swap in the exact art if
-pixel-fidelity matters.
+refresh test", cwd /home/demo/work/webapp); the model line is kept neutral (no
+account plan), and the real CLI's personal statusline is intentionally omitted.
+If a glyph/color/line drifts from the current CLI, adjust the lines below.
 """
+import shutil
 import sys
 import time
 
 # Claude Code palette (24-bit): the logo + action bullets use Claude's
-# terracotta accent; tips/results are dim grey, headings/prompts near-white.
+# terracotta accent; tips/results/rules are dim grey, headings near-white.
 ACCENT = "\x1b[38;2;215;119;87m"     # Claude "#d77757"
 DIM = "\x1b[38;2;136;136;136m"
 WHITE = "\x1b[38;2;230;230;230m"
 BOLD = "\x1b[1m"
 RESET = "\x1b[0m"
 
-W = 58                                # inner width of the rounded prompt box
+# Full-width horizontal rules frame the input, like the real CLI. Size them to
+# the pane's PTY (falls back to a sane width if the size can't be read).
+WIDTH = shutil.get_terminal_size((76, 24)).columns
+WIDTH = max(24, min(WIDTH, 200))
+rule = f"{DIM}{'─' * WIDTH}{RESET}"
 
 # OSC-0 title: the leading glyph is what saikai's status probe reads (idle).
 sys.stdout.write("\x1b]0;✳ webapp\x07")
 
-top = f"{ACCENT}╭{'─' * W}╮{RESET}"
-bot = f"{ACCENT}╰{'─' * W}╯{RESET}"
-
-prompt_ph = 'Try "run the full suite again"'
-prompt_pad = max(0, W - len("> " + prompt_ph) - 1)
+# The real startup logo (terracotta), transcribed glyph-for-glyph. Left-pad
+# each row to the widest one so the three header lines align cleanly.
+LOGO = ["▐▛███▜▌", "▝▜█████▛▘", "  ▘▘ ▝▝"]
+placeholder = 'Try "run the full suite again"'
 
 LINES = [
-    # ── startup header: logo + version + model + cwd (NOT boxed — the real CLI
-    #    prints the logo to the left of three header lines, no surrounding box).
-    f"{ACCENT}▄███▄{RESET}   {BOLD}{WHITE}Claude Code{RESET} {DIM}v2.1.177{RESET}",
-    f"{ACCENT}█ ▀ █{RESET}   {WHITE}Opus 4.8 (1M context){RESET}",
-    f"{ACCENT}▀███▀{RESET}   {DIM}/home/demo/work/webapp{RESET}",
+    # ── startup header: logo + version + model + cwd (no box — matches real) ──
+    f"{ACCENT}{LOGO[0]:<9}{RESET}  {BOLD}{WHITE}Claude Code{RESET} {DIM}v2.1.177{RESET}",
+    f"{ACCENT}{LOGO[1]:<9}{RESET}  {WHITE}Opus 4.8 (1M context){RESET} {DIM}with max effort{RESET}",
+    f"{ACCENT}{LOGO[2]:<9}{RESET}  {DIM}/home/demo/work/webapp{RESET}",
     "",
     f"  {DIM}/help for help, /status for your current setup{RESET}",
     "",
@@ -63,10 +66,10 @@ LINES = [
     f"{ACCENT}●{RESET} {BOLD}Update{RESET}(tests/test_auth.py)",
     f"  {DIM}⎿  Updated tests/test_auth.py with 2 additions and 1 removal{RESET}",
     "",
-    # ── bottom prompt box ────────────────────────────────────────────────────
-    top,
-    f"{ACCENT}│{RESET} {WHITE}›{RESET} {DIM}{prompt_ph}{RESET}{' ' * prompt_pad}{ACCENT}│{RESET}",
-    bot,
+    # ── input: two rules around the ❯ prompt (matches real Claude Code) ───────
+    rule,
+    f"{WHITE}❯{RESET} {DIM}{placeholder}{RESET}",
+    rule,
     f"  {DIM}? for shortcuts{RESET}",
 ]
 
