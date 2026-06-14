@@ -3067,6 +3067,20 @@ class _MirrorControl:
         except Exception:
             pass                               # app tearing down between gate + post
 
+    def _mirror_clients_changed(self, n: int) -> None:
+        """A browser connected to / disconnected from the mirror (now `n` viewers).
+        Runs on the UI thread (the hub's change handler marshals here). Toast on a
+        NEW connection so the user notices an unexpected viewer, and remember the
+        count so the F12 QR screen can show how many are watching."""
+        prev = getattr(self, "_mirror_clients", 0)
+        self._mirror_clients = n
+        if n > prev:
+            try:
+                self.notify(f"\N{GLOBE WITH MERIDIANS} mirror: a browser connected "
+                            f"— {n} now viewing", title="saikai", timeout=6)
+            except Exception:
+                pass
+
 
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                  flat: bool = False, reload_fn=None) -> None:
@@ -3536,15 +3550,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("f12", "dismiss", show=False),
         ]
 
-        def __init__(self, url, matrix, copied=True):
+        def __init__(self, url, matrix, copied=True, clients=0):
             super().__init__()
             self._url = url
             self._matrix = matrix
             self._copied = copied
+            self._clients = clients
 
         def compose(self) -> ComposeResult:
             with VerticalScroll(id="mirror-box"):
-                yield Static("[bold]Web mirror — scan to connect[/bold] [dim](read-only)[/dim]")
+                _conn = (f" · [b]{self._clients}[/b] browser(s) connected"
+                         if self._clients else " · no browser connected")
+                yield Static("[bold]Web mirror — scan to connect[/bold] "
+                             f"[dim](read-only){_conn}[/dim]")
                 yield Static(_render_qr(self._matrix), id="mirror-qr")
                 _tail = ("URL copied to clipboard" if self._copied
                          else "copy the URL above")
@@ -3885,6 +3903,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     except Exception:
                         pass
                 _hub.set_key_handler(_key_handler)
+
+                def _client_change(n, _app=_app_ref):
+                    if not getattr(_app, "is_running", False):
+                        return
+                    try:
+                        _app.call_from_thread(_app._mirror_clients_changed, n)
+                    except Exception:
+                        pass
+                _hub.set_client_change_handler(_client_change)
                 # Show the QR so a phone can join without typing the tokened URL
                 # (the stderr banner is alt-screen hidden). action_mirror_info also
                 # copies the URL to the host clipboard, every time — F12 re-opens it.
@@ -6092,7 +6119,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             _copied = _copy_to_host_clipboard(_url)
             try:
                 import saikai_mirror as _m
-                self.push_screen(MirrorScreen(_url, _m.qr_matrix(_url), _copied))
+                self.push_screen(MirrorScreen(_url, _m.qr_matrix(_url), _copied,
+                                              _hub.client_count()))
             except Exception:
                 self.notify(f"Web mirror: {_url}", title="saikai mirror",
                             timeout=12)
