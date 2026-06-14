@@ -663,9 +663,16 @@ term.onData((d) => {
   else if (!flushTimer) { flushTimer = setTimeout(() => { flushTimer=null; pump(); }, 25); }
 });
 
-// ── On-screen key bar: fixed-position buttons -> POST /key. Ctrl is a STICKY
-//    modifier: tap Ctrl to arm it; the next key is sent ctrl-combined
-//    (e.g. "ctrl+c"), then Ctrl disarms. ──────────────────────────────────────
+// ── On-screen key bar: fixed-position buttons -> POST /key. This is the ONLY
+//    channel for app-level keys: typed text rides /input -> the focused live
+//    pane's PTY, so keys the app itself must see (Enter to resume, arrows to
+//    move the list cursor, the release key) cannot come from the keyboard and
+//    must be tapped here. Enter resumes + focuses the cursored session (and,
+//    when a pane is already focused, is forwarded to claude as submit); "List"
+//    sends the release key (ctrl+] — saikai's default [keys] release; tap the
+//    list area instead if you rebound it) to drop pane focus back to the list.
+//    Ctrl is a STICKY modifier: tap Ctrl to arm it; the next key is sent
+//    ctrl-combined (e.g. "ctrl+c"), then Ctrl disarms. ─────────────────────────
 let ctrlSticky = false;
 const kbBar = document.createElement('div');
 kbBar.id = 'kb';
@@ -676,12 +683,14 @@ kbBar.innerHTML =
   '<button data-k="space">Leader</button>'+
   '<button data-k="escape">Esc</button>'+
   '<button data-k="tab">Tab</button>'+
+  '<button data-k="enter">&#9166; Enter</button>'+
   '<button data-k="up">&#8593;</button>'+
   '<button data-k="down">&#8595;</button>'+
   '<button data-k="left">&#8592;</button>'+
   '<button data-k="right">&#8594;</button>'+
   '<button id="kb-ctrl" data-k="">Ctrl</button>'+
-  '<button data-k="f12">F12</button>';
+  '<button data-k="f12">F12</button>'+
+  '<button data-k="ctrl+]">&#9776; List</button>';
 document.body.appendChild(kbBar);
 const kbCtrl = document.getElementById('kb-ctrl');
 kbBar.querySelectorAll('button').forEach((b) => {
