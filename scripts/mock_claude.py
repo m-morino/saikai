@@ -48,7 +48,10 @@ sys.stdout.write("\x1b]0;✳ webapp\x07")
 
 # The real startup logo (terracotta), transcribed glyph-for-glyph. Left-pad
 # each row to the widest one so the three header lines align cleanly.
-LOGO = ["▐▛███▜▌", "▝▜█████▛▘", "  ▘▘ ▝▝"]
+# Centre each row on the widest (the 9-wide body) so the creature is symmetric:
+# head (7) gets 1 leading space, feet (5) get 2 — without them the head sits a
+# column left of the body and the mascot looks skewed.
+LOGO = [" ▐▛███▜▌", "▝▜█████▛▘", "  ▘▘ ▝▝"]
 placeholder = 'Try "run the full suite again"'
 
 LINES = [
