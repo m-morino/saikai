@@ -157,12 +157,20 @@ for name, _ in FRAMES:
                     + svg.read_text(encoding="utf-8") + "</body></html>",
                     encoding="utf-8")
     png = svg.with_suffix(".png")
-    subprocess.run(
-        [browser, "--headless=new", "--disable-gpu",
-         "--force-device-scale-factor=1", "--hide-scrollbars",
-         f"--window-size={W},{H}", f"--screenshot={png}",
-         html.as_uri()],
-        check=True, capture_output=True, timeout=60)
+    cmd = [browser, "--headless=new", "--disable-gpu",
+           "--force-device-scale-factor=1", "--hide-scrollbars",
+           f"--window-size={W},{H}", f"--screenshot={png}",
+           html.as_uri()]
+    # `--headless=new` occasionally stalls on a cold spawn (AV / proxy / first
+    # paint). It uses an ephemeral profile, so a retry never lock-conflicts.
+    for attempt in range(2):
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=90)
+            break
+        except subprocess.TimeoutExpired:
+            if attempt:
+                raise
+            print(f"  {name}: render stalled, retrying once")
     if not png.is_file():
         raise SystemExit(f"render failed for {name}")
 print("rendered all frames to PNG")
