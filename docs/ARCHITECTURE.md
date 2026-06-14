@@ -107,7 +107,7 @@ After terminal, threading, lock, async, or teardown changes, at minimum run
 real-backend `tests/test_pty_backend.py`. Use Textual `App.run_test()` and
 `Pilot` for focus, key, and layout behavior.
 
-## Web mirror (opt-in, read-only)
+## Web mirror (opt-in; read-only by default, opt-in interactive control)
 
 `saikai_mirror.py` (app layer) can mirror the running UI to a browser. It is
 OFF unless `SAIKAI_MIRROR` is truthy, binds `127.0.0.1` unless
@@ -131,7 +131,17 @@ Contract:
   and `subprocess.run(claude_argv)` — Textual/driver/pyte are gone, so the
   mirror goes dark until the App returns. Work in split-live panes to stay
   mirrored.
-- Read-only: no browser input path exists in this phase (no input arbitration).
+- Interactive control (default OFF, opt-in): a local `Shift+F12` toggle arms
+  browser control; only then do `POST /input` (typed text), `/mouse` (tap/scroll
+  → synthesized Textual mouse events), and `/key` (on-screen key bar →
+  `events.Key`) inject. Every route is gated identically — Host allow-list +
+  per-run write-key header (delivered only over the authenticated SSE, never in a
+  URL/QR/log) + Origin fail-closed + control-on — and re-checks the App's
+  authoritative `_control_enabled` on the UI thread. The browser cannot enable
+  its own control; LAN input additionally requires `SAIKAI_MIRROR_ALLOW_LAN_INPUT`.
+  Typed text writes to a focused live pane's PTY, or is replayed as `events.Key`
+  for the focused widget (e.g. the search box) when no pane is focused. Control
+  idle-auto-disables.
 - Geometry is fixed at mount: the mirror's pyte screen is sized once from the
   host terminal. Resizing the real terminal mid-session is NOT yet propagated,
   so late-joiner snapshots and connected browsers keep the mount-time size
