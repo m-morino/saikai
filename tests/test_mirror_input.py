@@ -743,6 +743,35 @@ def test_page_routes_mouse_and_has_key_bar():
         hub.stop()
 
 
+def test_page_wires_touch_swipe_to_scroll():
+    """A phone has no wheel, so a touch-swipe emits no SGR scroll and xterm (mouse
+    mode 1000 = no motion) reports nothing — `overflow:auto` only pans the
+    rendered image, never the list. The page must translate a single-finger
+    VERTICAL drag into the same scrollup/scrolldown the wheel path uses (-> POST
+    /mouse), and manage touch-action so the browser yields the vertical drag while
+    keeping horizontal pan + pinch-zoom. (Manual phone verification covers real
+    swipe fidelity.)"""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=80, rows=24)
+    hub.set_mouse_handler(lambda *a: None)
+    port = hub.serve()
+    try:
+        page = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/?token=secret", timeout=3.0
+        ).read().decode("utf-8")
+    finally:
+        hub.stop()
+    # A touch-swipe handler must exist (not just the pointerdown focus listener).
+    assert "touchstart" in page, "no touch-swipe handler — a phone cannot scroll"
+    assert "touchmove" in page, "no touch-swipe handler — a phone cannot scroll"
+    # ...and it must drive the SAME /mouse scroll path the wheel already uses.
+    assert "scrolldown" in page and "scrollup" in page, page
+    assert "postMouse" in page, page
+    # touch-action must be set so the browser yields the vertical drag to us
+    # (pan-x keeps horizontal pan; pinch-zoom keeps zoom). Without it overflow:auto
+    # just pans the image and the swipe never reaches saikai.
+    assert "pan-x" in page, page
+
+
 def test_sgr_mouse_regex_is_escaping_safe_and_correct():
     """Regression (found by a headless-Edge smoke, not by the string-asserts):
     the SGR mouse regex must be built with NO backslash. A backslash inside a
@@ -827,4 +856,5 @@ if __name__ == "__main__":
     test_mirror_inject_mouse_double_gate_and_events()
     test_mirror_inject_key_double_gate_and_event()
     test_page_routes_mouse_and_has_key_bar()
+    test_page_wires_touch_swipe_to_scroll()
     print("OK test_mirror_input")

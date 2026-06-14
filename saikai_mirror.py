@@ -515,7 +515,7 @@ _PAGE_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <title>saikai mirror</title>
 <link rel="stylesheet" href="/xterm.min.css">
 <style>html,body{margin:0;height:100%;background:#000;overflow:hidden}
-#t{height:100%;overflow:auto}
+#t{height:100%;overflow:auto;touch-action:auto}
 #kb button{min-height:44px;min-width:44px;padding:8px 14px;margin:0;
 font:bold 16px monospace;flex:1 1 auto;border:1px solid #555;border-radius:6px;
 background:#333;color:#eee;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
@@ -572,6 +572,10 @@ document.body.appendChild(banner);
 
 function setBanner(on, target) {
   controlOn = on;
+  // When controlling, claim a single-finger VERTICAL drag for list scroll
+  // (pan-x keeps horizontal pan, pinch-zoom keeps zoom); read-only lets the
+  // browser pan freely so a viewer can move around the mirrored screen.
+  try { document.getElementById('t').style.touchAction = on ? 'pan-x pinch-zoom' : 'auto'; } catch (e) {}
   if (on) {
     banner.style.background = '#3a3';
     banner.textContent = 'CONTROL ON — typing into: ' + (target || '(no pane focused)');
@@ -703,6 +707,43 @@ term.onData((d) => {
   if (isControlByte(d)) { if (flushTimer) { clearTimeout(flushTimer); flushTimer=null; } pump(); }
   else if (!flushTimer) { flushTimer = setTimeout(() => { flushTimer=null; pump(); }, 25); }
 });
+
+// ── Phone scroll: a touch-swipe emits NO wheel events, so xterm (mouse mode
+//    1000 = no motion) reports nothing and #t's overflow:auto only pans the
+//    rendered image. Translate a single-finger VERTICAL drag into the same
+//    scrollup/scrolldown the wheel uses, at the touched cell so the list (or the
+//    pane) under the finger scrolls. Two-finger (pinch) + horizontal pans fall
+//    through to the browser via touch-action. Control-gated: read-only (where
+//    touch-action is 'auto') never drives the host. ─────────────────────────────
+(function () {
+  const el = document.getElementById('t');
+  const STEP = 22;                       // px of vertical drag per scroll tick
+  let lastY = null, accum = 0, scol = 0, srow = 0;
+  function cellAt(x, y) {
+    const scr = el.querySelector('.xterm-screen') || el;   // actual cell area
+    const r = scr.getBoundingClientRect();
+    const c = r.width  ? Math.floor((x - r.left) / (r.width  / term.cols)) : 0;
+    const w = r.height ? Math.floor((y - r.top)  / (r.height / term.rows)) : 0;
+    return [Math.max(0, Math.min(term.cols - 1, c)),
+            Math.max(0, Math.min(term.rows - 1, w))];
+  }
+  el.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) { lastY = null; return; }  // leave pinch to browser
+    lastY = e.touches[0].clientY; accum = 0;
+    const cc = cellAt(e.touches[0].clientX, lastY); scol = cc[0]; srow = cc[1];
+  }, {passive: true});
+  el.addEventListener('touchmove', (e) => {
+    if (lastY === null || e.touches.length !== 1 || !controlOn || fatal) return;
+    const y = e.touches[0].clientY;
+    accum += y - lastY; lastY = y;
+    let moved = false;
+    // finger up (y decreases) -> see items below -> scroll the list DOWN.
+    while (accum <= -STEP) { accum += STEP; postMouse(scol, srow, 0, 'scrolldown'); moved = true; }
+    while (accum >=  STEP) { accum -= STEP; postMouse(scol, srow, 0, 'scrollup');   moved = true; }
+    if (moved) e.preventDefault();        // we consumed this vertical drag
+  }, {passive: false});
+  el.addEventListener('touchend', () => { lastY = null; }, {passive: true});
+})();
 
 // ── On-screen key bar: fixed-position buttons -> POST /key. This is the ONLY
 //    channel for app-level keys: typed text rides /input -> the focused live
