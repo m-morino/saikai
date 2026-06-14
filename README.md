@@ -77,7 +77,7 @@ for:
 - finding older work from conversation text, changes, or previous prompts
   rather than from titles alone.
 
-The implementation is three small Python modules on
+The implementation is a few focused Python modules on
 [Textual](https://github.com/Textualize/textual), with a RAM gate that warns
 before another live pane would push the machine into thrashing.
 
@@ -306,17 +306,8 @@ by OS and host terminal. Honest status:
   also exercise the installed Textual Pilot and real PTY backend paths:
 
   ```bash
-  uv run python tests/test_config.py
-  uv run python tests/test_demo_audit.py
-  uv run python tests/test_demo_fixture.py
-  uv run python tests/test_keyboard_leader.py
-  uv run python tests/test_providers.py
-  uv run python tests/test_pty_backend.py
-  uv run python tests/test_resource_bounds.py
-  uv run python tests/test_sort_recency.py
-  uv run python tests/test_split_divider.py
-  uv run python tests/test_terminal_concurrency.py
-  uv run python tests/test_terminal_watchdog.py
+  # run the whole suite the way CI does (Pilot + real PTY paths included):
+  for t in tests/test_*.py; do uv run python "$t"; done
   ```
 
 - Linux/WSL2/macOS reviewers are wanted. Please report the terminal, local vs

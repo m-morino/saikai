@@ -76,8 +76,8 @@ saikai は全プロジェクトを横断する1つのビューを提供し、選
 - タイトルだけでは見つからない過去の作業を、会話内容、変更差分、以前の
   プロンプトから探す。
 
-実装は [Textual](https://github.com/Textualize/textual) 上の小さな Python
-モジュール 3 つです。ライブペインを増やす前に警告する RAM ゲートもあります。
+実装は [Textual](https://github.com/Textualize/textual) 上のいくつかの
+Python モジュールです。ライブペインを増やす前に警告する RAM ゲートもあります。
 
 > ライブペインは Windows では ConPTY、それ以外では POSIX PTY を使います。
 > OS ごとの検証状況は[プラットフォーム対応](#プラットフォーム対応)を参照
@@ -294,17 +294,8 @@ saikai 本体の大部分は Python + Textual ですが、実 PTY、クリップ
   backend の経路まで確認するには依存を入れて `uv run` で実行します:
 
   ```bash
-  uv run python tests/test_config.py
-  uv run python tests/test_demo_audit.py
-  uv run python tests/test_demo_fixture.py
-  uv run python tests/test_keyboard_leader.py
-  uv run python tests/test_providers.py
-  uv run python tests/test_pty_backend.py
-  uv run python tests/test_resource_bounds.py
-  uv run python tests/test_sort_recency.py
-  uv run python tests/test_split_divider.py
-  uv run python tests/test_terminal_concurrency.py
-  uv run python tests/test_terminal_watchdog.py
+  # CI と同じくスイート全体を実行 (Pilot + 実 PTY パスを含む):
+  for t in tests/test_*.py; do uv run python "$t"; done
   ```
 
 - Linux / WSL2 / macOSのレビュアーを募集しています。terminal名、localか
