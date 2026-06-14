@@ -2917,27 +2917,6 @@ def _ram_per_pane_mb() -> float:
     return _cfg("limits", "per_pane_mb", "SAIKAI_CLAUDE_MB", 600.0, float)
 
 
-def _key_for_char(ch: str):
-    """Map one browser-typed character to a Textual (key, character) pair, or
-    None to skip it. Printable chars carry their own character (a focused Input
-    inserts it; on_key's search-as-you-type reads event.character); a few control
-    bytes map to the named keys the search box understands. Pure + module-level
-    so it is unit-tested without textual."""
-    if ch == " ":
-        return ("space", " ")
-    if ch in ("\r", "\n"):
-        return ("enter", None)
-    if ch in ("\x7f", "\x08"):
-        return ("backspace", None)
-    if ch == "\t":
-        return ("tab", None)
-    if ch == "\x1b":
-        return ("escape", None)
-    if ch.isprintable():
-        return (ch, ch)
-    return None                                # other C0 control bytes: skip
-
-
 class _MirrorControl:
     """Phase B web-mirror interactive control, mixed into PickerApp.
 
@@ -2981,30 +2960,44 @@ class _MirrorControl:
         self._mirror_inject_text_as_keys(data)
 
     def _mirror_inject_text_as_keys(self, data: str) -> None:
-        """Replay typed text as Textual Key events for the focused non-pane
-        widget (e.g. the search Input) and the App's on_key. An ESC begins an
-        escape SEQUENCE (arrow / F-key) or is a lone Escape press: keep any
-        printable text typed BEFORE the first ESC, then stop -- drop the sequence
-        and everything after it, so a coalesced batch like 'abc\\x1b[A' (fast
-        typing then an arrow within the browser's 25ms flush window) types 'abc'
-        and never leaks a stray 'escape' + '[A' into the search box (navigation
-        comes from the key bar). A batch that is exactly one ESC maps to the
-        escape key. textual is imported in-body so the mixin stays importable
-        headless."""
-        if data != "\x1b":
-            esc = data.find("\x1b")
-            if esc != -1:
-                data = data[:esc]              # text before the sequence; drop the rest
+        """Parse the browser's terminal byte stream into Textual Key events with
+        Textual's OWN XTermParser and post them, so the focused widget (the list,
+        the search box, dialogs) sees EXACTLY the keys a real terminal delivers --
+        arrows, Home/End, Page Up/Down, F-keys, Shift+Tab, Ctrl/Alt combos, Enter,
+        Backspace -- not just printable characters. This is what makes browser
+        keyboard control terminal-equivalent for saikai's own UI. The parser is
+        stateful (it reassembles an escape sequence split across POST batches), so
+        it is created once per app. textual + the parser are imported in-body so
+        the mixin stays importable headless; mouse SGR never arrives here (the
+        browser routes taps to /mouse), so only Key/Paste tokens are forwarded. If
+        the (private) parser API is ever unavailable, degrade to printables."""
         from textual import events
-        for ch in data:
-            mapped = _key_for_char(ch)
-            if mapped is None:
-                continue
-            key, character = mapped
+        parser = getattr(self, "_mirror_parser", None)
+        if parser is None:
             try:
-                self.post_message(events.Key(key, character))
+                from textual._xterm_parser import XTermParser
+                parser = XTermParser()
             except Exception:
-                pass
+                parser = False                 # parser API gone: remember + fall back
+            self._mirror_parser = parser
+        if parser:
+            try:
+                tokens = list(parser.feed(data))
+            except Exception:
+                return
+            for ev in tokens:
+                if isinstance(ev, (events.Key, events.Paste)):
+                    try:
+                        self.post_message(ev)
+                    except Exception:
+                        pass
+            return
+        for ch in data:                        # fallback: printable characters only
+            if ch.isprintable():
+                try:
+                    self.post_message(events.Key(ch, ch))
+                except Exception:
+                    pass
 
     def _mirror_inject_mouse(self, col: int, row: int, button: int, kind: str) -> None:
         """Post a synthesized Textual mouse event into the App so it routes
