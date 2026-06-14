@@ -7,9 +7,12 @@ There are two different artifacts:
 - `docs/assets/saikai-demo-headless.gif` is a deterministic UI regression demo.
   It uses fictional transcripts and `scripts/mock_claude.py`; it is not
   evidence that a real Claude Code process is running.
-- `docs/assets/saikai-demo.gif` is the public hero. Replace it only with an
-  audited recording made with real Claude Code in the isolated environment
-  below.
+- `docs/assets/saikai-demo.gif` is the public hero shown in the README. It is
+  currently the same deterministic, leak-checked render as the regression GIF
+  above — `scripts/mock_claude.py` faithfully reproduces the Claude Code UI, so
+  the pane looks real without launching a real session (no auth, no token, no
+  history to leak). For an even more authentic hero, replace it with an audited
+  recording made with real Claude Code in the isolated environment below.
 
 For a **full feature tour** (every selling point, including the web mirror) —
 the long-form counterpart to the 25–35 s hero storyboard below — follow
