@@ -3074,6 +3074,10 @@ class _MirrorControl:
         count so the F12 QR screen can show how many are watching."""
         prev = getattr(self, "_mirror_clients", 0)
         self._mirror_clients = n
+        try:                                   # refresh the always-on statusbar count
+            self._update_subtitle()
+        except Exception:
+            pass
         if n > prev:
             try:
                 self.notify(f"\N{GLOBE WITH MERIDIANS} mirror: a browser connected "
@@ -4454,6 +4458,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _kb_parts.append("[dim]␣ menu · ? keys[/dim]")
             else:
                 _kb_parts.append("[dim]? keys[/dim]")
+            # Persistent web-mirror indicator: how many browsers are connected
+            # right now, so an unexpected viewer is always visible at the terminal.
+            _mc = getattr(self, "_mirror_clients", 0)
+            if _mc:
+                _kb_parts.insert(0, f"[b]\N{GLOBE WITH MERIDIANS} {_mc}[/b]")
             _kb = " · ".join(_kb_parts)
             text = (f"  {n} sessions{search_str}{sep}{sort_str}{sep}"
                     f"{scope}{sep}{group_str}{filt_str}{tree_str}"
