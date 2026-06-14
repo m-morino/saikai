@@ -222,6 +222,10 @@ LAN bind the mirror stays read-only unless you also opt in with
 token travels in the URL, while the separate write-key required for input is
 delivered only over the authenticated stream — never in the URL, QR, or logs.
 
+So an unexpected viewer is always visible, saikai shows how many browsers are
+connected — a `🌐 N` count in the status bar, a toast when one connects, and the
+count on the F12 screen.
+
 ## Configuration (environment variables)
 
 | Variable | Default | Meaning |
