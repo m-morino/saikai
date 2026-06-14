@@ -618,6 +618,62 @@ def test_pilot_mirror_arrow_byte_drives_app():
         f"down-arrow byte did not reach on_key to move focus to the list: {facts}"
 
 
+def test_pilot_mirror_space_leader_runs_mnemonic():
+    """Browser Space leader: a Space byte then a mnemonic byte ('f' = favorite),
+    injected via the mirror input path with the list focused, must arm the Space
+    leader on the App and run the mapped action -- i.e. Space-then-key works from
+    the browser keyboard. Drives the REAL PickerApp."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_mirror_space_leader_runs_mnemonic (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+    from textual.widgets import DataTable
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                self.query_one("#table", DataTable).focus()
+                await pilot.pause(0.1)
+                self._control_enabled = True
+                facts["leader_key"] = getattr(self, "_leader_key", None)
+                sid = self._cursor_sid()
+                fav = lambda: sid in (saikai._read_json(saikai.FAVORITE_FILE, []) or [])
+                facts["sid"] = sid
+                facts["before"] = fav()
+                self._mirror_inject_input(" ")        # Space -> arm the leader
+                await pilot.pause(0.2)
+                facts["pending_after_space"] = getattr(self, "_leader_pending", None)
+                self._mirror_inject_input("f")        # mnemonic -> favorite
+                await pilot.pause(0.3)
+                facts["after"] = fav()
+            facts["ran"] = True
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("ran"), facts
+    assert facts.get("sid"), f"no row under the cursor: {facts}"
+    assert facts.get("pending_after_space") is True, \
+        f"Space byte did not arm the leader: {facts}"
+    assert facts.get("after") != facts.get("before"), \
+        f"Space+f did not run the favorite mnemonic: {facts}"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -653,4 +709,6 @@ if __name__ == "__main__":
     print("PASS test_pilot_mirror_text_drives_search")
     test_pilot_mirror_arrow_byte_drives_app()
     print("PASS test_pilot_mirror_arrow_byte_drives_app")
+    test_pilot_mirror_space_leader_runs_mnemonic()
+    print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("ALL PASS")
