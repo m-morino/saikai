@@ -8,24 +8,32 @@
 
 **English** | [日本語](https://github.com/m-morino/saikai/blob/master/README.ja.md)
 
-Claude Code remembers every conversation, but `claude --resume` starts from the
-current working directory. When work spreads across repositories and worktrees,
-finding the right session gets tedious fast.
-
-saikai is a TUI for browsing and resuming Claude Code sessions across all your
-projects. It also runs real `claude` processes in panes beside the list so you
-can see what's running, what's waiting, and what needs your attention.
-
-```bash
-uv tool install saikai
-saikai
-```
+> **Mission control for Claude Code.** Every session across every repo, in one
+> screen — find it, resume it live, and see which ones need you.
 
 ![saikai demo](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-demo.gif)
 
 <sub>The demo uses fictional, leak-checked data. The current GIF is a
 deterministic UI recording; see [the recording guide](https://github.com/m-morino/saikai/blob/master/docs/demo-recording.md)
 for how public recordings are isolated and audited.</sub>
+
+saikai brings every Claude Code session — across all your repositories and
+worktrees — into one screen. Search by what you remember, resume any session
+live in a pane beside the list, and see at a glance which ones are working,
+waiting, or finished and awaiting your reply. It reads Claude's own transcript
+files directly — no daemon, no database.
+
+```bash
+uv tool install saikai
+saikai
+```
+
+#### Why not just `claude --resume`?
+
+`claude --resume` only sees the current working directory, so once your work
+spreads across repositories and worktrees the right session gets tedious to
+find. saikai gives you one cross-project view — and runs the sessions you pick
+as live panes beside the list.
 
 ### How to read the list
 
