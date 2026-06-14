@@ -2920,14 +2920,16 @@ def _ram_per_pane_mb() -> float:
 def _copy_to_host_clipboard(text: str) -> bool:
     """Copy `text` to the HOST OS clipboard via the platform clip tool, so the
     tokened mirror URL pastes cleanly. Returns True only on a clean exit, so the
-    QR screen can tell the truth about whether the copy actually worked (e.g.
-    `xclip` may be absent on Linux)."""
+    QR screen can tell the truth about whether the copy worked (e.g. `xclip` may
+    be absent on Linux). Bounded by a timeout: this runs on the Textual UI thread
+    (F12 / startup), and `xclip` can otherwise daemonize and block the event loop
+    holding the X selection — a timeout caps the worst case and reports False."""
     import subprocess as _sp
     clip = (["clip"] if sys.platform == "win32"
             else ["pbcopy"] if sys.platform == "darwin"
             else ["xclip", "-selection", "clipboard"])
     try:
-        return _sp.run(clip, input=text.encode("utf-8")).returncode == 0
+        return _sp.run(clip, input=text.encode("utf-8"), timeout=2.0).returncode == 0
     except Exception:
         return False
 
@@ -2969,6 +2971,19 @@ class _MirrorControl:
         if not self._control_enabled:
             return
         from textual import events
+        if data == "\x1b":
+            # A bare Esc keypress arrives as its OWN /input batch (the browser
+            # flushes ESC, a C0 control byte). A lone ESC fed to the stateful
+            # XTermParser buffers with no escape-timeout flush (the real driver has
+            # one) and then SWALLOWS every following key -- the keyboard goes dead
+            # after any Esc. Emit Escape directly; never poison the parser. (xterm
+            # emits a full escape SEQUENCE in one onData, so only a bare Esc lands
+            # here as a lone ESC.)
+            try:
+                self.post_message(events.Key("escape", None))
+            except Exception:
+                pass
+            return
         parser = getattr(self, "_mirror_parser", None)
         if parser is None:
             try:

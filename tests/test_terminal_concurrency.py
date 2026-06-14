@@ -645,6 +645,15 @@ def test_mirror_inject_input_parses_full_terminal_keys():
     app._mirror_inject_input("D")        # left-arrow, split across batches
     assert [e.key for e in posted] == ["left"], posted
 
+    # A BARE Esc keypress (its own batch) must emit Escape AND not poison the
+    # parser: every following key still arrives (regression -- a buffered lone ESC
+    # used to swallow all subsequent keys, killing the Space leader in the browser).
+    posted.clear()
+    app._mirror_inject_input("\x1b")     # bare Esc
+    app._mirror_inject_input(" ")        # then Space (leader)
+    app._mirror_inject_input("f")        # then mnemonic
+    assert [e.key for e in posted] == ["escape", "space", "f"], posted
+
     # The app gate is still authoritative.
     posted.clear()
     app._control_enabled = False
