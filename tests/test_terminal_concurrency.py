@@ -623,11 +623,12 @@ def test_mirror_inject_input_dead_or_torn_pane_noops():
     assert writes == [] and posted == [], "_pty None must fully no-op"
 
 
-def test_mirror_inject_input_no_pane_routes_text_as_keys():
-    """No focused pane -> replay text as Textual Key events so the search box /
-    list (App.on_key + the focused Input) receive them. Printables carry their
-    own character; Enter/Backspace map to named keys; an escape SEQUENCE is
-    dropped (navigation is the key bar's job); a lone Esc -> the escape key."""
+def test_mirror_inject_input_no_pane_parses_full_terminal_keys():
+    """No focused pane -> the browser's terminal byte stream is parsed (Textual's
+    own XTermParser) into the SAME Key events a real terminal delivers, giving the
+    list / search / dialogs FULL keyboard control: printables, Enter, Backspace,
+    AND arrows / Home / Page keys / Delete / Shift+Tab / Ctrl combos -- not just
+    printables. This is what makes browser control terminal-equivalent."""
     posted = []
     app = saikai._MirrorControl.__new__(saikai._MirrorControl)
     app._control_enabled = True
@@ -638,48 +639,30 @@ def test_mirror_inject_input_no_pane_routes_text_as_keys():
     app._mirror_inject_input("hi")
     assert [(e.key, e.character) for e in posted] == [("h", "h"), ("i", "i")], posted
 
-    # Enter + Backspace -> named keys the search box understands.
+    # Escape SEQUENCES now resolve to the right NAMED keys (previously dropped):
+    # arrows, Home, Page Up, Delete, Shift+Tab.
     posted.clear()
-    app._mirror_inject_input("\r")
-    app._mirror_inject_input("\x7f")
-    assert [e.key for e in posted] == ["enter", "backspace"], posted
+    app._mirror_inject_input("\x1b[A\x1b[B\x1b[H\x1b[5~\x1b[3~\x1b[Z")
+    assert [e.key for e in posted] == ["up", "down", "home", "pageup", "delete", "shift+tab"], posted
 
-    # An escape SEQUENCE (e.g. an arrow) is dropped, not typed as '[A'.
+    # Control combos + Enter + Backspace map to their terminal keys.
     posted.clear()
-    app._mirror_inject_input("\x1b[A")
-    assert posted == [], "escape sequence must not be typed into the search box"
+    app._mirror_inject_input("\x03")     # Ctrl-C
+    app._mirror_inject_input("\r")       # Enter
+    app._mirror_inject_input("\x7f")     # Backspace
+    assert [e.key for e in posted] == ["ctrl+c", "enter", "backspace"], posted
 
-    # A coalesced batch of text THEN an escape sequence (fast typing then an
-    # arrow within the browser's 25ms flush): type the text, drop the sequence.
+    # A sequence split across two POST batches is reassembled (stateful parser).
     posted.clear()
-    app._mirror_inject_input("ab\x1b[C")
-    assert [(e.key, e.character) for e in posted] == [("a", "a"), ("b", "b")], posted
-
-    # A lone Esc -> the escape key.
-    posted.clear()
-    app._mirror_inject_input("\x1b")
-    assert [e.key for e in posted] == ["escape"], posted
+    app._mirror_inject_input("\x1b[")
+    app._mirror_inject_input("D")        # left-arrow, split across batches
+    assert [e.key for e in posted] == ["left"], posted
 
     # The app gate is still authoritative.
     posted.clear()
     app._control_enabled = False
     app._mirror_inject_input("z")
     assert posted == [], "gate OFF must not route keys"
-
-
-def test_key_for_char_mapping():
-    """Pure char -> (key, character) map: printables carry their character,
-    control bytes map to named keys or are skipped."""
-    assert saikai._key_for_char("a") == ("a", "a")
-    assert saikai._key_for_char("/") == ("/", "/")
-    assert saikai._key_for_char(" ") == ("space", " ")
-    assert saikai._key_for_char("\r") == ("enter", None)
-    assert saikai._key_for_char("\n") == ("enter", None)
-    assert saikai._key_for_char("\x7f") == ("backspace", None)
-    assert saikai._key_for_char("\x08") == ("backspace", None)
-    assert saikai._key_for_char("\t") == ("tab", None)
-    assert saikai._key_for_char("\x1b") == ("escape", None)
-    assert saikai._key_for_char("\x00") is None
 
 
 def test_mirror_inject_input_swallows_pty_write_errors():
@@ -754,9 +737,7 @@ if __name__ == "__main__":
     print("PASS test_mirror_inject_input_writes_only_when_app_gate_on")
     test_mirror_inject_input_dead_or_torn_pane_noops()
     print("PASS test_mirror_inject_input_dead_or_torn_pane_noops")
-    test_mirror_inject_input_no_pane_routes_text_as_keys()
-    print("PASS test_mirror_inject_input_no_pane_routes_text_as_keys")
-    test_key_for_char_mapping()
-    print("PASS test_key_for_char_mapping")
+    test_mirror_inject_input_no_pane_parses_full_terminal_keys()
+    print("PASS test_mirror_inject_input_no_pane_parses_full_terminal_keys")
     test_mirror_inject_input_swallows_pty_write_errors()
     print("PASS test_mirror_inject_input_swallows_pty_write_errors")

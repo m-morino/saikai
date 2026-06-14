@@ -567,6 +567,57 @@ def test_pilot_mirror_text_drives_search():
         f"typed text did not drive search-as-you-type: {facts}"
 
 
+def test_pilot_mirror_arrow_byte_drives_app():
+    """Terminal-equivalence: an ARROW-KEY byte sequence from the browser ("\\x1b[B")
+    is parsed (Textual's XTermParser) into Key('down') and reaches App.on_key --
+    here, with the search box focused, Down moves focus to the list (the documented
+    behavior). Proves physical-arrow navigation works from the mirror, not just
+    printables / the key bar. Drives the REAL PickerApp."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_mirror_arrow_byte_drives_app (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                self._control_enabled = True
+                # Type a letter -> opens + focuses the search box.
+                self._mirror_inject_input("a")
+                await pilot.pause(0.3)
+                facts["focus_after_type"] = getattr(self.focused, "id", None)
+                # A down-arrow BYTE sequence -> Key('down') -> on_key moves focus
+                # from the search box to the list.
+                self._mirror_inject_input("\x1b[B")
+                await pilot.pause(0.3)
+                facts["focus_after_down"] = getattr(self.focused, "id", None)
+            facts["ran"] = True
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("ran"), facts
+    assert facts.get("focus_after_type") == "search", \
+        f"typing did not focus the search box: {facts}"
+    assert facts.get("focus_after_down") == "table", \
+        f"down-arrow byte did not reach on_key to move focus to the list: {facts}"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -600,4 +651,6 @@ if __name__ == "__main__":
     print("PASS test_pilot_mirror_tap_and_key_drive_ui")
     test_pilot_mirror_text_drives_search()
     print("PASS test_pilot_mirror_text_drives_search")
+    test_pilot_mirror_arrow_byte_drives_app()
+    print("PASS test_pilot_mirror_arrow_byte_drives_app")
     print("ALL PASS")
