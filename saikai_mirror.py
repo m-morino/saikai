@@ -675,8 +675,9 @@ term.onData((d) => {
 //    move the list cursor, the release key) cannot come from the keyboard and
 //    must be tapped here. Enter resumes + focuses the cursored session (and,
 //    when a pane is already focused, is forwarded to claude as submit); "List"
-//    sends the release key (ctrl+] — saikai's default [keys] release; tap the
-//    list area instead if you rebound it) to drop pane focus back to the list.
+//    sends ctrl+right_square_bracket — the Textual key name for saikai's DEFAULT
+//    release key (ctrl+]); if you rebound [keys] release, tap the list area
+//    instead — to drop pane focus back to the list.
 //    Ctrl is a STICKY modifier: tap Ctrl to arm it; the next key is sent
 //    ctrl-combined (e.g. "ctrl+c"), then Ctrl disarms. ─────────────────────────
 let ctrlSticky = false;
@@ -696,7 +697,7 @@ kbBar.innerHTML =
   '<button data-k="right">&#8594;</button>'+
   '<button id="kb-ctrl" data-k="">Ctrl</button>'+
   '<button data-k="f12">F12</button>'+
-  '<button data-k="ctrl+]">&#9776; List</button>';
+  '<button data-k="ctrl+right_square_bracket">&#9776; List</button>';
 document.body.appendChild(kbBar);
 const kbCtrl = document.getElementById('kb-ctrl');
 kbBar.querySelectorAll('button').forEach((b) => {
@@ -709,13 +710,27 @@ kbBar.querySelectorAll('button').forEach((b) => {
     }
     let k = b.getAttribute('data-k');
     if (ctrlSticky) {                         // next key goes ctrl-combined, then disarm
-      k = 'ctrl+' + k;
+      if (k.indexOf('ctrl+') !== 0) { k = 'ctrl+' + k; }   // don't double-prefix List (already ctrl+...)
       ctrlSticky = false;
       kbCtrl.style.background = '';
     }
     postKey(k);
   });
 });
+
+// Reserve space for the fixed top banner + bottom key bar so neither covers the
+// terminal. The key bar wraps to several rows on a narrow phone, so its height
+// is measured (not assumed) and re-measured on resize/rotate. #t scrolls
+// (overflow:auto), so the reserved padding lets the last rows clear the bar
+// instead of hiding under it.
+function fitChrome() {
+  const tdiv = document.getElementById('t');
+  if (!tdiv) return;
+  tdiv.style.paddingTop = banner.offsetHeight + 'px';
+  tdiv.style.paddingBottom = kbBar.offsetHeight + 'px';
+}
+fitChrome();
+window.addEventListener('resize', fitChrome);
 </script></body></html>"""
 
 

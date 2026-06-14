@@ -713,7 +713,10 @@ def test_page_routes_mouse_and_has_key_bar():
         # app-level keys can only reach the app via the key bar. Without Enter the
         # browser can never focus a pane and typed characters go nowhere.
         assert 'data-k="enter"' in page, page
-        assert 'data-k="ctrl+]"' in page, page
+        # List must send the Textual-normalized release key name (the literal
+        # "ctrl+]" does NOT match RELEASE_FOCUS_KEY=="ctrl+right_square_bracket",
+        # so it would never release pane focus).
+        assert 'data-k="ctrl+right_square_bracket"' in page, page
         # Mobile fit: a viewport meta so phones render at device-width (not a
         # ~980px zoomed-out layout that shrinks every control), and touch-sized
         # key-bar buttons (>=44px target, 16px font to avoid iOS focus-zoom).
