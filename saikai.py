@@ -2924,28 +2924,25 @@ def _copy_to_host_clipboard(text: str) -> bool:
     be absent on Linux). Bounded by a timeout: this runs on the Textual UI thread
     (F12 / startup), and `xclip` can otherwise daemonize and block the event loop
     holding the X selection — a timeout caps the worst case and reports False."""
-    import shutil as _sh
     import subprocess as _sp
     if sys.platform == "win32":
-        clip = ["clip"]
+        cmds = [["clip"]]
     elif sys.platform == "darwin":
-        clip = ["pbcopy"]
+        cmds = [["pbcopy"]]
     else:
-        # Linux/BSD: prefer Wayland's wl-copy, else X11 xclip, else xsel — use the
-        # first that exists rather than assuming xclip (absent on a Wayland-only
-        # or minimal box). None present -> report False (the QR is still scannable).
-        if os.environ.get("WAYLAND_DISPLAY") and _sh.which("wl-copy"):
-            clip = ["wl-copy"]
-        elif _sh.which("xclip"):
-            clip = ["xclip", "-selection", "clipboard"]
-        elif _sh.which("xsel"):
-            clip = ["xsel", "-b", "-i"]
-        else:
-            return False
-    try:
-        return _sp.run(clip, input=text.encode("utf-8"), timeout=2.0).returncode == 0
-    except Exception:
-        return False
+        # Linux/BSD: try Wayland's wl-copy, then X11 xclip, then xsel — the first
+        # tool actually installed wins (a missing one raises FileNotFoundError, so
+        # fall through). Avoids assuming xclip on a Wayland-only or minimal box.
+        cmds = ([["wl-copy"]] if os.environ.get("WAYLAND_DISPLAY") else []) + \
+               [["xclip", "-selection", "clipboard"], ["xsel", "-b", "-i"]]
+    for clip in cmds:
+        try:
+            return _sp.run(clip, input=text.encode("utf-8"), timeout=2.0).returncode == 0
+        except FileNotFoundError:
+            continue              # tool not installed -> try the next
+        except Exception:
+            return False          # ran but errored/timed out -> honest "not copied"
+    return False
 
 
 class _MirrorControl:

@@ -665,6 +665,7 @@ def test_copy_to_host_clipboard_picks_tool_and_reports():
     """_copy_to_host_clipboard runs the platform clip tool with the text on stdin
     and reports success by exit code, so the QR screen (F12) can copy the URL
     every time and tell the truth about whether it worked."""
+    import os
     import subprocess
     calls = []
 
@@ -673,6 +674,10 @@ def test_copy_to_host_clipboard_picks_tool_and_reports():
             self.returncode = rc
 
     orig = subprocess.run
+    # On Linux the tool order is wl-copy (Wayland) -> xclip -> xsel; unset
+    # WAYLAND_DISPLAY so this deterministically asserts the X11 path (xclip)
+    # regardless of the CI runner's session type.
+    orig_wl = os.environ.pop("WAYLAND_DISPLAY", None)
     try:
         subprocess.run = lambda cmd, input=None, **kw: (calls.append((cmd, input)) or _R(0))
         ok = saikai._copy_to_host_clipboard("http://x/?token=abc")
@@ -688,6 +693,8 @@ def test_copy_to_host_clipboard_picks_tool_and_reports():
         assert saikai._copy_to_host_clipboard("x") is False
     finally:
         subprocess.run = orig
+        if orig_wl is not None:
+            os.environ["WAYLAND_DISPLAY"] = orig_wl
 
 
 if __name__ == "__main__":
