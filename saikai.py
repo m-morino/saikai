@@ -2982,15 +2982,19 @@ class _MirrorControl:
 
     def _mirror_inject_text_as_keys(self, data: str) -> None:
         """Replay typed text as Textual Key events for the focused non-pane
-        widget (e.g. the search Input) and the App's on_key. Escape SEQUENCES
-        (arrows / F-keys arrive as their own ESC-led batch) are ignored here so we
-        never type a stray '[A' into the search box -- navigation comes from the
-        on-screen key bar; a LONE Esc maps to the escape key. textual is imported
-        in-body so the mixin stays importable headless."""
-        if data.startswith("\x1b"):
-            if len(data) > 1:
-                return                         # escape sequence: leave it to the key bar
-            data = "\x1b"                      # lone ESC -> escape key below
+        widget (e.g. the search Input) and the App's on_key. An ESC begins an
+        escape SEQUENCE (arrow / F-key) or is a lone Escape press: keep any
+        printable text typed BEFORE the first ESC, then stop -- drop the sequence
+        and everything after it, so a coalesced batch like 'abc\\x1b[A' (fast
+        typing then an arrow within the browser's 25ms flush window) types 'abc'
+        and never leaks a stray 'escape' + '[A' into the search box (navigation
+        comes from the key bar). A batch that is exactly one ESC maps to the
+        escape key. textual is imported in-body so the mixin stays importable
+        headless."""
+        if data != "\x1b":
+            esc = data.find("\x1b")
+            if esc != -1:
+                data = data[:esc]              # text before the sequence; drop the rest
         from textual import events
         for ch in data:
             mapped = _key_for_char(ch)

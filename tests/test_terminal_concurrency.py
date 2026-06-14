@@ -649,6 +649,12 @@ def test_mirror_inject_input_no_pane_routes_text_as_keys():
     app._mirror_inject_input("\x1b[A")
     assert posted == [], "escape sequence must not be typed into the search box"
 
+    # A coalesced batch of text THEN an escape sequence (fast typing then an
+    # arrow within the browser's 25ms flush): type the text, drop the sequence.
+    posted.clear()
+    app._mirror_inject_input("ab\x1b[C")
+    assert [(e.key, e.character) for e in posted] == [("a", "a"), ("b", "b")], posted
+
     # A lone Esc -> the escape key.
     posted.clear()
     app._mirror_inject_input("\x1b")
