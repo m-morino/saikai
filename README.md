@@ -48,6 +48,10 @@ live pane, no reply due · `@` open elsewhere · `+` active · `.` recent · `*`
   parent/child session chains.
 - Reads Claude's own transcript files directly — no daemon, no database;
   AI summaries are opt-in.
+- Mirror the live UI to your phone or another browser over the LAN (opt-in,
+  token-authenticated, read-only by default). Flip on control with `Shift+F12`
+  to drive saikai — and claude in a pane — from the browser: tap, scroll, an
+  on-screen key bar, and full terminal-equivalent physical-keyboard input.
 
 ## Who it is for
 
@@ -189,6 +193,35 @@ SAIKAI_SPLIT_LIVE=0 saikai     # also: false / no / off
 
 Press `?` inside saikai for the active color rule and marker legend.
 
+## Web mirror (opt-in)
+
+saikai can mirror its live UI to a phone or another browser — to glance at
+what's running, or to drive a session from across the room. It is **off by
+default** and **token-authenticated**.
+
+```bash
+SAIKAI_MIRROR=1 saikai                                   # loopback only (127.0.0.1)
+SAIKAI_MIRROR=1 SAIKAI_MIRROR_HOST=192.168.1.50 saikai   # reachable on your LAN
+```
+
+On launch saikai shows a scannable **QR code** (and copies the URL); press `F12`
+to bring it back anytime. The URL carries a per-run access token.
+
+The mirror is **read-only by default**. Press **`Shift+F12`** (a local-only key)
+to toggle browser **control** on — then the browser drives saikai with:
+
+- **tap** to click (select a row, sort a column, focus a pane) and **swipe** to scroll;
+- an **on-screen key bar** (Leader, Esc, Tab, Enter, arrows, Ctrl, F12, List) for a soft keyboard;
+- a **physical keyboard**, terminal-equivalent — arrows, Home/End, F-keys, Ctrl/Alt
+  combos, `Ctrl+]` to leave a pane, `Ctrl+C` to interrupt claude.
+
+Control auto-disables after a spell of inactivity, and **only the local
+`Shift+F12` can enable it** — a browser can never turn on its own control. Over a
+LAN bind the mirror stays read-only unless you also opt in with
+`SAIKAI_MIRROR_ALLOW_LAN_INPUT=1`. Use it only on a network you trust: the access
+token travels in the URL, while the separate write-key required for input is
+delivered only over the authenticated stream — never in the URL, QR, or logs.
+
 ## Configuration (environment variables)
 
 | Variable | Default | Meaning |
@@ -211,6 +244,10 @@ Press `?` inside saikai for the active color rule and marker legend.
 | `SAIKAI_COLOR_BY` | project | what tints the session title: `project` / `worktree` / `topic` / `none` |
 | `SAIKAI_SPLIT_RATIO` | 0.34 | initial list/pane split (drag the divider to change; the dragged value persists) |
 | `SAIKAI_RELEASE_KEY` | `ctrl+]` | key that returns focus from a live pane to the list |
+| `SAIKAI_MIRROR` | off | mirror the live UI to a browser; a truthy value (`1`/`true`/`yes`/`on`) enables it (token-authenticated, read-only until `Shift+F12`) |
+| `SAIKAI_MIRROR_HOST` | `127.0.0.1` | mirror bind address; set to a LAN IP to reach it from another device |
+| `SAIKAI_MIRROR_PORT` | `0` | fixed mirror port so a firewall rule can target it; `0` lets the OS pick a free port |
+| `SAIKAI_MIRROR_ALLOW_LAN_INPUT` | off | allow control **input** over a non-loopback bind; otherwise a LAN mirror stays read-only (loopback always permits input) |
 
 saikai also reads an optional **TOML config file** for these same knobs (with
 `env > config > default` precedence) plus `[keys]` rebinds. Run `saikai
