@@ -70,34 +70,25 @@ def fake_run(self, *a, **kw):
     async def go():
         async with self.run_test(size=SIZE) as pilot:
             await pilot.pause(0.8)
-            # Beat 1 — launch: State grouping + Recency sort + visible bar.
-            await snap(pilot, 1800)
-            # Beat 2 — type-to-search narrows the list live.
+            # Beat 1 — HOOK: open cold on the whole cross-project list. This is
+            # the value shot — every Claude Code session, every repo, one screen
+            # — so give it the longest hold of the loop. No search, no menu yet.
+            await snap(pilot, 3200)
+            # Beats 2-5 — FIND: search-as-you-type narrows to the remembered hit
+            # across projects. Quick keystrokes, then a beat to read the result.
             for i, ch in enumerate("auth"):
                 await pilot.press(ch)
-                await snap(pilot, 250 if i < 3 else 1300)
-            # Beat 3 — Esc returns to the list (filter + bar stay).
-            await pilot.press("escape")
-            await snap(pilot, 900)
-            # Beat 4 — ␣ menu: pause so the which-key hint pops up.
-            await pilot.press("space")
-            await pilot.pause(0.9)               # > 0.6 s hesitation hint
-            await snap(pilot, 2600)
-            # Beat 5 — f = favorite (★ appears on the row).
-            await pilot.press("f")
-            await snap(pilot, 1400)
-            # Beat 6 — Enter resumes the session in a live split pane.
+                await snap(pilot, 280 if i < 3 else 1600)
+            # Beats 6-8 — RESUME: Enter brings real Claude Code up live in a
+            # split pane, continuing the session in its own cwd. Hold on the
+            # live session, then the loop returns to the cross-project list.
             await pilot.press("enter")
-            for _ in range(12):                  # let the PTY paint
+            for _ in range(20):                  # let the PTY start painting
                 await pilot.pause(0.1)
-            await snap(pilot, 1500)
-            for _ in range(10):                  # streaming continues
+            await snap(pilot, 1300)              # the session streaming in
+            for _ in range(16):                  # finish painting (~36 cycles total)
                 await pilot.pause(0.1)
-            await snap(pilot, 1500)
-            for _ in range(10):
-                await pilot.pause(0.1)
-            # Beat 7 — final hero frame, long hold before the loop restarts.
-            await snap(pilot, 3000)
+            await snap(pilot, 2600)              # hold on the fully-painted session
     asyncio.run(go())
 
 
