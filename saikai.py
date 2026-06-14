@@ -3663,9 +3663,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         #searchrow { dock: top; height: 3; }   /* visible by default (the dropdowns ARE the discoverability); Space / toggles it and the last state persists */
         #search { width: 1fr; border: tall $accent; }
         #groupsel { width: 15; }
-        #sortsel { width: 17; }
+        #sortsel { width: 20; }   /* fit "Alphabetically" (14) + chevron without wrap */
         #statussel { width: 14; }
-        #lastsel { width: 12; }
+        #lastsel { width: 13; }   /* fit "All time" comfortably */
         #statusbar { height: 1; background: $surface; color: $warning; }
         #main { layout: horizontal; height: 1fr; }
         #table { width: 60%; }                /* default; inline style overrides on mount/drag */
