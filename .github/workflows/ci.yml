@@ -34,7 +34,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m py_compile saikai.py saikai_terminal.py saikai_provider.py
+          python -m py_compile saikai.py saikai_terminal.py saikai_provider.py saikai_mirror.py
           for test in tests/test_*.py; do
             echo "== $test =="
             python "$test"
