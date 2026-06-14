@@ -518,6 +518,55 @@ def test_pilot_mirror_tap_and_key_drive_ui():
         f"injected click did not reach App.on_event (mouse_position): {facts}"
 
 
+def test_pilot_mirror_text_drives_search():
+    """End-to-end: with control ON and NO pane focused, browser text routed through
+    _mirror_inject_input replays as Key events that App.on_event forwards to the
+    focused widget + App.on_key, driving search-as-you-type — the #search box opens
+    and fills. Proves typed text reaches saikai's OWN widgets, not just a live pane
+    (the bug: 'can't input search text into the search box'). Drives the REAL app."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_mirror_text_drives_search (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+    from textual.widgets import Input, DataTable
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                self.query_one("#table", DataTable).focus()   # list focused, no pane
+                await pilot.pause(0.1)
+                self._control_enabled = True
+                facts["focused_terminal"] = self._focused_terminal()
+                self._mirror_inject_input("hi")               # browser-typed text
+                await pilot.pause(0.3)
+                facts["search_value"] = self.query_one("#search", Input).value
+            facts["ran"] = True
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("ran"), facts
+    assert facts.get("focused_terminal") is None, \
+        f"precondition: no pane should be focused (text must route as keys): {facts}"
+    assert facts.get("search_value") == "hi", \
+        f"typed text did not drive search-as-you-type: {facts}"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -549,4 +598,6 @@ if __name__ == "__main__":
     print("PASS test_pilot_mirror_control_toggle")
     test_pilot_mirror_tap_and_key_drive_ui()
     print("PASS test_pilot_mirror_tap_and_key_drive_ui")
+    test_pilot_mirror_text_drives_search()
+    print("PASS test_pilot_mirror_text_drives_search")
     print("ALL PASS")

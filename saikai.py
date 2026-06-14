@@ -2917,6 +2917,27 @@ def _ram_per_pane_mb() -> float:
     return _cfg("limits", "per_pane_mb", "SAIKAI_CLAUDE_MB", 600.0, float)
 
 
+def _key_for_char(ch: str):
+    """Map one browser-typed character to a Textual (key, character) pair, or
+    None to skip it. Printable chars carry their own character (a focused Input
+    inserts it; on_key's search-as-you-type reads event.character); a few control
+    bytes map to the named keys the search box understands. Pure + module-level
+    so it is unit-tested without textual."""
+    if ch == " ":
+        return ("space", " ")
+    if ch in ("\r", "\n"):
+        return ("enter", None)
+    if ch in ("\x7f", "\x08"):
+        return ("backspace", None)
+    if ch == "\t":
+        return ("tab", None)
+    if ch == "\x1b":
+        return ("escape", None)
+    if ch.isprintable():
+        return (ch, ch)
+    return None                                # other C0 control bytes: skip
+
+
 class _MirrorControl:
     """Phase B web-mirror interactive control, mixed into PickerApp.
 
@@ -2932,22 +2953,54 @@ class _MirrorControl:
     _control_enabled: bool = False
 
     def _mirror_inject_input(self, data: str) -> None:
-        """Write browser-injected bytes into the focused live pane's PTY.
+        """Deliver browser-typed text to whatever holds focus in saikai's UI.
 
         Runs on the Textual UI thread (the input handler marshals here via
         call_from_thread). Re-checks the AUTHORITATIVE _control_enabled (the
-        hub's copy is advisory), then mirrors on_key's guard EXACTLY: bail on
-        no pane / dead pane / _pty is None, and contain any write error. The
-        PTY backend takes str — do NOT .encode()."""
+        hub's copy is advisory). Two targets:
+          * a focused LIVE pane -> raw bytes straight to its PTY (high fidelity
+            for claude: paste, control sequences; the PTY backend takes str -- do
+            NOT .encode()). Mirrors on_key's guard: dead pane / _pty None -> no-op.
+          * otherwise (the list / the search box / any Textual Input) -> replay
+            the text as synthesized Key events so the App routes them natively
+            (search-as-you-type + the focused Input's own editing). Without this,
+            typing only ever reached a pane and the search box got nothing."""
         if not self._control_enabled:
             return
         t = self._focused_terminal()
-        if t is None or getattr(t, "_pty", None) is None or getattr(t, "is_dead", False):
+        if t is not None:
+            # A live pane owns the keyboard: raw PTY write (no-op if torn down).
+            if getattr(t, "_pty", None) is None or getattr(t, "is_dead", False):
+                return
+            try:
+                t._pty.write(data)
+            except Exception:
+                pass
             return
-        try:
-            t._pty.write(data)
-        except Exception:
-            pass
+        # No pane focused: route to the App as Key events (search box / list).
+        self._mirror_inject_text_as_keys(data)
+
+    def _mirror_inject_text_as_keys(self, data: str) -> None:
+        """Replay typed text as Textual Key events for the focused non-pane
+        widget (e.g. the search Input) and the App's on_key. Escape SEQUENCES
+        (arrows / F-keys arrive as their own ESC-led batch) are ignored here so we
+        never type a stray '[A' into the search box -- navigation comes from the
+        on-screen key bar; a LONE Esc maps to the escape key. textual is imported
+        in-body so the mixin stays importable headless."""
+        if data.startswith("\x1b"):
+            if len(data) > 1:
+                return                         # escape sequence: leave it to the key bar
+            data = "\x1b"                      # lone ESC -> escape key below
+        from textual import events
+        for ch in data:
+            mapped = _key_for_char(ch)
+            if mapped is None:
+                continue
+            key, character = mapped
+            try:
+                self.post_message(events.Key(key, character))
+            except Exception:
+                pass
 
     def _mirror_inject_mouse(self, col: int, row: int, button: int, kind: str) -> None:
         """Post a synthesized Textual mouse event into the App so it routes
