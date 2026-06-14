@@ -591,9 +591,12 @@ def test_mirror_inject_input_writes_only_when_app_gate_on():
     assert writes == ["ls\r"], writes
 
 
-def test_mirror_inject_input_noops_without_pane_or_when_dead():
-    """No focused pane, a dead pane, or _pty is None -> no-op (mirrors on_key)."""
+def test_mirror_inject_input_dead_or_torn_pane_noops():
+    """A focused but dead pane, or _pty is None -> FULL no-op: it must NOT fall
+    through to key synthesis (the user is 'in' that pane; on_key owns its
+    Enter/Esc via the key bar)."""
     writes = []
+    posted = []
 
     class _FakePty:
         def write(self, data):
@@ -601,11 +604,7 @@ def test_mirror_inject_input_noops_without_pane_or_when_dead():
 
     app = saikai._MirrorControl.__new__(saikai._MirrorControl)
     app._control_enabled = True
-
-    # No focused pane.
-    app._focused_terminal = lambda: None
-    app._mirror_inject_input("a")
-    assert writes == [], "no pane must no-op"
+    app.post_message = lambda ev: posted.append(ev)
 
     # Dead pane.
     class _Dead:
@@ -613,7 +612,7 @@ def test_mirror_inject_input_noops_without_pane_or_when_dead():
         is_dead = True
     app._focused_terminal = lambda: _Dead()
     app._mirror_inject_input("b")
-    assert writes == [], "dead pane must no-op"
+    assert writes == [] and posted == [], "dead pane must fully no-op"
 
     # _pty is None.
     class _NoPty:
@@ -621,7 +620,60 @@ def test_mirror_inject_input_noops_without_pane_or_when_dead():
         is_dead = False
     app._focused_terminal = lambda: _NoPty()
     app._mirror_inject_input("c")
-    assert writes == [], "_pty None must no-op"
+    assert writes == [] and posted == [], "_pty None must fully no-op"
+
+
+def test_mirror_inject_input_no_pane_routes_text_as_keys():
+    """No focused pane -> replay text as Textual Key events so the search box /
+    list (App.on_key + the focused Input) receive them. Printables carry their
+    own character; Enter/Backspace map to named keys; an escape SEQUENCE is
+    dropped (navigation is the key bar's job); a lone Esc -> the escape key."""
+    posted = []
+    app = saikai._MirrorControl.__new__(saikai._MirrorControl)
+    app._control_enabled = True
+    app._focused_terminal = lambda: None
+    app.post_message = lambda ev: posted.append(ev)
+
+    # Printable text -> one Key per char, character preserved (drives search).
+    app._mirror_inject_input("hi")
+    assert [(e.key, e.character) for e in posted] == [("h", "h"), ("i", "i")], posted
+
+    # Enter + Backspace -> named keys the search box understands.
+    posted.clear()
+    app._mirror_inject_input("\r")
+    app._mirror_inject_input("\x7f")
+    assert [e.key for e in posted] == ["enter", "backspace"], posted
+
+    # An escape SEQUENCE (e.g. an arrow) is dropped, not typed as '[A'.
+    posted.clear()
+    app._mirror_inject_input("\x1b[A")
+    assert posted == [], "escape sequence must not be typed into the search box"
+
+    # A lone Esc -> the escape key.
+    posted.clear()
+    app._mirror_inject_input("\x1b")
+    assert [e.key for e in posted] == ["escape"], posted
+
+    # The app gate is still authoritative.
+    posted.clear()
+    app._control_enabled = False
+    app._mirror_inject_input("z")
+    assert posted == [], "gate OFF must not route keys"
+
+
+def test_key_for_char_mapping():
+    """Pure char -> (key, character) map: printables carry their character,
+    control bytes map to named keys or are skipped."""
+    assert saikai._key_for_char("a") == ("a", "a")
+    assert saikai._key_for_char("/") == ("/", "/")
+    assert saikai._key_for_char(" ") == ("space", " ")
+    assert saikai._key_for_char("\r") == ("enter", None)
+    assert saikai._key_for_char("\n") == ("enter", None)
+    assert saikai._key_for_char("\x7f") == ("backspace", None)
+    assert saikai._key_for_char("\x08") == ("backspace", None)
+    assert saikai._key_for_char("\t") == ("tab", None)
+    assert saikai._key_for_char("\x1b") == ("escape", None)
+    assert saikai._key_for_char("\x00") is None
 
 
 def test_mirror_inject_input_swallows_pty_write_errors():
@@ -694,7 +746,11 @@ if __name__ == "__main__":
     print("PASS test_bracketed_paste_mode_tracking")
     test_mirror_inject_input_writes_only_when_app_gate_on()
     print("PASS test_mirror_inject_input_writes_only_when_app_gate_on")
-    test_mirror_inject_input_noops_without_pane_or_when_dead()
-    print("PASS test_mirror_inject_input_noops_without_pane_or_when_dead")
+    test_mirror_inject_input_dead_or_torn_pane_noops()
+    print("PASS test_mirror_inject_input_dead_or_torn_pane_noops")
+    test_mirror_inject_input_no_pane_routes_text_as_keys()
+    print("PASS test_mirror_inject_input_no_pane_routes_text_as_keys")
+    test_key_for_char_mapping()
+    print("PASS test_key_for_char_mapping")
     test_mirror_inject_input_swallows_pty_write_errors()
     print("PASS test_mirror_inject_input_swallows_pty_write_errors")
