@@ -496,7 +496,12 @@ _PAGE_HTML = """<!doctype html><html><head><meta charset="utf-8">
 #kb button{min-height:44px;min-width:44px;padding:8px 14px;margin:0;
 font:bold 16px monospace;flex:1 1 auto;border:1px solid #555;border-radius:6px;
 background:#333;color:#eee;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
-#kb button:active{background:#3a3}</style></head>
+#kb button:active{background:#3a3}
+#kb{align-items:center}
+#kb-arrows{display:grid;grid-template-areas:". up ." "left down right";gap:4px;flex:0 0 auto}
+#kb-arrows>[data-k="up"]{grid-area:up}#kb-arrows>[data-k="down"]{grid-area:down}
+#kb-arrows>[data-k="left"]{grid-area:left}#kb-arrows>[data-k="right"]{grid-area:right}
+#kb-arrows>button{min-width:52px;padding:8px 0;flex:0 0 auto}</style></head>
 <body><div id="t"></div>
 <script src="/xterm.min.js"></script>
 <script src="/addon-canvas.js"></script>
@@ -507,6 +512,13 @@ try {
   const _CA = (window.CanvasAddon && window.CanvasAddon.CanvasAddon) || window.CanvasAddon;
   term.loadAddon(new _CA());     // crisp box/block borders; falls back to DOM
 } catch (e) {}
+// Keep the keyboard wired to saikai: focus the terminal on load, and re-focus on
+// every tap. Without this the xterm textarea can lose focus (mouse tracking eats
+// the tap) and keys (Space, etc.) fall through to the browser instead of saikai.
+try { term.focus(); } catch (e) {}
+document.getElementById('t').addEventListener('pointerdown', () => {
+  try { term.focus(); } catch (e) {}
+});
 // ESC built at runtime (never a literal ESC byte in this served string — a lone
 // CR/ESC once broke the page; the no-control-byte test guards it).
 const ESC = String.fromCharCode(27);
@@ -686,18 +698,22 @@ kbBar.id = 'kb';
 kbBar.style.cssText =
   'position:fixed;bottom:0;left:0;right:0;display:flex;flex-wrap:wrap;gap:4px;'+
   'padding:4px;background:#222;z-index:9;font:bold 14px monospace';
+// Action keys grouped on the left; the four arrows form a d-pad cross on the
+// right (↑ over ←↓→) so list/dropdown navigation reads like a real keypad.
 kbBar.innerHTML =
-  '<button data-k="space">Leader</button>'+
   '<button data-k="escape">Esc</button>'+
   '<button data-k="tab">Tab</button>'+
   '<button data-k="enter">&#9166; Enter</button>'+
-  '<button data-k="up">&#8593;</button>'+
-  '<button data-k="down">&#8595;</button>'+
-  '<button data-k="left">&#8592;</button>'+
-  '<button data-k="right">&#8594;</button>'+
+  '<button data-k="space">Leader</button>'+
   '<button id="kb-ctrl" data-k="">Ctrl</button>'+
+  '<button data-k="ctrl+right_square_bracket">&#9776; List</button>'+
   '<button data-k="f12">F12</button>'+
-  '<button data-k="ctrl+right_square_bracket">&#9776; List</button>';
+  '<div id="kb-arrows">'+
+    '<button data-k="up">&#8593;</button>'+
+    '<button data-k="left">&#8592;</button>'+
+    '<button data-k="down">&#8595;</button>'+
+    '<button data-k="right">&#8594;</button>'+
+  '</div>';
 document.body.appendChild(kbBar);
 const kbCtrl = document.getElementById('kb-ctrl');
 kbBar.querySelectorAll('button').forEach((b) => {

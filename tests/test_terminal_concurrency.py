@@ -652,6 +652,35 @@ def test_mirror_inject_input_parses_full_terminal_keys():
     assert posted == [], "gate OFF must not route keys"
 
 
+def test_copy_to_host_clipboard_picks_tool_and_reports():
+    """_copy_to_host_clipboard runs the platform clip tool with the text on stdin
+    and reports success by exit code, so the QR screen (F12) can copy the URL
+    every time and tell the truth about whether it worked."""
+    import subprocess
+    calls = []
+
+    class _R:
+        def __init__(self, rc):
+            self.returncode = rc
+
+    orig = subprocess.run
+    try:
+        subprocess.run = lambda cmd, input=None, **kw: (calls.append((cmd, input)) or _R(0))
+        ok = saikai._copy_to_host_clipboard("http://x/?token=abc")
+        assert ok is True, calls
+        assert calls and calls[0][1] == b"http://x/?token=abc", calls
+        expected = ("clip" if sys.platform == "win32"
+                    else "pbcopy" if sys.platform == "darwin" else "xclip")
+        assert calls[0][0][0] == expected, (calls[0][0], expected)
+        # A non-zero exit (or a missing tool) -> False = honest "not copied".
+        subprocess.run = lambda *a, **kw: _R(1)
+        assert saikai._copy_to_host_clipboard("x") is False
+        subprocess.run = lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError())
+        assert saikai._copy_to_host_clipboard("x") is False
+    finally:
+        subprocess.run = orig
+
+
 if __name__ == "__main__":
     test_update_status_marshals_outside_lock()
     print("PASS test_update_status_marshals_outside_lock")
@@ -707,3 +736,5 @@ if __name__ == "__main__":
     print("PASS test_agent_terminal_on_key_release_encode_and_dead")
     test_mirror_inject_input_parses_full_terminal_keys()
     print("PASS test_mirror_inject_input_parses_full_terminal_keys")
+    test_copy_to_host_clipboard_picks_tool_and_reports()
+    print("PASS test_copy_to_host_clipboard_picks_tool_and_reports")
