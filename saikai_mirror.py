@@ -634,9 +634,15 @@ async function postMouse(col, row, button, kind) {
 }
 
 // ── Input split: SGR mouse -> /mouse, everything else -> Phase B /input ─────
-// SGR report: ESC [ < b ; col ; row (M=press, m=release). Built from a string
-// so the source carries the two-char \\x1b (no literal ESC byte in this page).
-const sgrMouseRe = new RegExp('\\x1b\\[<(\\d+);(\\d+);(\\d+)([Mm])');
+// SGR report: ESC [ < b ; col ; row (M=press, m=release). Built from the ESC
+// const + a BACKSLASH-FREE body. A backslash inside a new RegExp('...') string
+// arg does NOT survive Python -> served-JS -> JS-string-literal -> RegExp: JS
+// string parsing drops the backslash (a bracket-escape becomes a class opener,
+// a digit-escape becomes the letter d), throwing at load and blanking the page.
+// So the body uses char classes with no backslash: [[] matches a literal '[',
+// [0-9] a digit. Anchored ^ (each SGR report is its own onData chunk; mode 1000
+// reports no motion) so it never misroutes keyboard data containing the prefix.
+const sgrMouseRe = new RegExp('^' + ESC + '[[]<([0-9]+);([0-9]+);([0-9]+)([Mm])');
 term.onData((d) => {
   if (!controlOn || fatal) return;      // disabled until a control on-frame
   const mm = d.match(sgrMouseRe);

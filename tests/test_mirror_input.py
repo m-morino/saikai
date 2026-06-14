@@ -693,7 +693,9 @@ def test_page_routes_mouse_and_has_key_bar():
         ).read().decode("utf-8")
         # (a) SGR mouse routing in onData: the parser + the /mouse endpoint.
         assert "/mouse" in page, page
-        assert "[<" in page, "page must detect the SGR mouse prefix ESC[<"   # \x1b[<
+        # SGR prefix detected via a backslash-free char class ([[] = literal '['
+        # then '<'); see test_sgr_mouse_regex_is_escaping_safe_and_correct.
+        assert "[[]<" in page, "page must detect the SGR mouse prefix ESC[<"
         # 1-based -> 0-based conversion is present (a subtraction by 1).
         assert "- 1" in page, page
         # press/release distinguished (M vs m).
@@ -715,6 +717,47 @@ def test_page_routes_mouse_and_has_key_bar():
         hub.stop()
 
 
+def test_sgr_mouse_regex_is_escaping_safe_and_correct():
+    """Regression (found by a headless-Edge smoke, not by the string-asserts):
+    the SGR mouse regex must be built with NO backslash. A backslash inside a
+    `new RegExp('...')` string argument does NOT survive the
+    Python-string -> served-JS -> JS-string-literal -> RegExp chain: JS string
+    parsing collapses the bracket-escape to a bare '[' and the digit-escape to
+    the letter 'd', producing an INVALID regex that throws at page load and
+    blanks the page on a real browser. Only executing the JS catches this; the
+    page string-asserts above (and a static source read) do not. The fix uses
+    String.fromCharCode(27) + char classes ([[] and [0-9]) so the pattern body
+    carries no backslash."""
+    import re as _re
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=80, rows=24)
+    hub.set_mouse_handler(lambda *a: None)
+    port = hub.serve()
+    try:
+        page = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/?token=secret", timeout=3.0
+        ).read().decode("utf-8")
+    finally:
+        hub.stop()
+    regex_lines = [ln for ln in page.splitlines()
+                   if "sgrMouseRe" in ln and "new RegExp" in ln]
+    assert regex_lines, "sgrMouseRe construction not found in served page"
+    regex_line = regex_lines[0]
+    # The bug: ANY backslash in the new RegExp string arg collapses in the
+    # browser's JS string parsing and throws -> blank page.
+    assert "\\" not in regex_line, (
+        "backslash in the SGR regex arg will collapse in JS and blank the page; "
+        "use char-class forms instead: " + regex_line)
+    # The effective pattern (ESC + the body) must be a valid regex that parses a
+    # real SGR mouse report. This proxy checks only the pattern SEMANTICS (the
+    # backslash-survival is asserted above); a literal '[' is matched here with
+    # \[ to avoid a Python-only "nested set" FutureWarning for the JS form [[].
+    rx = _re.compile(chr(27) + r"\[<([0-9]+);([0-9]+);([0-9]+)([Mm])")
+    mm = rx.match("\x1b[<0;5;3M")
+    assert mm and mm.groups() == ("0", "5", "3", "M"), "must parse a press report"
+    assert rx.match("\x1b[<64;10;2M"), "must match a scroll-up report"
+    assert rx.match("plain typed text") is None, "must not match plain text"
+
+
 if __name__ == "__main__":
     test_inject_gate_off_by_default_and_requires_handler()
     test_inject_is_fifo_via_single_drain()
@@ -733,6 +776,7 @@ if __name__ == "__main__":
     test_lan_input_requires_opt_in()
     test_page_contains_input_listeners_and_sender()
     test_page_has_no_js_breaking_control_bytes()
+    test_sgr_mouse_regex_is_escaping_safe_and_correct()
     test_wildcard_bind_allows_lan_ip_host()
     test_mirror_inject_mouse_double_gate_and_events()
     test_mirror_inject_key_double_gate_and_event()
