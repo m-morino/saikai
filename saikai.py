@@ -2917,6 +2917,21 @@ def _ram_per_pane_mb() -> float:
     return _cfg("limits", "per_pane_mb", "SAIKAI_CLAUDE_MB", 600.0, float)
 
 
+def _copy_to_host_clipboard(text: str) -> bool:
+    """Copy `text` to the HOST OS clipboard via the platform clip tool, so the
+    tokened mirror URL pastes cleanly. Returns True only on a clean exit, so the
+    QR screen can tell the truth about whether the copy actually worked (e.g.
+    `xclip` may be absent on Linux)."""
+    import subprocess as _sp
+    clip = (["clip"] if sys.platform == "win32"
+            else ["pbcopy"] if sys.platform == "darwin"
+            else ["xclip", "-selection", "clipboard"])
+    try:
+        return _sp.run(clip, input=text.encode("utf-8")).returncode == 0
+    except Exception:
+        return False
+
+
 class _MirrorControl:
     """Phase B web-mirror interactive control, mixed into PickerApp.
 
@@ -3506,17 +3521,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("f12", "dismiss", show=False),
         ]
 
-        def __init__(self, url, matrix):
+        def __init__(self, url, matrix, copied=True):
             super().__init__()
             self._url = url
             self._matrix = matrix
+            self._copied = copied
 
         def compose(self) -> ComposeResult:
             with VerticalScroll(id="mirror-box"):
                 yield Static("[bold]Web mirror — scan to connect[/bold] [dim](read-only)[/dim]")
                 yield Static(_render_qr(self._matrix), id="mirror-qr")
+                _tail = ("URL copied to clipboard" if self._copied
+                         else "copy the URL above")
                 yield Static(f"or open: [cyan]{self._url}[/cyan]\n"
-                             "[dim]URL copied to clipboard · Esc / F12 to close[/dim]")
+                             f"[dim]{_tail} · Esc / F12 to close[/dim]")
 
     class PickerApp(App, _MirrorControl):
         TITLE = "saikai"
@@ -3852,18 +3870,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     except Exception:
                         pass
                 _hub.set_key_handler(_key_handler)
-                # Copy the URL to the clipboard (host) so it pastes cleanly without
-                # selecting a wrapped line, then show the QR so a phone can join
-                # without typing the tokened URL (the stderr banner is alt-screen
-                # hidden). F12 re-opens the QR anytime.
-                try:
-                    import subprocess as _sp
-                    _clip = (["clip"] if sys.platform == "win32"
-                             else ["pbcopy"] if sys.platform == "darwin"
-                             else ["xclip", "-selection", "clipboard"])
-                    _sp.run(_clip, input=_hub.url().encode("utf-8"), check=False)
-                except Exception:
-                    pass
+                # Show the QR so a phone can join without typing the tokened URL
+                # (the stderr banner is alt-screen hidden). action_mirror_info also
+                # copies the URL to the host clipboard, every time — F12 re-opens it.
                 self.call_after_refresh(self.action_mirror_info)
 
         def _build_forest_bg(self) -> None:
@@ -6062,11 +6071,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             _hub = getattr(self, "_mirror_hub", None)
             if _hub is None:
                 return
+            _url = _hub.url()
+            # Copy on EVERY open (not just at startup) so F12 reliably puts the
+            # tokened URL on the clipboard; tell the truth if the copy failed.
+            _copied = _copy_to_host_clipboard(_url)
             try:
                 import saikai_mirror as _m
-                self.push_screen(MirrorScreen(_hub.url(), _m.qr_matrix(_hub.url())))
+                self.push_screen(MirrorScreen(_url, _m.qr_matrix(_url), _copied))
             except Exception:
-                self.notify(f"Web mirror: {_hub.url()}", title="saikai mirror",
+                self.notify(f"Web mirror: {_url}", title="saikai mirror",
                             timeout=12)
 
         def action_toggle_mirror_control(self) -> None:
