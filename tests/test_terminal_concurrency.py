@@ -557,82 +557,69 @@ def test_reopen_after_exit_requires_awaited_pane_removal():
     assert awaited_raise is None, f"awaited remove+add must mount cleanly, got {awaited_raise}"
 
 
-def test_mirror_inject_input_writes_only_when_app_gate_on():
-    """_mirror_inject_input re-checks the AUTHORITATIVE PickerApp._control_enabled
-    on the UI thread; the hub's advisory copy being stale-ON must NOT inject.
-
-    PickerApp is defined inside textual_pick() (needs textual, unreachable
-    headless), so the guard lives on the module-level _MirrorControl mixin that
-    PickerApp inherits — that is what we build here, the same __new__ + FakePty
-    style as the ClaudeTerminal guards above."""
-    writes = []
-
-    class _FakePty:
-        def write(self, data):
-            writes.append(data)
-
-    class _Term:
-        def __init__(self):
-            self._pty = _FakePty()
-            self.is_dead = False
-
-    app = saikai._MirrorControl.__new__(saikai._MirrorControl)
-    term = _Term()
-    app._focused_terminal = lambda: term
-
-    # App gate OFF -> no write, even though a focused live pane exists.
-    app._control_enabled = False
-    app._mirror_inject_input("rm -rf /\r")
-    assert writes == [], "app gate OFF must not inject (authority re-check)"
-
-    # App gate ON + alive pane -> exact bytes written.
-    app._control_enabled = True
-    app._mirror_inject_input("ls\r")
-    assert writes == ["ls\r"], writes
-
-
-def test_mirror_inject_input_dead_or_torn_pane_noops():
-    """A focused but dead pane, or _pty is None -> FULL no-op: it must NOT fall
-    through to key synthesis (the user is 'in' that pane; on_key owns its
-    Enter/Esc via the key bar)."""
+def test_agent_terminal_on_key_release_encode_and_dead():
+    """Stage-2 routing TARGET: a Key event the App forwards to a focused live pane
+    is handled by AgentTerminal.on_key EXACTLY like the host terminal -- the
+    release key (Ctrl+]) hands focus back (FocusReleased) and writes nothing to
+    claude; any other key encodes to the child PTY; a dead pane writes nothing
+    (keys bubble to the host's bindings). This is what makes the unified browser
+    input path terminal-equivalent INSIDE a pane (Ctrl+] to leave, Ctrl+C to
+    interrupt)."""
     writes = []
     posted = []
 
     class _FakePty:
-        def write(self, data):
-            writes.append(data)
+        def write(self, d):
+            writes.append(d)
 
-    app = saikai._MirrorControl.__new__(saikai._MirrorControl)
-    app._control_enabled = True
-    app.post_message = lambda ev: posted.append(ev)
+    class _Ev:
+        def __init__(self, key, character=None):
+            self.key = key
+            self.character = character
+            self.stopped = False
 
-    # Dead pane.
-    class _Dead:
-        _pty = _FakePty()
-        is_dead = True
-    app._focused_terminal = lambda: _Dead()
-    app._mirror_inject_input("b")
-    assert writes == [] and posted == [], "dead pane must fully no-op"
+        def stop(self):
+            self.stopped = True
 
-    # _pty is None.
-    class _NoPty:
-        _pty = None
-        is_dead = False
-    app._focused_terminal = lambda: _NoPty()
-    app._mirror_inject_input("c")
-    assert writes == [] and posted == [], "_pty None must fully no-op"
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t._pty = _FakePty()
+    t.is_dead = False
+    t._frozen = False
+    t.post_message = lambda m: posted.append(m)
+
+    # Release key -> hand focus back to the list; nothing written to claude.
+    t.on_key(_Ev(rt.RELEASE_FOCUS_KEY))
+    assert any(isinstance(m, rt.AgentTerminal.FocusReleased) for m in posted), posted
+    assert writes == [], writes
+
+    # A normal printable key -> encoded bytes to the child PTY (claude).
+    posted.clear()
+    t.on_key(_Ev("a", "a"))
+    assert writes == ["a"], writes
+
+    # Ctrl-C -> encoded to the PTY (interrupts claude), NOT bubbled to the host.
+    writes.clear()
+    ev = _Ev("ctrl+c", "\x03")
+    t.on_key(ev)
+    assert writes == ["\x03"] and ev.stopped, (writes, ev.stopped)
+
+    # Dead pane -> nothing written; the key bubbles so host bindings still work.
+    writes.clear()
+    t.is_dead = True
+    t.on_key(_Ev("b", "b"))
+    assert writes == [], writes
 
 
-def test_mirror_inject_input_no_pane_parses_full_terminal_keys():
-    """No focused pane -> the browser's terminal byte stream is parsed (Textual's
-    own XTermParser) into the SAME Key events a real terminal delivers, giving the
-    list / search / dialogs FULL keyboard control: printables, Enter, Backspace,
-    AND arrows / Home / Page keys / Delete / Shift+Tab / Ctrl combos -- not just
-    printables. This is what makes browser control terminal-equivalent."""
+def test_mirror_inject_input_parses_full_terminal_keys():
+    """Browser input is parsed (Textual's own XTermParser) into the SAME Key events
+    a real terminal delivers, then posted to the App -- giving the focused target
+    (list / search / dialogs, or a live pane's AgentTerminal) FULL keyboard
+    control: printables, Enter, Backspace, AND arrows / Home / Page keys / Delete /
+    Shift+Tab / Ctrl combos -- not just printables. This is what makes browser
+    control terminal-equivalent; the App then routes each event natively."""
     posted = []
     app = saikai._MirrorControl.__new__(saikai._MirrorControl)
     app._control_enabled = True
-    app._focused_terminal = lambda: None
     app.post_message = lambda ev: posted.append(ev)
 
     # Printable text -> one Key per char, character preserved (drives search).
@@ -663,23 +650,6 @@ def test_mirror_inject_input_no_pane_parses_full_terminal_keys():
     app._control_enabled = False
     app._mirror_inject_input("z")
     assert posted == [], "gate OFF must not route keys"
-
-
-def test_mirror_inject_input_swallows_pty_write_errors():
-    """A hostile/torn write (UnicodeEncodeError, child gone) is contained, exactly
-    like on_key's try/except — no exception escapes to the UI thread."""
-    class _BoomPty:
-        def write(self, data):
-            raise RuntimeError("child went away")
-
-    class _Term:
-        _pty = _BoomPty()
-        is_dead = False
-
-    app = saikai._MirrorControl.__new__(saikai._MirrorControl)
-    app._control_enabled = True
-    app._focused_terminal = lambda: _Term()
-    app._mirror_inject_input("x")     # must not raise
 
 
 if __name__ == "__main__":
@@ -733,11 +703,7 @@ if __name__ == "__main__":
     print("PASS test_toggle_freeze_flips_and_resumes")
     test_bracketed_paste_mode_tracking()
     print("PASS test_bracketed_paste_mode_tracking")
-    test_mirror_inject_input_writes_only_when_app_gate_on()
-    print("PASS test_mirror_inject_input_writes_only_when_app_gate_on")
-    test_mirror_inject_input_dead_or_torn_pane_noops()
-    print("PASS test_mirror_inject_input_dead_or_torn_pane_noops")
-    test_mirror_inject_input_no_pane_parses_full_terminal_keys()
-    print("PASS test_mirror_inject_input_no_pane_parses_full_terminal_keys")
-    test_mirror_inject_input_swallows_pty_write_errors()
-    print("PASS test_mirror_inject_input_swallows_pty_write_errors")
+    test_agent_terminal_on_key_release_encode_and_dead()
+    print("PASS test_agent_terminal_on_key_release_encode_and_dead")
+    test_mirror_inject_input_parses_full_terminal_keys()
+    print("PASS test_mirror_inject_input_parses_full_terminal_keys")
