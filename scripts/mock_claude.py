@@ -1,40 +1,34 @@
 """A faithful stand-in for `claude`, used only by the deterministic
 screenshot/GIF scripts.
 
-It paints the real Claude Code UI — the welcome box, tool calls with the `⎿`
-result connector, and the bottom prompt box — into the PTY so the split-live
-pane shows a convincing screen WITHOUT launching a real session: no auth, no real
-history, no enterprise token, no API call, nothing to leak. Then it blocks until
-the pane kills it.
+It paints the real Claude Code startup screen — the terracotta logo, the
+`Claude Code vX.Y.Z` / model / cwd header, the tool-call transcript with the
+`⎿` result connector, and the bottom prompt box — into the PTY so the
+split-live pane shows a convincing screen WITHOUT launching a real session: no
+auth, no real history, no enterprise token, no API call, nothing to leak. Then
+it blocks until the pane kills it.
 
 The content is the fixture's fictional task (webapp → "fix the flaky auth token
 refresh test", cwd /home/demo/work/webapp). Modeled on Claude Code 2.x; if a
 glyph/color/line drifts from the current CLI, adjust the lines below to match.
+The logo is an approximation built from block glyphs — swap in the exact art if
+pixel-fidelity matters.
 """
 import sys
 import time
 
-# Claude Code palette (24-bit): the banner + action bullets use Claude's
-# terracotta accent; tips/results are dim grey, prompts near-white.
+# Claude Code palette (24-bit): the logo + action bullets use Claude's
+# terracotta accent; tips/results are dim grey, headings/prompts near-white.
 ACCENT = "\x1b[38;2;215;119;87m"     # Claude "#d77757"
 DIM = "\x1b[38;2;136;136;136m"
 WHITE = "\x1b[38;2;230;230;230m"
 BOLD = "\x1b[1m"
 RESET = "\x1b[0m"
 
-W = 58                                # inner width of the rounded boxes
+W = 58                                # inner width of the rounded prompt box
 
 # OSC-0 title: the leading glyph is what saikai's status probe reads (idle).
 sys.stdout.write("\x1b]0;✳ webapp\x07")
-
-
-def boxline(plain: str, style: str = "") -> str:
-    """One rounded-box row: '│ <plain> …padding… │', padded by the VISIBLE length
-    of `plain` (style codes add no width)."""
-    pad = max(0, W - len(plain) - 1)
-    body = f"{style}{plain}{RESET if style else ''}"
-    return f"{ACCENT}│{RESET} {body}{' ' * pad}{ACCENT}│{RESET}"
-
 
 top = f"{ACCENT}╭{'─' * W}╮{RESET}"
 bot = f"{ACCENT}╰{'─' * W}╯{RESET}"
@@ -43,14 +37,13 @@ prompt_ph = 'Try "run the full suite again"'
 prompt_pad = max(0, W - len("> " + prompt_ph) - 1)
 
 LINES = [
-    # ── welcome box ──────────────────────────────────────────────────────────
-    top,
-    boxline("✻ Welcome back to Claude Code!", BOLD),
-    boxline(""),
-    boxline("/help for help, /status for your current setup", DIM),
-    boxline(""),
-    boxline("cwd: /home/demo/work/webapp", DIM),
-    bot,
+    # ── startup header: logo + version + model + cwd (NOT boxed — the real CLI
+    #    prints the logo to the left of three header lines, no surrounding box).
+    f"{ACCENT}▄███▄{RESET}   {BOLD}{WHITE}Claude Code{RESET} {DIM}v2.1.177{RESET}",
+    f"{ACCENT}█ ▀ █{RESET}   {WHITE}Opus 4.8 (1M context){RESET}",
+    f"{ACCENT}▀███▀{RESET}   {DIM}/home/demo/work/webapp{RESET}",
+    "",
+    f"  {DIM}/help for help, /status for your current setup{RESET}",
     "",
     # ── the resumed conversation ─────────────────────────────────────────────
     f"{DIM}>{RESET} Fix the flaky auth token refresh test",
@@ -72,7 +65,7 @@ LINES = [
     "",
     # ── bottom prompt box ────────────────────────────────────────────────────
     top,
-    f"{ACCENT}│{RESET} {WHITE}>{RESET} {DIM}{prompt_ph}{RESET}{' ' * prompt_pad}{ACCENT}│{RESET}",
+    f"{ACCENT}│{RESET} {WHITE}›{RESET} {DIM}{prompt_ph}{RESET}{' ' * prompt_pad}{ACCENT}│{RESET}",
     bot,
     f"  {DIM}? for shortcuts{RESET}",
 ]
