@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Quitting now takes a deliberate double press.** A single `Esc` (or `Ctrl+C`)
+  on the list quit saikai outright — too easy to fire by reflex (`Esc` interrupts
+  claude in a pane; Claude Code itself exits only on a *second* `Ctrl+C`). The
+  first press arms and shows a hint; a second within ~2.5s quits, and any other
+  key disarms. `Esc` still leaves search / dropdown / pane → list as before.
+
 ## [0.3.0] — 2026-06-15
 
 ### Added
