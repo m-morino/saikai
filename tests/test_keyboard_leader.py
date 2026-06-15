@@ -582,6 +582,51 @@ def test_status_refresh_deferred_while_pane_focused():
     assert facts.get("pending_after_return") is False, facts
 
 
+def test_launch_qr_dismiss_reshows_restore_hint():
+    """The launch QR screen is pushed over the 'Shift+F4 to reopen' toast, hiding
+    it; _after_launch_qr (the QR's on-dismiss callback) re-shows the hint — but
+    only when there are restore candidates."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_launch_qr_dismiss_reshows_restore_hint (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                notes = []
+                self.notify = lambda msg, **k: notes.append(msg)
+                self._restore_candidates = []            # nothing to restore
+                self._after_launch_qr()
+                facts["notes_no_cand"] = len(notes)
+                self._restore_candidates = [{"id": "a", "cwd": "x"},
+                                            {"id": "b", "cwd": "y"}]
+                self._after_launch_qr()
+                facts["hint"] = notes[-1] if notes else ""
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("notes_no_cand") == 0, f"no candidates -> no hint: {facts}"
+    assert "Shift+F4" in facts.get("hint", "") and "2 pane" in facts.get("hint", ""), \
+        f"the deferred hint must re-show with the count: {facts}"
+
+
 def test_pilot_mirror_control_toggle():
     """A focus-independent priority binding toggles _control_enabled and pushes
     the new state into the hub EVEN WHILE A PANE IS FOCUSED. This catches the
@@ -928,6 +973,8 @@ if __name__ == "__main__":
     print("PASS test_focus_moves_are_logged")
     test_status_refresh_deferred_while_pane_focused()
     print("PASS test_status_refresh_deferred_while_pane_focused")
+    test_launch_qr_dismiss_reshows_restore_hint()
+    print("PASS test_launch_qr_dismiss_reshows_restore_hint")
     test_pilot_mirror_control_toggle()
     print("PASS test_pilot_mirror_control_toggle")
     test_pilot_mirror_tap_and_key_drive_ui()

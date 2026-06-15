@@ -3941,7 +3941,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # Show the QR so a phone can join without typing the tokened URL
                 # (the stderr banner is alt-screen hidden). action_mirror_info also
                 # copies the URL to the host clipboard, every time — F12 re-opens it.
-                self.call_after_refresh(self.action_mirror_info)
+                # on_close re-surfaces the "Shift+F4 to reopen" hint the QR covers.
+                self.call_after_refresh(
+                    lambda: self.action_mirror_info(on_close=self._after_launch_qr))
 
         def _build_forest_bg(self) -> None:
             """Daemon: compute the cross-session forest off the pre-paint path,
@@ -6231,8 +6233,18 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             self.push_screen(SettingsScreen())
 
-        def action_mirror_info(self) -> None:
+        def _after_launch_qr(self, _result=None) -> None:
+            # The launch QR screen is pushed ON TOP of the "Shift+F4 to reopen"
+            # toast, hiding it; re-show that hint once the QR is dismissed so the
+            # restore reminder is actually seen.
+            if getattr(self, "_restore_candidates", None):
+                self.notify(f"{len(self._restore_candidates)} pane(s) from last "
+                            f"session — Shift+F4 to reopen", timeout=8)
+
+        def action_mirror_info(self, on_close=None) -> None:
             # F12 — (re)show the web-mirror QR + URL. No-op when the mirror is off.
+            # on_close: optional callback run when the QR is dismissed — the launch
+            # auto-show passes it to re-surface the Shift+F4 restore hint the QR hid.
             _hub = getattr(self, "_mirror_hub", None)
             if _hub is None:
                 return
@@ -6243,7 +6255,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             try:
                 import saikai_mirror as _m
                 self.push_screen(MirrorScreen(_url, _m.qr_matrix(_url), _copied,
-                                              _hub.client_count()))
+                                              _hub.client_count()), on_close)
             except Exception:
                 self.notify(f"Web mirror: {_url}", title="saikai mirror",
                             timeout=12)
