@@ -518,6 +518,70 @@ def test_focus_moves_are_logged():
         f"focus moves must be logged ([focus] ... -> ...): {facts['log']!r}"
 
 
+def test_status_refresh_deferred_while_pane_focused():
+    """The 1.5s status poll must not rebuild the list while a live pane is focused
+    (the rebuild disrupts typing into claude — keystrokes leak to the list/search).
+    on_descendant_focus catches the deferred rebuild up when focus returns to the
+    list, and must NOT rebuild while a pane is still focused."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_status_refresh_deferred_while_pane_focused (textual unavailable)")
+        return
+
+    import asyncio
+    import tempfile
+    import shutil
+    from types import SimpleNamespace
+    from pathlib import Path
+    from textual.app import App
+
+    _write_demo_session()
+    d = Path(tempfile.mkdtemp())
+    saved_log = saikai.LOG_FILE
+    saikai.LOG_FILE = d / "saikai.log"
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                calls = []
+                self._request_refresh = lambda: calls.append(1)
+                ev = SimpleNamespace(widget=self.query_one("#table"))
+                # A live pane is focused + a deferred refresh is pending: the
+                # focus handler must NOT rebuild the list yet.
+                self._focused_terminal = lambda: object()
+                self._status_refresh_pending = True
+                self.on_descendant_focus(ev)
+                facts["calls_while_pane"] = len(calls)
+                facts["pending_while_pane"] = self._status_refresh_pending
+                # Focus returns to the list: the deferred rebuild fires once.
+                self._focused_terminal = lambda: None
+                self.on_descendant_focus(ev)
+                facts["calls_after_return"] = len(calls)
+                facts["pending_after_return"] = self._status_refresh_pending
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+        saikai.LOG_FILE = saved_log
+        shutil.rmtree(d, ignore_errors=True)
+
+    assert facts.get("calls_while_pane") == 0, \
+        f"must NOT rebuild the list while a pane is focused: {facts}"
+    assert facts.get("pending_while_pane") is True, facts
+    assert facts.get("calls_after_return") == 1, \
+        f"must catch the deferred rebuild up on focus return: {facts}"
+    assert facts.get("pending_after_return") is False, facts
+
+
 def test_pilot_mirror_control_toggle():
     """A focus-independent priority binding toggles _control_enabled and pushes
     the new state into the hub EVEN WHILE A PANE IS FOCUSED. This catches the
@@ -860,6 +924,10 @@ if __name__ == "__main__":
     print("PASS test_ctrlc_double_press_and_disarm")
     test_ctrlq_is_double_press_guarded()
     print("PASS test_ctrlq_is_double_press_guarded")
+    test_focus_moves_are_logged()
+    print("PASS test_focus_moves_are_logged")
+    test_status_refresh_deferred_while_pane_focused()
+    print("PASS test_status_refresh_deferred_while_pane_focused")
     test_pilot_mirror_control_toggle()
     print("PASS test_pilot_mirror_control_toggle")
     test_pilot_mirror_tap_and_key_drive_ui()

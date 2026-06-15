@@ -5421,6 +5421,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self._last_focus_log = cur
             except Exception:
                 pass
+            # Catch up a list rebuild that _poll_live_status deferred while a pane
+            # was focused (markers weren't refreshed under the user's typing). Now
+            # that focus has left every pane, rebuilding is safe.
+            try:
+                if getattr(self, "_status_refresh_pending", False) and \
+                        self._focused_terminal() is None:
+                    self._status_refresh_pending = False
+                    self._request_refresh()
+            except Exception:
+                pass
 
         def _live_pane_ids(self) -> list:
             """All mounted live-pane ids (excludes the preview tab). Includes
@@ -5916,7 +5926,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             changed = (cur != prev)
             self._last_status = cur
             if changed or advanced:
-                self._request_refresh()
+                # Don't rebuild the list while the user is typing into a live pane:
+                # _do_refresh_table's table.clear()+rebuild disrupts the focused
+                # pane (the same reason _auto_tick skips), leaking keystrokes to the
+                # list / search. Defer; on_descendant_focus catches it up when focus
+                # returns to the list. The toasts above still fire either way.
+                if self._focused_terminal() is not None:
+                    self._status_refresh_pending = True
+                else:
+                    self._request_refresh()
 
         def action_copy_prompt(self) -> None:
             # F9: copy the selected session's opening user prompt to the
