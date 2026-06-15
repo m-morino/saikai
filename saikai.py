@@ -3592,10 +3592,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         ENABLE_COMMAND_PALETTE = False
         BINDINGS = [
             Binding("escape", "quit", "Quit"),
-            # Ctrl+C / Ctrl+Q quit is handled in on_key (double-press guarded).
-            # NOT a Binding: a binding fires the UNGUARDED action_quit_all and
-            # quits on the first press, defeating the guard (on_key + event.stop
-            # already shadow Textual's built-in ctrl+c, so no binding is needed).
+            # Ctrl+C is guarded in on_key, NOT via a Binding: a saikai ctrl+c
+            # binding would fire the UNGUARDED action_quit_all on the first press.
+            # Textual's built-in ctrl+c is `system` (non-priority), so on_key +
+            # event.stop() shadow it — the on_key double-press guard wins. Ctrl+Q
+            # needs no entry here: Textual's built-in ctrl+q binding IS priority,
+            # but its "quit" action resolves to our OVERRIDDEN action_quit (the
+            # guarded Esc path), so Ctrl+Q is double-press-guarded too (locked by
+            # test_ctrlq_is_double_press_guarded).
             # Resume only on Enter. We deliberately do NOT use RowSelected, so
             # a stray mouse click on a row never triggers resume — that was
             # the "screen disappears when I click around" symptom: the click
@@ -4608,11 +4612,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 pass
 
         def on_key(self, event) -> None:
-            # Ctrl+C / Ctrl+Q reaching the App means the LIST or search box is
-            # focused (a focused live terminal consumes Ctrl+C first, to interrupt
-            # claude). Route it to our force-quit (kill-all + join) so Textual's
-            # built-in quit can't exit WITHOUT reaping the claude trees — the
-            # Screen's default ctrl+c=quit would otherwise shadow our binding.
+            # Ctrl+C reaching the App means the LIST or search box is focused (a
+            # focused live terminal consumes Ctrl+C first, to interrupt claude).
+            # Route it through the double-press guard, then our force-quit
+            # (kill-all + join) so it never exits WITHOUT reaping the claude trees.
+            # Textual's built-in ctrl+c is `system` (non-priority), so this handler
+            # + event.stop() shadow it. (Ctrl+Q normally arrives via Textual's
+            # PRIORITY ctrl+q->quit binding -> our guarded action_quit, before
+            # on_key; handling it here too is a harmless fallback.)
             if event.key in ("ctrl+c", "ctrl+q"):
                 event.stop()
                 # Double-press guard: a single reflex Ctrl+C (claude treats it as
@@ -6070,6 +6077,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             muscle memory for interrupting claude in a pane — must not kill saikai."""
             if getattr(self, "_quit_armed", False):
                 self._quit_armed = False          # consume the arm
+                old = getattr(self, "_quit_disarm_timer", None)
+                if old is not None:               # cancel the pending disarm timer
+                    try:                          # so it can't fire during shutdown
+                        old.stop()
+                    except Exception:
+                        pass
                 return True
             self._quit_armed = True
             try:
@@ -6090,6 +6103,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             return False
 
         def _disarm_quit(self) -> None:
+            # Belt-and-suspenders: the timer is cancelled on quit and on re-arm,
+            # but if it still fires during teardown, don't touch a stopped app.
+            if not self.is_running:
+                return
             self._quit_armed = False
 
         def action_quit(self) -> None:

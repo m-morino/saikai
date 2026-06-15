@@ -424,6 +424,51 @@ def test_ctrlc_double_press_and_disarm():
         f"two consecutive Ctrl+C must quit: {facts}"
 
 
+def test_ctrlq_is_double_press_guarded():
+    """Ctrl+Q must NOT quit on a single press either. Textual's built-in
+    priority ctrl+q->quit resolves to saikai's overridden action_quit, so a
+    single Ctrl+Q should ARM (not exit) and a second should quit — a reflex
+    Ctrl+Q must not kill saikai (nor orphan its live panes)."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_ctrlq_is_double_press_guarded (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                self.query_one("#table").focus()
+                await pilot.press("ctrl+q")           # 1st Ctrl+Q: must NOT quit
+                await pilot.pause(0.2)
+                facts["after_one"] = self.is_running
+                await pilot.press("ctrl+q")           # 2nd: quit
+                await pilot.pause(0.3)
+                facts["after_two"] = self.is_running
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("after_one") is True, \
+        f"a single Ctrl+Q must NOT quit (must be guarded like Ctrl+C): {facts}"
+    assert facts.get("after_two") is False, \
+        f"a second Ctrl+Q must quit: {facts}"
+
+
 def test_pilot_mirror_control_toggle():
     """A focus-independent priority binding toggles _control_enabled and pushes
     the new state into the hub EVEN WHILE A PANE IS FOCUSED. This catches the
@@ -764,6 +809,8 @@ if __name__ == "__main__":
     print("PASS test_pilot_esc_quits_and_bar_toggle")
     test_ctrlc_double_press_and_disarm()
     print("PASS test_ctrlc_double_press_and_disarm")
+    test_ctrlq_is_double_press_guarded()
+    print("PASS test_ctrlq_is_double_press_guarded")
     test_pilot_mirror_control_toggle()
     print("PASS test_pilot_mirror_control_toggle")
     test_pilot_mirror_tap_and_key_drive_ui()
