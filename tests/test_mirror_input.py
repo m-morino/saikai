@@ -772,6 +772,32 @@ def test_page_wires_touch_swipe_to_scroll():
     assert "pan-x" in page, page
 
 
+def test_page_wires_mouse_drag_to_scroll():
+    """A desktop/laptop viewer drives the mirror with a MOUSE. xterm mouse mode
+    1000 reports a press/release but NO motion, so a click-drag produced no
+    scroll at all (the user saw a Claude pane ignore mouse-drag where a swipe
+    scrolls). The page must translate a held left-button mouse drag into the
+    SAME scrollup/scrolldown the touch-swipe + wheel paths use, so drag-to-scroll
+    works with a mouse too. (Manual desktop verification covers real fidelity.)"""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=80, rows=24)
+    hub.set_mouse_handler(lambda *a: None)
+    port = hub.serve()
+    try:
+        page = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/?token=secret", timeout=3.0
+        ).read().decode("utf-8")
+    finally:
+        hub.stop()
+    # A mouse-drag handler must exist (not only the touch-swipe one).
+    assert "mousedown" in page, "no mouse-drag handler — a mouse cannot scroll"
+    assert "mousemove" in page, "no mouse-drag handler — a mouse cannot scroll"
+    # It must gate on the HELD left button (e.buttons & 1) so a plain hover never
+    # scrolls and only a real drag drives the host.
+    assert "buttons" in page, "mouse-drag must require the button held (e.buttons)"
+    # ...and drive the SAME /mouse scroll path the touch + wheel paths use.
+    assert "postMouse" in page and "scrollup" in page and "scrolldown" in page, page
+
+
 def test_sgr_mouse_regex_is_escaping_safe_and_correct():
     """Regression (found by a headless-Edge smoke, not by the string-asserts):
     the SGR mouse regex must be built with NO backslash. A backslash inside a
@@ -857,4 +883,5 @@ if __name__ == "__main__":
     test_mirror_inject_key_double_gate_and_event()
     test_page_routes_mouse_and_has_key_bar()
     test_page_wires_touch_swipe_to_scroll()
+    test_page_wires_mouse_drag_to_scroll()
     print("OK test_mirror_input")

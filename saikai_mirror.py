@@ -708,13 +708,16 @@ term.onData((d) => {
   else if (!flushTimer) { flushTimer = setTimeout(() => { flushTimer=null; pump(); }, 25); }
 });
 
-// ── Phone scroll: a touch-swipe emits NO wheel events, so xterm (mouse mode
-//    1000 = no motion) reports nothing and #t's overflow:auto only pans the
-//    rendered image. Translate a single-finger VERTICAL drag into the same
-//    scrollup/scrolldown the wheel uses, at the touched cell so the list (or the
-//    pane) under the finger scrolls. Two-finger (pinch) + horizontal pans fall
-//    through to the browser via touch-action. Control-gated: read-only (where
-//    touch-action is 'auto') never drives the host. ─────────────────────────────
+// ── Drag to scroll (touch + mouse): a touch-swipe emits NO wheel events, and a
+//    mouse drag under mode 1000 reports a press/release but NO motion, so xterm
+//    reports nothing for either and #t's overflow:auto only pans the rendered
+//    image. Translate a single-finger / held-left-button VERTICAL drag into the
+//    same scrollup/scrolldown the wheel uses, at the dragged cell so the list (or
+//    the pane) under the pointer scrolls. Two-finger (pinch) + horizontal pans
+//    fall through to the browser via touch-action. Control-gated: read-only
+//    (where touch-action is 'auto') never drives the host. The mouse path
+//    coexists with xterm's SGR press/release (a plain click stays a tap; only a
+//    real drag adds scroll the mouse otherwise can't produce). ─────────────────
 (function () {
   const el = document.getElementById('t');
   const STEP = 22;                       // px of vertical drag per scroll tick
@@ -727,22 +730,39 @@ term.onData((d) => {
     return [Math.max(0, Math.min(term.cols - 1, c)),
             Math.max(0, Math.min(term.rows - 1, w))];
   }
-  el.addEventListener('touchstart', (e) => {
-    if (e.touches.length !== 1) { lastY = null; return; }  // leave pinch to browser
-    lastY = e.touches[0].clientY; accum = 0;
-    const cc = cellAt(e.touches[0].clientX, lastY); scol = cc[0]; srow = cc[1];
-  }, {passive: true});
-  el.addEventListener('touchmove', (e) => {
-    if (lastY === null || e.touches.length !== 1 || !controlOn || fatal) return;
-    const y = e.touches[0].clientY;
+  function begin(x, y) {
+    lastY = y; accum = 0;
+    const cc = cellAt(x, y); scol = cc[0]; srow = cc[1];
+  }
+  function drag(y) {                     // returns true once it emits >=1 scroll
+    if (lastY === null || !controlOn || fatal) return false;
     accum += y - lastY; lastY = y;
     let moved = false;
-    // finger up (y decreases) -> see items below -> scroll the list DOWN.
+    // pointer up (y decreases) -> see items below -> scroll the list DOWN.
     while (accum <= -STEP) { accum += STEP; postMouse(scol, srow, 0, 'scrolldown'); moved = true; }
     while (accum >=  STEP) { accum -= STEP; postMouse(scol, srow, 0, 'scrollup');   moved = true; }
-    if (moved) e.preventDefault();        // we consumed this vertical drag
+    return moved;
+  }
+  function end() { lastY = null; }
+  el.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) { lastY = null; return; }  // leave pinch to browser
+    begin(e.touches[0].clientX, e.touches[0].clientY);
+  }, {passive: true});
+  el.addEventListener('touchmove', (e) => {
+    if (e.touches.length !== 1) return;
+    if (drag(e.touches[0].clientY)) e.preventDefault();    // we consumed this drag
   }, {passive: false});
-  el.addEventListener('touchend', () => { lastY = null; }, {passive: true});
+  el.addEventListener('touchend', end, {passive: true});
+  // Mouse: a held LEFT-button drag scrolls the surface under the cursor. Listens
+  // on #t in the bubble phase (xterm's own listeners run first, so taps still
+  // become SGR press/release); mouseup is on window so a release outside #t ends
+  // the drag.
+  el.addEventListener('mousedown', (e) => { if (e.button === 0) begin(e.clientX, e.clientY); });
+  el.addEventListener('mousemove', (e) => {
+    if (lastY === null || !(e.buttons & 1)) return;        // only while left held
+    if (drag(e.clientY)) e.preventDefault();
+  });
+  window.addEventListener('mouseup', end);
 })();
 
 // ── On-screen key bar: fixed-position buttons -> POST /key. This is the ONLY
