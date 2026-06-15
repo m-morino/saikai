@@ -51,17 +51,31 @@ def test_server_rejects_bad_token_and_streams_with_good_token():
         # and the stream must open with the full-frame snapshot.
         hub.broadcast("\x1b[32mGO\x1b[0m")
         resp = _get(f"{base}/stream?token=secret")
-        deadline = time.time() + 3.0
+        deadline = time.time() + 5.0
         seen = b""
-        while time.time() < deadline and b"\n\n" not in seen[1:]:
-            seen += resp.read1(64)   # read1: return buffered bytes, don't block for a full 64
-        text = seen.decode("utf-8", "replace")
-        assert text.startswith("data: ")
-        payloads = [base64.b64decode(ln[6:]).decode("utf-8", "replace")
-                    for ln in text.splitlines() if ln.startswith("data: ")]
-        joined = "".join(payloads)
-        assert "\x1b[2J\x1b[H" in joined   # snapshot first
-        assert "GO" in joined
+        joined = ""
+        while time.time() < deadline:
+            chunk = resp.read1(64)   # read1: buffered bytes, don't block for a full 64
+            if not chunk:
+                break
+            seen += chunk
+            # Decode only COMPLETE "data:" lines. read1 can stop mid-frame, so
+            # the trailing line may be a partial base64 chunk — decoding it threw
+            # "Incorrect padding" flakily (timing-dependent, esp. on macOS CI).
+            parts = []
+            for ln in seen.decode("utf-8", "replace").split("\n")[:-1]:
+                ln = ln.rstrip("\r")
+                if ln.startswith("data: "):
+                    try:
+                        parts.append(base64.b64decode(ln[6:]).decode("utf-8", "replace"))
+                    except Exception:
+                        pass   # incomplete chunk — keep reading
+            joined = "".join(parts)
+            if "\x1b[2J\x1b[H" in joined and "GO" in joined:
+                break
+        assert seen.startswith(b"data: ")                      # stream opens with a frame
+        assert "\x1b[2J\x1b[H" in joined, f"snapshot missing: {joined!r}"   # snapshot first
+        assert "GO" in joined, f"GO frame missing: {joined!r}"
     finally:
         hub.stop()
 
