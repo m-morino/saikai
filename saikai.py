@@ -5405,6 +5405,23 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
 
+        def on_descendant_focus(self, event) -> None:
+            # Always-on focus trail: focus moves aren't otherwise logged, so an
+            # unexpected "focus changed on its own" had no record. Log each move
+            # to saikai.log next to the pane/refresh events that triggered it
+            # (e.g. a "[term] exit" immediately followed by "[focus] -> DataTable"
+            # pinpoints a pane-exit stealing focus). Best-effort; deduped.
+            try:
+                w = getattr(event, "widget", None)
+                cur = "?" if w is None else (
+                    type(w).__name__ + (f"#{w.id}" if getattr(w, "id", None) else ""))
+                prev = getattr(self, "_last_focus_log", "-")
+                if cur != prev:
+                    _log(f"[focus] {prev} -> {cur}")
+                    self._last_focus_log = cur
+            except Exception:
+                pass
+
         def _live_pane_ids(self) -> list:
             """All mounted live-pane ids (excludes the preview tab). Includes
             panes whose claude already EXITED (kept for the final frame), which

@@ -469,6 +469,55 @@ def test_ctrlq_is_double_press_guarded():
         f"a second Ctrl+Q must quit: {facts}"
 
 
+def test_focus_moves_are_logged():
+    """An always-on focus trail: on_descendant_focus appends a '[focus] a -> b'
+    line to saikai.log on each focus move, so an unexpected 'focus changed on its
+    own' is captured next to the pane/refresh events that caused it."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_focus_moves_are_logged (textual unavailable)")
+        return
+
+    import asyncio
+    import tempfile
+    import shutil
+    from pathlib import Path
+    from textual.app import App
+
+    _write_demo_session()
+    d = Path(tempfile.mkdtemp())
+    saved_log = saikai.LOG_FILE
+    saikai.LOG_FILE = d / "saikai.log"
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                await pilot.press("slash")            # focus the search box
+                await pilot.pause(0.15)
+                await pilot.press("escape")           # search -> table (focus move)
+                await pilot.pause(0.2)
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+        facts["log"] = (saikai.LOG_FILE.read_text(encoding="utf-8")
+                        if saikai.LOG_FILE.exists() else "")
+        saikai.LOG_FILE = saved_log
+        shutil.rmtree(d, ignore_errors=True)
+
+    assert "[focus]" in facts["log"], \
+        f"focus moves must be logged ([focus] ... -> ...): {facts['log']!r}"
+
+
 def test_pilot_mirror_control_toggle():
     """A focus-independent priority binding toggles _control_enabled and pushes
     the new state into the hub EVEN WHILE A PANE IS FOCUSED. This catches the
