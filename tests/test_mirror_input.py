@@ -743,6 +743,34 @@ def test_page_routes_mouse_and_has_key_bar():
         hub.stop()
 
 
+def test_page_key_bar_has_saikai_action_keys():
+    """The on-screen key bar must expose saikai's OWN actions so a phone can DRIVE
+    saikai, not just type into a pane: refresh (f5), next-attention (shift+f3),
+    close pane (f10), copy (f9), restore (shift+f4), open search (slash), and fast
+    list paging (pageup/pagedown). f5/f9/f10/shift+f3/shift+f4 are priority
+    bindings (fire even with a pane focused); slash + paging work when the list is
+    focused. They sit behind a 'More' toggle so the default bar stays compact.
+    (Manual phone verification covers real action firing.)"""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=80, rows=24)
+    hub.set_key_handler(lambda *a: None)
+    port = hub.serve()
+    try:
+        page = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/?token=secret", timeout=3.0
+        ).read().decode("utf-8")
+    finally:
+        hub.stop()
+    for k in ('data-k="f5"', 'data-k="shift+f3"', 'data-k="f10"', 'data-k="f9"',
+              'data-k="shift+f4"', 'data-k="slash"',
+              'data-k="pageup"', 'data-k="pagedown"'):
+        assert k in page, f"key bar missing {k}"
+    # A 'More' toggle reveals a secondary action row (keeps the default compact).
+    assert "kb-more" in page, "no More toggle for the secondary action row"
+    assert "kb2" in page, "no secondary action row container"
+    # The secondary buttons must ride the SAME postKey path (write-key + /key).
+    assert "postKey" in page and "/key" in page, page
+
+
 def test_page_wires_touch_swipe_to_scroll():
     """A phone has no wheel, so a touch-swipe emits no SGR scroll and xterm (mouse
     mode 1000 = no motion) reports nothing — `overflow:auto` only pans the
@@ -882,6 +910,7 @@ if __name__ == "__main__":
     test_mirror_inject_mouse_double_gate_and_events()
     test_mirror_inject_key_double_gate_and_event()
     test_page_routes_mouse_and_has_key_bar()
+    test_page_key_bar_has_saikai_action_keys()
     test_page_wires_touch_swipe_to_scroll()
     test_page_wires_mouse_drag_to_scroll()
     print("OK test_mirror_input")

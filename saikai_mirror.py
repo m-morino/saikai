@@ -791,21 +791,47 @@ kbBar.innerHTML =
   '<button data-k="space">Leader</button>'+
   '<button id="kb-ctrl" data-k="">Ctrl</button>'+
   '<button data-k="ctrl+right_square_bracket">&#9776; List</button>'+
+  '<button id="kb-more" data-k="">More</button>'+
   '<button data-k="f12">F12</button>'+
   '<div id="kb-arrows">'+
     '<button data-k="up">&#8593;</button>'+
     '<button data-k="left">&#8592;</button>'+
     '<button data-k="down">&#8595;</button>'+
     '<button data-k="right">&#8594;</button>'+
+  '</div>'+
+  // Secondary row: saikai's OWN actions, hidden until 'More' so the default bar
+  // stays compact. f5/f9/f10/shift+f3/shift+f4 are PRIORITY bindings (fire even
+  // with a pane focused); "Find" (slash) opens search and PgUp/PgDn/Top/End page
+  // the list (these work when the list, not a pane, is focused).
+  '<div id="kb2" style="display:none;flex-basis:100%;flex-wrap:wrap;gap:4px">'+
+    '<button data-k="slash">Find</button>'+
+    '<button data-k="f5">Refresh</button>'+
+    '<button data-k="shift+f3">Next!</button>'+
+    '<button data-k="f10">Close</button>'+
+    '<button data-k="f9">Copy</button>'+
+    '<button data-k="shift+f4">Restore</button>'+
+    '<button data-k="pageup">PgUp</button>'+
+    '<button data-k="pagedown">PgDn</button>'+
+    '<button data-k="home">Top</button>'+
+    '<button data-k="end">End</button>'+
   '</div>';
 document.body.appendChild(kbBar);
 const kbCtrl = document.getElementById('kb-ctrl');
+const kbMore = document.getElementById('kb-more');
 kbBar.querySelectorAll('button').forEach((b) => {
   b.addEventListener('click', (e) => {
     e.preventDefault();
     if (b.id === 'kb-ctrl') {                 // arm/disarm the sticky modifier
       ctrlSticky = !ctrlSticky;
       kbCtrl.style.background = ctrlSticky ? '#3a3' : '';
+      return;
+    }
+    if (b.id === 'kb-more') {                 // reveal/hide the secondary action row
+      const k2 = document.getElementById('kb2');
+      const show = k2.style.display === 'none';
+      k2.style.display = show ? 'flex' : 'none';
+      kbMore.style.background = show ? '#3a3' : '';
+      fitChrome();                            // bar height changed -> re-reserve padding
       return;
     }
     let k = b.getAttribute('data-k');
