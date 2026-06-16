@@ -994,6 +994,53 @@ def test_pilot_rename_modal_enter_saves_not_resumes():
     assert facts.get("stack_after") == 1, f"rename modal did not close on Enter: {facts}"
 
 
+def test_pilot_ctrlc_over_modal_does_not_quit():
+    """Bug-hunt finding (same root as the rename Enter leak): over a no-Input modal
+    (Help / Mirror QR / Settings) a reflex DOUBLE Ctrl+C quit the whole app. on_key's
+    quit guard had no modal guard and those modals define no ctrl+c binding, so
+    Ctrl+C bubbled to on_key -> _confirm_quit -> action_quit_all. Ctrl+C over a modal
+    must NOT quit; the modal stays open (Esc closes it). (Ctrl+Q, a priority binding
+    -> action_quit, shares action_quit's new screen_stack guard.)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_ctrlc_over_modal_does_not_quit (textual unavailable)")
+        return
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                self.action_quit_all = lambda: facts.__setitem__("quit", True)
+                await pilot.press("question_mark")       # open Help (priority binding)
+                await pilot.pause(0.2)
+                facts["screen"] = type(self.screen).__name__
+                await pilot.press("ctrl+c")              # reflex...
+                await pilot.press("ctrl+c")              # ...twice
+                await pilot.pause(0.2)
+                facts["quit_fired"] = facts.get("quit", False)
+                facts["screen_after"] = type(self.screen).__name__
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("screen") == "HelpScreen", f"'?' did not open Help: {facts}"
+    assert not facts.get("quit_fired"), f"Ctrl+C over a modal quit the app (BUG): {facts}"
+    assert facts.get("screen_after") == "HelpScreen", f"Ctrl+C should leave Help open: {facts}"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -1041,5 +1088,6 @@ if __name__ == "__main__":
     print("PASS test_pilot_mirror_arrow_byte_drives_app")
     test_pilot_mirror_space_leader_runs_mnemonic()
     test_pilot_rename_modal_enter_saves_not_resumes()
+    test_pilot_ctrlc_over_modal_does_not_quit()
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("ALL PASS")

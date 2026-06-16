@@ -4686,6 +4686,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # PRIORITY ctrl+q->quit binding -> our guarded action_quit, before
             # on_key; handling it here too is a harmless fallback.)
             if event.key in ("ctrl+c", "ctrl+q"):
+                # A modal / pushed screen owns the keyboard. Help / Mirror QR /
+                # Settings define no ctrl+c binding, so a reflex Ctrl+C bubbles here
+                # — it must NOT arm the app-quit guard (a double press would exit
+                # from under a dialog). Esc closes the modal; quit is list-only.
+                if len(self.screen_stack) > 1:
+                    return
                 event.stop()
                 # Double-press guard: a single reflex Ctrl+C (claude treats it as
                 # interrupt and exits only on a SECOND one) must not kill saikai.
@@ -6223,6 +6229,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # list, list → quit. The bar is a FIXTURE now (visible by default),
             # so Esc no longer hides it — a single Esc from the list quits, and
             # the filter/query stays applied + visible. ␣/ toggles the bar.
+            # A modal / pushed screen owns the keyboard: Esc is consumed by the
+            # modal's own escape binding, but Ctrl+Q (a priority binding) routes
+            # here regardless — never quit from under a dialog.
+            if len(self.screen_stack) > 1:
+                return
             if isinstance(self.focused, Input):
                 try:
                     self.query_one("#table", DataTable).focus()
