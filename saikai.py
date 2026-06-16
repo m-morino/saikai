@@ -665,6 +665,42 @@ def _set_custom_title(sid: str, name: str) -> None:
     _CUSTOM_TITLES_CACHE, _CUSTOM_TITLES_MTIME = None, None   # force reload next read
 
 
+# Lineage recovery pointer (Task 5): child_sid -> {parent, parent_jsonl, ts}.
+# Clones the mtime-cache + atomic-write pattern of the custom-titles sidecar.
+LINEAGE_FILE = CACHE_DIR / "lineage.json"     # child_sid -> {parent, parent_jsonl, ts}
+_LINEAGE_CACHE: "dict | None" = None
+_LINEAGE_MTIME: "float | None" = None
+
+
+def _load_lineage() -> dict:
+    """child_sid -> {parent, parent_jsonl, ts}. Re-read only when the file
+    mtime changes (or after a write)."""
+    global _LINEAGE_CACHE, _LINEAGE_MTIME
+    try:
+        m = LINEAGE_FILE.stat().st_mtime
+    except OSError:
+        _LINEAGE_CACHE, _LINEAGE_MTIME = {}, None
+        return {}
+    if _LINEAGE_CACHE is not None and m == _LINEAGE_MTIME:
+        return _LINEAGE_CACHE
+    raw = _read_json(LINEAGE_FILE, {})
+    _LINEAGE_CACHE = raw if isinstance(raw, dict) else {}
+    _LINEAGE_MTIME = m
+    return _LINEAGE_CACHE
+
+
+def _set_lineage(child: str, parent: str, parent_jsonl: str) -> None:
+    """Record that `child` was forked/cleared from `parent`. Atomic write;
+    cache invalidated so the next _load_lineage re-reads from disk."""
+    global _LINEAGE_CACHE, _LINEAGE_MTIME
+    import time
+    d = dict(_load_lineage())
+    d[child] = {"parent": parent, "parent_jsonl": parent_jsonl,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    _write_json(LINEAGE_FILE, d)
+    _LINEAGE_CACHE, _LINEAGE_MTIME = None, None     # force reload next read
+
+
 def _load_set(path: Path) -> set[str]:
     return set(_read_json(path, []))
 

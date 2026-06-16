@@ -4,6 +4,16 @@ Run:  python tests/test_resource_bounds.py
 """
 import os
 import sys
+import tempfile
+from pathlib import Path
+
+# Point saikai at a throwaway home BEFORE importing it (it derives CACHE_DIR /
+# state files from Path.home() at import time). Mirrors the pattern in
+# tests/test_keyboard_leader.py:18-25.
+_FAKE_HOME = Path(tempfile.mkdtemp(prefix="saikai-res-test-"))
+for _var in ("USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME"):
+    os.environ[_var] = str(_FAKE_HOME)
+os.environ.pop("SAIKAI_CONFIG", None)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import saikai
@@ -88,6 +98,15 @@ def test_ctx_window_inferred_from_observed_tokens():
     assert saikai._ctx_window_for(50_000, override=500_000) == 500_000
 
 
+def test_lineage_sidecar_roundtrip():
+    # _set_lineage(child, parent, parent_jsonl) persists; _load_lineage reads it back.
+    saikai._set_lineage("child-sid", "parent-sid", "/path/parent.jsonl")
+    lin = saikai._load_lineage()
+    assert lin["child-sid"]["parent"] == "parent-sid"
+    assert lin["child-sid"]["parent_jsonl"] == "/path/parent.jsonl"
+    assert "ts" in lin["child-sid"]
+
+
 def test_ctx_gauge_segment_formats_and_colours():
     # None tokens -> empty (no usage yet / unreadable).
     assert saikai._ctx_gauge_segment(None, 200_000) == ""
@@ -115,3 +134,5 @@ if __name__ == "__main__":
     print("PASS test_ctx_window_inferred_from_observed_tokens")
     test_ctx_gauge_segment_formats_and_colours()
     print("PASS test_ctx_gauge_segment_formats_and_colours")
+    test_lineage_sidecar_roundtrip()
+    print("PASS test_lineage_sidecar_roundtrip")
