@@ -1522,12 +1522,20 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
                 # dir). This mirrors the real ~2.5-4s latency: the snapshot is taken
                 # before /clear, the child file lands after.
                 drive_until("detect_child")
+                # Derive the child's transcript ts from the ACTUAL recorded clear
+                # instant (+2s, UTC) so the post-date check holds at any wall-clock
+                # time / host timezone — a hardcoded date made this clock-flaky.
+                from datetime import datetime as _dt, timedelta as _td
+                _clear = (getattr(self, "_b2", None) or {}).get("clear_ts") or ""
+                assert _clear, "clear_ts must be recorded before detect_child"
+                _child_ts = (_dt.fromisoformat(_clear.replace("Z", "+00:00"))
+                             + _td(seconds=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
                 child_jsonl = pdir / f"{child_sid}.jsonl"
                 child_jsonl.write_text("\n".join(json.dumps(r) for r in [
                     {"type": "mode", "sessionId": child_sid},
                     {"type": "file-history-snapshot"},
                     {"type": "attachment", "cwd": pane_cwd,
-                     "timestamp": "2026-06-17T10:00:03.000Z"},
+                     "timestamp": _child_ts},
                 ]) + "\n", encoding="utf-8")
 
                 # Finish the machine (detect -> reseed -> record_lineage -> done).

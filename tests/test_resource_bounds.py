@@ -262,6 +262,35 @@ def test_bind_cleared_child_falsifiable_detection():
     assert saikai._bind_cleared_child(proj2, {"old"}, pane_cwd, clear_ts) is None
 
 
+def test_bind_cleared_child_clear_ts_timezone_robust():
+    """Regression: a child's transcript `timestamp` is UTC (trailing 'Z'); the
+    recorded clear instant must compare correctly across host timezones. A naive
+    LOCAL clear_ts on a +UTC-offset host (e.g. JST, UTC+9) string-sorts AFTER the
+    child's earlier-looking UTC ts, which used to reject the only valid child and
+    silently drop b2 lineage. A tz-aware compare must still bind it."""
+    import json, tempfile, os
+    from datetime import datetime, timezone, timedelta
+    proj = tempfile.mkdtemp(prefix="saikai-b2tz-")
+    pane_cwd = "/home/alex/code/demo"
+    # the child claude mints ~now, written in the real transcript format (UTC 'Z').
+    child_ts = (datetime.now(timezone.utc) + timedelta(seconds=2)).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z")
+    with open(os.path.join(proj, "child-sid.jsonl"), "w", encoding="utf-8") as f:
+        f.write("\n".join(json.dumps(r) for r in [
+            {"type": "mode", "sessionId": "child-sid"},
+            {"type": "attachment", "cwd": pane_cwd, "timestamp": child_ts},
+        ]) + "\n")
+    # A naive LOCAL clear_ts (what the machine used to record). On a +offset host
+    # its string sorts after the child's UTC ts; a tz-aware compare interprets the
+    # naive value as local time and still recognises the child as post-clear.
+    clear_ts_naive_local = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    assert saikai._bind_cleared_child(proj, set(), pane_cwd, clear_ts_naive_local) \
+        == "child-sid", f"child wrongly rejected (naive clear_ts={clear_ts_naive_local!r})"
+    # the fixed generation path records UTC, directly comparable to the 'Z' ts.
+    clear_ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    assert saikai._bind_cleared_child(proj, set(), pane_cwd, clear_ts_utc) == "child-sid"
+
+
 def test_ctx_gauge_segment_formats_and_colours():
     # None tokens -> empty (no usage yet / unreadable).
     assert saikai._ctx_gauge_segment(None, 200_000) == ""
@@ -301,3 +330,5 @@ if __name__ == "__main__":
     print("PASS test_first_cwd_from_jsonl_scans_early_records")
     test_bind_cleared_child_falsifiable_detection()
     print("PASS test_bind_cleared_child_falsifiable_detection")
+    test_bind_cleared_child_clear_ts_timezone_robust()
+    print("PASS test_bind_cleared_child_clear_ts_timezone_robust")

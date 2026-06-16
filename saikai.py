@@ -3134,6 +3134,24 @@ def _first_ts_from_jsonl(path) -> "str | None":
     return None
 
 
+def _parse_iso_aware(s):
+    """Parse an ISO8601 timestamp to a timezone-AWARE datetime for safe ordering.
+    Transcript timestamps are UTC with a trailing 'Z'; a naive value (no offset)
+    is interpreted as the host's LOCAL time (what `time.strftime` produced before
+    clear_ts was switched to UTC). None if unparseable — callers must treat that
+    like a missing timestamp, never as "older than the clear"."""
+    if not isinstance(s, str) or not s:
+        return None
+    t = s.strip()
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    return dt.astimezone() if dt.tzinfo is None else dt
+
+
 def _bind_cleared_child(project_dir, pre_existing_sids, pane_cwd, clear_ts):
     """Falsifiably bind the child session minted by /clear (spike finding #6).
 
@@ -3159,11 +3177,17 @@ def _bind_cleared_child(project_dir, pre_existing_sids, pane_cwd, clear_ts):
         if pane_cwd and cwd != pane_cwd:
             continue                            # contamination: different pane
         ts = _first_ts_from_jsonl(p)
-        # Post-date check: only when both timestamps are present. A missing ts on
-        # a brand-new child (cwd already matched) shouldn't reject it; a present
-        # ts that pre-dates the clear is an old session and IS rejected.
-        if clear_ts and ts and ts < clear_ts:
-            continue
+        # Post-date check, tz-AWARE: the transcript ts is UTC ('Z') and clear_ts
+        # is UTC too, but parse both so a stray naive/offset value still orders
+        # correctly across host timezones (a raw string compare wrongly rejected
+        # the child on +UTC-offset hosts). Only reject when BOTH parse and the
+        # candidate genuinely pre-dates the clear; a missing/unparseable ts on a
+        # cwd-matched brand-new child shouldn't reject it.
+        if clear_ts and ts:
+            _cdt = _parse_iso_aware(clear_ts)
+            _tdt = _parse_iso_aware(ts)
+            if _cdt and _tdt and _tdt < _cdt:
+                continue
         candidates.append(stem)
     return candidates[0] if len(candidates) == 1 else None
 
@@ -7064,12 +7088,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
             if st == "inject_clear":
                 # Snapshot the project dir's sids BEFORE /clear so the post-clear
-                # diff is falsifiable (spike #6). Record the clear timestamp so a
-                # candidate child must post-date it.
-                import time
+                # diff is falsifiable (spike #6). Record the clear timestamp in
+                # UTC ('Z') so it is directly comparable to the transcript's UTC
+                # timestamps (a naive-local value mis-ordered the child on
+                # +UTC-offset hosts — see _parse_iso_aware / _bind_cleared_child).
                 if not b2.get("_clear_pasted"):
                     b2["pre_sids"] = _project_sids(b2["project_dir"])
-                    b2["clear_ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    b2["clear_ts"] = datetime.now(timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%S.000Z")
                     try:
                         term.paste_text("/clear")
                     except Exception:
