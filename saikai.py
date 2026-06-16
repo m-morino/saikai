@@ -2949,6 +2949,22 @@ def _ctx_tokens_from_jsonl(path) -> "int | None":
             + int(last.get("cache_creation_input_tokens", 0)))
 
 
+_CTX_TIERS = (200_000, 1_000_000)
+
+
+def _ctx_window_for(tokens, override=None) -> int:
+    """Context window for a session. The transcript's message.model is the base id
+    (no `[1m]`), so the window can't be read from it -- infer the smallest tier that
+    fits the observed count (a 720K reading can't be a 200K window). env/config
+    override wins."""
+    if override:
+        return int(override)
+    for t in _CTX_TIERS:
+        if tokens <= t:
+            return t
+    return _CTX_TIERS[-1]
+
+
 # Statusbar RAM indicator. The headroom ("~N fit") is the deductive precursor —
 # how many more panes fit before the gate trips, derived from _ram_fit. These add
 # a severity colour + a ⚠ to the system-load reading so the box "getting heavy" is

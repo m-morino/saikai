@@ -79,6 +79,15 @@ def test_ctx_tokens_reads_last_usage_block(tmp_path=None):
     assert saikai._ctx_tokens_from_jsonl(os.path.join(d, "nope.jsonl")) is None
 
 
+def test_ctx_window_inferred_from_observed_tokens():
+    # message.model lacks the [1m] suffix, so infer the tier from the count.
+    assert saikai._ctx_window_for(96_000) == 200_000
+    assert saikai._ctx_window_for(200_000) == 200_000
+    assert saikai._ctx_window_for(719_882) == 1_000_000     # this repo's real session
+    assert saikai._ctx_window_for(1_200_000) == 1_000_000   # clamp to top tier
+    assert saikai._ctx_window_for(50_000, override=500_000) == 500_000
+
+
 if __name__ == "__main__":
     test_na_cache_is_bounded()
     print("PASS test_na_cache_is_bounded")
@@ -88,3 +97,5 @@ if __name__ == "__main__":
     print("PASS test_live_ram_segment_estimate_and_severity_colour")
     test_ctx_tokens_reads_last_usage_block()
     print("PASS test_ctx_tokens_reads_last_usage_block")
+    test_ctx_window_inferred_from_observed_tokens()
+    print("PASS test_ctx_window_inferred_from_observed_tokens")
