@@ -866,6 +866,31 @@ def test_page_wires_mouse_drag_to_scroll():
     assert "postMouse" in page and "scrollup" in page and "scrolldown" in page, page
 
 
+def test_page_wires_long_press_context_menu():
+    """Feature 4: a long-press (touch) / right-click (mouse) on a row opens a
+    context menu whose buttons post saikai's existing row actions (resume / copy /
+    favorite / hide / rename) for the row under the pointer. Pure browser-side
+    (selects the row via a tap, then posts /key) -- no MouseMove synthesis."""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=80, rows=24)
+    hub.set_mouse_handler(lambda *a: None)
+    hub.set_key_handler(lambda *a: None)
+    port = hub.serve()
+    try:
+        page = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/?token=secret", timeout=3.0
+        ).read().decode("utf-8")
+    finally:
+        hub.stop()
+    # The menu builder + both entry points (touch long-press timer, right-click).
+    assert "openMenu" in page and "ctxmenu" in page, "no context-menu builder"
+    assert "contextmenu" in page, "no right-click entry to the context menu"
+    assert "setTimeout" in page, "no long-press timer"
+    # The menu rides the existing senders: select the row (postMouse), then the
+    # action keys (postKey -> /key). The action labels reference saikai's keys.
+    assert "postKey" in page and "postMouse" in page, page
+    assert "shift+f2" in page and "f9" in page, "menu must offer rename/copy"
+
+
 def test_sgr_mouse_regex_is_escaping_safe_and_correct():
     """Regression (found by a headless-Edge smoke, not by the string-asserts):
     the SGR mouse regex must be built with NO backslash. A backslash inside a
@@ -954,4 +979,5 @@ if __name__ == "__main__":
     test_page_key_bar_has_saikai_action_keys()
     test_page_wires_touch_swipe_to_scroll()
     test_page_wires_mouse_drag_to_scroll()
+    test_page_wires_long_press_context_menu()
     print("OK test_mirror_input")

@@ -763,8 +763,9 @@ term.onData((d) => {
     return [Math.max(0, Math.min(term.cols - 1, c)),
             Math.max(0, Math.min(term.rows - 1, w))];
   }
+  let pressX = 0, pressY = 0;
   function begin(x, y) {
-    lastY = y; accum = 0;
+    lastY = y; accum = 0; pressX = x; pressY = y;
     const cc = cellAt(x, y); scol = cc[0]; srow = cc[1];
   }
   function drag(y) {                     // returns true once it emits >=1 scroll
@@ -776,26 +777,83 @@ term.onData((d) => {
     while (accum >=  STEP) { accum -= STEP; postMouse(scol, srow, 0, 'scrollup');   moved = true; }
     return moved;
   }
-  function end() { lastY = null; }
+  function end() { lastY = null; cancelLongPress(); }
+
+  // ── Context menu (long-press on touch / right-click on mouse): act on the row
+  //    under the pointer. Open => tap that cell to SELECT the row, then show an
+  //    overlay whose buttons post saikai's existing action keys (resume / copy /
+  //    favorite / hide / rename) for that row. A drag (scroll) cancels the press.
+  let lpTimer = null, menuEl = null;
+  function cancelLongPress() { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } }
+  function closeMenu() { if (menuEl) { menuEl.remove(); menuEl = null; } }
+  function armLongPress() {
+    if (!controlOn || fatal) return;
+    cancelLongPress();
+    const c = scol, r = srow, px = pressX, py = pressY;
+    lpTimer = setTimeout(() => { lpTimer = null; openMenu(px, py, c, r); }, 500);
+  }
+  function openMenu(px, py, col, row) {
+    if (!controlOn || fatal) return;
+    closeMenu();
+    postMouse(col, row, 0, 'down'); postMouse(col, row, 0, 'up');   // select that row
+    menuEl = document.createElement('div');
+    menuEl.id = 'ctxmenu';
+    menuEl.style.cssText = 'position:fixed;z-index:20;background:#222;border:1px solid #666;'+
+      'border-radius:8px;padding:6px;display:flex;flex-direction:column;gap:4px;'+
+      'box-shadow:0 6px 20px rgba(0,0,0,.6)';
+    const items = [['Resume','enter'],['Copy prompt','f9'],['Favorite','f6'],
+                   ['Hide / show','f7'],['Rename','shift+f2'],['Close','']];
+    items.forEach((it) => {
+      const b = document.createElement('button');
+      b.textContent = it[0];
+      b.style.cssText = 'min-height:44px;font:bold 15px monospace;background:#333;color:#eee;'+
+        'border:1px solid #555;border-radius:6px;padding:8px 16px;text-align:left';
+      b.addEventListener('click', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        if (it[1]) postKey(it[1]);
+        closeMenu();
+      });
+      menuEl.appendChild(b);
+    });
+    document.body.appendChild(menuEl);
+    const w = menuEl.offsetWidth, h = menuEl.offsetHeight;
+    menuEl.style.left = Math.max(4, Math.min(px, window.innerWidth  - w - 4)) + 'px';
+    menuEl.style.top  = Math.max(4, Math.min(py, window.innerHeight - h - 4)) + 'px';
+  }
+  // Dismiss on any pointerdown OUTSIDE the menu (capture phase, so it beats the
+  // terminal's own handlers); a press INSIDE keeps it open so the button's click fires.
+  document.addEventListener('pointerdown', (e) => {
+    if (menuEl && !menuEl.contains(e.target)) closeMenu();
+  }, true);
+
   el.addEventListener('touchstart', (e) => {
-    if (e.touches.length !== 1) { lastY = null; return; }  // leave pinch to browser
+    if (e.touches.length !== 1) { lastY = null; cancelLongPress(); return; }  // pinch -> browser
     begin(e.touches[0].clientX, e.touches[0].clientY);
+    armLongPress();                       // hold without moving -> context menu
   }, {passive: true});
   el.addEventListener('touchmove', (e) => {
     if (e.touches.length !== 1) return;
-    if (drag(e.touches[0].clientY)) e.preventDefault();    // we consumed this drag
+    const ty = e.touches[0].clientY;
+    if (Math.abs(ty - pressY) > 10 || Math.abs(e.touches[0].clientX - pressX) > 10) cancelLongPress();
+    if (drag(ty)) e.preventDefault();     // we consumed this drag
   }, {passive: false});
   el.addEventListener('touchend', end, {passive: true});
   // Mouse: a held LEFT-button drag scrolls the surface under the cursor. Listens
   // on #t in the bubble phase (xterm's own listeners run first, so taps still
   // become SGR press/release); mouseup is on window so a release outside #t ends
-  // the drag.
+  // the drag. Right-click opens the same context menu (the desktop gesture).
   el.addEventListener('mousedown', (e) => { if (e.button === 0) begin(e.clientX, e.clientY); });
   el.addEventListener('mousemove', (e) => {
     if (lastY === null || !(e.buttons & 1)) return;        // only while left held
     if (drag(e.clientY)) e.preventDefault();
   });
   window.addEventListener('mouseup', end);
+  el.addEventListener('contextmenu', (e) => {
+    if (!controlOn || fatal) return;
+    e.preventDefault();
+    const cc = cellAt(e.clientX, e.clientY);
+    openMenu(e.clientX, e.clientY, cc[0], cc[1]);
+  });
 })();
 
 // ── On-screen key bar: fixed-position buttons -> POST /key. This is the ONLY
