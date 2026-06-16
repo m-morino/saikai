@@ -5158,6 +5158,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
 
+        def _filter_is_engaged(self) -> bool:
+            """True while the list is being actively FILTERED: the search box is
+            focused, OR a filter keystroke landed within the last beat. The
+            highlight handler uses this to NOT switch the foreground live pane out
+            from under a filter. The time window matters because the post-filter
+            RowHighlighted is queued (the rebuild is call_after_refresh'd), so a
+            bare `self.focused is #search` check can miss it if focus momentarily
+            moved during the rebuild — which silently switched the foreground."""
+            try:
+                if self.focused is self.query_one("#search", Input):
+                    return True
+            except Exception:
+                pass
+            return time.monotonic() < getattr(self, "_filter_active_until", 0.0)
+
         def on_key(self, event) -> None:
             # Ctrl+C reaching the App means the LIST or search box is focused (a
             # focused live terminal consumes Ctrl+C first, to interrupt claude).
@@ -5406,11 +5421,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # switching to the auto-selected one. (Enter-to-open sets just_opened
             # and is exempt; a preview-only foreground still follows the filter.)
             if not just_opened:
-                try:
-                    _searching = self.focused is self.query_one("#search", Input)
-                except Exception:
-                    _searching = False
-                if _searching:
+                if self._filter_is_engaged():
                     try:
                         _active = self.query_one("#right", TabbedContent).active or ""
                     except Exception:
@@ -6328,6 +6339,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Coalesce keystrokes: a burst of typing collapses to ~one rebuild per
             # frame instead of a full filter+sort+group+render over all sessions
             # PER keystroke. Reuses the proven poll-path coalescer.
+            # Mark "filtering" for a short window: the rebuild + its RowHighlighted
+            # are queued (call_after_refresh), so by the time the highlight handler
+            # runs the search box may have momentarily lost focus — _filter_is_engaged
+            # reads this window so the foreground live pane isn't switched out under
+            # the filter (see on_data_table_row_highlighted).
+            self._filter_active_until = time.monotonic() + 0.5
             self._request_refresh()
 
         # ── actions ─────────────────────────────────────────────────────────

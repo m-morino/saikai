@@ -1633,6 +1633,52 @@ def test_pilot_refresh_preserves_scroll_position():
         f"after={facts['after']})"
 
 
+def test_pilot_filter_engaged_window_survives_focus_move():
+    """Filtering must not switch the foreground live pane out from under the user.
+    The post-filter RowHighlighted is queued (the rebuild is call_after_refresh'd),
+    so by the time it runs focus may have briefly left the search box — a bare
+    `self.focused is #search` check then misses it and the foreground gets
+    switched. _filter_is_engaged() also honours a short window set on each filter
+    keystroke, so it stays True across that queued highlight."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_filter_engaged_window_survives_focus_move (textual unavailable)")
+        return
+    import asyncio, time as _time
+    from textual.app import App
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(120, 24)) as pilot:
+                await pilot.pause(0.3)
+                # Focus the TABLE (not the search box) with no recent filter.
+                self.query_one("#table").focus()
+                self._filter_active_until = 0.0
+                await pilot.pause(0.05)
+                facts["idle"] = self._filter_is_engaged()
+                # A filter keystroke just landed: engaged stays True even though
+                # focus is on the table (mimics the queued post-filter highlight).
+                self._filter_active_until = _time.monotonic() + 5
+                facts["windowed"] = self._filter_is_engaged()
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+    assert facts.get("idle") is False, \
+        f"table focused + no recent filter must NOT read as engaged: {facts}"
+    assert facts.get("windowed") is True, \
+        f"a filter keystroke in the last beat must read as engaged: {facts}"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -1689,10 +1735,12 @@ if __name__ == "__main__":
     test_pilot_context_refresh_idle_and_busy()
     test_pilot_checkpoint_gated_clear_and_lineage()
     test_pilot_refresh_preserves_scroll_position()
+    test_pilot_filter_engaged_window_survives_focus_move()
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("PASS test_pilot_ctx_gauge_in_statusbar")
     print("PASS test_pilot_open_parent")
     print("PASS test_pilot_context_refresh_idle_and_busy")
     print("PASS test_pilot_checkpoint_gated_clear_and_lineage")
     print("PASS test_pilot_refresh_preserves_scroll_position")
+    print("PASS test_pilot_filter_engaged_window_survives_focus_move")
     print("ALL PASS")
