@@ -904,6 +904,27 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 pass
             event.stop()
 
+    def paste_text(self, text: str) -> None:
+        """Inject text into the pane as a PASTE (bracketed when claude enabled
+        ?2004h) so embedded newlines don't submit line-by-line. UI-thread only."""
+        if self._pty is None or self.is_dead or not text:
+            return
+        if getattr(self, "_bracketed_paste", False):
+            text = "\x1b[200~" + text + "\x1b[201~"
+        try:
+            self._pty.write(text)
+        except Exception:
+            pass
+
+    def submit(self) -> None:
+        """Send a single Enter (\\r) to submit the current input. UI-thread only."""
+        if self._pty is None or self.is_dead:
+            return
+        try:
+            self._pty.write("\r")
+        except Exception:
+            pass
+
     # ── mouse wheel -> scroll back through history.top ─────────────────────────
     def on_mouse_scroll_up(self, event) -> None:    # events.MouseScrollUp
         if self._screen is None:

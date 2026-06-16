@@ -697,6 +697,27 @@ def test_copy_to_host_clipboard_picks_tool_and_reports():
             os.environ["WAYLAND_DISPLAY"] = orig_wl
 
 
+def test_paste_text_wraps_and_submits():
+    """paste_text wraps in bracketed-paste markers when _bracketed_paste is True,
+    sends raw when False; submit writes \\r; dead pane never writes."""
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    writes = []
+    t._pty = type("P", (), {"write": lambda self, d: writes.append(d)})()
+    t.is_dead = False
+    t._bracketed_paste = True
+    t.paste_text("/handoff")
+    assert writes == ["\x1b[200~/handoff\x1b[201~"], writes
+    writes.clear(); t._bracketed_paste = False
+    t.paste_text("/compact")
+    assert writes == ["/compact"], writes
+    writes.clear(); t.submit()
+    assert writes == ["\r"], writes
+    # dead pane: no write
+    writes.clear(); t.is_dead = True
+    t.paste_text("x"); t.submit()
+    assert writes == [], writes
+
+
 if __name__ == "__main__":
     test_update_status_marshals_outside_lock()
     print("PASS test_update_status_marshals_outside_lock")
@@ -754,3 +775,5 @@ if __name__ == "__main__":
     print("PASS test_mirror_inject_input_parses_full_terminal_keys")
     test_copy_to_host_clipboard_picks_tool_and_reports()
     print("PASS test_copy_to_host_clipboard_picks_tool_and_reports")
+    test_paste_text_wraps_and_submits()
+    print("PASS test_paste_text_wraps_and_submits")
