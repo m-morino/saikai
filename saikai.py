@@ -3865,6 +3865,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # priority=True so it fires even while a live pane is focused.
             Binding("shift+f6", "open_parent", "Parent", id="open_parent",
                     show=False, priority=True),
+            # Phase B1: inject /compact into the focused live pane (non-destructive).
+            # priority=True so it fires even while a live pane is focused.
+            Binding("shift+f11", "context_refresh", "Refresh ctx", id="ctx_refresh",
+                    show=False, priority=True),
         ]
         # The practical limit on concurrent live claude panes is MEMORY — each
         # is a full node process tree that sits CPU-idle waiting for input — so
@@ -3981,7 +3985,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             "freeze_pane", "restore_panes", "toggle_preview", "help",
             "close_live", "close_all_live", "prev_tab", "next_tab",
             "next_attention", "toggle_list", "rename", "shrink_list",
-            "grow_list", "notifications", "open_parent",
+            "grow_list", "notifications", "open_parent", "context_refresh",
         })
 
         def check_action(self, action: str, parameters):
@@ -6635,6 +6639,25 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 table.move_cursor(row=row)
             except Exception:
                 self.notify("could not open parent", severity="error", timeout=4)
+
+        def action_context_refresh(self) -> None:
+            """Shift+F11 — inject /compact into the focused live pane to summarise
+            the context in place (non-destructive). No-op + toast when no pane is
+            focused or the pane is mid-turn (busy/waiting — don't interrupt a
+            running turn or a pending permission prompt)."""
+            t = self._focused_terminal()
+            if t is None:
+                self.notify("focus a live pane to refresh its context", timeout=3)
+                return
+            sid = getattr(t, "sid", None)
+            status = self._live.statuses().get(sid) if self._live else None
+            if status in ("busy", "waiting"):
+                self.notify("pane is busy — refresh when it's idle",
+                            severity="warning", timeout=3)
+                return
+            t.paste_text("/compact")
+            t.submit()
+            self.notify("sent /compact to compact this session in place", timeout=4)
 
         def action_help(self) -> None:
             # '?' is a priority binding; don't pop the help modal over a focused

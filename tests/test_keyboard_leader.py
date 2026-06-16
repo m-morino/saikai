@@ -1277,6 +1277,105 @@ def test_pilot_ctx_gauge_in_statusbar():
     assert "ctx 96K/200K (48%)" in facts.get("seg", ""), facts
 
 
+def test_pilot_context_refresh_idle_and_busy():
+    """action_context_refresh (Shift+F11):
+    - idle pane  -> paste_text('/compact') + submit() are called
+    - busy pane  -> neither is called (toast warning only)
+    - no focused pane -> neither called (notify only)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_context_refresh_idle_and_busy (textual unavailable)"); return
+    import asyncio
+    from textual.app import App
+
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.3)
+
+                # Build a minimal fake terminal that records paste_text/submit calls.
+                class _FakeTerm:
+                    sid = "fake-sid-refresh"
+                    is_dead = False
+                    def __init__(self):
+                        self.paste_calls = []
+                        self.submit_calls = []
+                    def paste_text(self, text):
+                        self.paste_calls.append(text)
+                    def submit(self):
+                        self.submit_calls.append(True)
+
+                # Build a minimal fake LiveSessionManager whose statuses() is controllable.
+                class _FakeLive:
+                    def __init__(self, status_val):
+                        self._status_val = status_val
+                    def statuses(self):
+                        return {"fake-sid-refresh": self._status_val}
+
+                fake_term = _FakeTerm()
+                orig_focused = self._focused_terminal.__func__ if hasattr(self._focused_terminal, '__func__') else None
+
+                # --- Test 1: idle pane -> should inject /compact + submit ---
+                self._live = _FakeLive("idle")
+                self._focused_terminal = lambda: fake_term
+                await pilot.app.run_action("context_refresh")
+                await pilot.pause(0.1)
+                facts["idle_paste"] = list(fake_term.paste_calls)
+                facts["idle_submit"] = list(fake_term.submit_calls)
+
+                # --- Test 2: busy pane -> should NOT inject ---
+                fake_term.paste_calls.clear()
+                fake_term.submit_calls.clear()
+                self._live = _FakeLive("busy")
+                await pilot.app.run_action("context_refresh")
+                await pilot.pause(0.1)
+                facts["busy_paste"] = list(fake_term.paste_calls)
+                facts["busy_submit"] = list(fake_term.submit_calls)
+
+                # --- Test 3: waiting pane -> should NOT inject ---
+                fake_term.paste_calls.clear()
+                fake_term.submit_calls.clear()
+                self._live = _FakeLive("waiting")
+                await pilot.app.run_action("context_refresh")
+                await pilot.pause(0.1)
+                facts["waiting_paste"] = list(fake_term.paste_calls)
+
+                # --- Test 4: no focused pane -> no inject ---
+                fake_term.paste_calls.clear()
+                fake_term.submit_calls.clear()
+                self._focused_terminal = lambda: None
+                await pilot.app.run_action("context_refresh")
+                await pilot.pause(0.1)
+                facts["none_paste"] = list(fake_term.paste_calls)
+
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("idle_paste") == ["/compact"], \
+        f"idle pane should inject /compact: {facts}"
+    assert facts.get("idle_submit") == [True], \
+        f"idle pane should call submit: {facts}"
+    assert facts.get("busy_paste") == [], \
+        f"busy pane must not inject: {facts}"
+    assert facts.get("busy_submit") == [], \
+        f"busy pane must not submit: {facts}"
+    assert facts.get("waiting_paste") == [], \
+        f"waiting pane must not inject: {facts}"
+    assert facts.get("none_paste") == [], \
+        f"no focused pane must not inject: {facts}"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -1330,7 +1429,9 @@ if __name__ == "__main__":
     test_pilot_notification_center_records_and_opens()
     test_pilot_ctx_gauge_in_statusbar()
     test_pilot_open_parent()
+    test_pilot_context_refresh_idle_and_busy()
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("PASS test_pilot_ctx_gauge_in_statusbar")
     print("PASS test_pilot_open_parent")
+    print("PASS test_pilot_context_refresh_idle_and_busy")
     print("ALL PASS")
