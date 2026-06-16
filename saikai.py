@@ -6301,6 +6301,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if len(self.screen_stack) > 1:
                 return
             if isinstance(self.focused, Input):
+                # Esc in the search box CLEARS an active filter first (a non-empty
+                # query — especially with the bar hidden — reads as "sessions
+                # missing"), then returns to the list. Empty box -> just focus it.
+                inp = self.focused
+                if getattr(inp, "value", ""):
+                    inp.value = ""    # fires Input.Changed -> on_input_changed -> unfiltered refresh
                 try:
                     self.query_one("#table", DataTable).focus()
                 except Exception:

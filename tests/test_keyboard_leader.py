@@ -1041,6 +1041,55 @@ def test_pilot_ctrlc_over_modal_does_not_quit():
     assert facts.get("screen_after") == "HelpScreen", f"Ctrl+C should leave Help open: {facts}"
 
 
+def test_pilot_esc_in_search_clears_filter():
+    """Bug-hunt 1A: a non-empty search filter (especially with the bar hidden)
+    read as 'sessions missing', and Esc only moved focus — it never cleared the
+    query. Esc in the search box now CLEARS an active filter first, then returns
+    to the list."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_esc_in_search_clears_filter (textual unavailable)")
+        return
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                await pilot.press("slash")             # open + focus the search box
+                await pilot.pause(0.1)
+                for ch in "zzz":
+                    await pilot.press(ch)
+                await pilot.pause(0.1)
+                inp = self.query_one("#search")
+                facts["typed"] = inp.value
+                facts["focus_was_search"] = self.focused is inp
+                await pilot.press("escape")            # clear the filter
+                await pilot.pause(0.1)
+                facts["after_value"] = self.query_one("#search").value
+                facts["focus_table"] = self.focused is self.query_one("#table")
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("typed") == "zzz", f"typing into the search box failed: {facts}"
+    assert facts.get("focus_was_search"), f"search box should hold focus: {facts}"
+    assert facts.get("after_value") == "", f"Esc should clear the filter: {facts}"
+    assert facts.get("focus_table"), f"Esc should return focus to the list: {facts}"
+
+
 def test_pilot_quit_arm_cleared_when_a_screen_opens():
     """Bug-hunt C2: arm the quit guard (one Esc on the list), then open a screen
     via a PRIORITY binding (? -> Help). The priority binding bypasses on_key's
@@ -1144,5 +1193,6 @@ if __name__ == "__main__":
     test_pilot_rename_modal_enter_saves_not_resumes()
     test_pilot_ctrlc_over_modal_does_not_quit()
     test_pilot_quit_arm_cleared_when_a_screen_opens()
+    test_pilot_esc_in_search_clears_filter()
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("ALL PASS")

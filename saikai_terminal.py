@@ -1276,6 +1276,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if not self.is_dead:
             _log(f"exit: sid={(getattr(self, 'sid', None) or '?')[:8]} (agent ended)")
         self.is_dead = True
+        # A pane frozen for copy/select (Shift+F9) that then dies must not stay
+        # pinned to its stale snapshot — clear freeze so the final live frame shows
+        # (on_key early-returns for a dead pane before its resume-unfreeze line).
+        self._frozen = False
+        self._frozen_buf = None
         if self._status != "dead":
             self._status = "dead"
             if self._on_status and self.sid:
