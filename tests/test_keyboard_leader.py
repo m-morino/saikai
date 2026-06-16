@@ -1585,6 +1585,54 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
     assert lin.get("parent_jsonl") == str(parent_jsonl), facts
 
 
+def test_pilot_refresh_preserves_scroll_position():
+    """A background list rebuild (the ~1.5s poll, a filter keystroke, a fav/hide
+    toggle) must NOT yank the viewport back to the cursor row — the user's
+    mouse-scroll position is kept across _refresh_table. Regression: _do_refresh_
+    table cleared + move_cursor'd (default scroll=True) without preserving the
+    scroll offset, so every state update snapped the list back to the cursor."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_refresh_preserves_scroll_position (textual unavailable)")
+        return
+    import asyncio
+    from textual.app import App
+    for _ in range(40):
+        _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(120, 18)) as pilot:
+                await pilot.pause(0.4)
+                table = self.query_one("#table")
+                # Scroll DOWN, away from the cursor (which sits near the top after
+                # mount) — mimics the user mouse-scrolling through the list.
+                table.scroll_to(y=12, animate=False)
+                await pilot.pause(0.2)
+                facts["before"] = table.scroll_offset.y
+                # A background list rebuild (exactly what the live-status poll
+                # triggers on a session-state change).
+                self._refresh_table()
+                await pilot.pause(0.2)
+                facts["after"] = table.scroll_offset.y
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+    assert facts.get("before", 0) > 0, f"test setup: table did not scroll: {facts}"
+    assert facts["after"] == facts["before"], \
+        f"refresh yanked the scroll back to the cursor (before={facts['before']} " \
+        f"after={facts['after']})"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -1640,9 +1688,11 @@ if __name__ == "__main__":
     test_pilot_open_parent()
     test_pilot_context_refresh_idle_and_busy()
     test_pilot_checkpoint_gated_clear_and_lineage()
+    test_pilot_refresh_preserves_scroll_position()
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("PASS test_pilot_ctx_gauge_in_statusbar")
     print("PASS test_pilot_open_parent")
     print("PASS test_pilot_context_refresh_idle_and_busy")
     print("PASS test_pilot_checkpoint_gated_clear_and_lineage")
+    print("PASS test_pilot_refresh_preserves_scroll_position")
     print("ALL PASS")

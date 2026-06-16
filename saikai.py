@@ -4595,6 +4595,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             table = self.query_one("#table", DataTable)
             saved_cursor = table.cursor_row
             saved_sid = self._cursor_sid()   # restore by SESSION, not row index (headers/grouping shift it)
+            saved_scroll_y = table.scroll_offset.y   # preserve the user's scroll across the rebuild
             table.clear(columns=True)
 
             # Read state first; layout mode decides whether the Topic column
@@ -4854,13 +4855,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             restored = False
             if saved_sid:
                 try:
-                    table.move_cursor(row=table.get_row_index(saved_sid))
+                    table.move_cursor(row=table.get_row_index(saved_sid), scroll=False)
                     restored = True
                 except Exception:
                     restored = False
             if not restored and n and 0 <= saved_cursor < n:
                 try:
-                    table.move_cursor(row=saved_cursor)
+                    table.move_cursor(row=saved_cursor, scroll=False)
                 except Exception:
                     pass
             if n_sessions and first_session_row is not None and self._cursor_sid() is None:
@@ -4868,7 +4869,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # row, which has no session → preview/Enter would act on nothing.
                 # Nudge down to the first real session.
                 try:
-                    table.move_cursor(row=first_session_row)
+                    table.move_cursor(row=first_session_row, scroll=False)
                 except Exception:
                     pass
             elif n_sessions == 0:
@@ -4898,6 +4899,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     pv.write(msg)
                 except Exception:
                     pass
+            # Restore the user's scroll position so a BACKGROUND rebuild (the live
+            # poll, a filter keystroke, a fav/hide toggle) never yanks the viewport
+            # back to the cursor row (the cursor restores above use scroll=False).
+            # Set synchronously to avoid a flicker, then again after layout in case
+            # the new rows' virtual size wasn't known yet (the sync set would clamp).
+            try:
+                table.scroll_to(y=saved_scroll_y, animate=False)
+                _sy = saved_scroll_y
+                self.call_after_refresh(lambda: table.scroll_to(y=_sy, animate=False))
+            except Exception:
+                pass
             self._update_subtitle()
 
         def _update_subtitle(self) -> None:
