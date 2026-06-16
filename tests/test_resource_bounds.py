@@ -88,6 +88,20 @@ def test_ctx_window_inferred_from_observed_tokens():
     assert saikai._ctx_window_for(50_000, override=500_000) == 500_000
 
 
+def test_ctx_gauge_segment_formats_and_colours():
+    # None tokens -> empty (no usage yet / unreadable).
+    assert saikai._ctx_gauge_segment(None, 200_000) == ""
+    # healthy: green, K-rounded, percent.
+    s = saikai._ctx_gauge_segment(96_000, 200_000)
+    assert "ctx 96K/200K (48%)" in s and "[green]" in s
+    # 1M window, heavy: 719882/1.0M = 72% -> red (>= high band 70).
+    s2 = saikai._ctx_gauge_segment(719_882, 1_000_000)
+    assert "720K/1.0M (72%)" in s2 and "[red]" in s2
+    # warn band (>= 55, < 70) -> yellow.
+    s3 = saikai._ctx_gauge_segment(120_000, 200_000)   # 60%
+    assert "[yellow]" in s3
+
+
 if __name__ == "__main__":
     test_na_cache_is_bounded()
     print("PASS test_na_cache_is_bounded")
@@ -99,3 +113,5 @@ if __name__ == "__main__":
     print("PASS test_ctx_tokens_reads_last_usage_block")
     test_ctx_window_inferred_from_observed_tokens()
     print("PASS test_ctx_window_inferred_from_observed_tokens")
+    test_ctx_gauge_segment_formats_and_colours()
+    print("PASS test_ctx_gauge_segment_formats_and_colours")

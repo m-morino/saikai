@@ -3002,6 +3002,28 @@ def _live_ram_segment(cnt, att, ms, fit, per_pane_mb, max_load) -> str:
             f"  [{fitcol}]~{fit} fit[/{fitcol}]  ({ms.avail_phys_mb / 1024:.1f}G free)")
 
 
+def _ctx_severity(pct) -> str:
+    if pct >= 0.70:
+        return "crit"
+    if pct >= 0.55:
+        return "warn"
+    return "ok"
+
+
+def _fmt_k(n) -> str:
+    return f"{n/1_000_000:.1f}M" if n >= 1_000_000 else f"{round(n/1000)}K"
+
+
+def _ctx_gauge_segment(tokens, window) -> str:
+    """Statusbar 'ctx' segment for the focused pane: ground-truth fill, K-rounded,
+    severity-coloured (green<55% / yellow / red>=70%). '' when tokens is None."""
+    if tokens is None or not window:
+        return ""
+    pct = tokens / window
+    col = _LOAD_COL[_ctx_severity(pct)]
+    return f"[{col}]ctx {_fmt_k(tokens)}/{_fmt_k(window)} ({pct*100:.0f}%)[/{col}]"
+
+
 def _copy_to_host_clipboard(text: str) -> bool:
     """Copy `text` to the HOST OS clipboard via the platform clip tool, so the
     tokened mirror URL pastes cleanly. Returns True only on a clean exit, so the
