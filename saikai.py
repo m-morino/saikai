@@ -3771,6 +3771,33 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                   highlight=False, markup=False)
             yield Footer()
 
+        # Actions that operate on the list / live panes. They are PRIORITY
+        # bindings (so they fire even when a live pane owns focus), but Textual
+        # checks priority bindings against the FULL binding chain — it IGNORES
+        # the modal boundary that _modal_binding_chain enforces for normal
+        # bindings (app.py: _check_bindings uses _binding_chain when priority).
+        # Without this gate the App's Enter would resume a session from under the
+        # rename box, "?" would open Help instead of typing into an input, F10
+        # would close a pane mid-dialog, etc.
+        _MODAL_BLOCKED_ACTIONS = frozenset({
+            "resume", "refresh", "toggle_fav", "toggle_hide", "preview_changes",
+            "copy_prompt", "toggle_tree", "cycle_group", "new_session",
+            "freeze_pane", "restore_panes", "toggle_preview", "help",
+            "close_live", "close_all_live", "prev_tab", "next_tab",
+            "next_attention", "toggle_list", "rename", "shrink_list",
+            "grow_list",
+        })
+
+        def check_action(self, action: str, parameters):
+            # Gate the list/pane priority bindings while a modal / pushed screen
+            # is open (screen_stack > 1 means something sits over the main list).
+            # Returning False makes run_action skip the action, so the key falls
+            # through to the focused widget — e.g. the rename Input gets Enter ->
+            # Input.Submitted -> save, instead of the App resuming a session.
+            if action in self._MODAL_BLOCKED_ACTIONS and len(self.screen_stack) > 1:
+                return False
+            return super().check_action(action, parameters)
+
         def on_mount(self) -> None:
             # sid -> session map so the preview pane can warm its own cache on
             # demand: rendered and cached on a cache miss.

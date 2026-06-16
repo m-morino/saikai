@@ -938,6 +938,62 @@ def test_pilot_mirror_space_leader_runs_mnemonic():
         f"Space+f did not run the favorite mnemonic: {facts}"
 
 
+def test_pilot_rename_modal_enter_saves_not_resumes():
+    """Reported bug: open the rename box (Shift+F2), type a name, press Enter —
+    instead of saving, the LIST's resume fired (focus jumped to the list and it
+    resumed). Cause: `enter->resume` is a priority binding, and Textual checks
+    priority bindings against the FULL binding chain (App included), IGNORING the
+    modal boundary that `_modal_binding_chain` enforces for normal bindings. So
+    the App's Enter leaked past the RenameScreen modal. Enter in the modal must
+    SAVE the typed name and NOT dispatch resume."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_rename_modal_enter_saves_not_resumes (textual unavailable)")
+        return
+    import asyncio
+    from textual.app import App
+
+    sid = _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                # Record (and neutralize) any resume dispatch: the real action
+                # would spawn `claude --resume` as a PTY child during the test.
+                self.action_resume = lambda: facts.__setitem__("resume_fired", True)
+                # The rename targets the cursored row; other suites in this
+                # process seed extra sessions, so capture the actual target sid
+                # rather than assuming the cursor sits on our demo row.
+                facts["target"] = self._cursor_sid()
+                await pilot.press("shift+f2")            # open the rename modal
+                await pilot.pause(0.2)
+                facts["modal_open"] = type(self.screen).__name__ == "RenameScreen"
+                for ch in "myname":
+                    await pilot.press(ch)
+                await pilot.press("enter")               # must SAVE, not resume
+                await pilot.pause(0.3)
+                facts["stack_after"] = len(self.screen_stack)
+                facts["saved"] = (saikai._load_custom_titles() or {}).get(facts["target"], "")
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("modal_open"), f"Shift+F2 did not open RenameScreen: {facts}"
+    assert not facts.get("resume_fired"), f"Enter in the rename modal fired resume (BUG): {facts}"
+    assert facts.get("saved") == "myname", f"Enter did not save the typed name: {facts}"
+    assert facts.get("stack_after") == 1, f"rename modal did not close on Enter: {facts}"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -984,5 +1040,6 @@ if __name__ == "__main__":
     test_pilot_mirror_arrow_byte_drives_app()
     print("PASS test_pilot_mirror_arrow_byte_drives_app")
     test_pilot_mirror_space_leader_runs_mnemonic()
+    test_pilot_rename_modal_enter_saves_not_resumes()
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("ALL PASS")
