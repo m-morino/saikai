@@ -801,8 +801,8 @@ def test_page_key_bar_has_saikai_action_keys():
     finally:
         hub.stop()
     for k in ('data-k="f5"', 'data-k="shift+f3"', 'data-k="f10"', 'data-k="f9"',
-              'data-k="shift+f2"', 'data-k="shift+f4"', 'data-k="slash"',
-              'data-k="pageup"', 'data-k="pagedown"'):
+              'data-k="shift+f2"', 'data-k="shift+f4"', 'data-k="f11"',
+              'data-k="slash"', 'data-k="pageup"', 'data-k="pagedown"'):
         assert k in page, f"key bar missing {k}"
     # A 'More' toggle reveals a secondary action row (keeps the default compact).
     assert "kb-more" in page, "no More toggle for the secondary action row"

@@ -3572,6 +3572,46 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def on_input_submitted(self, event) -> None:
             self.dismiss(event.value or "")     # "" = clear; None only via cancel
 
+    class NotificationsScreen(ModalScreen):
+        """Recent-notifications recall (F11). Toasts auto-dismiss; this lists the
+        ones that already vanished — newest first, with time + severity colour —
+        so a missed 'needs input' / 'done' / error / memory-pressure warning can
+        be reviewed after the fact. Esc / F11 close. Drawn in the TUI, so it is
+        mirrored to the browser too."""
+        CSS = """
+        NotificationsScreen { align: center middle; }
+        #notif-box { background: $panel; border: solid $accent; padding: 1 2;
+                     width: 92; max-width: 96%; height: 80%; max-height: 40; }
+        #notif-log { height: 1fr; }
+        """
+        BINDINGS = [Binding("escape", "dismiss", show=False),
+                    Binding("f11", "dismiss", show=False)]
+
+        def __init__(self, entries):
+            super().__init__()
+            self._entries = list(entries)
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="notif-box"):
+                yield Static(f"[bold cyan]Recent notifications[/bold cyan]   "
+                             f"[dim]{len(self._entries)} kept · newest first · "
+                             f"Esc closes[/dim]")
+                yield RichLog(id="notif-log", wrap=True, highlight=False, markup=True)
+
+        def on_mount(self) -> None:
+            log = self.query_one("#notif-log", RichLog)
+            if not self._entries:
+                log.write("[dim](no notifications yet)[/dim]")
+                return
+            _col = {"information": "cyan", "warning": "yellow", "error": "red"}
+            for ts, sev, title, msg in reversed(self._entries):   # newest first
+                c = _col.get(sev, "white")
+                head = f"[dim]{ts}[/dim] [{c}]{sev[:4].upper()}[/{c}]"
+                if title:
+                    head += f" [b]{title}[/b]"
+                log.write(head)
+                log.write(f"  {msg}")
+
     def _render_qr(matrix):
         """Render a QR bool-matrix as Rich Text using upper-half-block cells
         (fg paints the top module, bg the bottom), explicit black-on-white so it
@@ -3694,6 +3734,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # wipe every pane (that was the accidental "全件終了"). Esc from the
             # list snapshots + quits; Ctrl+] returns focus pane → list.
             Binding("f10", "close_live", "Close tab", id="close", show=False, priority=True),
+            Binding("f11", "notifications", "Notifs", id="notifs", show=False, priority=True),
             Binding("shift+f10", "close_all_live", "Close all", id="close_all", show=False, priority=True),
             Binding("f2", "prev_tab", "◀Tab", id="prev_tab", show=False, priority=True),
             Binding("f3", "next_tab", "Tab▶", id="next_tab", show=False, priority=True),
@@ -3830,7 +3871,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             "freeze_pane", "restore_panes", "toggle_preview", "help",
             "close_live", "close_all_live", "prev_tab", "next_tab",
             "next_attention", "toggle_list", "rename", "shrink_list",
-            "grow_list",
+            "grow_list", "notifications",
         })
 
         def check_action(self, action: str, parameters):
@@ -3854,6 +3895,30 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if getattr(self, "_quit_armed", False):
                 self._disarm_quit()
             return super().push_screen(*args, **kwargs)
+
+        def notify(self, message, **kwargs):
+            # Keep a bounded recall log of every toast — they auto-dismiss, so a
+            # missed "needs input" / "done" / error / memory-pressure warning is
+            # otherwise gone. F11 (action_notifications) surfaces it. Lazy-init so
+            # toasts raised during mount/startup are captured too.
+            buf = getattr(self, "_notif_log", None)
+            if buf is None:
+                from collections import deque
+                buf = self._notif_log = deque(maxlen=200)
+            try:
+                import time as _t
+                buf.append((_t.strftime("%H:%M:%S"),
+                            str(kwargs.get("severity", "information")),
+                            str(kwargs.get("title", "") or ""),
+                            str(message)))
+            except Exception:
+                pass
+            return super().notify(message, **kwargs)
+
+        def action_notifications(self) -> None:
+            """F11 — recall recent notifications (the toasts that already
+            auto-dismissed). Opens a scrollable, mirror-visible panel."""
+            self.push_screen(NotificationsScreen(getattr(self, "_notif_log", [])))
 
         def on_mount(self) -> None:
             # sid -> session map so the preview pane can warm its own cache on

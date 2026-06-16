@@ -1041,6 +1041,51 @@ def test_pilot_ctrlc_over_modal_does_not_quit():
     assert facts.get("screen_after") == "HelpScreen", f"Ctrl+C should leave Help open: {facts}"
 
 
+def test_pilot_notification_center_records_and_opens():
+    """Feature 3: toasts auto-dismiss, so a missed 'needs input'/'done'/error was
+    gone. notify() now keeps a bounded recall log and F11 opens a
+    NotificationsScreen listing them (drawn in the TUI, so mirror-visible)."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_notification_center_records_and_opens (textual unavailable)")
+        return
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                self.notify("recall-me-xyz", severity="warning", title="T")
+                await pilot.pause(0.1)
+                facts["logged"] = any("recall-me-xyz" in e[3]
+                                      for e in getattr(self, "_notif_log", []))
+                await pilot.press("f11")               # open the notification center
+                await pilot.pause(0.2)
+                facts["screen"] = type(self.screen).__name__
+                await pilot.press("escape")            # close it
+                await pilot.pause(0.1)
+                facts["screen_after"] = type(self.screen).__name__
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("logged"), f"notify() must record into the recall log: {facts}"
+    assert facts.get("screen") == "NotificationsScreen", f"F11 must open the center: {facts}"
+    assert facts.get("screen_after") != "NotificationsScreen", f"Esc must close it: {facts}"
+
+
 def test_pilot_esc_in_search_clears_filter():
     """Bug-hunt 1A: a non-empty search filter (especially with the bar hidden)
     read as 'sessions missing', and Esc only moved focus — it never cleared the
@@ -1194,5 +1239,6 @@ if __name__ == "__main__":
     test_pilot_ctrlc_over_modal_does_not_quit()
     test_pilot_quit_arm_cleared_when_a_screen_opens()
     test_pilot_esc_in_search_clears_filter()
+    test_pilot_notification_center_records_and_opens()
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("ALL PASS")
