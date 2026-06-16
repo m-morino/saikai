@@ -1,164 +1,191 @@
-# saikai Context-Lifecycle Assistant — Design
+# saikai Context-Lifecycle Assistant — Design (rev. 2, post expert review)
 
-**Goal:** Make Anthropic's recommended "keep context lean + reset on purpose"
-workflow frictionless, so a user stops riding auto-compact on a bloated session.
-saikai (a) shows how full each live session's context is and nudges before the
-bloat zone, (b) turns "checkpoint the grown state -> clear -> rehydrate lean" into
-one action, and (c) tracks session lineage as a navigable tree.
+**Goal:** Help the user stay in the optimal context band and reset *on purpose*
+instead of riding auto-compact on a bloated session — by (a) showing, at a glance
+across all live panes, how full each session's context really is, and (b) making
+"compact / checkpoint-and-refresh" a one-key, *safe* action. saikai surfaces the
+signal and orchestrates standard commands; Claude Code owns the window.
 
-**Architecture:** saikai is an *external orchestrator*, not a context manager --
-Claude Code owns the window (`/clear`, `/compact`, `/context`). saikai estimates
-context fill from the transcript JSONL, drives standard commands into the live
-pane via the existing key-injection path, and records parent->child lineage in a
-small sidecar. No `claude -p` (separately billed); the handoff is written by the
-*already-running* session.
+**Status:** Revised after a 3-reviewer expert panel (Anthropic context-engineering,
+Textual/concurrency, product/UX). The panel found rev.1 rested on a false premise
+and an unsafe centerpiece; this revision fixes both. Key changes are marked **[rev2]**.
 
-**Tech stack:** Python/Textual (saikai.py, saikai_terminal.py), sidecar JSON in
-`~/.cache/saikai/`, no-pytest tests (`uv run python tests/test_x.py`).
+**Tech stack:** Python/Textual (saikai.py, saikai_terminal.py), sidecar JSON under
+`CACHE_DIR`, no-pytest tests (`uv run python tests/test_x.py`).
 
 ---
 
-## Motivation & best-practice grounding (verified)
+## Motivation & verified grounding
 
-Sources: code.claude.com/docs/best-practices, /context-window, /memory;
-anthropic.com/engineering/effective-context-engineering-for-ai-agents.
+- Anthropic does **not** blanket-prefer `/clear` over `/compact`. `/clear` = between
+  *unrelated* tasks / after repeated corrections; `/compact` = same task continuing
+  (auto-compact near the limit is standard). Proactive compaction at ~50-60% is the
+  team's rule of thumb. Core principle: optimize for the **smallest set of
+  high-signal tokens**; biggest levers are subagents + CLAUDE.md/memory, then
+  resetting at task boundaries.
+- User's real pain (verbatim): resetting + rehydrating a *grown* session is
+  laborious, so they avoid it and ride auto-compact (degraded). Friction, not
+  ignorance — so the high-value piece is making the reset itself trivial + safe.
 
-- Anthropic does **not** blanket-prefer `/clear` over `/compact`. `/clear` =
-  between *unrelated* tasks / after repeated corrections; `/compact` = same task
-  continuing (auto-compact near the limit is standard).
-- Core principle: **context is a finite resource; optimize for the smallest set
-  of high-signal tokens.** Noise (failed attempts, stale files) dilutes signal.
-- Biggest levers: **subagents** (isolated context), **CLAUDE.md / memory**
-  (persistent), then `/clear` at task boundaries. `/context` shows live usage.
-- The user's real pain: clearing + rehydrating the *grown* working state is
-  laborious, so they avoid it and ride auto-compact (degraded). This feature
-  removes that friction.
+**[rev2] CORRECTED premise — token counts are already on disk.** Each assistant
+turn in the transcript JSONL carries a `usage` block (`input_tokens`,
+`cache_read_input_tokens`, `cache_creation_input_tokens`, `output_tokens`); the
+**last** such turn's `input + cache_read + cache_creation` is the *exact* live
+context size (what `/context` shows). It also records
+`{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger","preTokens"}}`.
+Empirically (this repo's session): real **662,561** tokens vs rev.1's chars/4
+estimate **965,025** (1.46x over). So the rev.1 estimator is deleted: **read the
+real number; never estimate when `usage` is present.**
 
-**Honest boundaries (non-goals):** saikai cannot read live context usage from an
-API (none exists) -- it *estimates* from the transcript. saikai does not manage
-the window; it nudges + orchestrates standard commands. An "offload to subagent"
-nudge is out of scope (future).
-
----
-
-## Component (a): Context-fill gauge + proactive nudge
-
-**Files:** saikai.py (new pure fns + statusbar/list wiring + poll hook).
-
-- **Estimate** per live session: `est_tokens ~= STARTUP_OVERHEAD + transcript_tokens`,
-  where `transcript_tokens ~= sum(len(text_content)) / 4` (chars-per-token
-  heuristic; no tokenizer dependency) and `STARTUP_OVERHEAD ~= 10_000` (system
-  prompt + tools + CLAUDE.md, roughly constant). Pure fn
-  `_estimate_ctx_tokens(jsonl_path)`.
-- **Window** per session: detect the model from the transcript (assistant turns
-  carry a model id) -> map known model -> window (200_000 default; 1_000_000 for
-  `*[1m]` / Opus extended-context). Fall back to `SAIKAI_CTX_WINDOW` (default
-  200_000). Pure fn `_ctx_window_for(model)`.
-- **Gauge**: `pct = est_tokens / window`. Surface for the focused live pane in the
-  statusbar next to the RAM segment, e.g. `ctx ~96K/200K (48%)`, severity-coloured
-  in green/yellow/red bands (same shape as `_load_severity`).
-- **Nudge threshold**: `SAIKAI_CTX_NUDGE_PCT` (default 0.55 -- comfortably before
-  the ~70-100K auto-compact zone on a 200K window). When a focused live session
-  crosses it, a once-per-crossing toast (hysteresis like the memory-pressure
-  toast): "context ~55% -- checkpoint & refresh (Shift+F11) to stay lean".
-- **Cadence**: reuse `_poll_live_status` (1.5s). Estimate is cheap (byte/4 over the
-  transcript; cache by mtime like other parses).
-- **Caveat (documented):** estimate only -- excludes the exact system/tool token
-  cost; for the precise breakdown the user runs `/context` in the pane.
-
-**Tests:** `_estimate_ctx_tokens` on a fixture JSONL (known content -> expected
-band); `_ctx_window_for` mapping (200K default, 1M for `[1m]`); the gauge string
-formatter (pure) for green/yellow/red + the K/window text.
+**Honest boundaries / non-goals:** saikai cannot *manage* the window except by
+driving the pane. It reads ground-truth fill, surfaces it, and orchestrates
+standard commands. An auto-nudge and a navigable lineage *tree* are **deferred**.
 
 ---
 
-## Component (b): One-action checkpoint -> clear -> rehydrate
+## Component (a) — Multi-pane context-fill gauge  [SHIP FIRST; the real unmet need]
 
-**Files:** saikai.py (new `action_context_refresh` + orchestration helper),
-binding, mirror key-bar button.
+`/context` is per-session; saikai uniquely sees *all live panes at once*.
 
-Triggered by **Shift+F11** (`action_context_refresh`, priority + in
-`_MODAL_BLOCKED_ACTIONS`) on a focused live pane, or from the (a) nudge toast.
-Sequence, driven into the live pane via the existing key/text injection -- all
-standard commands, no `claude -p`:
+**Files:** saikai.py (new pure fns + statusbar wiring + reuse the poll).
 
-1. **Write a high-signal handoff (in-session).** saikai types a fixed prompt:
-   "Write a concise handoff for a fresh session to the file
-   `~/.cache/saikai/handoff/<sid>.md` -- goal, current state, key files+decisions,
-   next steps, open threads -- then reply DONE. Write nothing else." The running
-   session (already billed; full context) authors it. **File-based capture** so
-   saikai never parses terminal output. (Alternative to evaluate: the standard
-   `/handoff` skill -- VERIFY its output target; default to the explicit
-   file-write prompt, which is robust regardless.)
-2. **Wait for the file** (`<cache>/handoff/<sid>.md`) with a timeout (e.g. 60s,
-   poll 0.5s). On timeout: abort with a toast, change nothing (safe).
-3. **`/clear`** typed into the pane (standard -> new session id, same pane, fresh
-   context; old transcript preserved on disk).
-4. **Detect the child sid.** After `/clear`, scan the pane's cwd dir under
-   `~/.claude/projects/<enc>/` for the newest transcript that is not the parent
-   (mtime-ordered, short retry to cover the race). That sid = the child.
-5. **Rehydrate (seed) the fresh session**: type "Continue the work. Read
-   `~/.cache/saikai/handoff/<parent_sid>.md` for context, then proceed." The new
-   session starts **lean + high-signal** (reads a small handoff, not the full
-   transcript).
-6. **Record lineage** (Component c): `parent_sid -> child_sid`.
+- **Ground-truth read** `_ctx_tokens_from_jsonl(path) -> int | None`: scan to the
+  **last** assistant record bearing `usage`; return
+  `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`. None if no
+  `usage` (old transcripts) -> caller may fall back to a clearly *labelled* chars/4
+  estimate, but prefers the real number. **[rev2] no STARTUP_OVERHEAD, no chars/4 as
+  the primary path.**
+- **Compaction awareness:** the last turn's `input_tokens` already reflects the
+  post-compaction window, so reading the last `usage` is correct across compactions.
+  Optionally surface `compact_boundary` (e.g. "auto-compacted at 1.0M").
+- **Window** `_ctx_window_for(model) -> int`: model id is on each assistant turn
+  (`message.model`); map family -> window (200_000 default; **1_000_000 when the id
+  carries the `[1m]` suffix**). Fallback `SAIKAI_CTX_WINDOW` (200_000).
+- **Display** — a NEW pure formatter `_ctx_gauge_segment(tokens, window)`,
+  **per-focused-pane** (NOT folded into the aggregate `_live_ram_segment`). In the
+  statusbar builder, when `_focused_terminal()` is not None, resolve
+  `.sid -> _sid_index[sid]["jsonl_path"]`, compute, append e.g. `ctx 662K/1.0M (66%)`,
+  severity-coloured by reusing `_load_severity` / `_LOAD_COL`. **[rev2] with real
+  numbers the percentage is trustworthy** (the panel's "band not number" advice was
+  contingent on the estimate being wrong; it no longer is).
+- **Cadence/caching:** reuse `_poll_live_status` / `_restat_live`; cache on
+  `(mtime, size)`. UI-thread read-only; touches no lock.
 
-**Why `/clear`-in-place (not launch-new):** honours the user's "clear" + stays in
-one pane; the cost is child-sid detection (step 4), handled by the
-newest-transcript scan + retry. Launch-a-new-pane was considered (saikai would own
-the new sid directly) but spawns a second ~400 MB claude and reads less like
-"clear". Documented as the considered alternative.
-
-**Failure handling:** any step failing leaves the session untouched (handoff file
-+ old transcript persist); a toast reports which step failed. `/clear` is only
-typed *after* the handoff file exists (never lose state).
-
-**Tests:** the sequence builder is a pure fn returning the ordered steps (assert
-the handoff-write prompt, that the wait-for-file gate precedes `/clear`, that the
-rehydrate prompt references the parent handoff path); a Pilot test with a stub
-pane recording injected text asserts the order + that `/clear` is not sent until
-the (mocked) handoff file appears; child-sid detection on a fixture dir.
+**Tests:** `_ctx_tokens_from_jsonl` on a fixture with `usage` blocks (last turn's
+sum; None when absent); `_ctx_window_for` (200K default, 1M for `[1m]`);
+`_ctx_gauge_segment` formatting + green/yellow/red bands.
 
 ---
 
-## Component (c): Lineage tree
+## Component (b) — One-key refresh, made SAFE  [rev2: autonomous /clear REMOVED]
 
-**Files:** saikai.py (sidecar read/write + group-by + a marker), reuse group-by.
+**[rev2]** rev.1's "type a prompt -> trust a file -> autonomously `/clear`" was
+data-loss-capable (existence-check != validity; mid-task injection; fire-and-forget,
+no read-back) and reinvented `/compact`/`/handoff`/`/rewind`. Replaced by two modes,
+neither clearing autonomously.
 
-- **Sidecar** `~/.cache/saikai/lineage.json`:
-  `{ child_sid: {"parent": parent_sid, "ts": iso8601} }`. Helpers
-  `_load_lineage()` / `_set_lineage(child, parent)` (mtime-cached, atomic write --
-  same pattern as custom-titles.json).
-- **Display**: a new **group-by "Lineage"** option (reuse the Group dropdown /
-  leader group cycling) that nests a child under its parent with a `>` indent
-  marker; and a `_list_title` suffix `(from <short parent>)` otherwise. Sessions
-  with no lineage render flat (unchanged).
-- **Navigate**: a key / context-menu item "open parent" jumps the cursor to the
-  parent sid (deep-dive the grown session if the lean one lacks detail).
-- **Mirror**: lineage is list data -> already mirrored; the (b) trigger gets a
-  "Refresh ctx" button on the mirror key-bar (data-k="shift+f11").
+**Common gates (both modes):**
+- Trigger: **Shift+F11** (`action_context_refresh`, priority, in
+  `_MODAL_BLOCKED_ACTIONS`) on a focused live pane; or a mirror key-bar button.
+- **Idle gate:** no-op + toast if the pane is mid-turn (streaming / tool running /
+  awaiting a permission prompt). Reuse the pane's busy/idle status. Never inject into
+  a busy pane.
+- **Injection:** new `AgentTerminal.paste_text(s)` + `submit()` wrapping the body in
+  bracketed paste (`ESC[200~ ... ESC[201~`), **gated on `_bracketed_paste`**, then one
+  CR. **Never per-line enter keys** (each CR would submit a fragment). PTY writes
+  stay on the UI thread.
 
-**Tests:** lineage sidecar round-trip + mtime cache invalidation; group-by
-"Lineage" nests child under parent (pure grouping fn on a fixture session set);
-the "(from ...)" title suffix.
+**(b1) Compact — DEFAULT, non-destructive, zero data-loss.** Shift+F11 injects
+`/compact` (standard, in-place). ~80% of the value at ~5% of the risk. The everyday
+"stay lean" action.
+
+**(b2) Checkpoint & fresh-start — OPT-IN, human-gated, for deliberate task
+boundaries.** A tick-driven state machine (NOT a blocking wait):
+1. Inject the existing **`/handoff` skill** (anchor on it: ~80-line cap, strips
+   failed-attempt noise, emits a paste-ready `NEW SESSION PROMPT` block, ends with
+   "/clear して"). **[rev2] /handoff is the building block, not a bespoke prompt.**
+2. **Detect completion via the transcript** (saikai already parses these): when a new
+   assistant turn appears and the pane is idle, read its last message and extract the
+   `NEW SESSION PROMPT` block. No bespoke cache file, no terminal scraping.
+3. **Human gate:** show the extracted prompt in a modal — "Refresh? old session stays
+   reopenable. [Enter] clear+reseed / [Esc] cancel." **saikai never types `/clear`
+   autonomously.**
+4. On confirm: inject `/clear`; detect the child sid (see spike); inject the
+   `NEW SESSION PROMPT` to reseed lean; record the recovery pointer (c).
+
+**[rev2] SPIKE FIRST (task zero of b2):** verify in a *real* live pane that `/clear`
+mints a new session-id detectable on disk, and how reliably the child sid emerges,
+BEFORE building b2. Child detection must be falsifiable: capture the pre-existing sid
+set; bind the *first new* sid whose first record's cwd matches the pane and whose
+timestamp post-dates the clear; if 0 or >=2 candidates, **record nothing + toast**
+(sibling panes / `claude -p` transcripts in the same project dir are real
+contaminants).
+
+**Failure-safety:** b1 is non-destructive. b2 `/clear`s only after the human confirms
+a *shown* handoff; state is never *lost* (old transcript persists + the recovery
+pointer). Honest boundary: after `/clear` the session IS mutated; recovery is via
+"reopen previous", not in-place.
+
+**Concurrency [rev2, blocker-grade]:** the b2 wait/poll MUST be a tick-based state
+machine (off `_poll_live_status` or a self-cancelling `set_interval`), **never a
+blocking UI-thread loop** — reader threads block on `call_from_thread` to the UI
+thread, so a blocking wait freezes every pane. Run
+`tests/test_terminal_concurrency.py` + `test_pty_backend.py` after b.
+
+**Tests:** a pure sequence-builder for b2 (order: handoff -> detect -> gate -> clear
+-> reseed; clear gated behind human-confirm); a Pilot test with a stub pane recording
+injected text (idle-gate no-op when busy; b1 injects `/compact`; b2 does not inject
+`/clear` before confirm); bracketed-paste helper unit test.
 
 ---
 
-## Data, config, build order
+## Component (c) — Recovery pointer only  [rev2: tree CUT]
 
-- **Cache**: `~/.cache/saikai/handoff/<sid>.md`, `~/.cache/saikai/lineage.json`
-  (repo never touched -- the "do not pollute" requirement).
-- **Config/env**: `SAIKAI_CTX_WINDOW` (200000), `SAIKAI_CTX_NUDGE_PCT` (0.55),
-  `SAIKAI_CTX_HIGH_PCT` (0.75), mirrored under a `[context]` config table.
-- **Build order (for the plan):** (a) gauge [independent] -> (c) lineage
-  sidecar+tree [needed by b's record/display] -> (b) orchestration [uses c]. Each
-  is independently testable and shippable.
+**[rev2]** The navigable lineage *tree* (group-by "Lineage", indent, title suffix,
+mirror tree) was scope-creep for this pain and clashes with saikai's group-by (closed
+enum + flat partition, mutually exclusive with tree-mode). **Cut.** Keep only the
+recovery net that makes a deliberate `/clear` safe.
 
-## Open items to verify during implementation (decisions made; verification noted)
+- **Sidecar** `CACHE_DIR/lineage.json`: `{ child_sid: {"parent": sid, "parent_jsonl":
+  path, "ts": iso8601} }`. Reuse the custom-titles pattern (`_read_json`/`_write_json`,
+  mtime-cached, atomic, strict-read). **Use `CACHE_DIR`, not a hardcoded `~/.cache`.**
+- **One action:** "reopen previous / open parent" — from a b2 child, jump the cursor
+  to (or open) the parent for deep-dive when the lean handoff misses a detail. One
+  binding; no tree UI.
 
-1. The standard `/handoff` skill's output target -- default to the explicit
-   file-write prompt regardless; evaluate `/handoff` as a nicety only.
-2. The transcript's model-id field name (for window detection) -- fall back to
-   `SAIKAI_CTX_WINDOW` if absent.
-3. Child-sid detection race after `/clear` -- newest-transcript scan + short
-   retry; verify against a real `/clear` in a live pane during implementation.
+**Tests:** lineage sidecar round-trip + mtime-cache invalidation; "open parent"
+resolves child -> parent.
+
+---
+
+## Deferred (explicitly out of scope here)
+
+- **Auto-nudge toast** — parasitic on (b) (the user knows it's heavy; a nudge only
+  helps if acting is trivial). Ship after b1 exists + is trusted; then it triggers the
+  same Shift+F11. Threshold ~55% (aligned with 50-60% proactive-compact), window-aware,
+  per-sid hysteresis (clone the memory-pressure toast pattern).
+- **Lineage tree / group-by "Lineage" / mirror tree** — a future session-management
+  feature with its own justification.
+- **Bespoke handoff prompt / `~/.cache/saikai/handoff/*.md` protocol** — dropped in
+  favour of the existing `/handoff` skill.
+
+---
+
+## Config & build order
+
+- **Config/env:** `SAIKAI_CTX_WINDOW` (200000). (Nudge thresholds deferred with the
+  nudge.)
+- **Build order:** **(a) gauge [standalone MVP, ground-truth usage]** -> **(c)
+  recovery pointer sidecar** -> **(b1) `/compact` one-key** -> **/clear spike** ->
+  **(b2) human-gated checkpoint** (only if the spike is positive). Each step is
+  independently testable + shippable; the destructive b2 is last and gated on the
+  spike.
+
+## Open items resolved / to verify
+
+1. `/handoff` output: anchor on it; detect completion + extract the `NEW SESSION
+   PROMPT` block from the transcript's last assistant message (no bespoke file).
+2. model-id field for window detection: `message.model`; fall back to
+   `SAIKAI_CTX_WINDOW`.
+3. **`/clear` new-sid behaviour: a real-pane SPIKE is task zero of b2** — load-bearing;
+   a negative result reshapes b2 + (c).
