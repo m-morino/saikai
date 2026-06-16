@@ -4670,6 +4670,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     fit = min(fit, max(0, self._live.max_live - cnt))   # MAX_LIVE backstop
                     live_str = f"{sep}" + _live_ram_segment(
                         cnt, _att, _ms, fit, per, float(_kw.get("max_load") or 85.0))
+                # Context-fill gauge for the FOCUSED live pane (ground-truth tokens).
+                _ft = self._focused_terminal()
+                if _ft is not None:
+                    _jp = (self._sid_index.get(getattr(_ft, "sid", None)) or {}).get("jsonl_path")
+                    if _jp:
+                        _tok = _ctx_tokens_from_jsonl(_jp)
+                        if _tok is not None:
+                            _seg = _ctx_gauge_segment(_tok, _ctx_window_for(
+                                _tok, override=_cfg("context", "window", "SAIKAI_CTX_WINDOW", 0, int) or None))
+                            if _seg:
+                                live_str += f"{sep}{_seg}"
             # Search: when the on-demand bar is hidden, surface the active text
             # query (so a filtered list isn't mistaken for "sessions missing");
             # otherwise hint how to open it.

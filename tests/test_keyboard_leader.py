@@ -1189,6 +1189,41 @@ def test_pilot_quit_arm_cleared_when_a_screen_opens():
     assert not facts.get("quit_fired"), f"single Esc after a screen closed must not quit: {facts}"
 
 
+def test_pilot_ctx_gauge_in_statusbar():
+    """A focused live pane shows a ctx gauge in the statusbar from the transcript's
+    usage block. (Stubs a live pane + sid_index entry; no real claude.)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_ctx_gauge_in_statusbar (textual unavailable)"); return
+    import asyncio, json, uuid
+    from textual.app import App
+    sid = str(uuid.uuid4())
+    pdir = _FAKE_HOME / ".claude" / "projects" / "-ctx-demo"
+    pdir.mkdir(parents=True, exist_ok=True)
+    jp = pdir / f"{sid}.jsonl"
+    jp.write_text(json.dumps({"type": "assistant", "message": {"model": "claude-opus-4-8",
+        "usage": {"input_tokens": 100, "cache_read_input_tokens": 95_000,
+                  "cache_creation_input_tokens": 900, "output_tokens": 10}}}) + "\n",
+        encoding="utf-8")
+    facts = {}
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(140, 30)) as pilot:
+                await pilot.pause(0.3)
+                facts["seg"] = saikai._ctx_gauge_segment(
+                    saikai._ctx_tokens_from_jsonl(str(jp)),
+                    saikai._ctx_window_for(saikai._ctx_tokens_from_jsonl(str(jp))))
+        asyncio.run(go())
+    orig, App.run = App.run, fake_run
+    try:
+        sys.argv = ["saikai", "--all"]; saikai.main()
+    finally:
+        App.run = orig
+    # 96000/200000 = 48% -> the segment renders the gauge.
+    assert "ctx 96K/200K (48%)" in facts.get("seg", ""), facts
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -1240,5 +1275,7 @@ if __name__ == "__main__":
     test_pilot_quit_arm_cleared_when_a_screen_opens()
     test_pilot_esc_in_search_clears_filter()
     test_pilot_notification_center_records_and_opens()
+    test_pilot_ctx_gauge_in_statusbar()
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
+    print("PASS test_pilot_ctx_gauge_in_statusbar")
     print("ALL PASS")
