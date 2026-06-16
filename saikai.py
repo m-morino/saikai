@@ -336,11 +336,18 @@ DEFAULT_LEADER_LETTERS = {           # action id -> letter (config orientation)
     "restore": "p", "freeze": "z", "attention": "a", "toggle_list": "l",
     "close": "x", "prev_tab": "[", "next_tab": "]", "mark": " ",
     "settings": ",", "search_bar": "/",
+    # b2 (Task 11): the human-gated checkpoint→/clear→rehydrate flow. A LEADER
+    # action (not an F-key) because the F-key / Shift+F-key space is full AND a
+    # deliberate, discoverable two-keystroke gesture (which-key hinted) suits a
+    # flow that ends in a destructive /clear. b1's plain Shift+F11 stays
+    # /compact-only; b2 is its own entry-point sharing b1's idle-gate helpers.
+    "checkpoint": "c",
 }
 # Leader-only action ids (no Binding / F-key behind them): id -> action name.
 LEADER_VIRTUAL_ACTIONS = {"sort": "sort", "order": "order", "mark": "toggle_mark",
                           "settings": "settings",
-                          "search_bar": "toggle_search_bar"}
+                          "search_bar": "toggle_search_bar",
+                          "checkpoint": "checkpoint"}
 
 # Leader families: action name -> family, in display order. The which-key hint
 # and the ? help render the map grouped this way (Session / View / Panes)
@@ -356,7 +363,7 @@ LEADER_FAMILY_OF = {
     "settings": "View", "toggle_search_bar": "View",
     "new_session": "Panes", "restore_panes": "Panes", "freeze_pane": "Panes",
     "next_attention": "Panes", "close_live": "Panes", "prev_tab": "Panes",
-    "next_tab": "Panes", "toggle_mark": "Panes",
+    "next_tab": "Panes", "toggle_mark": "Panes", "checkpoint": "Panes",
 }
 
 
@@ -2985,6 +2992,192 @@ def _ctx_tokens_from_jsonl(path) -> "int | None":
             + int(last.get("cache_creation_input_tokens", 0)))
 
 
+# ── b2 (Task 11): human-gated checkpoint → /handoff → confirm → /clear → reseed.
+# Pure helpers below; the tick state machine lives on the App (action_checkpoint
+# + _b2_tick). The flow is intentionally a tick-driven machine — NEVER a blocking
+# wait — because the PTY reader threads marshal onto the UI thread, so a UI-thread
+# sleep/poll-loop would freeze every pane (ARCHITECTURE.md concurrency invariant).
+
+
+# The ordered states the b2 machine advances through (one step per tick). Exposed
+# as a function so the safety ORDERING (the destructive /clear sits AFTER the
+# human confirm AND after the handoff settles) is unit-testable without any I/O.
+_B2_STEPS = (
+    "inject_handoff",       # paste /handoff into the pane (non-destructive)
+    "await_handoff_idle",   # wait for the turn to settle (status back to idle)
+    "extract_prompt",       # read the NEW SESSION PROMPT out of the transcript
+    "confirm",              # push ConfirmRefreshScreen — the HUMAN GATE
+    "inject_clear",         # ONLY after confirm: snapshot sids, paste /clear
+    "detect_child",         # bind the fresh child sid (falsifiable, see below)
+    "inject_reseed",        # paste the parent's NEW SESSION PROMPT into the child
+    "record_lineage",       # _set_lineage(child, parent, parent_jsonl)
+)
+
+
+def _b2_step_sequence() -> tuple:
+    """The ordered b2 state names. Pure — unit-tested for the safety invariant
+    that inject_clear comes after both `confirm` and `await_handoff_idle`."""
+    return _B2_STEPS
+
+
+def _extract_handoff_prompt(text: "str | None") -> "str | None":
+    """Slice the `NEW SESSION PROMPT` block out of a /handoff assistant turn.
+
+    Tolerates the two shapes claude's /handoff produces: a fenced ``` block whose
+    first line is `NEW SESSION PROMPT`, or a markdown header (`## NEW SESSION
+    PROMPT`) followed by the prompt. Returns the inner prompt text (stripped), or
+    None when there is no NEW SESSION PROMPT marker (never guess — b2 aborts +
+    toasts on None rather than reseeding with garbage)."""
+    if not text:
+        return None
+    lines = text.splitlines()
+    n = len(lines)
+    marker = "NEW SESSION PROMPT"
+    for i, ln in enumerate(lines):
+        if marker not in ln.upper():
+            continue
+        # Case A: the marker is the opening line INSIDE a ``` fence. The fence
+        # open is the previous non-empty line; the prompt runs to the closing
+        # fence. Collect the lines AFTER the marker up to the next ``` (or EOF).
+        body = []
+        j = i + 1
+        while j < n and not lines[j].lstrip().startswith("```"):
+            body.append(lines[j])
+            j += 1
+        out = "\n".join(body).strip()
+        if out:
+            return out
+    return None
+
+
+def _last_assistant_text_from_jsonl(path) -> "str | None":
+    """The text of the LAST assistant turn in a transcript (the /handoff output).
+
+    Tail-read like _ctx_tokens_from_jsonl (transcripts are large); decode the
+    assistant message content with the same _extract_text helper the parser uses.
+    None if unreadable or there is no assistant text yet."""
+    try:
+        import os
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 400_000))      # tail: the handoff reply is near the end
+            chunk = f.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+    last = None
+    for ln in chunk.splitlines():
+        ln = ln.strip()
+        if not ln.startswith("{") or '"assistant"' not in ln:
+            continue
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if obj.get("type") != "assistant":
+            continue
+        msg = obj.get("message") or {}
+        txt = _extract_text(msg.get("content", "")) if isinstance(msg, dict) else ""
+        if txt:
+            last = txt
+    return last
+
+
+def _first_cwd_from_jsonl(path) -> "str | None":
+    """The first `cwd` in a transcript, scanning the first several records.
+
+    Spike finding #3: a freshly /clear'd child's record 1 is {"type":"mode"} and
+    record 2 is file-history-snapshot — `cwd` first appears on the early
+    `attachment` records. So scan a window of leading records, not just record 1.
+    None if no cwd appears (or the file is unreadable)."""
+    try:
+        with open(path, "rb") as f:
+            scanned = 0
+            for line in f:
+                if scanned == 0 and line.startswith(b"\xef\xbb\xbf"):
+                    line = line[3:]
+                scanned += 1
+                if scanned > 30:                # generous window; cwd is in the first few
+                    break
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj.get("cwd"), str) and obj["cwd"]:
+                    return obj["cwd"]
+    except OSError:
+        return None
+    return None
+
+
+def _first_ts_from_jsonl(path) -> "str | None":
+    """The first ISO8601 `timestamp` in a transcript (scanning leading records),
+    used to confirm a candidate child session post-dates the /clear. None if
+    absent/unreadable."""
+    try:
+        with open(path, "rb") as f:
+            scanned = 0
+            for line in f:
+                if scanned == 0 and line.startswith(b"\xef\xbb\xbf"):
+                    line = line[3:]
+                scanned += 1
+                if scanned > 30:
+                    break
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                ts = obj.get("timestamp")
+                if isinstance(ts, str) and ts:
+                    return ts
+    except OSError:
+        return None
+    return None
+
+
+def _bind_cleared_child(project_dir, pre_existing_sids, pane_cwd, clear_ts):
+    """Falsifiably bind the child session minted by /clear (spike finding #6).
+
+    `/clear` mints exactly ONE new `<sid>.jsonl`, but unrelated new transcripts
+    also appear in the same project dir from other lifecycle events (a sibling
+    pane's first turn, a session flushing on exit). So: among the *.jsonl whose
+    stem is NOT in the pre-/clear snapshot, keep only those whose first-record
+    cwd matches the pane AND whose first timestamp post-dates the clear. Return
+    the single survivor, or None on 0 or ≥2 candidates — record NO lineage and
+    toast rather than guess. Pure (filesystem read only); unit-tested."""
+    try:
+        from pathlib import Path as _P
+        pd = _P(project_dir)
+        present = {p.stem: p for p in pd.glob("*.jsonl")}
+    except Exception:
+        return None
+    pre = set(pre_existing_sids or ())
+    candidates = []
+    for stem, p in present.items():
+        if stem in pre:
+            continue
+        cwd = _first_cwd_from_jsonl(p)
+        if pane_cwd and cwd != pane_cwd:
+            continue                            # contamination: different pane
+        ts = _first_ts_from_jsonl(p)
+        # Post-date check: only when both timestamps are present. A missing ts on
+        # a brand-new child (cwd already matched) shouldn't reject it; a present
+        # ts that pre-dates the clear is an old session and IS rejected.
+        if clear_ts and ts and ts < clear_ts:
+            continue
+        candidates.append(stem)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _project_sids(project_dir) -> set:
+    """The set of session sids (jsonl stems) currently present in a project dir.
+    Snapshotted BEFORE /clear so the post-clear diff is falsifiable."""
+    try:
+        from pathlib import Path as _P
+        return {p.stem for p in _P(project_dir).glob("*.jsonl")}
+    except Exception:
+        return set()
+
+
 _CTX_TIERS = (200_000, 1_000_000)
 
 
@@ -3678,6 +3871,46 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def on_input_submitted(self, event) -> None:
             self.dismiss(event.value or "")     # "" = clear; None only via cancel
 
+    class ConfirmRefreshScreen(ModalScreen):
+        """The HUMAN GATE in the b2 checkpoint flow (leader ␣c). Shows the
+        NEW SESSION PROMPT extracted from the /handoff so the user can vet it
+        before the destructive /clear runs. Enter proceeds (dismiss True), Esc
+        cancels (dismiss False). The /clear is injected ONLY on a True dismiss —
+        every other path (Esc, closing the screen) leaves the live session
+        untouched."""
+        CSS = """
+        ConfirmRefreshScreen { align: center middle; }
+        #confref-box { background: $panel; border: solid $warning; padding: 1 2;
+                       width: 96; max-width: 96%; height: auto; max-height: 80%; }
+        #confref-prompt { height: auto; max-height: 24; margin: 1 0;
+                          border: tall $accent; padding: 0 1; }
+        """
+        BINDINGS = [Binding("enter", "proceed", show=False),
+                    Binding("escape", "cancel", show=False)]
+
+        def __init__(self, prompt: str):
+            super().__init__()
+            self._prompt = prompt or ""
+
+        def prompt_text(self) -> str:
+            """The extracted NEW SESSION PROMPT this modal is gating on."""
+            return self._prompt
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="confref-box"):
+                yield Static("[bold yellow]Checkpoint → refresh this session?[/bold yellow]   "
+                             "[dim]Enter clears + reseeds · Esc cancels[/dim]")
+                yield Static("[dim]/handoff is done. Enter will send /clear "
+                             "(destructive) and reseed a fresh session with:[/dim]")
+                with VerticalScroll(id="confref-prompt"):
+                    yield Static(self._prompt or "[red](no NEW SESSION PROMPT found)[/red]")
+
+        def action_proceed(self) -> None:
+            self.dismiss(True)
+
+        def action_cancel(self) -> None:
+            self.dismiss(False)
+
     class NotificationsScreen(ModalScreen):
         """Recent-notifications recall (F11). Toasts auto-dismiss; this lists the
         ones that already vanished — newest first, with time + severity colour —
@@ -3909,6 +4142,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         _sid_index: dict = {}      # sid -> session; populated in on_mount
         _na_cache: dict = {}       # sid -> (mtime, needs_attention); Group-by-State
         _last_status: dict = {}    # sid -> last live status; for waiting toasts
+        _b2: "dict | None" = None  # b2 (Task 11) checkpoint state machine; None = idle
+        _b2_timer = None           # the self-cancelling tick interval handle
 
         def compose(self) -> ComposeResult:
             with Horizontal(id="searchrow"):
@@ -3986,6 +4221,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             "close_live", "close_all_live", "prev_tab", "next_tab",
             "next_attention", "toggle_list", "rename", "shrink_list",
             "grow_list", "notifications", "open_parent", "context_refresh",
+            "checkpoint",
         })
 
         def check_action(self, action: str, parameters):
@@ -6640,6 +6876,26 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 self.notify("could not open parent", severity="error", timeout=4)
 
+        def _ctx_target_pane(self):
+            """The live pane a context action (b1 /compact, b2 checkpoint) targets:
+            the FOCUSED pane if one is focused, else — when armed from the LIST via
+            the leader — the cursor-selected session if it is live. Returns the
+            AgentTerminal or None. Shared by b1 and b2."""
+            t = self._focused_terminal()
+            if t is not None:
+                return t
+            # Leader path: the list owns focus, so resolve the cursor row's live pane.
+            sid = self._cursor_sid()
+            if sid and self._live is not None and self._live.has(sid):
+                return self._live.get(sid)
+            return None
+
+        def _pane_is_midturn(self, sid) -> bool:
+            """True if the pane is busy/waiting (a running turn or a pending
+            permission prompt) — context actions must not interrupt it."""
+            status = self._live.statuses().get(sid) if self._live else None
+            return status in ("busy", "waiting")
+
         def action_context_refresh(self) -> None:
             """Shift+F11 — inject /compact into the focused live pane to summarise
             the context in place (non-destructive). No-op + toast when no pane is
@@ -6649,15 +6905,244 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if t is None:
                 self.notify("focus a live pane to refresh its context", timeout=3)
                 return
-            sid = getattr(t, "sid", None)
-            status = self._live.statuses().get(sid) if self._live else None
-            if status in ("busy", "waiting"):
+            if self._pane_is_midturn(getattr(t, "sid", None)):
                 self.notify("pane is busy — refresh when it's idle",
                             severity="warning", timeout=3)
                 return
             t.paste_text("/compact")
             t.submit()
             self.notify("sent /compact to compact this session in place", timeout=4)
+
+        # ── b2 (Task 11): human-gated checkpoint → /handoff → confirm → /clear →
+        # reseed → lineage. Implemented as a TICK STATE MACHINE (off a
+        # self-cancelling set_interval) — never a blocking UI-thread wait, which
+        # would freeze every pane (the reader threads marshal onto this thread).
+        # Triggered by leader ␣c (a distinct gesture from b1's plain Shift+F11,
+        # which stays /compact-only). The destructive /clear is gated behind the
+        # ConfirmRefreshScreen — it is sent ONLY after the user presses Enter.
+        _B2_DETECT_TICKS = 34          # ~10s at 0.3s/tick: child sid visible in 2.5-4s
+        _B2_SETTLE_TICKS = 2           # let a just-injected turn register as busy
+        _B2_CLEAR_SETTLE_TICKS = 2     # ~0.6s between /clear paste and its CR (spike #5)
+        _B2_HANDOFF_IDLE_TICKS = 200   # ~60s ceiling for a /handoff to finish
+
+        def action_checkpoint(self) -> None:
+            """Leader ␣c — start the human-gated checkpoint flow on the target live
+            pane (focused, or the cursor-selected session when armed from the list).
+            Injects /handoff, waits for it to settle, shows the extracted NEW
+            SESSION PROMPT for confirmation, then (only on confirm) /clear + reseed
+            and records child→parent lineage. No-op + toast when there is no live
+            target, the pane is mid-turn, or a checkpoint is already running."""
+            if getattr(self, "_b2", None) is not None:
+                self.notify("a checkpoint is already in progress", timeout=3)
+                return
+            t = self._ctx_target_pane()
+            if t is None:
+                self.notify("select or focus a live pane to checkpoint", timeout=3)
+                return
+            sid = getattr(t, "sid", None)
+            if self._pane_is_midturn(sid):
+                self.notify("pane is busy — checkpoint when it's idle",
+                            severity="warning", timeout=3)
+                return
+            s = self._sid_index.get(sid) or {}
+            jp = s.get("jsonl_path")
+            if not jp:
+                self.notify("no transcript for this pane yet", timeout=3)
+                return
+            from pathlib import Path as _P
+            jp = _P(jp)
+            self._b2 = {
+                "state": "inject_handoff",
+                "sid": sid,                  # parent sid (pre-/clear)
+                "term": t,
+                "parent_jsonl": str(jp),
+                "project_dir": str(jp.parent),
+                "pane_cwd": s.get("origin_cwd") or s.get("cwd") or "",
+                "prompt": None,
+                "pre_sids": set(),
+                "child": None,
+                "clear_ts": None,
+                "ticks": 0,                  # generic per-state countdown/counter
+                "resent_cr": False,
+            }
+            # Drive the machine off a self-cancelling interval (cancelled in
+            # _b2_finish). 0.3s matches the spike's settle granularity.
+            self._b2_timer = self.set_interval(0.3, self._b2_tick)
+            self.notify("checkpoint: sending /handoff…", timeout=4)
+
+        def _b2_finish(self, msg=None, severity="information") -> None:
+            """Tear down the b2 machine: stop the interval, drop state, optional
+            toast. Idempotent."""
+            tm = getattr(self, "_b2_timer", None)
+            if tm is not None:
+                try:
+                    tm.stop()
+                except Exception:
+                    pass
+                self._b2_timer = None
+            self._b2 = None
+            if msg:
+                self.notify(msg, severity=severity, timeout=5)
+
+        def _b2_tick(self) -> None:
+            """Advance the b2 machine at most one step. UI-thread only (set_interval
+            fires here; the test calls it directly). Each branch either advances
+            `state`, parks (waiting on the modal), or finishes."""
+            b2 = getattr(self, "_b2", None)
+            if not b2:
+                return
+            term = b2.get("term")
+            # The pane died under us (claude exited) — abort, never inject into a corpse.
+            if term is None or getattr(term, "is_dead", False):
+                self._b2_finish("checkpoint aborted — pane closed", "warning")
+                return
+            st = b2.get("state")
+
+            if st == "inject_handoff":
+                try:
+                    term.paste_text("/handoff")
+                    term.submit()
+                except Exception:
+                    self._b2_finish("checkpoint aborted — could not inject /handoff",
+                                    "error")
+                    return
+                b2["ticks"] = self._B2_SETTLE_TICKS
+                b2["state"] = "await_handoff_idle"
+                return
+
+            if st == "await_handoff_idle":
+                # Give the turn a couple ticks to register as busy, then wait for it
+                # to settle back to idle (or the pane to die). A ceiling avoids
+                # waiting forever if /handoff stalls.
+                if b2["ticks"] > 0:
+                    b2["ticks"] -= 1
+                    b2.setdefault("idle_wait", 0)
+                    return
+                b2["idle_wait"] = b2.get("idle_wait", 0) + 1
+                if b2["idle_wait"] > self._B2_HANDOFF_IDLE_TICKS:
+                    self._b2_finish("checkpoint aborted — /handoff did not finish",
+                                    "warning")
+                    return
+                status = (self._live.statuses().get(b2["sid"])
+                          if self._live else None)
+                if status in ("busy", "waiting"):
+                    return                    # still working — keep waiting
+                b2["state"] = "extract_prompt"
+                return
+
+            if st == "extract_prompt":
+                txt = _last_assistant_text_from_jsonl(b2["parent_jsonl"])
+                prompt = _extract_handoff_prompt(txt)
+                if not prompt:
+                    self._b2_finish(
+                        "checkpoint aborted — no NEW SESSION PROMPT in the handoff",
+                        "warning")
+                    return
+                b2["prompt"] = prompt
+                b2["state"] = "confirm"
+                return
+
+            if st == "confirm":
+                # Park the machine and push the human gate. The callback resumes
+                # it (proceed) or finishes it (cancel). Guard so we push once.
+                b2["state"] = "awaiting_confirm"
+
+                def _resume(ok, _self=self):
+                    cur = getattr(_self, "_b2", None)
+                    if not cur or cur.get("state") != "awaiting_confirm":
+                        return                # machine torn down meanwhile
+                    if ok:
+                        cur["state"] = "inject_clear"
+                    else:
+                        _self._b2_finish("checkpoint cancelled — session untouched")
+
+                self.push_screen(ConfirmRefreshScreen(b2["prompt"]), _resume)
+                return
+
+            if st == "awaiting_confirm":
+                return                        # waiting on the modal; ticks no-op
+
+            if st == "inject_clear":
+                # Snapshot the project dir's sids BEFORE /clear so the post-clear
+                # diff is falsifiable (spike #6). Record the clear timestamp so a
+                # candidate child must post-date it.
+                import time
+                if not b2.get("_clear_pasted"):
+                    b2["pre_sids"] = _project_sids(b2["project_dir"])
+                    b2["clear_ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    try:
+                        term.paste_text("/clear")
+                    except Exception:
+                        self._b2_finish("checkpoint aborted — could not inject /clear",
+                                        "error")
+                        return
+                    b2["_clear_pasted"] = True
+                    b2["ticks"] = self._B2_CLEAR_SETTLE_TICKS
+                    return
+                # ~0.5s settle between the /clear paste and its CR: the leading
+                # '/' opens the slash palette and a CR arriving too soon is
+                # absorbed (spike #5).
+                if b2["ticks"] > 0:
+                    b2["ticks"] -= 1
+                    return
+                try:
+                    term.submit()
+                except Exception:
+                    self._b2_finish("checkpoint aborted — could not submit /clear",
+                                    "error")
+                    return
+                b2["ticks"] = self._B2_DETECT_TICKS
+                b2["state"] = "detect_child"
+                return
+
+            if st == "detect_child":
+                child = _bind_cleared_child(
+                    b2["project_dir"], b2["pre_sids"], b2["pane_cwd"], b2["clear_ts"])
+                if child:
+                    b2["child"] = child
+                    b2["state"] = "inject_reseed"
+                    return
+                # Defensive re-send: one extra CR partway through the window in
+                # case the first CR was absorbed (spike #5). Harmless on a fresh
+                # empty session.
+                if (not b2["resent_cr"]
+                        and b2["ticks"] <= self._B2_DETECT_TICKS - 14):
+                    try:
+                        term.submit()
+                    except Exception:
+                        pass
+                    b2["resent_cr"] = True
+                b2["ticks"] -= 1
+                if b2["ticks"] <= 0:
+                    self._b2_finish(
+                        "checkpoint: /clear sent, but the new session could not be "
+                        "identified — no lineage recorded", "warning")
+                return
+
+            if st == "inject_reseed":
+                try:
+                    term.paste_text(b2["prompt"])
+                    term.submit()
+                except Exception:
+                    self._b2_finish(
+                        "checkpoint: reseed prompt could not be injected", "error")
+                    return
+                b2["state"] = "record_lineage"
+                return
+
+            if st == "record_lineage":
+                try:
+                    _set_lineage(b2["child"], b2["sid"], b2["parent_jsonl"])
+                except Exception as e:               # noqa: BLE001
+                    self._b2_finish(f"checkpoint reseeded, but lineage write failed: {e}",
+                                    "warning")
+                    return
+                self._b2_finish("checkpoint done — fresh session reseeded "
+                                "(Shift+F6 jumps back to the parent)")
+                return
+
+            # Unknown state — fail safe.
+            self._b2_finish("checkpoint aborted — internal state error", "error")
 
         def action_help(self) -> None:
             # '?' is a priority binding; don't pop the help modal over a focused

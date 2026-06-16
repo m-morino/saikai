@@ -1377,6 +1377,206 @@ def test_pilot_context_refresh_idle_and_busy():
         f"no focused pane must not inject: {facts}"
 
 
+def test_pilot_checkpoint_gated_clear_and_lineage():
+    """b2 (Task 11) — human-gated checkpoint → /handoff → confirm → /clear →
+    reseed → lineage, driven as a tick state machine:
+
+    - action_checkpoint on an idle pane injects /handoff (NOT /clear).
+    - the machine waits for the handoff to settle, extracts the NEW SESSION
+      PROMPT from the transcript, and pushes ConfirmRefreshScreen.
+    - while the modal is up, NO /clear has been injected (the destructive step
+      is gated behind the human confirm).
+    - dismissing the modal with Enter resumes the machine: /clear is injected,
+      the fresh child sid is detected, the reseed prompt is injected, and
+      _set_lineage records child -> parent.
+    """
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_checkpoint_gated_clear_and_lineage (textual unavailable)"); return
+    import asyncio, json, uuid
+    from textual.app import App
+
+    pane_cwd = "/home/alex/code/demo"
+    pdir = _FAKE_HOME / ".claude" / "projects" / "-home-alex-code-demo"
+    pdir.mkdir(parents=True, exist_ok=True)
+    parent_sid = str(uuid.uuid4())
+    parent_jsonl = pdir / f"{parent_sid}.jsonl"
+    # Parent transcript: a /handoff exchange whose last assistant turn carries a
+    # fenced NEW SESSION PROMPT block (what b2 extracts + reseeds with).
+    parent_recs = [
+        {"type": "ai-title", "aiTitle": "Parent", "timestamp": "2026-06-17T09:00:00.000Z",
+         "cwd": pane_cwd},
+        {"type": "user", "timestamp": "2026-06-17T09:05:00.000Z", "cwd": pane_cwd,
+         "message": {"role": "user", "content": "/handoff"}},
+        {"type": "assistant", "timestamp": "2026-06-17T09:05:30.000Z", "cwd": pane_cwd,
+         "message": {"role": "assistant", "content": [{"type": "text", "text":
+            "Handoff ready.\n\n```\nNEW SESSION PROMPT\n"
+            "Resume saikai Task 11: the parent built the state machine; "
+            "continue from the failing detect test.\n```\n"}]}},
+    ]
+    parent_jsonl.write_text("\n".join(json.dumps(r) for r in parent_recs) + "\n",
+                            encoding="utf-8")
+    child_sid = str(uuid.uuid4())          # the sid /clear will "mint"
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(120, 32)) as pilot:
+                await pilot.pause(0.3)
+
+                class _FakeTerm:
+                    """Records the ORDER of paste/submit so we can prove /clear
+                    is never injected before the modal is confirmed."""
+                    sid = parent_sid
+                    is_dead = False
+                    def __init__(self):
+                        self.events = []
+                    def paste_text(self, text):
+                        self.events.append(("paste", text))
+                    def submit(self):
+                        self.events.append(("submit",))
+
+                class _FakeLive:
+                    # Implements the slice of LiveSessionManager the running app's
+                    # background _poll_live_status / _restat_live touch (they fire
+                    # on a 1.5s interval while this test spans several pauses).
+                    def __init__(self, status_val):
+                        self._status_val = status_val
+                    def statuses(self):
+                        return {parent_sid: self._status_val}
+                    def all_terms(self):
+                        return []
+                    def get(self, sid):
+                        return fake_term if sid == parent_sid else None
+                    def has(self, sid):
+                        return sid == parent_sid
+                    @staticmethod
+                    def pane_id(sid):
+                        return f"tab-live-{sid}"
+                    def set_status(self, sid, status):
+                        pass
+                    def status(self, sid):
+                        return self._status_val if sid == parent_sid else ""
+                    @property
+                    def count(self):
+                        return 1
+
+                fake_term = _FakeTerm()
+                self._live = _FakeLive("idle")
+                self._focused_terminal = lambda: fake_term
+                # sid_index entry so the machine can resolve the pane's transcript
+                # path + project dir (parent_jsonl) the way the real app does.
+                self._sid_index[parent_sid] = {
+                    "id": parent_sid, "jsonl_path": parent_jsonl,
+                    "cwd": pane_cwd, "origin_cwd": pane_cwd,
+                }
+
+                def drive_until(state, cap=40):
+                    """Advance the tick machine until it reaches `state` (or the
+                    machine ends / cap hit). Returns the state actually reached."""
+                    for _ in range(cap):
+                        b2 = getattr(self, "_b2", None)
+                        if b2 is None:
+                            return None
+                        if b2.get("state") == state:
+                            return state
+                        self._b2_tick()
+                    return (getattr(self, "_b2", None) or {}).get("state")
+
+                # Kick off the flow.
+                await pilot.app.run_action("checkpoint")
+                await pilot.pause(0.05)
+                facts["started"] = getattr(self, "_b2", None) is not None
+
+                # Drive up to the confirm modal. Handoff is injected; /clear is NOT.
+                reached = drive_until("confirm")
+                # the confirm step pushes the modal on the tick that enters it;
+                # run one more tick to actually push it if needed.
+                for _ in range(3):
+                    if type(self.screen).__name__ == "ConfirmRefreshScreen":
+                        break
+                    self._b2_tick()
+                    await pilot.pause(0.05)
+                facts["reached_confirm"] = reached
+                facts["modal"] = type(self.screen).__name__
+                facts["events_at_modal"] = list(fake_term.events)
+                # the extracted prompt is shown in the modal (so the human can vet it)
+                try:
+                    facts["modal_shows_prompt"] = "Resume saikai Task 11" in \
+                        self.screen.prompt_text()
+                except Exception as e:  # noqa: BLE001
+                    facts["modal_err"] = repr(e)
+
+                # The destructive /clear must NOT have happened yet.
+                facts["clear_before_confirm"] = any(
+                    e == ("paste", "/clear") for e in fake_term.events)
+
+                # Confirm with Enter -> the machine resumes past the gate.
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                facts["modal_after_enter"] = type(self.screen).__name__
+
+                # Advance to just-after the clear injection, THEN simulate claude
+                # minting the fresh child session (its JSONL appears in the project
+                # dir). This mirrors the real ~2.5-4s latency: the snapshot is taken
+                # before /clear, the child file lands after.
+                drive_until("detect_child")
+                child_jsonl = pdir / f"{child_sid}.jsonl"
+                child_jsonl.write_text("\n".join(json.dumps(r) for r in [
+                    {"type": "mode", "sessionId": child_sid},
+                    {"type": "file-history-snapshot"},
+                    {"type": "attachment", "cwd": pane_cwd,
+                     "timestamp": "2026-06-17T10:00:03.000Z"},
+                ]) + "\n", encoding="utf-8")
+
+                # Finish the machine (detect -> reseed -> record_lineage -> done).
+                for _ in range(40):
+                    if getattr(self, "_b2", None) is None:
+                        break
+                    self._b2_tick()
+                    await pilot.pause(0.02)
+
+                facts["events_final"] = list(fake_term.events)
+                facts["lineage"] = saikai._load_lineage().get(child_sid)
+
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("started"), f"action_checkpoint did not start the machine: {facts}"
+    assert facts.get("modal") == "ConfirmRefreshScreen", \
+        f"the confirm modal must be shown before /clear: {facts}"
+    assert facts.get("modal_shows_prompt"), \
+        f"the modal must display the extracted NEW SESSION PROMPT: {facts}"
+    # the load-bearing safety assertion: /handoff was injected, /clear was NOT,
+    # at the moment the modal is up.
+    assert ("paste", "/handoff") in facts.get("events_at_modal", []), facts
+    assert facts.get("clear_before_confirm") is False, \
+        f"/clear must NOT be injected before the human confirms: {facts}"
+    # after Enter the modal closes and the machine resumes
+    assert facts.get("modal_after_enter") != "ConfirmRefreshScreen", facts
+    ev = facts.get("events_final", [])
+    assert ("paste", "/clear") in ev, f"/clear must be injected after confirm: {facts}"
+    # /clear comes AFTER /handoff in the recorded order
+    assert ev.index(("paste", "/clear")) > ev.index(("paste", "/handoff")), facts
+    # the reseed injects the extracted prompt (references the parent handoff).
+    # events are mixed arity — ("paste", text) vs ("submit",) — so guard the unpack.
+    assert any(e[0] == "paste" and "Resume saikai Task 11" in e[1]
+               for e in ev if len(e) >= 2), f"reseed prompt not injected: {facts}"
+    # and lineage records child -> parent with the parent transcript path
+    lin = facts.get("lineage")
+    assert lin and lin.get("parent") == parent_sid, f"lineage child->parent not recorded: {facts}"
+    assert lin.get("parent_jsonl") == str(parent_jsonl), facts
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -1431,8 +1631,10 @@ if __name__ == "__main__":
     test_pilot_ctx_gauge_in_statusbar()
     test_pilot_open_parent()
     test_pilot_context_refresh_idle_and_busy()
+    test_pilot_checkpoint_gated_clear_and_lineage()
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("PASS test_pilot_ctx_gauge_in_statusbar")
     print("PASS test_pilot_open_parent")
     print("PASS test_pilot_context_refresh_idle_and_busy")
+    print("PASS test_pilot_checkpoint_gated_clear_and_lineage")
     print("ALL PASS")

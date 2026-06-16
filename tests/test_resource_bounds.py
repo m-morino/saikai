@@ -107,6 +107,161 @@ def test_lineage_sidecar_roundtrip():
     assert "ts" in lin["child-sid"]
 
 
+def test_b2_step_sequence_orders_clear_after_confirm_and_idle():
+    """b2 (Task 11) is a tick-driven state machine: the destructive /clear must
+    come AFTER the user confirm AND after the handoff settles, and the reseed
+    must reference the parent handoff/prompt. Pure: assert the ordered shape."""
+    seq = list(saikai._b2_step_sequence())
+    # the spec'd states, all present
+    for st in ("inject_handoff", "await_handoff_idle", "extract_prompt",
+               "confirm", "inject_clear", "detect_child", "inject_reseed",
+               "record_lineage"):
+        assert st in seq, f"missing state {st!r}: {seq}"
+    i = {st: seq.index(st) for st in seq}
+    # the load-bearing safety invariant: /clear is gated behind the confirm
+    # AND behind the handoff having gone idle.
+    assert i["inject_clear"] > i["confirm"], seq
+    assert i["inject_clear"] > i["await_handoff_idle"], seq
+    # handoff is injected, then we wait for it, then read the prompt out, then
+    # the human confirms — only then do we clear.
+    assert i["inject_handoff"] < i["await_handoff_idle"] < i["extract_prompt"] < i["confirm"], seq
+    # detect the fresh child before reseeding it, and record lineage last.
+    assert i["inject_clear"] < i["detect_child"] < i["inject_reseed"] < i["record_lineage"], seq
+
+
+def test_extract_handoff_prompt_slices_new_session_block():
+    """The reseed prompt is the fenced NEW SESSION PROMPT block in the last
+    assistant turn (the /handoff output). Slice it out; tolerate prose around
+    the fence and varied fence languages."""
+    ex = saikai._extract_handoff_prompt
+    # ``` fence with a NEW SESSION PROMPT header inside
+    body = (
+        "Here's the handoff.\n\n"
+        "```\n"
+        "NEW SESSION PROMPT\n"
+        "You are picking up saikai Task 11. The parent did X and Y.\n"
+        "Continue with Z.\n"
+        "```\n"
+        "Good luck!"
+    )
+    got = ex(body)
+    assert got is not None
+    assert "picking up saikai Task 11" in got
+    assert "Continue with Z." in got
+    # the surrounding prose and the fence markers are not part of the prompt
+    assert "Here's the handoff" not in got
+    assert "Good luck!" not in got
+    assert "```" not in got
+    # header-as-markdown variant (## NEW SESSION PROMPT) with no fence still works
+    body2 = (
+        "blah\n\n## NEW SESSION PROMPT\n\n"
+        "Resume the build from the failing test.\n\nmore"
+    )
+    got2 = ex(body2)
+    assert got2 is not None and "Resume the build from the failing test." in got2
+    # no NEW SESSION PROMPT anywhere -> None (never guess)
+    assert ex("just an ordinary assistant reply, no handoff here") is None
+    assert ex("") is None
+
+
+def test_last_assistant_text_from_jsonl_reads_tail():
+    import json, tempfile, os
+    d = tempfile.mkdtemp(prefix="saikai-b2-")
+    p = os.path.join(d, "s.jsonl")
+    recs = [
+        {"type": "user", "message": {"role": "user", "content": "hi"}},
+        {"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "first answer"}]}},
+        {"type": "user", "message": {"role": "user", "content": "/handoff"}},
+        {"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "```\nNEW SESSION PROMPT\nresume me\n```"}]}},
+    ]
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("\n".join(json.dumps(r) for r in recs) + "\n")
+    txt = saikai._last_assistant_text_from_jsonl(p)
+    assert txt is not None and "NEW SESSION PROMPT" in txt and "resume me" in txt
+    # and it composes with the extractor
+    assert saikai._extract_handoff_prompt(txt) == "resume me"
+    # missing file -> None, never raises
+    assert saikai._last_assistant_text_from_jsonl(os.path.join(d, "nope.jsonl")) is None
+
+
+def test_first_cwd_from_jsonl_scans_early_records():
+    """Spike finding #3: cwd is NOT on record 1 of a freshly /clear'd child
+    (record 1 is {"type":"mode"}). The detector must scan the first several
+    records for the first cwd, not just record 1."""
+    import json, tempfile, os
+    d = tempfile.mkdtemp(prefix="saikai-b2cwd-")
+    p = os.path.join(d, "child.jsonl")
+    recs = [
+        {"type": "mode", "sessionId": "child-xyz"},          # rec 1: no cwd
+        {"type": "file-history-snapshot"},                    # rec 2: no cwd
+        {"type": "attachment", "cwd": "/home/alex/code/demo", # rec 3: first cwd
+         "timestamp": "2026-06-17T10:00:05.000Z"},
+        {"type": "user", "cwd": "/home/alex/code/demo",
+         "message": {"content": "go"}},
+    ]
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("\n".join(json.dumps(r) for r in recs) + "\n")
+    assert saikai._first_cwd_from_jsonl(p) == "/home/alex/code/demo"
+    # a transcript with no cwd at all -> None
+    p2 = os.path.join(d, "nocwd.jsonl")
+    with open(p2, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "mode", "sessionId": "x"}) + "\n")
+    assert saikai._first_cwd_from_jsonl(p2) is None
+    assert saikai._first_cwd_from_jsonl(os.path.join(d, "missing.jsonl")) is None
+
+
+def test_bind_cleared_child_falsifiable_detection():
+    """Spike finding #6: exactly 1 new file per /clear, but unrelated new
+    *.jsonl appear from other lifecycle events. Bind the child as: the FIRST
+    new sid whose first-record cwd matches the pane AND ts post-dates the clear;
+    on 0 or >=2 candidates -> None (record NO lineage, never guess)."""
+    import json, tempfile, os
+    proj = tempfile.mkdtemp(prefix="saikai-b2bind-")
+    pane_cwd = "/home/alex/code/demo"
+
+    def _write(stem, cwd, ts):
+        recs = [
+            {"type": "mode", "sessionId": stem},
+            {"type": "attachment", "cwd": cwd, "timestamp": ts},
+        ]
+        p = os.path.join(proj, f"{stem}.jsonl")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("\n".join(json.dumps(r) for r in recs) + "\n")
+        return p
+
+    parent = "parent-sid"
+    _write(parent, pane_cwd, "2026-06-17T09:00:00.000Z")     # pre-existing
+    pre = {parent}
+    clear_ts = "2026-06-17T10:00:00.000Z"
+
+    # Happy path: exactly one new sid, matching cwd, ts after the clear.
+    child = "child-sid"
+    _write(child, pane_cwd, "2026-06-17T10:00:03.000Z")
+    got = saikai._bind_cleared_child(proj, pre, pane_cwd, clear_ts)
+    assert got == child, got
+
+    # Contamination: a sibling pane's new session in a DIFFERENT cwd also lands.
+    # cwd filter rejects it -> still exactly one valid candidate.
+    _write("sibling-sid", "/home/alex/code/other", "2026-06-17T10:00:04.000Z")
+    assert saikai._bind_cleared_child(proj, pre, pane_cwd, clear_ts) == child
+
+    # Ambiguous: a SECOND matching-cwd new sid post-dating the clear -> None.
+    _write("child2-sid", pane_cwd, "2026-06-17T10:00:06.000Z")
+    assert saikai._bind_cleared_child(proj, pre, pane_cwd, clear_ts) is None
+
+    # Zero candidates (none post-date the clear) -> None.
+    proj2 = tempfile.mkdtemp(prefix="saikai-b2bind0-")
+    _write_old = os.path.join(proj2, "old.jsonl")
+    with open(_write_old, "w", encoding="utf-8") as f:
+        f.write("\n".join(json.dumps(r) for r in [
+            {"type": "mode", "sessionId": "old"},
+            {"type": "attachment", "cwd": pane_cwd,
+             "timestamp": "2026-06-17T08:00:00.000Z"}]) + "\n")
+    assert saikai._bind_cleared_child(proj2, {"old"}, pane_cwd, clear_ts) is None
+
+
 def test_ctx_gauge_segment_formats_and_colours():
     # None tokens -> empty (no usage yet / unreadable).
     assert saikai._ctx_gauge_segment(None, 200_000) == ""
@@ -136,3 +291,13 @@ if __name__ == "__main__":
     print("PASS test_ctx_gauge_segment_formats_and_colours")
     test_lineage_sidecar_roundtrip()
     print("PASS test_lineage_sidecar_roundtrip")
+    test_b2_step_sequence_orders_clear_after_confirm_and_idle()
+    print("PASS test_b2_step_sequence_orders_clear_after_confirm_and_idle")
+    test_extract_handoff_prompt_slices_new_session_block()
+    print("PASS test_extract_handoff_prompt_slices_new_session_block")
+    test_last_assistant_text_from_jsonl_reads_tail()
+    print("PASS test_last_assistant_text_from_jsonl_reads_tail")
+    test_first_cwd_from_jsonl_scans_early_records()
+    print("PASS test_first_cwd_from_jsonl_scans_early_records")
+    test_bind_cleared_child_falsifiable_detection()
+    print("PASS test_bind_cleared_child_falsifiable_detection")
