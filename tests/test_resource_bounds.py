@@ -53,6 +53,32 @@ def test_live_ram_segment_estimate_and_severity_colour():
     assert "[red]" in s3 and "90% RAM" in s3 and "[red]~0 fit[/red]" in s3, s3
 
 
+def test_ctx_tokens_reads_last_usage_block(tmp_path=None):
+    import json, tempfile, os
+    d = tempfile.mkdtemp(prefix="saikai-ctx-")
+    p = os.path.join(d, "s.jsonl")
+    recs = [
+        {"type": "user", "message": {"role": "user", "content": "hi"}},
+        {"type": "assistant", "message": {"model": "claude-opus-4-8",
+            "usage": {"input_tokens": 100, "cache_read_input_tokens": 5000,
+                      "cache_creation_input_tokens": 200, "output_tokens": 50}}},
+        {"type": "assistant", "message": {"model": "claude-opus-4-8",
+            "usage": {"input_tokens": 131, "cache_read_input_tokens": 715734,
+                      "cache_creation_input_tokens": 4017, "output_tokens": 4229}}},
+    ]
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("\n".join(json.dumps(r) for r in recs) + "\n")
+    # last usage block: 131 + 715734 + 4017
+    assert saikai._ctx_tokens_from_jsonl(p) == 719882
+    # no usage anywhere -> None
+    p2 = os.path.join(d, "n.jsonl")
+    with open(p2, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "user", "message": {"content": "x"}}) + "\n")
+    assert saikai._ctx_tokens_from_jsonl(p2) is None
+    # missing file -> None (never raises)
+    assert saikai._ctx_tokens_from_jsonl(os.path.join(d, "nope.jsonl")) is None
+
+
 if __name__ == "__main__":
     test_na_cache_is_bounded()
     print("PASS test_na_cache_is_bounded")
@@ -60,3 +86,5 @@ if __name__ == "__main__":
     print("PASS test_load_severity_bands")
     test_live_ram_segment_estimate_and_severity_colour()
     print("PASS test_live_ram_segment_estimate_and_severity_colour")
+    test_ctx_tokens_reads_last_usage_block()
+    print("PASS test_ctx_tokens_reads_last_usage_block")

@@ -2917,6 +2917,38 @@ def _ram_per_pane_mb() -> float:
     return _cfg("limits", "per_pane_mb", "SAIKAI_CLAUDE_MB", 600.0, float)
 
 
+def _ctx_tokens_from_jsonl(path) -> "int | None":
+    """Live context size of a session, read from the LAST transcript record that
+    carries a usage block: input + cache_read + cache_creation input tokens (the
+    number `/context` shows). Ground truth, no estimation. None if the file is
+    unreadable or has no usage yet. Reads only the tail (transcripts are large)."""
+    try:
+        import os
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 400_000))      # tail: the last usage is near the end
+            chunk = f.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+    last = None
+    for ln in chunk.splitlines():
+        ln = ln.strip()
+        if not ln.startswith("{") or '"usage"' not in ln:
+            continue
+        try:
+            msg = (json.loads(ln).get("message") or {})
+            u = msg.get("usage") if isinstance(msg, dict) else None
+        except Exception:
+            continue
+        if isinstance(u, dict) and "input_tokens" in u:
+            last = u
+    if last is None:
+        return None
+    return (int(last.get("input_tokens", 0))
+            + int(last.get("cache_read_input_tokens", 0))
+            + int(last.get("cache_creation_input_tokens", 0)))
+
+
 # Statusbar RAM indicator. The headroom ("~N fit") is the deductive precursor —
 # how many more panes fit before the gate trips, derived from _ram_fit. These add
 # a severity colour + a ⚠ to the system-load reading so the box "getting heavy" is
