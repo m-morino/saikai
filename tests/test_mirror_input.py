@@ -116,6 +116,30 @@ def test_mouse_and_key_inject_gate_on_control_and_handler():
     assert hub._inject_q.get_nowait() == ("key", "f12")
 
 
+def test_update_control_target_syncs_without_rearming_idle():
+    """update_control_target refreshes ONLY the banner 'typing into' target (focus
+    moved while control stays ON): no-op when control is OFF or the target is
+    unchanged, and -- unlike set_control_state -- it does NOT re-arm the idle
+    auto-disable (so focus churn can't keep control alive forever)."""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=10, rows=2,
+                      idle_secs=999)
+    hub.set_input_handler(lambda d: None)
+    # Control OFF -> no-op (never stores a target).
+    hub.update_control_target("X")
+    assert hub._control_target is None, "OFF must not store a target"
+    # Enable (this arms the idle timer) then move the target.
+    hub.set_control_state(True, "pane-A")
+    assert hub._control_target == "pane-A"
+    t_before = hub._idle_timer
+    hub.update_control_target("pane-B")
+    assert hub._control_target == "pane-B"
+    assert hub._idle_timer is t_before, "update_control_target must NOT re-arm idle"
+    # Unchanged target -> still no re-arm.
+    hub.update_control_target("pane-B")
+    assert hub._idle_timer is t_before
+    hub.stop()
+
+
 def _post(port, path, body=None, headers=None, raw=None):
     """POST helper returning (status, body_text). Uses a same-origin Host+Origin
     so this test isolates the write-key/body checks (Host/Origin get their own
@@ -639,6 +663,18 @@ def test_mirror_inject_mouse_double_gate_and_events():
     app._mirror_inject_mouse(4, -1, 0, "down")
     assert posted == [], "out-of-range cell must be ignored"
 
+    # Over-range coord (beyond the live screen) -> ignored too. size is the App's
+    # at runtime; set a stand-in on this headless mixin instance to exercise the
+    # upper clamp.
+    posted.clear()
+    app.size = type("Sz", (), {"width": 80, "height": 24})()
+    app._mirror_inject_mouse(999, 5, 0, "down")
+    app._mirror_inject_mouse(5, 999, 0, "down")
+    assert posted == [], "out-of-range (over screen) cell must be ignored"
+    app._mirror_inject_mouse(10, 10, 0, "down")     # in range -> still posts
+    assert len(posted) == 1 and isinstance(posted[0], events.MouseDown), posted
+    posted.clear()
+
     # Unknown kind -> ignored.
     app._mirror_inject_mouse(1, 1, 0, "wiggle")
     assert posted == [], "unknown kind must post nothing"
@@ -713,6 +749,10 @@ def test_page_routes_mouse_and_has_key_bar():
         assert "'M'" in page or '"M"' in page, page
         # keyboard still routes to /input (unchanged Phase B path).
         assert "/input" in page, page
+        # The /mouse sender QUEUES reports (never drops a down/up — a dropped
+        # 'up' would leave the host pane frozen / divider captured); only
+        # consecutive same-direction scroll ticks coalesce.
+        assert "mouseQueue" in page, "postMouse must queue (not drop) down/up"
         # (b) postKey single-flight to /key with the write-key header.
         assert "/key" in page and "X-Mirror-Write-Key" in page, page
         # (c) the on-screen key bar buttons.
@@ -891,6 +931,7 @@ if __name__ == "__main__":
     test_inject_is_fifo_via_single_drain()
     test_typed_inject_dispatches_by_tag_in_order()
     test_mouse_and_key_inject_gate_on_control_and_handler()
+    test_update_control_target_syncs_without_rearming_idle()
     test_post_input_write_key_and_body_matrix()
     test_host_allow_list_and_origin_matrix()
     test_post_mouse_gate_and_body_matrix()

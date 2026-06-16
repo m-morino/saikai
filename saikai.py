@@ -3071,7 +3071,15 @@ class _MirrorControl:
         scope, so this mixin stays importable without textual."""
         if not self._control_enabled:
             return
-        if col < 0 or row < 0:                 # out-of-range cell: ignore
+        # Reject out-of-range cells. The browser clamps to term cols/rows, but a
+        # buggy/hostile client could POST anything; the upper bound mirrors the
+        # existing <0 guard against the live screen size so a wild coord can't
+        # reach hit-testing with a bogus value. (size is absent on the headless
+        # mixin used in tests -> the <0 guard still applies, upper clamp skipped.)
+        if col < 0 or row < 0:
+            return
+        _sz = getattr(self, "size", None)
+        if _sz is not None and (col >= _sz.width or row >= _sz.height):
             return
         from textual import events
         if kind == "down":
@@ -5502,6 +5510,23 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
 
+        def _resync_mirror_target(self) -> None:
+            """Keep the mirror CONTROL banner ('typing into: X') honest when focus
+            moves or the focused pane closes/dies while control is ON — otherwise
+            it keeps naming a pane that no longer has focus while remote keys land
+            on whatever is focused now (the list, search, another pane). The hub
+            method is a no-op when control is OFF / target unchanged and never
+            re-arms the idle auto-disable."""
+            _hub = getattr(self, "_mirror_hub", None)
+            if _hub is None or not getattr(self, "_control_enabled", False):
+                return
+            t = self._focused_terminal()
+            target = getattr(t, "title", None) if t is not None else None
+            try:
+                _hub.update_control_target(target)
+            except Exception:
+                pass
+
         def on_descendant_focus(self, event) -> None:
             # Always-on focus trail: focus moves aren't otherwise logged, so an
             # unexpected "focus changed on its own" had no record. Log each move
@@ -5529,6 +5554,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         self._leader_pending = False
             except Exception:
                 pass
+            # Keep the mirror control banner's "typing into" target in sync with
+            # the actual focus while control is ON (a stale target was a lie that
+            # sent remote keys blind into a different widget).
+            self._resync_mirror_target()
             # Catch up a list rebuild that _poll_live_status deferred while a pane
             # was focused (markers weren't refreshed under the user's typing). Now
             # that focus has left every pane, rebuilding is safe.

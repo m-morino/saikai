@@ -337,6 +337,28 @@ class MirrorHub:
         else:
             self._cancel_idle_timer()
 
+    def update_control_target(self, target=None) -> None:
+        """Refresh ONLY the control banner's 'typing into' target (focus moved
+        while control stays ON) — broadcast a fresh control frame iff the target
+        changed, WITHOUT re-arming the idle timer or flipping the gate. No-op when
+        control is OFF or the target is unchanged, so focus churn neither spams a
+        broadcast nor keeps the idle auto-disable from ever firing."""
+        if not self._control_enabled or target == self._control_target:
+            return
+        self._control_target = target
+        frame = _Control(json.dumps({"on": True, "target": self._control_target}))
+        with self._clients_lock:
+            targets = list(self._clients)
+        for cq in targets:
+            try:
+                cq.put_nowait(frame)
+            except queue.Full:
+                try:
+                    cq.get_nowait()
+                    cq.put_nowait(frame)
+                except (queue.Empty, queue.Full):
+                    pass
+
     def _arm_idle_timer(self) -> None:
         with self._idle_lock:
             if self._idle_timer is not None:
@@ -657,11 +679,22 @@ async function postKey(key) {
     if (keyPending !== null) { const k = keyPending; keyPending = null; postKey(k); }
   }
 }
-let mouseSending = false, mousePending = null;
+let mouseSending = false;
+const mouseQueue = [];          // pending /mouse msgs, drained single-flight in order
 async function postMouse(col, row, button, kind) {
   if (fatal || !controlOn || writeKey === null) return;
   const msg = {col: col, row: row, button: button, kind: kind};
-  if (mouseSending) { mousePending = msg; return; }  // coalesce: last report wins
+  if (mouseSending) {
+    // Coalesce ONLY consecutive same-direction scroll ticks; NEVER drop a
+    // down/up. The old "last report wins" could collapse a down..up (or up..down)
+    // pair to a single report, leaving the host pane frozen / the split divider
+    // captured with no matching release. Bounded so a wild burst can't grow forever.
+    const last = mouseQueue[mouseQueue.length - 1];
+    if ((kind === 'scrollup' || kind === 'scrolldown') && last && last.kind === kind) return;
+    mouseQueue.push(msg);
+    if (mouseQueue.length > 64) mouseQueue.shift();
+    return;
+  }
   mouseSending = true;
   try {
     const resp = await fetch('/mouse', {
@@ -673,8 +706,8 @@ async function postMouse(col, row, button, kind) {
   } catch (_) { /* transient; drop */ }
   finally {
     mouseSending = false;
-    if (mousePending !== null) { const p = mousePending; mousePending = null;
-      postMouse(p.col, p.row, p.button, p.kind); }
+    const n = mouseQueue.shift();
+    if (n !== undefined) { postMouse(n.col, n.row, n.button, n.kind); }
   }
 }
 
