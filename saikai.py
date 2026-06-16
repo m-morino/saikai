@@ -7069,7 +7069,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # waiting forever if /handoff stalls.
                 if b2["ticks"] > 0:
                     b2["ticks"] -= 1
-                    b2.setdefault("idle_wait", 0)
                     return
                 b2["idle_wait"] = b2.get("idle_wait", 0) + 1
                 if b2["idle_wait"] > self._B2_HANDOFF_IDLE_TICKS:
@@ -7116,6 +7115,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return                        # waiting on the modal; ticks no-op
 
             if st == "inject_clear":
+                # Two sub-phases within this one state, gated by b2["_clear_pasted"]:
+                #   phase 1 (key absent): snapshot sids + stamp clear_ts + paste
+                #                         "/clear", arm a settle countdown, return;
+                #   phase 2 (key set):    after the settle ticks, submit the CR and
+                #                         advance to detect_child.
                 # Snapshot the project dir's sids BEFORE /clear so the post-clear
                 # diff is falsifiable (spike #6). Record the clear timestamp in
                 # UTC ('Z') so it is directly comparable to the transcript's UTC

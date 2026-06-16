@@ -212,6 +212,31 @@ def test_first_cwd_from_jsonl_scans_early_records():
     assert saikai._first_cwd_from_jsonl(os.path.join(d, "missing.jsonl")) is None
 
 
+def test_first_ts_from_jsonl_scans_early_records():
+    """The first ISO8601 `timestamp` drives the post-/clear ordering check; like
+    cwd it is NOT on record 1 of a fresh child (record 1 is {"type":"mode"}). Scan
+    the first several records, not just record 1. None when absent / unreadable."""
+    import json, tempfile, os
+    d = tempfile.mkdtemp(prefix="saikai-b2ts-")
+    p = os.path.join(d, "child.jsonl")
+    recs = [
+        {"type": "mode", "sessionId": "child-xyz"},            # rec 1: no timestamp
+        {"type": "file-history-snapshot"},                      # rec 2: no timestamp
+        {"type": "attachment", "cwd": "/home/alex/code/demo",   # rec 3: first ts
+         "timestamp": "2026-06-17T10:00:05.000Z"},
+    ]
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("\n".join(json.dumps(r) for r in recs) + "\n")
+    assert saikai._first_ts_from_jsonl(p) == "2026-06-17T10:00:05.000Z"
+    # no timestamp anywhere -> None
+    p2 = os.path.join(d, "nots.jsonl")
+    with open(p2, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "mode", "sessionId": "x"}) + "\n")
+    assert saikai._first_ts_from_jsonl(p2) is None
+    # missing file -> None (never raises)
+    assert saikai._first_ts_from_jsonl(os.path.join(d, "missing.jsonl")) is None
+
+
 def test_bind_cleared_child_falsifiable_detection():
     """Spike finding #6: exactly 1 new file per /clear, but unrelated new
     *.jsonl appear from other lifecycle events. Bind the child as: the FIRST
@@ -328,6 +353,8 @@ if __name__ == "__main__":
     print("PASS test_last_assistant_text_from_jsonl_reads_tail")
     test_first_cwd_from_jsonl_scans_early_records()
     print("PASS test_first_cwd_from_jsonl_scans_early_records")
+    test_first_ts_from_jsonl_scans_early_records()
+    print("PASS test_first_ts_from_jsonl_scans_early_records")
     test_bind_cleared_child_falsifiable_detection()
     print("PASS test_bind_cleared_child_falsifiable_detection")
     test_bind_cleared_child_clear_ts_timezone_robust()

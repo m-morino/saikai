@@ -1548,6 +1548,26 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
                 facts["events_final"] = list(fake_term.events)
                 facts["lineage"] = saikai._load_lineage().get(child_sid)
 
+                # --- Esc (cancel) path: a SECOND checkpoint, dismissed at the
+                # confirm modal with Esc, must leave the session UNTOUCHED (no
+                # /clear injected) and tear the machine down — the other half of
+                # the human-gate safety contract (Enter=proceed was asserted above).
+                fake_term.events.clear()
+                await pilot.app.run_action("checkpoint")
+                await pilot.pause(0.05)
+                drive_until("confirm")
+                for _ in range(3):
+                    if type(self.screen).__name__ == "ConfirmRefreshScreen":
+                        break
+                    self._b2_tick()
+                    await pilot.pause(0.05)
+                facts["esc_modal_shown"] = type(self.screen).__name__
+                await pilot.press("escape")
+                await pilot.pause(0.1)
+                facts["esc_modal_after"] = type(self.screen).__name__
+                facts["esc_b2_torn_down"] = getattr(self, "_b2", None) is None
+                facts["esc_events"] = list(fake_term.events)
+
         asyncio.run(go())
 
     orig_run, App.run = App.run, fake_run
@@ -1583,6 +1603,16 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
     lin = facts.get("lineage")
     assert lin and lin.get("parent") == parent_sid, f"lineage child->parent not recorded: {facts}"
     assert lin.get("parent_jsonl") == str(parent_jsonl), facts
+    # Esc (cancel) path: modal shown, Esc dismissed it, machine torn down, and
+    # crucially NO /clear injected — cancelling leaves the session untouched.
+    assert facts.get("esc_modal_shown") == "ConfirmRefreshScreen", \
+        f"second checkpoint must reach the confirm modal: {facts}"
+    assert facts.get("esc_modal_after") != "ConfirmRefreshScreen", \
+        f"Esc must dismiss the confirm modal: {facts}"
+    assert facts.get("esc_b2_torn_down") is True, \
+        f"Esc must tear down the checkpoint machine: {facts}"
+    assert ("paste", "/clear") not in facts.get("esc_events", []), \
+        f"Esc must NOT inject /clear — the session stays untouched: {facts}"
 
 
 def test_pilot_refresh_preserves_scroll_position():
