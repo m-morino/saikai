@@ -1314,9 +1314,10 @@ def test_pilot_context_refresh_idle_and_busy():
                         self._status_val = status_val
                     def statuses(self):
                         return {"fake-sid-refresh": self._status_val}
+                    def all_terms(self):
+                        return []     # _poll_live_status iterates this each tick
 
                 fake_term = _FakeTerm()
-                orig_focused = self._focused_terminal.__func__ if hasattr(self._focused_terminal, '__func__') else None
 
                 # --- Test 1: idle pane -> should inject /compact + submit ---
                 self._live = _FakeLive("idle")
