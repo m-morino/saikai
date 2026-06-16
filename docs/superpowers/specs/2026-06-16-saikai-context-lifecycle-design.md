@@ -199,9 +199,47 @@ resolves child -> parent.
 - Transcripts carry `cwd` in their early records (saikai already reads this as
   `origin_cwd`), so the "first-record cwd matches the pane" half of child detection is
   grounded.
-- **NOT yet live-timing-tested** (how soon the new transcript appears; the sibling-pane
-  race). Therefore b2's child detection MUST be falsifiable: snapshot the pre-existing
+- Therefore b2's child detection MUST be falsifiable: snapshot the pre-existing
   sids in the pane's project dir BEFORE `/clear`; bind the FIRST new sid whose
   first-record cwd matches the pane and whose ts post-dates the clear; on 0 or >=2
-  candidates, record NO lineage + toast (never guess). A real-pane `/clear` timing
-  check is the FIRST sub-step of the b2 implementation.
+  candidates, record NO lineage + toast (never guess).
+
+### Live timing spike — DONE 2026-06-17 (gate CONFIRMED positive)
+
+Method: a throwaway harness spawned a REAL `claude --session-id <parent>` in a
+`winpty` ConPTY exactly the way `AgentTerminal` does (stripping the parent
+session's `CLAUDE_*` env so the child boots standalone — esp.
+`CLAUDE_NO_SESSION_PERSISTENCE`, which otherwise suppresses the transcript),
+established one real turn, then injected `/clear` via the SAME path b2 will use
+(bracketed paste `ESC[200~/clear ESC[201~` + CR) and watched
+`~/.claude/projects/<enc>/`. N=4 `/clear` events in the real (already-populated)
+saikai project dir.
+
+- **Gate POSITIVE, live-confirmed.** Every `/clear` minted **exactly one** new
+  `<newsid>.jsonl` with a brand-new sid; the parent transcript was left untouched
+  (it is a NEW FILE, *not* a same-file reset / truncate).
+- **Child sid is usable as the key:** filename stem == the records' `sessionId`
+  field == a fresh UUID, all consistent. cwd matches the pane in every run
+  (`C:\Users\…\CLI\saikai`).
+- **cwd is NOT on the first record.** The child's record 1 is `{"type":"mode"}`
+  (sessionId only), record 2 `file-history-snapshot`; `cwd` (+ `timestamp` ISO8601
+  `…Z` UTC, `version`, `gitBranch`) first appears on the early `attachment`
+  records. The detector must scan the first ~several records for the first `cwd`
+  (same as saikai's existing `origin_cwd` read) — not just record 1.
+- **Latency:** the child transcript becomes visible ~**2.5–4 s** after the
+  effective `/clear` submit (measured 2.56 / 3.81 / 3.87 s; one early run ~4.9 s).
+  -> b2's detection window should be generous (~**8–10 s**) before giving up.
+- **Injection reliability:** bracketed-paste(`/clear`) + a **single** CR submits
+  reliably (3/3) **when a ~0.5 s settle separates the paste from the CR**. The
+  leading `/` opens the slash-command palette; a CR arriving before it settles was
+  absorbed once (0.4 s gap, 1 run) so the command did not run until a second CR.
+  -> b2: settle ~0.5 s between `paste_text("/clear")` and `submit()`, and
+  **defensively re-send one CR if no child sid appears within ~4 s** before
+  declaring detection failure (an extra CR on the fresh empty session is a no-op).
+- **Contamination is real (falsifiable detection is mandatory, not optional):**
+  exactly 1 new file per `/clear` in all runs, BUT unrelated new `*.jsonl` DO
+  appear in the same dir from other lifecycle events — a sibling pane's first turn,
+  or a session flushing its transcript on exit (observed: a killed spike session
+  wrote its transcript on shutdown). So the cwd-match + new-since-snapshot +
+  exactly-one guard (0 or >=2 -> record nothing + toast) is required to avoid
+  binding a sibling's sid.
