@@ -2917,6 +2917,43 @@ def _ram_per_pane_mb() -> float:
     return _cfg("limits", "per_pane_mb", "SAIKAI_CLAUDE_MB", 600.0, float)
 
 
+# Statusbar RAM indicator. The headroom ("~N fit") is the deductive precursor —
+# how many more panes fit before the gate trips, derived from _ram_fit. These add
+# a severity colour + a ⚠ to the system-load reading so the box "getting heavy" is
+# visible in the WARN band (approaching the gate) rather than only once it trips.
+_LOAD_COL = {"ok": "green", "warn": "yellow", "crit": "red"}
+
+
+def _load_severity(load, max_load) -> str:
+    """ok / warn / crit for the statusbar load reading. warn = the precursor band
+    (within 15 points of the gate); crit = at/over the gate. Pure."""
+    if load is None:
+        return "ok"
+    if load >= max_load:
+        return "crit"
+    if load >= max_load - 15.0:
+        return "warn"
+    return "ok"
+
+
+def _live_ram_segment(cnt, att, ms, fit, per_pane_mb, max_load) -> str:
+    """The statusbar 'Live' segment: pane count + saikai's ESTIMATED RAM share
+    (cnt x per-pane, so 'is saikai the cause of the slowdown?' is answerable at a
+    glance), a severity-coloured system-load reading (the heaviness precursor),
+    the ~fit headroom, and free RAM. Pure -> unit-testable."""
+    if ms is None or ms.avail_phys_mb is None:
+        return f"Live: {cnt}{att}"
+    est = cnt * per_pane_mb / 1024.0
+    fitcol = "green" if fit > 0 else "red"
+    load_str = ""
+    if ms.load is not None:
+        col = _LOAD_COL[_load_severity(ms.load, max_load)]
+        warn = "\N{WARNING SIGN} " if col != "green" else ""
+        load_str = f"  [{col}]{warn}{ms.load:.0f}% RAM[/{col}]"
+    return (f"Live: {cnt}~{est:.1f}G{att}{load_str}"
+            f"  [{fitcol}]~{fit} fit[/{fitcol}]  ({ms.avail_phys_mb / 1024:.1f}G free)")
+
+
 def _copy_to_host_clipboard(text: str) -> bool:
     """Copy `text` to the HOST OS clipboard via the platform clip tool, so the
     tokened mirror URL pastes cleanly. Returns True only on a clean exit, so the
@@ -4471,14 +4508,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     live_str = f"{sep}Live: {cnt}{_att}"
                 else:
                     per = _ram_per_pane_mb()
+                    _kw = _ram_gate_kwargs()
                     # 'fit' from the SAME gate math (commit/load/phys), not a raw
                     # free-RAM floor, so the indicator matches what the gate allows.
-                    fit, _ = _ram_fit(_ms, per, **_ram_gate_kwargs())
+                    fit, _ = _ram_fit(_ms, per, **_kw)
                     fit = min(fit, max(0, self._live.max_live - cnt))   # MAX_LIVE backstop
-                    _col = "green" if fit > 0 else "red"
-                    _load = f"{_ms.load:.0f}% load · " if _ms.load is not None else ""
-                    live_str = (f"{sep}Live: {cnt}{_att}  [{_col}]~{fit} fit[/{_col}]"
-                                f"  ({_load}{_ms.avail_phys_mb / 1024:.1f}GB free)")
+                    live_str = f"{sep}" + _live_ram_segment(
+                        cnt, _att, _ms, fit, per, float(_kw.get("max_load") or 85.0))
             # Search: when the on-demand bar is hidden, surface the active text
             # query (so a filtered list isn't mistaken for "sessions missing");
             # otherwise hint how to open it.
