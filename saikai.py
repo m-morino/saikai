@@ -3835,6 +3835,18 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return False
             return super().check_action(action, parameters)
 
+        def push_screen(self, *args, **kwargs):
+            # A pushed screen (rename / new / help / settings / mirror QR) takes
+            # over the keyboard. Clear any half-armed leader or quit-guard state:
+            # a PRIORITY binding can open a screen, and priority bindings bypass
+            # on_key (where these are normally resolved/disarmed), so without this
+            # an arm could dangle into the keystrokes after the screen closes (a
+            # later single Esc quitting, or a letter running a leader action).
+            self._leader_pending = False
+            if getattr(self, "_quit_armed", False):
+                self._disarm_quit()
+            return super().push_screen(*args, **kwargs)
+
         def on_mount(self) -> None:
             # sid -> session map so the preview pane can warm its own cache on
             # demand: rendered and cached on a cache miss.
@@ -5447,6 +5459,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             dead PTY."""
             if self._live is None:
                 return
+            # If the pane that just died was the FOCUSED one, focus is now stranded
+            # on the dead terminal (it stays mounted to show the final frame, and
+            # _focused_terminal() excludes dead panes), so every later keystroke is
+            # silently dropped until the user clicks / Enter / Ctrl+]. Capture that
+            # here (before forget()) and return focus to the list at the end — but
+            # ONLY when it WAS focused, so a BACKGROUND pane exiting never steals
+            # focus from the pane you are typing in.
+            _dead_t = self._live.get(sid)
+            _was_focused = _dead_t is not None and self.focused is _dead_t
             self._unread.discard(sid)   # a dead pane is no longer a live unread answer
             self._busy_seen.discard(sid)  # …nor owed a "done" toast
             try:
@@ -5467,6 +5488,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._opened_sids.discard(sid)
             self._save_open_panes()
             self._refresh_table()
+            if _was_focused:
+                try:
+                    self.query_one("#table", DataTable).focus()
+                except Exception:
+                    pass
 
         def on_agent_terminal_focus_released(self, event) -> None:
             """The terminal's Ctrl+] (SAIKAI_RELEASE_KEY) escape hatch: refocus the list."""
@@ -5490,6 +5516,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if cur != prev:
                     _log(f"[focus] {prev} -> {cur}")
                     self._last_focus_log = cur
+            except Exception:
+                pass
+            # A focus change while the leader is half-armed means the next key
+            # won't be the table's leader letter (focus moved to search / a pane /
+            # a dropdown) — clear it so the key types normally instead of leaking
+            # into a leader action. Priority bindings can move focus while
+            # bypassing on_key, where the leader is normally resolved.
+            try:
+                if getattr(self, "_leader_pending", False):
+                    if getattr(event, "widget", None) is not self.query_one("#table", DataTable):
+                        self._leader_pending = False
             except Exception:
                 pass
             # Catch up a list rebuild that _poll_live_status deferred while a pane

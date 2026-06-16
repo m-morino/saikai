@@ -1041,6 +1041,60 @@ def test_pilot_ctrlc_over_modal_does_not_quit():
     assert facts.get("screen_after") == "HelpScreen", f"Ctrl+C should leave Help open: {facts}"
 
 
+def test_pilot_quit_arm_cleared_when_a_screen_opens():
+    """Bug-hunt C2: arm the quit guard (one Esc on the list), then open a screen
+    via a PRIORITY binding (? -> Help). The priority binding bypasses on_key's
+    disarm, so the arm used to dangle — a single later Esc on the list then quit.
+    push_screen now clears the arm, so after the screen closes a single Esc only
+    re-arms (does not quit)."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_quit_arm_cleared_when_a_screen_opens (textual unavailable)")
+        return
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                orig_exit = self.exit
+                self.exit = lambda *a, **k: facts.__setitem__("quit", True)
+                self.action_quit_all = lambda: facts.__setitem__("quit", True)
+                await pilot.press("escape")            # arm the quit guard
+                await pilot.pause(0.05)
+                facts["armed"] = getattr(self, "_quit_armed", False)
+                await pilot.press("question_mark")     # priority binding -> push Help
+                await pilot.pause(0.1)
+                facts["armed_after_push"] = getattr(self, "_quit_armed", False)
+                facts["help"] = type(self.screen).__name__
+                await pilot.press("escape")            # dismiss Help
+                await pilot.pause(0.1)
+                await pilot.press("escape")            # single Esc on list -> must NOT quit
+                await pilot.pause(0.1)
+                facts["quit_fired"] = facts.get("quit", False)
+                self.exit = orig_exit                  # restore for clean teardown
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("armed"), f"first Esc should arm the quit guard: {facts}"
+    assert facts.get("help") == "HelpScreen", f"'?' should open Help: {facts}"
+    assert not facts.get("armed_after_push"), f"opening a screen must clear the quit arm: {facts}"
+    assert not facts.get("quit_fired"), f"single Esc after a screen closed must not quit: {facts}"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -1089,5 +1143,6 @@ if __name__ == "__main__":
     test_pilot_mirror_space_leader_runs_mnemonic()
     test_pilot_rename_modal_enter_saves_not_resumes()
     test_pilot_ctrlc_over_modal_does_not_quit()
+    test_pilot_quit_arm_cleared_when_a_screen_opens()
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("ALL PASS")
