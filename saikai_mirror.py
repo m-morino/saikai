@@ -809,6 +809,7 @@ kbBar.innerHTML =
     '<button data-k="shift+f3">Next!</button>'+
     '<button data-k="f10">Close</button>'+
     '<button data-k="f9">Copy</button>'+
+    '<button data-k="shift+f2">Rename</button>'+
     '<button data-k="shift+f4">Restore</button>'+
     '<button data-k="pageup">PgUp</button>'+
     '<button data-k="pagedown">PgDn</button>'+
