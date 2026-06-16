@@ -189,3 +189,19 @@ resolves child -> parent.
    `SAIKAI_CTX_WINDOW`.
 3. **`/clear` new-sid behaviour: a real-pane SPIKE is task zero of b2** — load-bearing;
    a negative result reshapes b2 + (c).
+
+## Spike findings (Task 10 — /clear new-sid)
+
+- **DECISION GATE: PASSED (positive).** Official Claude Code docs (verified via the
+  claude-code-guide): `/clear` mints a NEW session-id and a NEW transcript file under
+  `~/.claude/projects/<enc>/`; the prior session is kept (shows in `/resume`); sessions
+  are independent. So `/clear`-in-place + newest-transcript child detection IS viable.
+- Transcripts carry `cwd` in their early records (saikai already reads this as
+  `origin_cwd`), so the "first-record cwd matches the pane" half of child detection is
+  grounded.
+- **NOT yet live-timing-tested** (how soon the new transcript appears; the sibling-pane
+  race). Therefore b2's child detection MUST be falsifiable: snapshot the pre-existing
+  sids in the pane's project dir BEFORE `/clear`; bind the FIRST new sid whose
+  first-record cwd matches the pane and whose ts post-dates the clear; on 0 or >=2
+  candidates, record NO lineage + toast (never guess). A real-pane `/clear` timing
+  check is the FIRST sub-step of the b2 implementation.
