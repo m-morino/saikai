@@ -3861,6 +3861,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # never a browser button.
             Binding("shift+f12", "toggle_mirror_control", "Mirror control",
                     id="mirror_control", show=False, priority=True),
+            # Phase C: jump to the session this one was forked/cleared from.
+            # priority=True so it fires even while a live pane is focused.
+            Binding("shift+f6", "open_parent", "Parent", id="open_parent",
+                    show=False, priority=True),
         ]
         # The practical limit on concurrent live claude panes is MEMORY — each
         # is a full node process tree that sits CPU-idle waiting for input — so
@@ -3977,7 +3981,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             "freeze_pane", "restore_panes", "toggle_preview", "help",
             "close_live", "close_all_live", "prev_tab", "next_tab",
             "next_attention", "toggle_list", "rename", "shrink_list",
-            "grow_list", "notifications",
+            "grow_list", "notifications", "open_parent",
         })
 
         def check_action(self, action: str, parameters):
@@ -6614,6 +6618,23 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             else:
                 self.notify("Mirror control OFF (read-only)",
                             title="saikai mirror", timeout=4)
+
+        def action_open_parent(self) -> None:
+            """Shift+F6 — jump to the session this one was forked/cleared from
+            (lineage recovery). No-op + toast when there is no recorded parent
+            or the parent is not in the current session index."""
+            sid = self._cursor_sid()
+            rec = _load_lineage().get(sid or "")
+            parent = rec.get("parent") if rec else None
+            if not parent or parent not in self._sid_index:
+                self.notify("no parent session recorded", timeout=3)
+                return
+            try:
+                table = self.query_one("#table", DataTable)
+                row = table.get_row_index(parent)
+                table.move_cursor(row=row)
+            except Exception:
+                self.notify("could not open parent", severity="error", timeout=4)
 
         def action_help(self) -> None:
             # '?' is a priority binding; don't pop the help modal over a focused

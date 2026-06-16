@@ -1189,6 +1189,59 @@ def test_pilot_quit_arm_cleared_when_a_screen_opens():
     assert not facts.get("quit_fired"), f"single Esc after a screen closed must not quit: {facts}"
 
 
+def test_pilot_open_parent():
+    """Shift+F6 (open_parent) jumps the cursor to the session recorded as the
+    parent of the currently-selected child session via _set_lineage."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_open_parent (textual unavailable)"); return
+    import asyncio
+    from textual.app import App
+
+    # Write two demo sessions: child and parent.
+    parent_sid = _write_demo_session()
+    child_sid = _write_demo_session()
+    # Record lineage: child -> parent.
+    pdir = _FAKE_HOME / ".claude" / "projects" / "-home-alex-code-demo"
+    parent_jsonl = str(pdir / f"{parent_sid}.jsonl")
+    saikai._set_lineage(child_sid, parent_sid, parent_jsonl)
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                # Move cursor to the child row.
+                table = self.query_one("#table")
+                try:
+                    table.move_cursor(row=table.get_row_index(child_sid))
+                except Exception as e:
+                    facts["setup_error"] = repr(e)
+                    return
+                await pilot.pause(0.1)
+                facts["cursor_before"] = self._cursor_sid()
+                # Invoke open_parent action.
+                await pilot.app.run_action("open_parent")
+                await pilot.pause(0.2)
+                facts["cursor_after"] = self._cursor_sid()
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("cursor_before") == child_sid, \
+        f"cursor should start on child: {facts}"
+    assert facts.get("cursor_after") == parent_sid, \
+        f"open_parent should jump to parent sid: {facts}"
+
+
 def test_pilot_ctx_gauge_in_statusbar():
     """A focused live pane shows a ctx gauge in the statusbar from the transcript's
     usage block. (Stubs a live pane + sid_index entry; no real claude.)"""
@@ -1276,6 +1329,8 @@ if __name__ == "__main__":
     test_pilot_esc_in_search_clears_filter()
     test_pilot_notification_center_records_and_opens()
     test_pilot_ctx_gauge_in_statusbar()
+    test_pilot_open_parent()
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("PASS test_pilot_ctx_gauge_in_statusbar")
+    print("PASS test_pilot_open_parent")
     print("ALL PASS")
