@@ -8,8 +8,9 @@
 
 **English** | [日本語](https://github.com/m-morino/saikai/blob/master/README.ja.md)
 
-> **Mission control for Claude Code.** Every session across every repo, in one
-> screen — find it, resume it live, and see which ones need you.
+> **Mission control for every Claude Code session** — every session across every
+> repo as a live pane, instant switching, grouped by what needs you. **And the
+> dreaded reset of a session that's grown bloated and dumb is now one safe keystroke.**
 
 ![saikai demo](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-demo.gif)
 
@@ -17,16 +18,30 @@
 deterministic UI recording; see [the recording guide](https://github.com/m-morino/saikai/blob/master/docs/demo-recording.md)
 for how public recordings are isolated and audited.</sub>
 
-saikai brings every Claude Code session — across all your repositories and
-worktrees — into one screen. Search by what you remember, resume any session
-live in a pane beside the list, and see at a glance which ones are working,
-waiting, or finished and awaiting your reply. It reads Claude's own transcript
-files directly — no daemon, no database.
+saikai is keyboard-first mission control for all your Claude Code sessions. Run
+many as live `claude` panes, switch between them instantly, and group/sort them
+by status — working `~`, waiting for you `?`, finished and awaiting your reply
+`!` — so you always know which one needs a human. Find and resume any session
+across every repo and worktree. It reads Claude's own transcript files directly
+— no daemon, no database.
 
 ```bash
 uv tool install saikai
 saikai
 ```
+
+**The bloated-session problem.** A long session quietly fills its context window
+and gets dumber — but the fix is a chore: reset, and you re-explain everything,
+so you ride auto-compact on a degraded session instead. saikai surfaces the
+problem and makes the fix trivial. Every live pane shows its **real** context
+fill read straight from the transcript — `ctx 662K/1.0M (66%)`, green → yellow →
+red — so you can see *which* session has grown heavy. Then **`Shift+F11`** drops
+a `/compact` in place for everyday leanness, and **`Space` `c`** (Checkpoint)
+does the full, safe reset: saikai has the session write a handoff, shows you the
+paste-ready `NEW SESSION PROMPT` to approve, and only on your **Enter** clears +
+reseeds a fresh, lean session — with **`Shift+F6`** to jump back to the parent.
+It never `/clear`s on its own. (Claude owns the context window; saikai surfaces
+the fill and drives the standard commands.)
 
 #### Why not just `claude --resume`?
 
@@ -47,19 +62,28 @@ live pane, no reply due · `@` open elsewhere · `+` active · `.` recent · `*`
 
 ## Features
 
-- Browse Claude Code history across repositories and worktrees, then resume
-  from the cwd where the session started.
-- Run several real `claude` sessions in split-live tabs; `~`, `?`, and `!`
-  show working, waiting, and finished at a glance.
-- Quit without losing your open panes; reopen the same set later with `Shift+F4`.
-- Preview transcripts, compare changes, reuse prompts, and follow inferred
-  parent/child session chains.
-- Reads Claude's own transcript files directly — no daemon, no database;
-  AI summaries are opt-in.
-- Mirror the live UI to your phone or another browser over the LAN (opt-in,
-  token-authenticated, read-only by default). Flip on control with `Shift+F12`
-  to drive saikai — and claude in a pane — from the browser: tap, scroll, an
-  on-screen key bar, and full terminal-equivalent physical-keyboard input.
+- **Every session, one screen.** Browse and search Claude Code history across all
+  your repositories and worktrees, then resume from the cwd where each session
+  started.
+- **Live panes, instant switching.** Run several real `claude` sessions in
+  split-live tabs and move between them with a keystroke.
+- **Status at a glance — and jump to what needs you.** `~` working · `?` waiting ·
+  `!` finished and awaiting your reply; group/sort by it and hop straight to the
+  next pane that needs a human.
+- **Quit without losing your panes.** Reopen the same working set later with
+  `Shift+F4`. No daemon, no database — it reads Claude's own transcripts (AI
+  summaries are opt-in).
+- **Preview, diff, reuse, and trace.** Preview transcripts, compare changes,
+  reuse prompts, and follow inferred parent/child session chains.
+- **★ See which session is bloated — and reset it safely in one keystroke.** Each
+  pane shows its real token count from the transcript (`ctx 662K/1.0M (66%)`, not
+  a `chars/4` guess), coloured green/yellow/red. `Shift+F11` injects `/compact` in
+  place; **Checkpoint** (`Space` `c`) has the session write a handoff, shows you
+  the exact reseed prompt to approve, then on your Enter clears + reseeds a fresh,
+  lean session (marking the row `↻` while it works) — `Shift+F6` jumps back to the
+  parent.
+- **Mirror to your phone / another browser** (opt-in, token-authenticated,
+  read-only by default) — see [Web mirror](#web-mirror-opt-in) below.
 
 ## Who it is for
 
