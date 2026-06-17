@@ -67,6 +67,40 @@ python scripts/record_demo.py --record-real --root /home/demo/saikai-demo \
 - **Show:** focus jumping straight to the `?`/`!` pane, skipping idle ones.
 - **Caption:** *"Jump only to the sessions that actually need a human."*
 
+### A5b — See which session is bloated (the context gauge)
+- **Action:** focus a pane that has accumulated a lot of context (seed a
+  high-context session in the fixture for this); read its statusbar gauge.
+- **Show:** the gauge in **red**, e.g. `ctx 712K/1.0M (71%)`; a leaner pane reads
+  green. `/context` is per-session — saikai shows every pane's fill at once.
+- **Caption:** *"Real context fill per pane, from the transcript — see which
+  session is bloated and getting dumber."*
+
+### A5c — One-key /compact (the everyday stay-lean)
+- **Action:** on the bloated pane, `Shift+F11`.
+- **Show:** `/compact` injected in place; the gauge drops and recolours toward green.
+- **Caption:** *"Shift+F11 = /compact in place — the everyday way to stay lean."*
+
+### A5d — Checkpoint: reset on purpose, safely (the standout)
+- **Action:** leader `Space` then `c`. Let the handoff turn run (the row shows
+  `↻`); the confirm modal appears with the extracted `NEW SESSION PROMPT`. **Pause
+  on it.** Press `Enter`.
+- **Show:** saikai never types `/clear` until your Enter; then `/clear` runs and the
+  pane reseeds a fresh, lean session (gauge → green).
+- **Caption:** *"Checkpoint: it writes a handoff, shows you the reseed prompt, and
+  only on your Enter clears + restarts lean. It never /clears on its own."*
+
+### A5e — Jump back to the parent (recovery)
+- **Action:** `Shift+F6`.
+- **Show:** the cursor moves to / opens the pre-clear parent session — still intact.
+- **Caption:** *"Missed a detail in the lean handoff? Shift+F6 → back to the old session."*
+
+> **Recording note for A5b–A5e:** the fixture needs a high-context seeded session so
+> the gauge reads red, and the pane must run the real Checkpoint flow (handoff →
+> `NEW SESSION PROMPT` → `/clear` → reseed). `scripts/mock_claude.py` doesn't
+> reproduce that flow today, so record this cluster with **real Claude Code** in the
+> isolated environment (or extend the mock to emit a fenced `NEW SESSION PROMPT` and
+> honour `/clear`).
+
 ### A6 — The command menu (which-key)
 - **Action:** press `Space` and **pause** ~1 s so the grouped menu appears; then
   `t` (tree) to show inferred parent/child chains, then `Space d` (diff) on a
@@ -164,6 +198,10 @@ End Segment B on the phone showing the live list with `CONTROL OFF`.
 | Resume from the original cwd | A3 |
 | Several real `claude` in split-live; `~ ? !` at a glance | A3, A4 |
 | Jump to what needs attention | A5 |
+| Real per-pane context gauge (which session is bloated) | A5b |
+| One-key /compact (stay lean) | A5c |
+| Checkpoint: human-gated /clear + reseed lean (the standout) | A5d |
+| Jump back to the parent after a checkpoint (recovery) | A5e |
 | Command menu (which-key), history, diff, tree, prompt reuse | A6 |
 | New session in any folder/worktree | A7 |
 | Quit + restore the working set; no daemon/database | A8 |

@@ -134,20 +134,49 @@ agg /home/demo/saikai-demo/saikai-real.cast \
 
 ## Hero storyboard
 
-Keep the hero to 25-35 seconds. It should make one claim, not tour every
-feature:
+Keep the hero to ≈30 s. Establish **what saikai is** in the first few seconds
+(so the standout has context), then land the one standout — the safe, one-key
+reset of a bloated session. One theme, two beats; do not tour every feature.
 
-1. Open on many sessions across projects. Do not begin with help or a menu.
-2. Search for a remembered phrase from the target conversation.
-3. Pause briefly on the cross-project result and its project/title color.
-4. Press Enter. Real Claude Code resumes in the correct fictional cwd.
-5. Ask Claude to fix the failing test and run the suite; show genuine tool
-   activity.
-6. Return to the list as a background pane changes to `!` or `?`.
-7. Use next-attention to jump directly to it.
-8. End on: **Find it. Resume it. Know what needs you.**
+**Beat 1 — identity (≈0–10 s): mission control for your Claude Code fleet.**
 
-Do not spend hero time on favorites, the command menu, Settings, or every key.
+1. Open on many sessions across projects (`saikai --all`), with a couple already
+   running as live panes. Do not begin with help or a menu.
+2. Flip between two live panes (`F3`/`F2`); show the status markers `~` working /
+   `?` waiting / `!` finished-needs-you, grouped/sorted by status.
+3. Next-attention (`Shift+F3`) jumps straight to the pane that needs you.
+   Caption: **"Every Claude Code session, across every repo — live, grouped by
+   what needs you."**
+
+**Beat 2 — the standout (≈10–28 s): spot the bloated one, reset it safely in one key.**
+
+4. Focus a pane whose statusbar gauge is **red** — e.g. `ctx 712K/1.0M (71%)`.
+   Caption: **"Real context fill per pane — straight from the transcript. This one's
+   bloated and getting dumber."**
+5. *(optional, cut if tight)* `Shift+F11` injects `/compact`; the gauge drops and
+   recolours toward green. Caption: **"Shift+F11 = one-key /compact."**
+6. Leader `Space` then `c` (Checkpoint). Show the row's `↻` marker, then the
+   confirm modal with the extracted `NEW SESSION PROMPT`. **Hold here — the trust
+   beat.** Caption: **"It shows you the new prompt before anything clears. You decide."**
+7. Press `Enter`: `/clear` runs, the pane reseeds lean, the gauge goes green.
+   Caption: **"Enter → /clear → fresh, lean session, auto-seeded."**
+8. Press `Shift+F6`: the parent (pre-clear) session is still there.
+   Caption: **"Shift+F6 → back to the old session if you need it. Nothing lost."**
+9. End on: **See what's bloated. Reset it in one key. Resume lean — safely.**
+
+Money-shot still (for the social/OG card): the split view with the status-grouped
+list on the left **and** a red-gauge pane with the Checkpoint modal open over it —
+identity + standout in one frame.
+
+**Recording prerequisites for Beat 2 (note for whoever records):** the fixture must
+seed a **high-context** session so the gauge reads red, and the pane must be able to
+run the Checkpoint flow (handoff turn → `NEW SESSION PROMPT` → `/clear` → reseed).
+`scripts/mock_claude.py` does not reproduce that flow today, so Beat 2 needs **real
+Claude Code in the isolated environment** (or a `mock_claude.py` extension that emits
+a fenced `NEW SESSION PROMPT` and honours `/clear`). Beat 1 records as before.
+
+Do not spend hero time on favorites, the command menu, Settings, the web mirror,
+or every key.
 
 ## Secondary clips
 
