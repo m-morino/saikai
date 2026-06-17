@@ -5116,7 +5116,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # Context-fill gauge for the FOCUSED live pane (ground-truth tokens).
                 _ft = self._focused_terminal()
                 if _ft is not None:
-                    _jp = (self._sid_index.get(getattr(_ft, "sid", None)) or {}).get("jsonl_path")
+                    # A b2 checkpoint re-points the RUNNING pane at the fresh child
+                    # session (same PTY, new sid minted on /clear), so prefer that
+                    # transcript — otherwise the gauge keeps reading the frozen
+                    # parent and stays red after a successful lean reset.
+                    _jp = (getattr(_ft, "_live_jsonl", None)
+                           or (self._sid_index.get(getattr(_ft, "sid", None)) or {}).get("jsonl_path"))
                     if _jp:
                         _tok = _ctx_tokens_from_jsonl(_jp)
                         if _tok is not None:
@@ -7379,6 +7384,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self._b2_finish(f"checkpoint reseeded, but lineage write failed: {e}",
                                     "warning")
                     return
+                # The running pane IS the child now (same PTY, new sid after
+                # /clear). Point its gauge at the child transcript so it reflects
+                # the lean reseed IN PLACE instead of the frozen parent. (The pane's
+                # _live/list identity still keys on the launch sid — a deeper re-key
+                # is a separate change; this fixes the user-visible gauge.)
+                try:
+                    from pathlib import Path as _P
+                    term._live_jsonl = str(_P(b2["project_dir"]) / f"{b2['child']}.jsonl")
+                except Exception:
+                    pass
                 self._b2_finish("checkpoint done — fresh session reseeded "
                                 "(Shift+F6 jumps back to the parent)")
                 return

@@ -1553,6 +1553,7 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
 
                 facts["events_final"] = list(fake_term.events)
                 facts["lineage"] = saikai._load_lineage().get(child_sid)
+                facts["live_jsonl"] = getattr(fake_term, "_live_jsonl", None)
 
                 # --- Esc (cancel) path: a SECOND checkpoint, dismissed at the
                 # confirm modal with Esc, must leave the session UNTOUCHED (no
@@ -1614,6 +1615,10 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
     lin = facts.get("lineage")
     assert lin and lin.get("parent") == parent_sid, f"lineage child->parent not recorded: {facts}"
     assert lin.get("parent_jsonl") == str(parent_jsonl), facts
+    # After /clear the running pane IS the child — its gauge must re-point at the
+    # child transcript (not stay on the frozen parent), so it reads lean in place.
+    assert facts.get("live_jsonl") == str(pdir / f"{child_sid}.jsonl"), \
+        f"pane gauge not re-pointed at the child transcript: {facts}"
     # Esc (cancel) path: modal shown, Esc dismissed it, machine torn down, and
     # crucially NO /clear injected — cancelling leaves the session untouched.
     assert facts.get("esc_modal_shown") == "ConfirmRefreshScreen", \
