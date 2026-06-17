@@ -4852,6 +4852,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     raw_title = _ANSI_RE.sub("", tree_prefixes[s["id"]]) + raw_title
                 if s["id"] in getattr(self, "_marked", ()):
                     raw_title = "▣ " + raw_title       # batch-launch selection (Space)
+                if s["id"] == (getattr(self, "_b2", None) or {}).get("sid"):
+                    raw_title = "↻ " + raw_title       # b2 checkpoint in progress on this session
                 _tstyle = _title_color.get(_color_key_for(s, _color_by), "")  # [display] color_by
                 if narrow:
                     # marker · relative-Last · title (title tinted per color_by).
@@ -7053,6 +7055,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # _b2_finish). 0.3s matches the spike's settle granularity.
             self._b2_timer = self.set_interval(0.3, self._b2_tick)
             self.notify("checkpoint: drafting the handoff…", timeout=4)
+            self._refresh_table()      # show the ↻ checkpoint marker on the row now
 
         def _b2_finish(self, msg=None, severity="information") -> None:
             """Tear down the b2 machine: stop the interval, drop state, optional
@@ -7064,7 +7067,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
                 self._b2_timer = None
+            had_state = self._b2 is not None
             self._b2 = None
+            if had_state:
+                self._refresh_table()  # clear the ↻ checkpoint marker from the row
             if msg:
                 self.notify(msg, severity=severity, timeout=5)
 

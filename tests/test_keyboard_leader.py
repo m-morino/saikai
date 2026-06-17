@@ -1664,6 +1664,55 @@ def test_pilot_refresh_preserves_scroll_position():
         f"after={facts['after']})"
 
 
+def test_pilot_checkpoint_marker_on_row():
+    """While a b2 checkpoint is in flight, the target session's list row is
+    prefixed with ↻ so you can see WHICH session is being checkpointed; the marker
+    clears when the flow ends (driven by _do_refresh_table off self._b2)."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_checkpoint_marker_on_row (textual unavailable)")
+        return
+    import asyncio
+    from textual.app import App
+    sid = _write_demo_session()
+    facts: dict = {}
+
+    def _title(table, key):
+        try:
+            return str(table.get_row(key)[-1])
+        except Exception as e:  # noqa: BLE001
+            return f"<err {e!r}>"
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(120, 24)) as pilot:
+                await pilot.pause(0.4)
+                table = self.query_one("#table")
+                facts["before"] = _title(table, sid)
+                self._b2 = {"sid": sid}        # simulate a checkpoint in flight
+                self._refresh_table()
+                await pilot.pause(0.05)
+                facts["during"] = _title(table, sid)
+                self._b2 = None                # flow ended
+                self._refresh_table()
+                await pilot.pause(0.05)
+                facts["after"] = _title(table, sid)
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+    assert "↻" not in facts.get("before", ""), f"no marker before a checkpoint: {facts}"
+    assert "↻" in facts.get("during", ""), f"↻ marker must show during a checkpoint: {facts}"
+    assert "↻" not in facts.get("after", ""), f"marker must clear after: {facts}"
+
+
 def test_pilot_filter_engaged_window_survives_focus_move():
     """Filtering must not switch the foreground live pane out from under the user.
     The post-filter RowHighlighted is queued (the rebuild is call_after_refresh'd),
@@ -1767,6 +1816,7 @@ if __name__ == "__main__":
     test_pilot_checkpoint_gated_clear_and_lineage()
     test_pilot_refresh_preserves_scroll_position()
     test_pilot_filter_engaged_window_survives_focus_move()
+    test_pilot_checkpoint_marker_on_row()
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("PASS test_pilot_ctx_gauge_in_statusbar")
     print("PASS test_pilot_open_parent")
@@ -1774,4 +1824,5 @@ if __name__ == "__main__":
     print("PASS test_pilot_checkpoint_gated_clear_and_lineage")
     print("PASS test_pilot_refresh_preserves_scroll_position")
     print("PASS test_pilot_filter_engaged_window_survives_focus_move")
+    print("PASS test_pilot_checkpoint_marker_on_row")
     print("ALL PASS")
