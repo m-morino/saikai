@@ -7002,7 +7002,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         _B2_DETECT_TICKS = 34          # ~10s at 0.3s/tick: child sid visible in 2.5-4s
         _B2_SETTLE_TICKS = 2           # let a just-injected turn register as busy
         _B2_CLEAR_SETTLE_TICKS = 2     # ~0.6s between /clear paste and its CR (spike #5)
-        _B2_HANDOFF_IDLE_TICKS = 200   # ~60s ceiling for a /handoff to finish
+        _B2_HANDOFF_IDLE_TICKS = 1000  # ~5min ceiling for the handoff turn to finish
+                                       # (b2's use case is a GROWN session, where
+                                       # summarising into a NEW SESSION PROMPT — with
+                                       # thinking — easily exceeds a minute; only a
+                                       # true hang should hit this, and a dead pane
+                                       # is caught separately)
 
         def action_checkpoint(self) -> None:
             """Leader ␣c — start the human-gated checkpoint flow on the target live
@@ -7094,14 +7099,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
             if st == "await_handoff_idle":
                 # Give the turn a couple ticks to register as busy, then wait for it
-                # to settle back to idle (or the pane to die). A ceiling avoids
-                # waiting forever if /handoff stalls.
+                # to settle back to idle (or the pane to die). idle_wait accrues only
+                # while the pane is busy/waiting (idle exits below), so the ceiling
+                # bounds how long the handoff turn may run before we give up.
                 if b2["ticks"] > 0:
                     b2["ticks"] -= 1
                     return
                 b2["idle_wait"] = b2.get("idle_wait", 0) + 1
                 if b2["idle_wait"] > self._B2_HANDOFF_IDLE_TICKS:
-                    self._b2_finish("checkpoint aborted — /handoff did not finish",
+                    self._b2_finish("checkpoint aborted — the handoff didn't finish in time",
                                     "warning")
                     return
                 status = (self._live.statuses().get(b2["sid"])
