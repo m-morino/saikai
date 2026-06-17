@@ -7241,6 +7241,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self._b2_finish("checkpoint aborted — the handoff didn't finish in time",
                                     "warning")
                     return
+                # Keep the TARGET's status fresh from ITS OWN screen each tick rather
+                # than depending on the 1.5s poll (which is deferred while another pane
+                # is focused). This makes the wait focus-INDEPENDENT: switching away
+                # from the checkpointed session never stalls or "times out" the
+                # machine — it tracks b2["sid"], not whatever is focused now.
+                if term is not None:
+                    try:
+                        term.refresh_status()
+                        self._live.set_status(b2["sid"], getattr(term, "_status", ""))
+                    except Exception:
+                        pass
                 status = (self._live.statuses().get(b2["sid"])
                           if self._live else None)
                 if status in ("busy", "waiting"):

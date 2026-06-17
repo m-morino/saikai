@@ -1488,6 +1488,12 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
                 await pilot.app.run_action("checkpoint")
                 await pilot.pause(0.05)
                 facts["started"] = getattr(self, "_b2", None) is not None
+                # The user immediately navigates AWAY from the checkpointed session
+                # (focus leaves it). The machine must NOT stall/timeout — it tracks
+                # the captured b2["sid"]/term, not the focused pane. Simulate that by
+                # dropping the focused-terminal; the rest of the flow must still
+                # reach the modal, /clear after confirm, and record lineage.
+                self._focused_terminal = lambda: None
 
                 # Drive up to the confirm modal. Handoff is injected; /clear is NOT.
                 reached = drive_until("confirm")
@@ -1552,6 +1558,10 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
                 # confirm modal with Esc, must leave the session UNTOUCHED (no
                 # /clear injected) and tear the machine down — the other half of
                 # the human-gate safety contract (Enter=proceed was asserted above).
+                # Re-focus the pane so this second checkpoint can RESOLVE its target
+                # (starting needs a focused/cursor live pane; the de-focus above was
+                # to prove the RUNNING machine doesn't stall, which it didn't).
+                self._focused_terminal = lambda: fake_term
                 fake_term.events.clear()
                 await pilot.app.run_action("checkpoint")
                 await pilot.pause(0.05)
