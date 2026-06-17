@@ -388,6 +388,35 @@ def test_set_status_ignores_forgotten_sid():
     assert "sidA" not in mgr.statuses(), "forgotten sid resurrected as a ghost"
 
 
+def test_rekey_moves_term_status_and_pane_id():
+    """After /clear the SAME live pane becomes the CHILD session, so the manager
+    must re-key it parent->child: the term, the status, AND the TabPane DOM id
+    string all move under the new sid. The pane_id must stay the ORIGINAL
+    'tab-live-{parent}' (Textual sets a TabPane's DOM id at mount and it cannot
+    change at runtime — the pane keeps its id but is now found under the child),
+    while an UNREGISTERED sid still falls back to the 'tab-live-{sid}' default."""
+    mgr = rt.LiveSessionManager()
+    term = object()
+    mgr.register("parent", term)
+    assert mgr.pane_id("parent") == "tab-live-parent"
+    mgr.set_status("parent", "idle")
+
+    mgr.rekey("parent", "child")
+    assert mgr.has("child") and not mgr.has("parent"), "term not moved parent->child"
+    assert mgr.get("child") is term, "the SAME term must follow the child sid"
+    assert mgr.status("child") == "idle" and mgr.status("parent") == "", "status not moved"
+    # The TabPane's DOM id can't change at runtime: the child REUSES the parent's
+    # existing 'tab-live-parent' id, just looked up under the child sid now.
+    assert mgr.pane_id("child") == "tab-live-parent", "pane_id string must follow the re-key"
+    # An unregistered sid still derives the deterministic default.
+    assert mgr.pane_id("never-seen") == "tab-live-never-seen", "default pane_id broke"
+    # No-ops: same sid, or an absent old sid, must not raise or fabricate entries.
+    mgr.rekey("child", "child")
+    assert mgr.has("child") and mgr.pane_id("child") == "tab-live-parent"
+    mgr.rekey("ghost", "ghost2")
+    assert not mgr.has("ghost2")
+
+
 def test_note_reap_prunes_finished_threads():
     """note_reap drops already-finished reaps so _reaps can't grow unbounded over
     open/close pane churn — while still tracking in-flight ones. This does NOT
@@ -781,6 +810,8 @@ if __name__ == "__main__":
     print("PASS test_copy_text_skips_pbcopy_on_macos_over_ssh")
     test_set_status_ignores_forgotten_sid()
     print("PASS test_set_status_ignores_forgotten_sid")
+    test_rekey_moves_term_status_and_pane_id()
+    print("PASS test_rekey_moves_term_status_and_pane_id")
     test_note_reap_prunes_finished_threads()
     print("PASS test_note_reap_prunes_finished_threads")
     test_kitty_keyboard_csi_u_is_scrubbed()

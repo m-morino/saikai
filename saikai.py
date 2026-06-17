@@ -7385,15 +7385,52 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                     "warning")
                     return
                 # The running pane IS the child now (same PTY, new sid after
-                # /clear). Point its gauge at the child transcript so it reflects
-                # the lean reseed IN PLACE instead of the frozen parent. (The pane's
-                # _live/list identity still keys on the launch sid — a deeper re-key
-                # is a separate change; this fixes the user-visible gauge.)
+                # /clear) — so re-key the pane's whole identity parent->child, not
+                # just its gauge. Without this the pane stays keyed by the PARENT
+                # sid and: restore (_save_open_panes) resumes the frozen parent and
+                # drops the lean child; Shift+F6 from the pane can't find the parent
+                # (it's parent-keyed, so _load_lineage().get(parent) is None);
+                # re-opening the child row spawns a 2nd `claude --resume child`; and
+                # the list marks the FROZEN parent row live. All of it is pure UI-
+                # thread dict work here (no PTY write / lock / marshal / close).
+                from pathlib import Path as _P
+                parent_sid, child_sid = b2["sid"], b2["child"]
+                child_jsonl = _P(b2["project_dir"]) / f"{child_sid}.jsonl"
                 try:
-                    from pathlib import Path as _P
-                    term._live_jsonl = str(_P(b2["project_dir"]) / f"{b2['child']}.jsonl")
+                    self._live.rekey(parent_sid, child_sid)
                 except Exception:
                     pass
+                try:
+                    term.sid = child_sid
+                except Exception:
+                    pass
+                # The gauge override is now redundant (term.sid == child and the
+                # child's _sid_index jsonl is the child transcript) but harmless;
+                # keep it so the gauge re-points even if the rescan lags.
+                try:
+                    term._live_jsonl = str(child_jsonl)
+                except Exception:
+                    pass
+                # Inject an interim child session so the list / status / Shift+F6
+                # resolve BEFORE the next rescan converges. The parent stays in the
+                # index as a real historical session (it now has its own transcript).
+                try:
+                    s_par = self._sid_index.get(parent_sid) or {}
+                    title = (s_par.get("ai_title") or s_par.get("summary")
+                             or _P(b2["pane_cwd"]).name or child_sid[:8])
+                    stub = _new_session_stub(child_sid, b2["pane_cwd"], title)
+                    stub["jsonl_path"] = child_jsonl
+                    self._sid_index[child_sid] = stub
+                except Exception:
+                    pass
+                # Restore must follow the session: drop the parent, add the child.
+                try:
+                    self._opened_sids.discard(parent_sid)
+                    self._opened_sids.add(child_sid)
+                    self._save_open_panes()
+                except Exception:
+                    pass
+                self._b2_mark_dirty()      # focus-safe list repaint for the re-key
                 self._b2_finish("checkpoint done — fresh session reseeded "
                                 "(Shift+F6 jumps back to the parent)")
                 return

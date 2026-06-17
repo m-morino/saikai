@@ -1441,26 +1441,39 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
                     # Implements the slice of LiveSessionManager the running app's
                     # background _poll_live_status / _restat_live touch (they fire
                     # on a 1.5s interval while this test spans several pauses).
+                    # Backed by REAL dicts (not a hard-coded parent_sid) so the b2
+                    # record_lineage re-key is observable: after the checkpoint the
+                    # pane must be found under the CHILD sid, not the parent.
                     def __init__(self, status_val):
-                        self._status_val = status_val
+                        self._terms = {parent_sid: fake_term}
+                        self._status = {parent_sid: status_val}
+                        self._pane_ids = {parent_sid: f"tab-live-{parent_sid}"}
                     def statuses(self):
-                        return {parent_sid: self._status_val}
+                        return dict(self._status)
                     def all_terms(self):
-                        return []
+                        return list(self._terms.values())
                     def get(self, sid):
-                        return fake_term if sid == parent_sid else None
+                        return self._terms.get(sid)
                     def has(self, sid):
-                        return sid == parent_sid
-                    @staticmethod
-                    def pane_id(sid):
-                        return f"tab-live-{sid}"
+                        return sid in self._terms
+                    def pane_id(self, sid):
+                        return self._pane_ids.get(sid) or f"tab-live-{sid}"
                     def set_status(self, sid, status):
-                        pass
+                        if sid in self._terms:
+                            self._status[sid] = status
                     def status(self, sid):
-                        return self._status_val if sid == parent_sid else ""
+                        return self._status.get(sid, "")
+                    def rekey(self, old_sid, new_sid):
+                        if old_sid == new_sid or old_sid not in self._terms:
+                            return
+                        self._terms[new_sid] = self._terms.pop(old_sid)
+                        if old_sid in self._status:
+                            self._status[new_sid] = self._status.pop(old_sid)
+                        if old_sid in self._pane_ids:
+                            self._pane_ids[new_sid] = self._pane_ids.pop(old_sid)
                     @property
                     def count(self):
-                        return 1
+                        return len(self._terms)
 
                 fake_term = _FakeTerm()
                 self._live = _FakeLive("idle")
@@ -1471,6 +1484,10 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
                     "id": parent_sid, "jsonl_path": parent_jsonl,
                     "cwd": pane_cwd, "origin_cwd": pane_cwd,
                 }
+                # The pane was opened under the PARENT sid, so restore currently
+                # targets the parent. After the checkpoint re-keys the pane to the
+                # child, _opened_sids must point at the child instead (harm #1).
+                self._opened_sids.add(parent_sid)
 
                 def drive_until(state, cap=40):
                     """Advance the tick machine until it reaches `state` (or the
@@ -1554,6 +1571,15 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
                 facts["events_final"] = list(fake_term.events)
                 facts["lineage"] = saikai._load_lineage().get(child_sid)
                 facts["live_jsonl"] = getattr(fake_term, "_live_jsonl", None)
+                # --- re-key facts: after the checkpoint the SAME pane IS the child.
+                facts["opened_has_child"] = child_sid in self._opened_sids
+                facts["opened_has_parent"] = parent_sid in self._opened_sids
+                facts["live_has_child"] = self._live.has(child_sid)
+                facts["live_has_parent"] = self._live.has(parent_sid)
+                facts["term_sid"] = getattr(fake_term, "sid", None)
+                facts["child_in_sid_index"] = child_sid in self._sid_index
+                facts["parent_in_sid_index"] = parent_sid in self._sid_index
+                facts["child_lineage_parent"] = (saikai._load_lineage().get(child_sid) or {}).get("parent")
 
                 # --- Esc (cancel) path: a SECOND checkpoint, dismissed at the
                 # confirm modal with Esc, must leave the session UNTOUCHED (no
@@ -1562,6 +1588,21 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
                 # Re-focus the pane so this second checkpoint can RESOLVE its target
                 # (starting needs a focused/cursor live pane; the de-focus above was
                 # to prove the RUNNING machine doesn't stall, which it didn't).
+                # The pane is now the CHILD (re-keyed above), so the 2nd checkpoint
+                # targets the child sid + its transcript — give that transcript its
+                # own /handoff exchange (a reseeded child you checkpoint again has
+                # worked + handed off) so extract_prompt can reach the confirm modal.
+                with child_jsonl.open("a", encoding="utf-8") as _f:
+                    for _r in [
+                        {"type": "user", "timestamp": "2026-06-17T10:00:00.000Z",
+                         "cwd": pane_cwd, "message": {"role": "user", "content": "/handoff"}},
+                        {"type": "assistant", "timestamp": "2026-06-17T10:00:30.000Z",
+                         "cwd": pane_cwd, "message": {"role": "assistant", "content": [
+                            {"type": "text", "text":
+                             "Handoff ready.\n\n```\nNEW SESSION PROMPT\n"
+                             "Continue the child's work from here.\n```\n"}]}},
+                    ]:
+                        _f.write(json.dumps(_r) + "\n")
                 self._focused_terminal = lambda: fake_term
                 fake_term.events.clear()
                 await pilot.app.run_action("checkpoint")
@@ -1619,6 +1660,25 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
     # child transcript (not stay on the frozen parent), so it reads lean in place.
     assert facts.get("live_jsonl") == str(pdir / f"{child_sid}.jsonl"), \
         f"pane gauge not re-pointed at the child transcript: {facts}"
+    # --- the pane's IDENTITY must follow the session parent->child (the 4 harms):
+    # harm #1 (restore resumes the WRONG session): _opened_sids — which
+    # _save_open_panes persists for Shift+F4 — must now hold the child, not parent.
+    assert facts.get("opened_has_child") is True and facts.get("opened_has_parent") is False, \
+        f"restore set must target the child, not the frozen parent: {facts}"
+    # harm #3/#4 (re-opening the child spawns a DUPLICATE / list mislabels the
+    # frozen parent as live): the live manager must find the pane under the child.
+    assert facts.get("live_has_child") is True and facts.get("live_has_parent") is False, \
+        f"live pane must be keyed by the child sid, not the parent: {facts}"
+    # the running pane's own sid is the child now (gauge + status resolve via it).
+    assert facts.get("term_sid") == child_sid, f"term.sid not re-pointed to the child: {facts}"
+    # an interim child stub bridges the list/status until the next rescan; the
+    # parent stays a real historical session (both resolvable).
+    assert facts.get("child_in_sid_index") is True, f"child not injected into _sid_index: {facts}"
+    assert facts.get("parent_in_sid_index") is True, f"parent dropped from _sid_index: {facts}"
+    # harm #2 (Shift+F6 from the reseeded pane fails): lineage maps child->parent,
+    # so action_open_parent from the child row resolves the parent.
+    assert facts.get("child_lineage_parent") == parent_sid, \
+        f"Shift+F6 from the child would not find the parent: {facts}"
     # Esc (cancel) path: modal shown, Esc dismissed it, machine torn down, and
     # crucially NO /clear injected — cancelling leaves the session untouched.
     assert facts.get("esc_modal_shown") == "ConfirmRefreshScreen", \

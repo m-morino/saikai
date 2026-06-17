@@ -1534,16 +1534,22 @@ class LiveSessionManager:
         self.max_live = max_live
         self._terms: dict[str, "AgentTerminal"] = {}     # sid -> widget
         self._status: dict[str, str] = {}                 # sid -> status
+        self._pane_ids: dict[str, str] = {}               # sid -> TabPane DOM id
         self._reaps: list = []                            # in-flight taskkill threads
 
-    @staticmethod
-    def pane_id(sid: str) -> str:
-        # Use the FULL sid (Textual DOM ids have no length limit): an 8-char
-        # prefix can collide between two sessions sharing their first 8 UUID hex
-        # chars, and the mount path would then remove the wrong pane's tab without
-        # killing its process. Nothing parses this back to a sid (every compare
-        # re-derives via pane_id()), so the full form is a safe drop-in.
-        return f"tab-live-{sid}"
+    def pane_id(self, sid: str) -> str:
+        # The TabPane's DOM id, set at mount to f"tab-live-{sid}" and IMMUTABLE in
+        # Textual. Stored per sid so a re-key (parent->child after /clear) can move
+        # the SAME pane's id under the new sid — the TabPane keeps its existing
+        # tab-live-{parent} id but is now found via the child sid. An unregistered
+        # sid falls back to the deterministic default (callers compare by re-
+        # deriving via pane_id(), so the fallback is a safe drop-in).
+        #
+        # Use the FULL sid (Textual DOM ids have no length limit): an 8-char prefix
+        # can collide between two sessions sharing their first 8 UUID hex chars, and
+        # the mount path would then remove the wrong pane's tab without killing its
+        # process. Nothing parses this back to a sid, so the full form is safe.
+        return self._pane_ids.get(sid) or f"tab-live-{sid}"
 
     @property
     def count(self) -> int:
@@ -1561,10 +1567,30 @@ class LiveSessionManager:
     def register(self, sid: str, term: "AgentTerminal") -> None:
         self._terms[sid] = term
         self._status[sid] = "idle"
+        self._pane_ids[sid] = f"tab-live-{sid}"
 
     def forget(self, sid: str) -> None:
         self._terms.pop(sid, None)
         self._status.pop(sid, None)
+        self._pane_ids.pop(sid, None)
+
+    def rekey(self, old_sid: str, new_sid: str) -> None:
+        """Move the live pane's identity old_sid -> new_sid: term + status + the
+        TabPane DOM id string. After a b2 /clear checkpoint the SAME PTY pane IS
+        the child session, so its bookkeeping must follow the new sid (else restore
+        resumes the wrong session, Shift+F6 can't find the parent, and re-opening
+        the child spawns a duplicate). The pane_id moves verbatim so the child
+        REUSES the parent's existing tab-live-{old} DOM id (Textual TabPane ids are
+        immutable at runtime — the pane keeps its id, just looked up under the
+        child now). Pure dict manipulation, UI-thread only. No-op if old == new or
+        old is absent."""
+        if old_sid == new_sid or old_sid not in self._terms:
+            return
+        self._terms[new_sid] = self._terms.pop(old_sid)
+        if old_sid in self._status:
+            self._status[new_sid] = self._status.pop(old_sid)
+        if old_sid in self._pane_ids:
+            self._pane_ids[new_sid] = self._pane_ids.pop(old_sid)
 
     def set_status(self, sid: str, status: str) -> None:
         # Only track status for a REGISTERED pane. A status callback marshalled by
@@ -1615,6 +1641,7 @@ class LiveSessionManager:
                 pass
         self._terms.clear()
         self._status.clear()
+        self._pane_ids.clear()
         if wait:
             self.join_reaps()
 
