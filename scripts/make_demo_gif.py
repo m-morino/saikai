@@ -54,8 +54,23 @@ import saikai  # noqa: E402
 def _resume(full_id, sessions):
     s = next((x for x in (sessions or []) if x.get("id") == full_id), {})
     disp = s.get("cwd") or s.get("origin_cwd") or "/home/demo/work/webapp"
-    # The auth session plays the faithful idle transcript; any other session
-    # plays "working -> needs you", which animates its list marker ~ -> ?.
+    # The BLOATED session plays the context-lifecycle "checkpoint" scenario: it
+    # reads saikai's injected handoff/`/clear` and drives the REAL b2 machine
+    # (mints the post-/clear child transcript into its project dir so detect_child
+    # binds it honestly). The auth session plays the faithful idle transcript;
+    # any other session plays "working -> needs you" (animates ~ -> ?).
+    if full_id == fixture.bloated_sid:
+        return ([sys.executable, str(MOCK_CLAUDE), "checkpoint", disp,
+                 str(fixture.bloated_project_dir), str(fixture.bloated_sid)],
+                str(fixture.hero_repo), dict(os.environ))
+    # The reseeded CHILD: a session minted in the bloated project dir that is NOT
+    # the bloated session itself (b2's /clear created it). It has a low usage, so
+    # opening it shows the GREEN gauge — the honest "resumed lean" frame.
+    _jp = s.get("jsonl_path")
+    if (full_id != fixture.bloated_sid and _jp is not None
+            and Path(_jp).parent == Path(str(fixture.bloated_project_dir))):
+        return ([sys.executable, str(MOCK_CLAUDE), "fresh", disp],
+                str(fixture.hero_repo), dict(os.environ))
     sc = "idle" if "auth" in (s.get("ai_title") or "").lower() else "needs-you"
     return ([sys.executable, str(MOCK_CLAUDE), sc, disp],
             str(fixture.hero_repo), dict(os.environ))
@@ -65,7 +80,10 @@ saikai._build_resume_invocation = _resume
 
 from textual.app import App  # noqa: E402
 
-SIZE = (128, 35)
+# 144 cols (was 128) so the per-pane context gauge in the status row — which sits
+# after the Live/RAM segment — is FULLY visible (it needs ~136 cols; 128 clipped
+# "862K/1.0M (86%)"). The callouts are fractional, so they scale with the width.
+SIZE = (144, 35)
 FRAMES: list[tuple[str, int]] = []   # (svg filename, duration ms)
 _n = 0
 
@@ -139,11 +157,111 @@ def fake_run(self, *a, **kw):
             self.query_one("#sortsel").value = "title"        # sort A->Z
             await pilot.pause(0.7)
             await snap(pilot, 2600)
-            # Beat 8 — the closer: mirror to ANOTHER DEVICE via the scannable QR.
-            # Call F12's action directly (key routing depends on focus; this does
-            # not). We're already on the list after the sort beat.
+            # Beat 8 — mirror to ANOTHER DEVICE via the scannable QR. Call F12's
+            # action directly (key routing depends on focus; this does not).
+            # We're already on the list after the sort beat.
             self.action_mirror_info()            # F12's action — show the QR
             await pilot.pause(0.8)
+            await snap(pilot, 3000)
+            await pilot.press("escape")          # close the QR modal
+            await pilot.pause(0.4)
+
+            # ── Context-lifecycle arc (the standout). Drive the REAL b2 machine
+            # on the deliberately bloated session: red gauge → Checkpoint → the
+            # confirm gate → /clear+reseed → green gauge → Shift+F6 back. The
+            # mock pane honours the injected handoff/`/clear` and mints the child
+            # transcript, so detect_child binds it honestly (nothing faked).
+            from textual.widgets import DataTable as _DT
+            _table = self.query_one("#table", _DT)
+
+            async def open_and_focus(sid):
+                """Open `sid` as a live pane and put KEYBOARD FOCUS on its
+                terminal — the statusbar context gauge only renders for the
+                FOCUSED live pane (_focused_terminal()), so an opened-but-unfocused
+                pane shows no gauge. Move the cursor by SID (robust to grouping /
+                sort), open, focus the terminal, THEN recompute the subtitle so the
+                gauge reflects the now-focused pane (nothing else refreshes it on a
+                bare focus change)."""
+                _table.focus()
+                await pilot.pause(0.2)
+                _table.move_cursor(row=_table.get_row_index(sid))
+                await pilot.pause(0.3)
+                self._open_or_attach_live(sid)
+                t = None
+                for _ in range(40):                # let it mount (python spawn + paint)
+                    await pilot.pause(0.1)
+                    t = self._live.get(sid) if self._live and self._live.has(sid) else None
+                    if t is not None:
+                        t.focus()                  # gauge needs the pane focused
+                        await pilot.pause(0.1)
+                        if self._focused_terminal() is not None:
+                            break
+                # Wait for the mock to actually PAINT (PTY spawn is slow on Windows)
+                # so the pane isn't a blank rectangle at snap time, then hold focus
+                # and refresh the statusbar so the ctx gauge for THIS pane renders.
+                if t is not None:
+                    for _ in range(30):
+                        await pilot.pause(0.1)
+                        try:
+                            _txt, _ = t._current_screen()
+                        except Exception:
+                            _txt = ""
+                        if _txt and "Claude Code" in _txt:
+                            break
+                    t.focus()
+                    await pilot.pause(0.4)
+                    try:
+                        self._update_subtitle()
+                    except Exception:
+                        pass
+                    await pilot.pause(0.2)
+
+            # Beat 9 — RESUME the bloated session live + FOCUS it; the statusbar
+            # context gauge reads its transcript and shows RED (~86%).
+            await open_and_focus(fixture.bloated_sid)
+            await pilot.pause(0.4)
+            await snap(pilot, 3000)              # RED ctx gauge in the statusbar
+            # Beat 10 — Space-c Checkpoint: drafts the handoff, then HOLDS on the
+            # confirm modal showing the extracted NEW SESSION PROMPT (the trust
+            # beat). run_action drives it regardless of key routing.
+            await pilot.app.run_action("checkpoint")
+            for _ in range(70):                  # ~7s: handoff busy→idle→extract
+                await pilot.pause(0.1)
+                if type(self.screen).__name__ == "ConfirmRefreshScreen":
+                    break
+            await pilot.pause(0.4)
+            await snap(pilot, 3400)             # the confirm modal — HOLD
+            # Beat 11 — Enter: the REAL b2 machine runs /clear, the mock mints the
+            # fresh child transcript (low usage), b2 binds it + records lineage +
+            # pastes the reseed prompt. Then re-scan (F5) so the new child session
+            # is indexed, open + focus it, and snap its GREEN gauge (the child
+            # transcript's real low context — nothing faked).
+            await pilot.press("enter")           # confirm the destructive step
+            for _ in range(90):                  # ~9s: /clear → detect child → reseed
+                await pilot.pause(0.1)
+                if getattr(self, "_b2", None) is None:
+                    break
+            await pilot.pause(0.6)
+            # The child sid b2 just bound (read it back from the lineage it wrote).
+            _lin = saikai._load_lineage()
+            _child = next((c for c, r in _lin.items()
+                           if r.get("parent") == fixture.bloated_sid), None)
+            await pilot.app.run_action("refresh")   # F5 — index the new child
+            await pilot.pause(0.7)
+            if _child is not None and _child in self._sid_index:
+                await open_and_focus(_child)        # open the reseeded child live
+            await pilot.pause(0.4)
+            await snap(pilot, 3400)             # GREEN ctx gauge on the reseeded pane
+            # Beat 12 — Shift+F6: the parent (pre-clear) session is still there. The
+            # list cursor is on the child (lineage child→parent), so open_parent
+            # jumps the cursor to the parent row. Release focus to the list so the
+            # parent row is highlighted under the cursor.
+            if _child is not None and _child in self._sid_index:
+                _table.move_cursor(row=_table.get_row_index(_child))
+            await pilot.press("ctrl+right_square_bracket")   # focus the list
+            await pilot.pause(0.4)
+            await pilot.app.run_action("open_parent")        # Shift+F6
+            await pilot.pause(0.7)
             await snap(pilot, 3000)
     asyncio.run(go())
 
@@ -303,7 +421,11 @@ _POS = [(0.40, 0.71, 0.17, 0.28), (0.42, 0.72, 0.72, 0.42), (0.43, 0.40, 0.56, 0
         None, (0.04, 0.60, 0.02, 0.225), (0.04, 0.60, 0.02, 0.225),
         (0.42, 0.72, 0.72, 0.42),
         (0.30, 0.30, 0.40, 0.09), (0.42, 0.30, 0.55, 0.09),
-        (0.63, 0.38, 0.54, 0.42)]
+        (0.63, 0.38, 0.54, 0.42),
+        # 9 RED gauge + 11 GREEN gauge: tail → the ctx segment in the TOP status
+        # row (right side, y≈0.13). 10 confirm modal (centre). 12 parent (list).
+        (0.34, 0.40, 0.88, 0.135), (0.28, 0.20, 0.50, 0.32),
+        (0.34, 0.40, 0.88, 0.135), (0.40, 0.70, 0.18, 0.30)]
 _EN = ["Every Claude Code session — across every repo, one screen",
        "Resume it live — real Claude Code, in its own directory",
        "Run several at once — flip between them", None,
@@ -312,7 +434,11 @@ _EN = ["Every Claude Code session — across every repo, one screen",
        "Jump straight to the one that needs you",
        "Group by State, Project, or Date",
        "Sort by Recency, Created, or A–Z",
-       "Scan to mirror & control it from another device"]
+       "Scan to mirror & control it from another device",
+       "Real context fill per pane — this one's bloated, getting dumber",
+       "Space then c: it shows the new prompt before anything clears — you decide",
+       "Enter → /clear → fresh, lean session, auto-seeded",
+       "Shift+F6 → back to the old session. Nothing lost"]
 _JA = ["全リポジトリの Claude Code を1画面に",
        "元のディレクトリでそのまま再開",
        "複数を同時に動かして行き来", None,
@@ -321,7 +447,11 @@ _JA = ["全リポジトリの Claude Code を1画面に",
        "要対応のセッションへジャンプ",
        "State・Project・Date でグループ分け",
        "Recency・Created・A–Z で並べ替え",
-       "QR を読むだけで別の端末から操作"]
+       "QR を読むだけで別の端末から操作",
+       "ペインごとに実際のコンテキスト量 — これは肥大化して劣化中",
+       "Space → c：消す前に新プロンプトを提示。判断はあなた",
+       "Enter → /clear → 軽い新セッションを自動で種まき",
+       "Shift+F6 で元のセッションへ。失うものなし"]
 
 
 def _callouts(texts):
