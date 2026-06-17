@@ -1834,6 +1834,85 @@ def test_pilot_filter_engaged_window_survives_focus_move():
         f"a filter keystroke in the last beat must read as engaged: {facts}"
 
 
+def test_pilot_cycle_tab_skips_dead_pane():
+    """F2/F3 (cycle_tab) must NEVER focus a DEAD ✓ pane. A corpse has no PTY, so
+    keys would vanish into it (and a stray printable would bubble to the list as
+    type-to-search) — same guard as action_toggle_list. Cycling onto a dead pane
+    lands focus on the session list instead. The test starts with the SEARCH box
+    focused so "focus moved to the list" is a real signal, then cycles onto a
+    mounted dead pane and asserts the dead terminal's focus() was never called."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_cycle_tab_skips_dead_pane (textual unavailable)"); return
+    import asyncio
+    from textual.app import App
+    from textual.widgets import TabbedContent, TabPane, Static, DataTable, Input
+
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.3)
+                dead_sid = "dead-cycle-sid"
+                pane_id = "tab-live-" + dead_sid
+                tabs = self.query_one("#right", TabbedContent)
+                await tabs.add_pane(TabPane("✓ dead", Static("corpse"),
+                                            id=pane_id))
+                await pilot.pause(0.05)
+
+                class _DeadTerm:
+                    is_dead = True
+                    def focus(self):
+                        facts["dead_focus_called"] = True   # the bug would call this
+
+                dead_term = _DeadTerm()
+
+                class _FakeLive:
+                    count = 1
+                    max_live = 64
+                    def statuses(self):
+                        return {dead_sid: "dead"}
+                    def pane_id(self, sid):
+                        return pane_id
+                    def get(self, sid):
+                        return dead_term if sid == dead_sid else None
+                    def all_terms(self):
+                        return []
+                    def has(self, sid):
+                        return sid == dead_sid
+                self._live = _FakeLive()
+
+                # Start OFF the list (search focused) so "focus went to the list"
+                # is a genuine signal, then cycle onto the dead pane's tab.
+                tabs.active = "tab-preview"
+                self.query_one("#search", Input).focus()
+                await pilot.pause(0.05)
+                await pilot.app.run_action("next_tab")
+                await pilot.pause(0.1)
+                facts["active"] = tabs.active
+                facts["dead_focus_called"] = facts.get("dead_focus_called", False)
+                facts["focus_is_table"] = (
+                    self.focused is self.query_one("#table", DataTable))
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+    assert facts.get("active") == "tab-live-dead-cycle-sid", \
+        f"cycle should land on the dead pane's tab: {facts}"
+    assert facts.get("dead_focus_called") is False, \
+        f"a DEAD pane must never be focused by cycle_tab: {facts}"
+    assert facts.get("focus_is_table") is True, \
+        f"cycling onto a dead pane must focus the list: {facts}"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -1892,6 +1971,7 @@ if __name__ == "__main__":
     test_pilot_refresh_preserves_scroll_position()
     test_pilot_filter_engaged_window_survives_focus_move()
     test_pilot_checkpoint_marker_on_row()
+    test_pilot_cycle_tab_skips_dead_pane()
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("PASS test_pilot_ctx_gauge_in_statusbar")
     print("PASS test_pilot_open_parent")
@@ -1900,4 +1980,5 @@ if __name__ == "__main__":
     print("PASS test_pilot_refresh_preserves_scroll_position")
     print("PASS test_pilot_filter_engaged_window_survives_focus_move")
     print("PASS test_pilot_checkpoint_marker_on_row")
+    print("PASS test_pilot_cycle_tab_skips_dead_pane")
     print("ALL PASS")

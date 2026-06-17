@@ -4262,7 +4262,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         #searchrow { dock: top; height: 3; }   /* visible by default (the dropdowns ARE the discoverability); Space / toggles it and the last state persists */
         /* 1fr so it still shrinks on narrow terminals, but capped — without the
            cap it swallows the whole bar and dwarfs the filter dropdowns. */
-        #search { width: 1fr; max-width: 42; border: tall $accent; }
+        #search { width: 1fr; max-width: 42; border: tall $panel; }
+        #search:focus { border: tall $accent; }   /* focus visible: dim panel -> accent */
         /* widths sized for the LONGEST option + Select border/chevron overhead
            (~6 cols): "Alphabetically"=14, "Archived"/"All time"=8, "Project"=7 */
         #groupsel { width: 16; }
@@ -4283,7 +4284,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         #main.nolist #table { display: none; }
         #main.nolist #grip { display: none; }
         #preview { padding: 0 1; height: 1fr; }
-        AgentTerminal { width: 1fr; height: 1fr; }
+        /* Always-present border (same thickness focused/unfocused -> no PTY resize
+           on a focus toggle); the colour brightens on focus so the ACTIVE pane is
+           obvious when several are open. self.size already excludes the border, so
+           pyte gets the inner region. */
+        AgentTerminal { width: 1fr; height: 1fr; border: round $panel; }
+        AgentTerminal:focus { border: round $accent; }
         """
 
         preview_mode = "summary"   # "summary" or "full"
@@ -6375,8 +6381,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     for sid in self._live.statuses():
                         if self._live.pane_id(sid) == ids[i]:
                             t = self._live.get(sid)
-                            if t is not None:
+                            # Never focus a DEAD ✓ pane — it has no PTY, so keys
+                            # would vanish into a corpse (and a stray printable
+                            # would bubble to the list as type-to-search). Land on
+                            # the list instead, same guard as action_toggle_list.
+                            if t is not None and not getattr(t, "is_dead", False):
                                 t.focus()
+                            else:
+                                self.query_one("#table", DataTable).focus()
                             return
                 self.query_one("#table", DataTable).focus()
             except Exception:
@@ -6929,7 +6941,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
                 return
-            if self._focused_terminal() is not None:
+            # A focused terminal → Esc returns to the list. _focused_terminal()
+            # only counts LIVE panes; a focused DEAD (✓) pane bubbles Esc here too
+            # (its on_key lets keys through with no PTY), so match the widget type
+            # directly — otherwise Esc on a corpse falls through to the quit prompt
+            # instead of releasing to the list.
+            if self._focused_terminal() is not None or (
+                    _LIVE_TERM is not None
+                    and isinstance(self.focused, _LIVE_TERM.AgentTerminal)):
                 self.query_one("#table", DataTable).focus()
                 return
             # Bare list → quit, but only on a DELIBERATE second Esc. A single Esc
