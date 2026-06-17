@@ -234,6 +234,30 @@ def test_classify_pty_status_basics():
     assert rt.classify_pty_status("Would you like to continue?", "⠹ working") == "busy"
 
 
+def test_classify_trust_folder_dialog_is_waiting():
+    """The startup 'trust this folder?' gate blocks the session on the human, but
+    it renders at the TOP of the screen (rest blank) so it sits OUTSIDE the tail
+    window the other prompt checks use, and its footer ('Enter to confirm · Esc to
+    cancel') lacks the 'Press' the _WAITING_RE patterns want. classify must still
+    flag it 'waiting' (-> the needs-input toast + list marker). Layout captured
+    from a real claude 2.1.178 startup in an untrusted folder."""
+    dialog = (
+        " Accessing workspace:\n\n C:\\Users\\me\\AppData\\Local\\Temp\\foo\n\n"
+        " Quick safety check: Is this a project you created or one you trust?\n\n"
+        " Claude Code'll be able to read, edit, and execute files here.\n\n"
+        " Security guide\n\n"
+        " ❯ 1. Yes, I trust this folder\n   2. No, exit\n\n"
+        " Enter to confirm · Esc to cancel\n"
+    )
+    # ~22 blank 140-col rows below fill the tail window the other checks look at,
+    # so the dialog is only reachable by the full-screen trust scan.
+    screen = dialog + "\n".join([" " * 140] * 22)
+    assert rt.classify_pty_status(screen, "claude") == "waiting"
+    # A braille-spinner title still WINS — never flag a streaming pane that merely
+    # printed "trust this folder" somewhere in its output.
+    assert rt.classify_pty_status(screen, "⠇ working") == "busy"
+
+
 def test_status_classifier_profiles_and_injection():
     generic = rt.classifier_for_profile("generic")
     assert generic is rt.classify_generic_status
@@ -741,6 +765,8 @@ if __name__ == "__main__":
     print("PASS test_refresh_status_skips_stable_idle_pane")
     test_classify_pty_status_basics()
     print("PASS test_classify_pty_status_basics")
+    test_classify_trust_folder_dialog_is_waiting()
+    print("PASS test_classify_trust_folder_dialog_is_waiting")
     test_status_classifier_profiles_and_injection()
     print("PASS test_status_classifier_profiles_and_injection")
     test_encode_key_meta_and_release()

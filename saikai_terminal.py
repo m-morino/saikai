@@ -254,6 +254,14 @@ _WAITING_RE = re.compile(
 # A multi-line numbered menu (>=2 "N. text" lines) is also a forced choice.
 _MENU_RE = re.compile(r"(?:^\s*\d+\.\s+\S.*$\n?){2,}", re.MULTILINE)
 
+# The startup "trust this folder?" gate. It blocks the session on the human
+# ("❯ 1. Yes, I trust this folder / 2. No, exit"), but it renders at the TOP of
+# the screen with the rest blank — so it falls OUTSIDE the tail window the prompt
+# checks use, AND its footer ("Enter to confirm · Esc to cancel") lacks the
+# "Press"/"press" the _WAITING_RE patterns want. Detect it across the whole
+# screen by its characteristic wording instead.
+_TRUST_RE = re.compile(r"trust (?:this folder|the files in this folder)", re.IGNORECASE)
+
 
 def classify_pty_status(screen_text: str, title: str = "") -> str:
     """Classify into ``"busy"`` / ``"waiting"`` / ``"idle"``.
@@ -277,6 +285,11 @@ def classify_pty_status(screen_text: str, title: str = "") -> str:
     g = (title or "")[:1]
     if g and 0x2800 <= ord(g) <= 0x28FF:
         return "busy"
+    # Startup "trust this folder?" gate: a hard human block rendered at the TOP of
+    # the screen (rest blank), so it sits OUTSIDE the tail window below. It's a
+    # cheap substring scan over the full screen and only runs when NOT busy.
+    if _TRUST_RE.search(screen_text or ""):
+        return "waiting"
     # Slice to the tail BEFORE the ANSI-strip (pyte's .display is escape-free and
     # we only need the last ~2000 chars). Not generating → a visible permission /
     # forced-choice prompt is the strongest "needs you".
