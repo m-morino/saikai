@@ -176,6 +176,27 @@ def test_extract_handoff_prompt_slices_new_session_block():
     got3 = ex(body3)
     assert got3 is not None and "Resume: run the failing test, then ship." in got3
     assert "Recap of what we did" not in got3, f"locked onto the prose echo: {got3!r}"
+    # an EARLIER example/echo fenced block must NOT win over the real trailing one
+    # — the prompt says "END with ONE fenced block", so the real block is LAST.
+    body4 = (
+        "Here's the format I'll use:\n"
+        "```\n"
+        "NEW SESSION PROMPT\n"
+        "<your goal, paths, next step here>\n"
+        "```\n"
+        "Now the real one:\n"
+        "```\n"
+        "NEW SESSION PROMPT\n"
+        "Resume the parser fix at saikai.py:3100; run the failing test.\n"
+        "```\n"
+    )
+    got4 = ex(body4)
+    assert got4 is not None and "Resume the parser fix" in got4
+    assert "<your goal" not in got4, f"locked onto the example block: {got4!r}"
+    # a ~~~ (tilde) CommonMark fence is valid: recognise its closer, don't swallow it
+    body5 = "ok\n~~~\nNEW SESSION PROMPT\nResume X.\n~~~\n"
+    got5 = ex(body5)
+    assert got5 is not None and got5.strip() == "Resume X.", f"~~~ fence mishandled: {got5!r}"
     # no NEW SESSION PROMPT anywhere -> None (never guess)
     assert ex("just an ordinary assistant reply, no handoff here") is None
     assert ex("") is None

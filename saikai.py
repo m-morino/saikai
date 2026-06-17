@@ -264,7 +264,12 @@ _CONFIG_TEMPLATE = (
     "# leader_defaults = false     # start from an EMPTY letter map\n"
     '# release         = "ctrl+]"  # return focus from a live pane to the session list\n'
     '# favorite        = "v"       # single letter = leader sequence remap\n'
-    '# refresh         = "f5"      # multi-char    = direct key rebind\n'
+    '# refresh         = "f5"      # multi-char    = direct key rebind\n\n'
+    "[checkpoint]                  # b2 checkpoint flow (leader Space-c)\n"
+    '# handoff_prompt_file = ""    # path to a custom handoff prompt ("" = built-in).\n'
+    "#   It MUST instruct the model to END with a fenced block whose first line is\n"
+    "#   'NEW SESSION PROMPT'; a file dropping that is rejected (falls back to the\n"
+    "#   built-in). Seed an editable copy with:  saikai --dump-handoff-prompt\n"
 )
 
 
@@ -472,6 +477,7 @@ _CONFIG_SPECS = [
     ("limits", "max_live", "SAIKAI_MAX_LIVE", 64),
     ("limits", "scrollback_lines", "SAIKAI_SCROLLBACK", 2000),
     ("keys", "release", "SAIKAI_RELEASE_KEY", "ctrl+]"),
+    ("checkpoint", "handoff_prompt_file", "SAIKAI_HANDOFF_PROMPT_FILE", ""),
 ]
 
 
@@ -3074,10 +3080,10 @@ HANDOFF_PROMPT_FILE = CACHE_DIR / "handoff-prompt.md"
 
 def _handoff_prompt_path() -> Path:
     """Override-file path for the b2 handoff prompt: SAIKAI_HANDOFF_PROMPT_FILE /
-    [checkpoint] handoff_prompt_file, else CACHE_DIR/handoff-prompt.md."""
-    return Path(_cfg("checkpoint", "handoff_prompt_file",
-                     "SAIKAI_HANDOFF_PROMPT_FILE",
-                     str(HANDOFF_PROMPT_FILE), str)).expanduser()
+    [checkpoint] handoff_prompt_file (registered in _CONFIG_SPECS with a "" default),
+    else CACHE_DIR/handoff-prompt.md."""
+    p = _cfg("checkpoint", "handoff_prompt_file", "SAIKAI_HANDOFF_PROMPT_FILE", "", str)
+    return Path(p).expanduser() if p else HANDOFF_PROMPT_FILE
 
 
 def _resolve_handoff_prompt() -> "tuple[str, str | None]":
@@ -3089,11 +3095,11 @@ def _resolve_handoff_prompt() -> "tuple[str, str | None]":
     try:
         if path.is_file():
             text = path.read_text(encoding="utf-8", errors="replace").strip()
-            if text and "NEW SESSION PROMPT" not in text.upper():
-                return (_B2_HANDOFF_PROMPT,
-                        f"{path.name}: missing the required 'NEW SESSION PROMPT' "
-                        f"contract — using the built-in handoff prompt")
             if text:
+                if "NEW SESSION PROMPT" not in text.upper():
+                    return (_B2_HANDOFF_PROMPT,
+                            f"{path.name}: missing the required 'NEW SESSION PROMPT' "
+                            f"contract — using the built-in handoff prompt")
                 return (text, None)
     except OSError:
         pass
@@ -3114,33 +3120,55 @@ def _extract_handoff_prompt(text: "str | None") -> "str | None":
     n = len(lines)
     marker = "NEW SESSION PROMPT"
 
-    def _prev_nonempty_is_fence(idx):
+    def _fence_char(ln):
+        # The fence token of a fence line: '`' for ```, '~' for ~~~, else "".
+        s = ln.strip()
+        if s.startswith("```"):
+            return "`"
+        if s.startswith("~~~"):
+            return "~"
+        return ""
+
+    def _opener_char(idx):
+        # Fence char of the opening fence on the previous non-empty line, else "".
         k = idx - 1
         while k >= 0 and not lines[k].strip():
             k -= 1
-        return k >= 0 and lines[k].lstrip().startswith("```")
+        return _fence_char(lines[k]) if k >= 0 else ""
 
-    def _body_after(idx):
-        # Lines AFTER the marker up to the next ``` (or EOF), stripped.
+    def _is_close_fence(ln, ch):
+        # A CLOSING fence is a line of ONLY the fence char (>=3), no info string —
+        # so a "```bash" opener or an inner indented "```lang" is NOT mistaken for
+        # the close, and a ~~~ block closes on ~~~ (not on a stray ```).
+        s = ln.strip()
+        return len(s) >= 3 and set(s) == {ch}
+
+    def _body_after(idx, ch):
         body = []
         j = idx + 1
-        while j < n and not lines[j].lstrip().startswith("```"):
+        while j < n:
+            if ch:
+                if _is_close_fence(lines[j], ch):
+                    break
+            elif _fence_char(lines[j]):          # bare/header: stop at any fence line
+                break
             body.append(lines[j])
             j += 1
         return "\n".join(body).strip()
 
     markers = [i for i, ln in enumerate(lines) if marker in ln.upper()]
-    # PREFER the canonical shape — the marker is the first line INSIDE a ``` fence
-    # — over a bare/prose match. The improved handoff prompt tells the model to
-    # "END with a fenced block whose first line is NEW SESSION PROMPT", so the
-    # reply often NARRATES that phrase before the real block; without this
-    # preference the slicer locks onto the prose echo and reseeds garbage. The
-    # second pass keeps the older header/bare shapes working.
+    # The real block is the LAST one: the prompt says "END with ONE fenced block",
+    # and replies often NARRATE the phrase or show an EXAMPLE block first. So scan
+    # markers in REVERSE and PREFER a marker that opens a fenced block (pass 1) over
+    # a bare/header match (pass 2) — an earlier prose echo or example can't win.
     for prefer_fenced in (True, False):
-        for i in markers:
-            if prefer_fenced and not _prev_nonempty_is_fence(i):
+        for i in reversed(markers):
+            ch = _opener_char(i)
+            if prefer_fenced and not ch:
                 continue
-            out = _body_after(i)
+            if not prefer_fenced and ch:
+                continue                          # in-fence markers handled in pass 1
+            out = _body_after(i, ch)
             if out:
                 return out
     return None
@@ -4710,6 +4738,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Claude-Desktop 'Last activity' window: drop rows older than N days.
             hidden = _load_hidden()
             favorites = _load_favorites()
+            _b2_sid = (getattr(self, "_b2", None) or {}).get("sid")  # ↻ checkpoint row (hoisted; constant per rebuild)
             _lastact = _get_lastact_days()
             if _lastact:
                 _cut = datetime.now() - timedelta(days=_lastact)
@@ -4922,7 +4951,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     raw_title = _ANSI_RE.sub("", tree_prefixes[s["id"]]) + raw_title
                 if s["id"] in getattr(self, "_marked", ()):
                     raw_title = "▣ " + raw_title       # batch-launch selection (Space)
-                if s["id"] == (getattr(self, "_b2", None) or {}).get("sid"):
+                if _b2_sid and s["id"] == _b2_sid:
                     raw_title = "↻ " + raw_title       # b2 checkpoint in progress on this session
                 _tstyle = _title_color.get(_color_key_for(s, _color_by), "")  # [display] color_by
                 if narrow:
@@ -7080,6 +7109,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                        # thinking — easily exceeds a minute; only a
                                        # true hang should hit this, and a dead pane
                                        # is caught separately)
+        _B2_HANDOFF_START_TICKS = 24   # ~7s grace for the turn to FLIP to busy before
+                                       # we conclude "idle => done" (a grown session
+                                       # can take seconds to spin up; concluding too
+                                       # early would extract the PRE-handoff text)
 
         def action_checkpoint(self) -> None:
             """Leader ␣c — start the human-gated checkpoint flow on the target live
@@ -7125,7 +7158,18 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # _b2_finish). 0.3s matches the spike's settle granularity.
             self._b2_timer = self.set_interval(0.3, self._b2_tick)
             self.notify("checkpoint: drafting the handoff…", timeout=4)
-            self._refresh_table()      # show the ↻ checkpoint marker on the row now
+            self._b2_mark_dirty()      # show the ↻ checkpoint marker (focus-safe)
+
+        def _b2_mark_dirty(self) -> None:
+            """Repaint the list for the ↻ checkpoint marker WITHOUT disrupting a
+            focused live pane. _do_refresh_table's clear()+rebuild leaks keystrokes
+            into the list/search if a pane is focused — so defer exactly like
+            _poll_live_status does (on_descendant_focus catches it up when focus
+            leaves the pane); otherwise repaint via the coalesced path."""
+            if self._focused_terminal() is not None:
+                self._status_refresh_pending = True
+            else:
+                self._request_refresh()
 
         def _b2_finish(self, msg=None, severity="information") -> None:
             """Tear down the b2 machine: stop the interval, drop state, optional
@@ -7140,7 +7184,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             had_state = self._b2 is not None
             self._b2 = None
             if had_state:
-                self._refresh_table()  # clear the ↻ checkpoint marker from the row
+                self._b2_mark_dirty()  # clear the ↻ checkpoint marker (focus-safe)
             if msg:
                 self.notify(msg, severity=severity, timeout=5)
 
@@ -7163,7 +7207,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # personal `/handoff` skill) so the session summarises itself into a
                 # paste-ready NEW SESSION PROMPT block — works without any skill.
                 # Overridable via SAIKAI_HANDOFF_PROMPT_FILE; a rejected override
-                # toasts and falls back to the built-in default.
+                # toasts and falls back to the built-in default. The prompt is
+                # MULTI-LINE: paste_text wraps it in bracketed paste so the embedded
+                # newlines don't submit line-by-line. That relies on the pane having
+                # ?2004h on — guaranteed here because b2 only injects when the pane
+                # is idle (action_checkpoint's _pane_is_midturn gate), i.e. claude is
+                # at its prompt with bracketed paste enabled.
                 _hp, _hp_warn = _resolve_handoff_prompt()
                 if _hp_warn:
                     self.notify(_hp_warn, severity="warning", timeout=6)
@@ -7179,10 +7228,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
 
             if st == "await_handoff_idle":
-                # Give the turn a couple ticks to register as busy, then wait for it
-                # to settle back to idle (or the pane to die). idle_wait accrues only
-                # while the pane is busy/waiting (idle exits below), so the ceiling
-                # bounds how long the handoff turn may run before we give up.
+                # Wait for the handoff turn to run and settle back to idle. idle_wait
+                # counts every tick here; the ceiling (_B2_HANDOFF_IDLE_TICKS) bounds
+                # the total wait -> abort. A dead pane is caught at the top of _b2_tick.
+                # We require actually SEEING the pane go busy/waiting (seen_busy) — or
+                # a short start grace — before accepting "idle" as "done" (below).
                 if b2["ticks"] > 0:
                     b2["ticks"] -= 1
                     return
@@ -7194,7 +7244,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 status = (self._live.statuses().get(b2["sid"])
                           if self._live else None)
                 if status in ("busy", "waiting"):
+                    b2["seen_busy"] = True
                     return                    # still working — keep waiting
+                # idle: only conclude the turn is DONE once we've actually seen it
+                # run, or after a start grace — otherwise a grown session that
+                # hasn't spun up yet looks "done" and we'd read the PRE-handoff text.
+                if not b2.get("seen_busy") and b2["idle_wait"] < self._B2_HANDOFF_START_TICKS:
+                    return
                 b2["state"] = "extract_prompt"
                 return
 
