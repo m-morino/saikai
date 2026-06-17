@@ -3029,21 +3029,75 @@ def _b2_step_sequence() -> tuple:
 # `NEW SESSION PROMPT` — that is what _extract_handoff_prompt slices out, the
 # confirm modal shows, and inject_reseed pastes into the fresh session.
 _B2_HANDOFF_PROMPT = (
-    "Wrap up this session for a fresh one — do not keep working here. Goal: spend "
-    "the least context. Don't recap the whole history; keep only what the next "
-    "session needs to resume the work.\n"
-    "Rules:\n"
-    "- Be concise. Omit exploration logs, dead ends, large tool output, long quotes.\n"
-    "- Keep file paths, commands, unfinished tasks, and key constraints/decisions.\n"
-    "- If you changed code, list the changed files and how each was verified.\n"
-    "- List open questions explicitly.\n"
-    "- Write in the language this session has been using.\n"
-    "- END with ONE fenced code block, paste-ready for the next session, whose "
-    "FIRST line is exactly: NEW SESSION PROMPT\n"
-    "Structure: 1) current goal  2) settled facts / decisions  3) changed vs "
-    "unchanged files  4) next steps  5) constraints / gotchas  6) the NEW SESSION "
-    "PROMPT block."
+    "Wrap up THIS session so a brand-new session can resume the work. Do not keep "
+    "working here. Goal: hand off the least context that is still SUFFICIENT — "
+    "short on narration, complete on anything expensive or impossible to rederive.\n"
+    "\n"
+    "DROP: exploration play-by-play, tool output, long quotes, history. (The old "
+    "session stays reopenable, so detail is recoverable — don't pad.)\n"
+    "KEEP even at the cost of length (never drop these to save space):\n"
+    "- WHY behind each key decision, not just the decision — and what it rules out.\n"
+    "- What you RULED OUT and why (so the next session doesn't retry a dead end).\n"
+    "- Exact state to resume from: branch / dirty files / services up / env vars "
+    "(BY NAME) / the precise failing command + its last observed output / "
+    "migrations / flags — whatever applies to this kind of work.\n"
+    "- The user's standing constraints and preferences stated this session (tech "
+    "choices, \"don't touch X\", scope, deadline, tone/audience).\n"
+    "- Stable identifiers: file paths, PR/issue/commit/run IDs, URLs, doc paths.\n"
+    "- WHERE to look: the 2-3 files/functions/sources that are the center of "
+    "gravity, so the next session reads the right thing instead of re-exploring.\n"
+    "\n"
+    "Status discipline (guards against false \"done\"): give every work item a "
+    "status — DONE / IN-PROGRESS / NOT-STARTED. For anything DONE or \"verified\", "
+    "state the exact evidence (command run + result observed); if you did not "
+    "actually observe it, mark it UNVERIFIED. Never write \"done\" from assumption.\n"
+    "\n"
+    "Write a short human summary: 1) current goal  2) decided + why / ruled out  "
+    "3) what changed or was produced + how verified (files, OR a published doc / "
+    "query result / provisioned resource / drafted section — whatever this session "
+    "produced; \"none\" if nothing)  4) state to resume from + where to look  "
+    "5) constraints, preferences, gotchas  6) open questions.\n"
+    "\n"
+    "Write in the language this session has been using.\n"
+    "\n"
+    "Then END your reply with ONE fenced code block and NOTHING after it. Its FIRST "
+    "line must be exactly: NEW SESSION PROMPT\n"
+    "The block is the fresh session's ONLY memory of this work — it must stand fully "
+    "alone: no \"as discussed / above / earlier\"; restate the goal, key paths, the "
+    "resume state, and the immediate next step inline. Never inline secrets, tokens, "
+    "credentials, or PII — refer to them by name and location. Keep it compact; do "
+    "not put triple-backtick fences inside it (indent code or use single backticks)."
 )
+
+HANDOFF_PROMPT_FILE = CACHE_DIR / "handoff-prompt.md"
+
+
+def _handoff_prompt_path() -> Path:
+    """Override-file path for the b2 handoff prompt: SAIKAI_HANDOFF_PROMPT_FILE /
+    [checkpoint] handoff_prompt_file, else CACHE_DIR/handoff-prompt.md."""
+    return Path(_cfg("checkpoint", "handoff_prompt_file",
+                     "SAIKAI_HANDOFF_PROMPT_FILE",
+                     str(HANDOFF_PROMPT_FILE), str)).expanduser()
+
+
+def _resolve_handoff_prompt() -> "tuple[str, str | None]":
+    """The handoff prompt b2 injects: the user's override file if present AND it
+    still carries the load-bearing `NEW SESSION PROMPT` contract, else the built-in
+    default. Returns (prompt, warning): a non-None warning means an override file
+    existed but was REJECTED (the caller should toast + fall back). Pure read."""
+    path = _handoff_prompt_path()
+    try:
+        if path.is_file():
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+            if text and "NEW SESSION PROMPT" not in text.upper():
+                return (_B2_HANDOFF_PROMPT,
+                        f"{path.name}: missing the required 'NEW SESSION PROMPT' "
+                        f"contract — using the built-in handoff prompt")
+            if text:
+                return (text, None)
+    except OSError:
+        pass
+    return (_B2_HANDOFF_PROMPT, None)
 
 
 def _extract_handoff_prompt(text: "str | None") -> "str | None":
@@ -3059,20 +3113,36 @@ def _extract_handoff_prompt(text: "str | None") -> "str | None":
     lines = text.splitlines()
     n = len(lines)
     marker = "NEW SESSION PROMPT"
-    for i, ln in enumerate(lines):
-        if marker not in ln.upper():
-            continue
-        # Case A: the marker is the opening line INSIDE a ``` fence. The fence
-        # open is the previous non-empty line; the prompt runs to the closing
-        # fence. Collect the lines AFTER the marker up to the next ``` (or EOF).
+
+    def _prev_nonempty_is_fence(idx):
+        k = idx - 1
+        while k >= 0 and not lines[k].strip():
+            k -= 1
+        return k >= 0 and lines[k].lstrip().startswith("```")
+
+    def _body_after(idx):
+        # Lines AFTER the marker up to the next ``` (or EOF), stripped.
         body = []
-        j = i + 1
+        j = idx + 1
         while j < n and not lines[j].lstrip().startswith("```"):
             body.append(lines[j])
             j += 1
-        out = "\n".join(body).strip()
-        if out:
-            return out
+        return "\n".join(body).strip()
+
+    markers = [i for i, ln in enumerate(lines) if marker in ln.upper()]
+    # PREFER the canonical shape — the marker is the first line INSIDE a ``` fence
+    # — over a bare/prose match. The improved handoff prompt tells the model to
+    # "END with a fenced block whose first line is NEW SESSION PROMPT", so the
+    # reply often NARRATES that phrase before the real block; without this
+    # preference the slicer locks onto the prose echo and reseeds garbage. The
+    # second pass keeps the older header/bare shapes working.
+    for prefer_fenced in (True, False):
+        for i in markers:
+            if prefer_fenced and not _prev_nonempty_is_fence(i):
+                continue
+            out = _body_after(i)
+            if out:
+                return out
     return None
 
 
@@ -7092,8 +7162,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # Inject saikai's OWN handoff prompt (a plain prompt, not the
                 # personal `/handoff` skill) so the session summarises itself into a
                 # paste-ready NEW SESSION PROMPT block — works without any skill.
+                # Overridable via SAIKAI_HANDOFF_PROMPT_FILE; a rejected override
+                # toasts and falls back to the built-in default.
+                _hp, _hp_warn = _resolve_handoff_prompt()
+                if _hp_warn:
+                    self.notify(_hp_warn, severity="warning", timeout=6)
                 try:
-                    term.paste_text(_B2_HANDOFF_PROMPT)
+                    term.paste_text(_hp)
                     term.submit()
                 except Exception:
                     self._b2_finish("checkpoint aborted — could not inject the handoff prompt",
@@ -8340,6 +8415,10 @@ def main():
                    help="Write a commented config.toml template to the config path, then exit.")
     p.add_argument("--print-config", action="store_true",
                    help="Print the resolved settings + their source (default/config/env), then exit.")
+    p.add_argument("--dump-handoff-prompt", action="store_true",
+                   help="Write the built-in b2 handoff prompt to the override file "
+                        "(SAIKAI_HANDOFF_PROMPT_FILE, else CACHE_DIR/handoff-prompt.md) "
+                        "so you can edit it, then exit.")
     p.add_argument("--force", action="store_true",
                    help="With --init-config: overwrite an existing config file.")
     # default=None on persisted flags so we can detect "not provided" and use
@@ -8425,6 +8504,20 @@ def main():
         sys.exit(_init_config(force=args.force))
     if args.print_config:
         sys.exit(_print_config())
+    if args.dump_handoff_prompt:
+        _hp_path = _handoff_prompt_path()
+        try:
+            _hp_path.parent.mkdir(parents=True, exist_ok=True)
+            _hp_path.write_text(_B2_HANDOFF_PROMPT + "\n", encoding="utf-8")
+        except OSError as e:
+            print(f"could not write {_hp_path}: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"wrote the default b2 handoff prompt to:\n  {_hp_path}\n")
+        print("Edit it freely — but KEEP an instruction to END with a fenced block "
+              "whose first line is exactly 'NEW SESSION PROMPT'. saikai aborts the "
+              "checkpoint (no /clear) if that block is missing, and on launch it "
+              "falls back to the built-in prompt if your file drops that contract.")
+        sys.exit(0)
 
     if args.preview:
         preview_session(args.preview)

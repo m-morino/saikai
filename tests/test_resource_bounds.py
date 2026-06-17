@@ -159,9 +159,56 @@ def test_extract_handoff_prompt_slices_new_session_block():
     )
     got2 = ex(body2)
     assert got2 is not None and "Resume the build from the failing test." in got2
+    # an assistant that ECHOES the marker in PROSE before the real fenced block
+    # (e.g. the improved prompt tells it to "end with ... NEW SESSION PROMPT", so
+    # the reply narrates that) must NOT make the extractor lock onto the prose —
+    # it must prefer the marker that sits INSIDE a ``` fence.
+    body3 = (
+        "I'll summarize, then give the NEW SESSION PROMPT below.\n"
+        "Recap of what we did:\n"
+        "- explored the parser\n"
+        "- fixed the bug\n\n"
+        "```\n"
+        "NEW SESSION PROMPT\n"
+        "Resume: run the failing test, then ship.\n"
+        "```\n"
+    )
+    got3 = ex(body3)
+    assert got3 is not None and "Resume: run the failing test, then ship." in got3
+    assert "Recap of what we did" not in got3, f"locked onto the prose echo: {got3!r}"
     # no NEW SESSION PROMPT anywhere -> None (never guess)
     assert ex("just an ordinary assistant reply, no handoff here") is None
     assert ex("") is None
+
+
+def test_resolve_handoff_prompt_override():
+    """The b2 handoff prompt is overridable via SAIKAI_HANDOFF_PROMPT_FILE, but the
+    `NEW SESSION PROMPT` contract is non-negotiable: a file that drops it is
+    rejected (warn + fall back to the built-in), never silently used."""
+    import os, tempfile
+    os.environ.pop("SAIKAI_HANDOFF_PROMPT_FILE", None)
+    # no override -> built-in default, no warning
+    prompt, note = saikai._resolve_handoff_prompt()
+    assert prompt == saikai._B2_HANDOFF_PROMPT and note is None
+    d = tempfile.mkdtemp(prefix="saikai-hp-")
+    try:
+        # a valid override (keeps the contract marker) -> used, no warning
+        good = os.path.join(d, "good.md")
+        with open(good, "w", encoding="utf-8") as f:
+            f.write("My custom handoff. End with a fenced NEW SESSION PROMPT block.")
+        os.environ["SAIKAI_HANDOFF_PROMPT_FILE"] = good
+        prompt, note = saikai._resolve_handoff_prompt()
+        assert "My custom handoff." in prompt and note is None
+        # an override that DROPPED the contract -> reject + warn + built-in default
+        bad = os.path.join(d, "bad.md")
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write("Just summarise things. (no marker line here)")
+        os.environ["SAIKAI_HANDOFF_PROMPT_FILE"] = bad
+        prompt, note = saikai._resolve_handoff_prompt()
+        assert prompt == saikai._B2_HANDOFF_PROMPT
+        assert note and "NEW SESSION PROMPT" in note
+    finally:
+        os.environ.pop("SAIKAI_HANDOFF_PROMPT_FILE", None)
 
 
 def test_last_assistant_text_from_jsonl_reads_tail():
@@ -349,6 +396,8 @@ if __name__ == "__main__":
     print("PASS test_b2_step_sequence_orders_clear_after_confirm_and_idle")
     test_extract_handoff_prompt_slices_new_session_block()
     print("PASS test_extract_handoff_prompt_slices_new_session_block")
+    test_resolve_handoff_prompt_override()
+    print("PASS test_resolve_handoff_prompt_override")
     test_last_assistant_text_from_jsonl_reads_tail()
     print("PASS test_last_assistant_text_from_jsonl_reads_tail")
     test_first_cwd_from_jsonl_scans_early_records()
