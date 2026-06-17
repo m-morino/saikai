@@ -101,9 +101,16 @@ neither clearing autonomously.
 
 **(b2) Checkpoint & fresh-start — OPT-IN, human-gated, for deliberate task
 boundaries.** A tick-driven state machine (NOT a blocking wait):
-1. Inject the existing **`/handoff` skill** (anchor on it: ~80-line cap, strips
-   failed-attempt noise, emits a paste-ready `NEW SESSION PROMPT` block, ends with
-   "/clear して"). **[rev2] /handoff is the building block, not a bespoke prompt.**
+1. Inject **saikai's own self-contained handoff prompt** (`_B2_HANDOFF_PROMPT`):
+   summarise lean, keep only what the next session needs, emit a paste-ready fenced
+   block whose first line is `NEW SESSION PROMPT`. **[rev3 — CORRECTION] rev2 said
+   "anchor on the existing `/handoff` skill, not a bespoke prompt", on the premise
+   that `/handoff` is a *standard* command. It is NOT — `/handoff` is a personal
+   user skill (`~/.claude/commands/handoff.md`), so depending on it makes b2 break
+   on any machine/user without that skill. b2 therefore injects its OWN generic
+   prompt (no personal/English-harness sections); it is a PLAIN prompt (not a slash
+   command) so it also dodges the slash-palette CR-absorb the spike found. If the
+   handoff turn yields no `NEW SESSION PROMPT`, b2 aborts BEFORE `/clear` (no loss).**
 2. **Detect completion via the transcript** (saikai already parses these): when a new
    assistant turn appears and the pane is idle, read its last message and extract the
    `NEW SESSION PROMPT` block. No bespoke cache file, no terminal scraping.
@@ -166,8 +173,12 @@ resolves child -> parent.
   per-sid hysteresis (clone the memory-pressure toast pattern).
 - **Lineage tree / group-by "Lineage" / mirror tree** — a future session-management
   feature with its own justification.
-- **Bespoke handoff prompt / `~/.cache/saikai/handoff/*.md` protocol** — dropped in
-  favour of the existing `/handoff` skill.
+- **`~/.cache/saikai/handoff/*.md` cache-file protocol** — still dropped (b2
+  detects completion + extracts the block straight from the transcript; no cache
+  file). NOTE [rev3]: an *inline* handoff prompt is NOT deferred — b2 now injects
+  its own `_B2_HANDOFF_PROMPT` (see Component (b) step 1); rev2's "use the existing
+  /handoff skill instead of a bespoke prompt" was reversed because `/handoff` is a
+  personal skill, not a standard command.
 
 ---
 
@@ -183,8 +194,10 @@ resolves child -> parent.
 
 ## Open items resolved / to verify
 
-1. `/handoff` output: anchor on it; detect completion + extract the `NEW SESSION
-   PROMPT` block from the transcript's last assistant message (no bespoke file).
+1. Handoff: inject saikai's own `_B2_HANDOFF_PROMPT` (NOT the personal `/handoff`
+   skill — see Component (b) step 1 [rev3]); detect completion + extract the
+   `NEW SESSION PROMPT` block from the transcript's last assistant message (no
+   bespoke cache file).
 2. model-id field for window detection: `message.model`; fall back to
    `SAIKAI_CTX_WINDOW`.
 3. **`/clear` new-sid behaviour: a real-pane SPIKE is task zero of b2** — load-bearing;

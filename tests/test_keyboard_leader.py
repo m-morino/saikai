@@ -1584,17 +1584,18 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
         f"the confirm modal must be shown before /clear: {facts}"
     assert facts.get("modal_shows_prompt"), \
         f"the modal must display the extracted NEW SESSION PROMPT: {facts}"
-    # the load-bearing safety assertion: /handoff was injected, /clear was NOT,
-    # at the moment the modal is up.
-    assert ("paste", "/handoff") in facts.get("events_at_modal", []), facts
+    # the load-bearing safety assertion: the handoff prompt was injected, /clear
+    # was NOT, at the moment the modal is up. (saikai injects its OWN handoff
+    # prompt now — not the personal /handoff skill — so match the constant.)
+    assert ("paste", saikai._B2_HANDOFF_PROMPT) in facts.get("events_at_modal", []), facts
     assert facts.get("clear_before_confirm") is False, \
         f"/clear must NOT be injected before the human confirms: {facts}"
     # after Enter the modal closes and the machine resumes
     assert facts.get("modal_after_enter") != "ConfirmRefreshScreen", facts
     ev = facts.get("events_final", [])
     assert ("paste", "/clear") in ev, f"/clear must be injected after confirm: {facts}"
-    # /clear comes AFTER /handoff in the recorded order
-    assert ev.index(("paste", "/clear")) > ev.index(("paste", "/handoff")), facts
+    # /clear comes AFTER the handoff prompt in the recorded order
+    assert ev.index(("paste", "/clear")) > ev.index(("paste", saikai._B2_HANDOFF_PROMPT)), facts
     # the reseed injects the extracted prompt (references the parent handoff).
     # events are mixed arity — ("paste", text) vs ("submit",) — so guard the unpack.
     assert any(e[0] == "paste" and "Resume saikai Task 11" in e[1]

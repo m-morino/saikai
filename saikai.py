@@ -3003,7 +3003,7 @@ def _ctx_tokens_from_jsonl(path) -> "int | None":
 # as a function so the safety ORDERING (the destructive /clear sits AFTER the
 # human confirm AND after the handoff settles) is unit-testable without any I/O.
 _B2_STEPS = (
-    "inject_handoff",       # paste /handoff into the pane (non-destructive)
+    "inject_handoff",       # paste saikai's handoff prompt (non-destructive)
     "await_handoff_idle",   # wait for the turn to settle (status back to idle)
     "extract_prompt",       # read the NEW SESSION PROMPT out of the transcript
     "confirm",              # push ConfirmRefreshScreen — the HUMAN GATE
@@ -3018,6 +3018,32 @@ def _b2_step_sequence() -> tuple:
     """The ordered b2 state names. Pure — unit-tested for the safety invariant
     that inject_clear comes after both `confirm` and `await_handoff_idle`."""
     return _B2_STEPS
+
+
+# The handoff instructions b2 injects, instead of depending on a personal
+# `/handoff` slash-command skill being present in the controlled pane (it isn't a
+# Claude Code built-in). Self-contained so b2 works in any session / machine /
+# user; deliberately generic (no personal or English-harness sections). It is a
+# PLAIN prompt, not a slash command, so it also dodges the slash-palette CR-absorb
+# the spike hit. It MUST end with a fenced block whose first line is exactly
+# `NEW SESSION PROMPT` — that is what _extract_handoff_prompt slices out, the
+# confirm modal shows, and inject_reseed pastes into the fresh session.
+_B2_HANDOFF_PROMPT = (
+    "Wrap up this session for a fresh one — do not keep working here. Goal: spend "
+    "the least context. Don't recap the whole history; keep only what the next "
+    "session needs to resume the work.\n"
+    "Rules:\n"
+    "- Be concise. Omit exploration logs, dead ends, large tool output, long quotes.\n"
+    "- Keep file paths, commands, unfinished tasks, and key constraints/decisions.\n"
+    "- If you changed code, list the changed files and how each was verified.\n"
+    "- List open questions explicitly.\n"
+    "- Write in the language this session has been using.\n"
+    "- END with ONE fenced code block, paste-ready for the next session, whose "
+    "FIRST line is exactly: NEW SESSION PROMPT\n"
+    "Structure: 1) current goal  2) settled facts / decisions  3) changed vs "
+    "unchanged files  4) next steps  5) constraints / gotchas  6) the NEW SESSION "
+    "PROMPT block."
+)
 
 
 def _extract_handoff_prompt(text: "str | None") -> "str | None":
@@ -7021,7 +7047,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Drive the machine off a self-cancelling interval (cancelled in
             # _b2_finish). 0.3s matches the spike's settle granularity.
             self._b2_timer = self.set_interval(0.3, self._b2_tick)
-            self.notify("checkpoint: sending /handoff…", timeout=4)
+            self.notify("checkpoint: drafting the handoff…", timeout=4)
 
         def _b2_finish(self, msg=None, severity="information") -> None:
             """Tear down the b2 machine: stop the interval, drop state, optional
@@ -7052,11 +7078,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             st = b2.get("state")
 
             if st == "inject_handoff":
+                # Inject saikai's OWN handoff prompt (a plain prompt, not the
+                # personal `/handoff` skill) so the session summarises itself into a
+                # paste-ready NEW SESSION PROMPT block — works without any skill.
                 try:
-                    term.paste_text("/handoff")
+                    term.paste_text(_B2_HANDOFF_PROMPT)
                     term.submit()
                 except Exception:
-                    self._b2_finish("checkpoint aborted — could not inject /handoff",
+                    self._b2_finish("checkpoint aborted — could not inject the handoff prompt",
                                     "error")
                     return
                 b2["ticks"] = self._B2_SETTLE_TICKS
