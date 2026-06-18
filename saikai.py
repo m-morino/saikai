@@ -4300,6 +4300,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         #statussel { width: 16; }
         #lastsel { width: 16; }
         #statusbar { height: 1; background: $surface; color: $warning; }
+        /* which-key panel (Space-leader): a dedicated bottom-docked, ALIGNED
+           Static — not a toast — so the family columns line up and it never sits
+           over the live pane's bottom-right. Hidden until armed + hesitating. */
+        #leaderhint { dock: bottom; height: auto; max-height: 12;
+                      background: $panel; color: $text; border-top: solid $accent;
+                      padding: 0 1; display: none; }
+        /* Transient toasts move to the TOP-RIGHT — Textual defaults to bottom-right,
+           which covers the live pane's input line. */
+        ToastRack { dock: top; align: right top; }
         #main { layout: horizontal; height: 1fr; }
         #table { width: 60%; }                /* default; inline style overrides on mount/drag */
         #main.split #table { width: 34%; }    /* split-live: give the live pane the room */
@@ -4388,6 +4397,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     yield RichLog(id="preview", classes="right", wrap=True,
                                   highlight=False, markup=False)
             yield Footer()
+            yield Static("", id="leaderhint")   # which-key panel (dock: bottom)
 
         # Actions that operate on the list / live panes. They are PRIORITY
         # bindings (so they fire even when a live pane owns focus), but Textual
@@ -4425,6 +4435,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # an arm could dangle into the keystrokes after the screen closes (a
             # later single Esc quitting, or a letter running a leader action).
             self._leader_pending = False
+            self._set_leader_hint(None)
             if getattr(self, "_quit_armed", False):
                 self._disarm_quit()
             return super().push_screen(*args, **kwargs)
@@ -4814,11 +4825,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Column labels carry a sort indicator (priority + direction arrow)
             # so a glance at the header tells the user the current sort spec.
             sort_keys = _load_sort()
+            # Show the sort PRIORITY number only when more than one column sorts —
+            # a lone sort key's "1" (e.g. "Last 1v") is noise; a bare arrow is clear.
+            _n_active_sort = sum(1 for k in sort_keys if k.get("col", "-") != "-")
             def col_label(col_key: str, base: str) -> str:
                 for i, k in enumerate(sort_keys, 1):
                     if k["col"] == col_key:
                         arrow = "v" if k["dir"] == "desc" else "^"
-                        return f"{base} {i}{arrow}"
+                        rank = f"{i}" if _n_active_sort > 1 else ""
+                        return f"{base} {rank}{arrow}"
                 return base
 
             # Column definitions. Fixed widths (Textual auto-width was producing
@@ -5079,33 +5094,41 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Section-header rows inflate row_count; use the tracked session count.
             n = getattr(self, "_n_sessions", table.row_count)
 
-            # Sort: show first active sort key
+            # Sort + Group ALSO live in the searchrow dropdowns, so only echo them
+            # in the statusbar when that row is HIDDEN (mirrors the search query
+            # below) — a visible dropdown row makes them redundant here.
+            sep = "  [dim]·[/dim]  "
+            _bar_hidden = not self._search_visible()
             _COL_LABEL = {
                 "date": "Start", "last": "Last", "title": "Title",
                 "proj": "Proj", "topic": "Topic", "turns": "Turns", "fav": "Fav",
             }
             sort_keys = _load_sort()
             first = next((k for k in sort_keys if k["col"] != "-"), None)
-            if first:
+            if not _bar_hidden:
+                sort_str = ""
+            elif first:
                 arrow = "↓" if first["dir"] == "desc" else "↑"
                 col_display = _COL_LABEL.get(first["col"], first["col"].capitalize())
-                sort_str = f"Sort: {col_display}{arrow}"
+                sort_str = f"{sep}Sort: {col_display}{arrow}"
             else:
-                sort_str = "Sort: default"
+                sort_str = f"{sep}Sort: default"
 
             # Scope: "All projects" when --all-projects, else repo name
             scope = "All projects" if show_project else (repo.name if repo else "All projects")
+            scope_str = f"{sep}{scope}"
 
-            sep = "  [dim]·[/dim]  "
-            # Show Tree only when ON (a row of OFFs is noise); Group stays
-            # visible — dimmed when off — so the feature advertises itself.
+            # Show Tree only when ON (a row of OFFs is noise).
             tree_str = f"{sep}Tree: [green]ON[/green]" if _get_tree_mode() else ""
             _GROUP_LABEL = {"date": "[green]Date[/green]",
                             "project": "[green]Project[/green]",
                             "state": "[green]State[/green]"}
-            group_str = ("Group: " + _GROUP_LABEL[_get_group_by()]
-                         if _get_group_by() in _GROUP_LABEL
-                         else "[dim]Group: off[/dim]")
+            if not _bar_hidden:
+                group_str = ""
+            elif _get_group_by() in _GROUP_LABEL:
+                group_str = f"{sep}Group: " + _GROUP_LABEL[_get_group_by()]
+            else:
+                group_str = f"{sep}[dim]Group: off[/dim]"
             # Active Desktop-style filters (only shown when non-default).
             _filt = []
             if _get_status_filter() != "active":
@@ -5201,8 +5224,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if _mc:
                 _kb_parts.insert(0, f"[b]\N{GLOBE WITH MERIDIANS} {_mc}[/b]")
             _kb = " · ".join(_kb_parts)
-            text = (f"  {n} sessions{search_str}{sep}{sort_str}{sep}"
-                    f"{scope}{sep}{group_str}{filt_str}{tree_str}"
+            text = (f"  {n} sessions{search_str}{sort_str}"
+                    f"{scope_str}{group_str}{filt_str}{tree_str}"
                     f"{live_str}{sep}{_kb}")
             self.query_one("#statusbar", Static).update(text)
 
@@ -5377,6 +5400,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if self._leader_key:
                 if self._leader_pending:
                     self._leader_pending = False
+                    self._set_leader_hint(None)
                     event.stop()
                     if event.key != "escape":
                         _act = self._leader_actions.get((event.character or "").lower())
@@ -5455,6 +5479,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             """Leader timed out / cancelled — drop the pending state (the next key
             types normally again)."""
             self._leader_pending = False
+            self._set_leader_hint(None)
 
         def action_arm_leader(self) -> None:
             """The footer's ␣ Menu binding: arm the leader from any non-typing
@@ -5472,19 +5497,35 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.set_timer(0.6, self._show_leader_hint)
             self.set_timer(2.5, self._cancel_leader)
 
-        def _show_leader_hint(self) -> None:
-            """Deferred which-key hint: fires 0.6 s after the leader press, and
-            only if the sequence is STILL pending — the user hesitated, so show
-            the map grouped by family. Completed / cancelled sequences (and a
-            double-Space mark spree) never see a toast."""
-            if not self._leader_pending or not self._leader_actions:
+        def _set_leader_hint(self, lines: "list[str] | None") -> None:
+            """Show the which-key panel with `lines` (a dedicated bottom-docked
+            Static — NOT a toast — so the family columns align and it never sits
+            over the live pane's bottom-right), or hide it when `lines` is None.
+            Safe to call before mount / after teardown."""
+            try:
+                panel = self.query_one("#leaderhint", Static)
+            except Exception:
                 return
-            lines = []
+            if lines:
+                panel.update("\n".join(lines))
+                panel.display = True
+            else:
+                panel.display = False
+
+        def _show_leader_hint(self) -> None:
+            """Deferred which-key panel: fires 0.6 s after the leader press, and
+            only if the sequence is STILL pending — the user hesitated, so show the
+            map grouped by family. Completed / cancelled sequences (and a
+            double-Space mark spree) never see it."""
+            if not self._leader_pending or not self._leader_actions:
+                self._set_leader_hint(None)
+                return
+            lines = ["[bold cyan]Command menu[/bold cyan]  "
+                     "[dim]press one key · Esc cancels[/dim]"]
             for fam, pairs in _leader_groups(self._leader_actions):
                 seq = "  ".join(_leader_hint_item(k, lbl) for k, lbl in pairs)
                 lines.append(f"[bold cyan]{fam:<7}[/bold cyan] {seq}")
-            self.notify("\n".join(lines), title="Command menu · press one key",
-                        timeout=4)
+            self._set_leader_hint(lines)
 
         def _over_tab_bar(self, event) -> bool:
             """True when the mouse is over the split-live tab bar. Textual's Tabs
