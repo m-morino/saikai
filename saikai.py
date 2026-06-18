@@ -3655,7 +3655,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         from textual.screen import ModalScreen
         from textual.widgets import (DataTable, Footer, Input, OptionList, RichLog,
                                      Select, Static, Switch, TabbedContent,
-                                     TabPane, Tabs)
+                                     TabPane, Tabs, TextArea)
         from textual.widgets.option_list import Option
         from rich.text import Text
     except ImportError as e:
@@ -4059,34 +4059,36 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         ConfirmRefreshScreen { align: center middle; }
         #confref-box { background: $panel; border: solid $warning; padding: 1 2;
                        width: 96; max-width: 96%; height: auto; max-height: 80%; }
-        #confref-prompt { height: auto; max-height: 24; margin: 1 0;
-                          border: tall $accent; padding: 0 1; }
+        #confref-prompt { height: auto; min-height: 6; max-height: 24; margin: 1 0; }
         """
-        BINDINGS = [Binding("enter", "proceed", show=False),
-                    Binding("escape", "cancel", show=False)]
+        BINDINGS = [Binding("ctrl+s", "proceed", show=False, priority=True),
+                    Binding("escape", "cancel", show=False, priority=True)]
 
         def __init__(self, prompt: str):
             super().__init__()
             self._prompt = prompt or ""
 
         def prompt_text(self) -> str:
-            """The extracted NEW SESSION PROMPT this modal is gating on."""
-            return self._prompt
+            """The NEW SESSION PROMPT this modal is gating on — the live (possibly
+            edited) text once mounted, else the originally extracted prompt."""
+            try:
+                return self.query_one("#confref-prompt", TextArea).text
+            except Exception:
+                return self._prompt
 
         def compose(self) -> ComposeResult:
             with Vertical(id="confref-box"):
                 yield Static("[bold yellow]Checkpoint → refresh this session?[/bold yellow]   "
-                             "[dim]Enter clears + reseeds · Esc cancels[/dim]")
-                yield Static("[dim]/handoff is done. Enter will send /clear "
-                             "(destructive) and reseed a fresh session with:[/dim]")
-                with VerticalScroll(id="confref-prompt"):
-                    yield Static(self._prompt or "[red](no NEW SESSION PROMPT found)[/red]")
+                             "[dim]edit if needed · Ctrl+S reseeds · Esc cancels[/dim]")
+                yield Static("[dim]/handoff is done. Ctrl+S sends /clear (destructive) "
+                             "and reseeds a fresh session with this prompt:[/dim]")
+                yield TextArea(self._prompt, id="confref-prompt")
 
         def action_proceed(self) -> None:
-            self.dismiss(True)
+            self.dismiss(self.prompt_text())   # the (possibly edited) reseed prompt
 
         def action_cancel(self) -> None:
-            self.dismiss(False)
+            self.dismiss(None)
 
     class OpenElsewhereScreen(ModalScreen):
         """Guard for resuming a session already open in ANOTHER Claude
@@ -7441,13 +7443,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # it (proceed) or finishes it (cancel). Guard so we push once.
                 b2["state"] = "awaiting_confirm"
 
-                def _resume(ok, _self=self):
+                def _resume(result, _self=self):
                     cur = getattr(_self, "_b2", None)
                     if not cur or cur.get("state") != "awaiting_confirm":
                         return                # machine torn down meanwhile
-                    if ok:
+                    if result is not None:    # Ctrl+S → proceed with the (edited) prompt
+                        if str(result).strip():
+                            cur["prompt"] = result   # reseed with the edited text
                         cur["state"] = "inject_clear"
-                    else:
+                    else:                     # Esc → cancel, session untouched
                         _self._b2_finish("checkpoint cancelled — session untouched")
 
                 self.push_screen(ConfirmRefreshScreen(b2["prompt"]), _resume)

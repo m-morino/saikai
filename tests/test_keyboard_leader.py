@@ -1535,8 +1535,9 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
                 facts["clear_before_confirm"] = any(
                     e == ("paste", "/clear") for e in fake_term.events)
 
-                # Confirm with Enter -> the machine resumes past the gate.
-                await pilot.press("enter")
+                # Confirm with Ctrl+S -> the machine resumes past the gate (Enter now
+                # inserts a newline in the editable prompt; Ctrl+S commits the edit).
+                await pilot.press("ctrl+s")
                 await pilot.pause(0.1)
                 facts["modal_after_enter"] = type(self.screen).__name__
 
