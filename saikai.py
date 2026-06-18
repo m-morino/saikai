@@ -2966,11 +2966,12 @@ def _ram_per_pane_mb() -> float:
     return _cfg("limits", "per_pane_mb", "SAIKAI_CLAUDE_MB", 600.0, float)
 
 
-def _ctx_tokens_from_jsonl(path) -> "int | None":
-    """Live context size of a session, read from the LAST transcript record that
-    carries a usage block: input + cache_read + cache_creation input tokens (the
-    number `/context` shows). Ground truth, no estimation. None if the file is
-    unreadable or has no usage yet. Reads only the tail (transcripts are large)."""
+def _ctx_usage_from_jsonl(path) -> "tuple[int | None, str | None]":
+    """(live context size, model id) from the LAST transcript record that carries a
+    usage block: tokens = input + cache_read + cache_creation input tokens (the
+    number `/context` shows), model = that turn's message.model. Ground truth, no
+    estimation. (None, None) if the file is unreadable or has no usage yet. Reads
+    only the tail (transcripts are large)."""
     try:
         import os
         size = os.path.getsize(path)
@@ -2978,8 +2979,9 @@ def _ctx_tokens_from_jsonl(path) -> "int | None":
             f.seek(max(0, size - 400_000))      # tail: the last usage is near the end
             chunk = f.read().decode("utf-8", "replace")
     except (OSError, ValueError):
-        return None
+        return None, None
     last = None
+    last_model = None
     for ln in chunk.splitlines():
         ln = ln.strip()
         if not ln.startswith("{") or '"usage"' not in ln:
@@ -2991,11 +2993,19 @@ def _ctx_tokens_from_jsonl(path) -> "int | None":
             continue
         if isinstance(u, dict) and "input_tokens" in u:
             last = u
+            last_model = msg.get("model") if isinstance(msg, dict) else None
     if last is None:
-        return None
-    return (int(last.get("input_tokens", 0))
-            + int(last.get("cache_read_input_tokens", 0))
-            + int(last.get("cache_creation_input_tokens", 0)))
+        return None, None
+    tokens = (int(last.get("input_tokens", 0))
+              + int(last.get("cache_read_input_tokens", 0))
+              + int(last.get("cache_creation_input_tokens", 0)))
+    return tokens, last_model
+
+
+def _ctx_tokens_from_jsonl(path) -> "int | None":
+    """Live context size only (see _ctx_usage_from_jsonl) — for callers/tests that
+    don't need the model id."""
+    return _ctx_usage_from_jsonl(path)[0]
 
 
 # ── b2 (Task 11): human-gated checkpoint → /handoff → confirm → /clear → reseed.
@@ -3328,14 +3338,33 @@ def _project_sids(project_dir) -> set:
 
 _CTX_TIERS = (200_000, 1_000_000)
 
+# Model id families that offer a 1M-token context window. The transcript records
+# only the BASE model id (no `[1m]` suffix), so a session's true window can't be
+# read back -- but when the model CAN do 1M we default the gauge to the 1M window,
+# because 1M is the common mode for these models now. The rare cost: a 200K-mode
+# session on one of these models reads as a low % and won't redden until ~700K;
+# set SAIKAI_CTX_WINDOW=200000 (or [context] window) to pin it.
+_CTX_1M_MODELS = ("opus-4", "sonnet-4")
 
-def _ctx_window_for(tokens, override=None) -> int:
-    """Context window for a session. The transcript's message.model is the base id
-    (no `[1m]`), so the window can't be read from it -- infer the smallest tier that
-    fits the observed count (a 720K reading can't be a 200K window). env/config
-    override wins."""
+
+def _model_supports_1m(model) -> bool:
+    """True when `model` (a transcript base id like 'claude-opus-4-8') is from a
+    family that offers a 1M context window. Pure."""
+    if not model:
+        return False
+    m = str(model).lower()
+    return any(tag in m for tag in _CTX_1M_MODELS)
+
+
+def _ctx_window_for(tokens, override=None, model=None) -> int:
+    """Context window for a session. `override` (env/config) wins. Else, if the
+    turn's model is 1M-capable, default to the 1M window -- the base model id can't
+    tell a 1M session from a 200K one, and 1M is the common mode. Else infer the
+    smallest tier that fits the observed count (a 720K reading can't be 200K)."""
     if override:
         return int(override)
+    if _model_supports_1m(model):
+        return 1_000_000
     for t in _CTX_TIERS:
         if tokens <= t:
             return t
@@ -5129,10 +5158,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _jp = (getattr(_ft, "_live_jsonl", None)
                            or (self._sid_index.get(getattr(_ft, "sid", None)) or {}).get("jsonl_path"))
                     if _jp:
-                        _tok = _ctx_tokens_from_jsonl(_jp)
+                        _tok, _model = _ctx_usage_from_jsonl(_jp)
                         if _tok is not None:
                             _seg = _ctx_gauge_segment(_tok, _ctx_window_for(
-                                _tok, override=_cfg("context", "window", "SAIKAI_CTX_WINDOW", 0, int) or None))
+                                _tok, model=_model,
+                                override=_cfg("context", "window", "SAIKAI_CTX_WINDOW", 0, int) or None))
                             if _seg:
                                 live_str += f"{sep}{_seg}"
             # Search: when the on-demand bar is hidden, surface the active text

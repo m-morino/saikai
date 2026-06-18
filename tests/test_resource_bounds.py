@@ -80,13 +80,17 @@ def test_ctx_tokens_reads_last_usage_block(tmp_path=None):
         f.write("\n".join(json.dumps(r) for r in recs) + "\n")
     # last usage block: 131 + 715734 + 4017
     assert saikai._ctx_tokens_from_jsonl(p) == 719882
+    # _ctx_usage_from_jsonl also returns that turn's model id
+    assert saikai._ctx_usage_from_jsonl(p) == (719882, "claude-opus-4-8")
     # no usage anywhere -> None
     p2 = os.path.join(d, "n.jsonl")
     with open(p2, "w", encoding="utf-8") as f:
         f.write(json.dumps({"type": "user", "message": {"content": "x"}}) + "\n")
     assert saikai._ctx_tokens_from_jsonl(p2) is None
+    assert saikai._ctx_usage_from_jsonl(p2) == (None, None)
     # missing file -> None (never raises)
     assert saikai._ctx_tokens_from_jsonl(os.path.join(d, "nope.jsonl")) is None
+    assert saikai._ctx_usage_from_jsonl(os.path.join(d, "nope.jsonl")) == (None, None)
 
 
 def test_ctx_window_inferred_from_observed_tokens():
@@ -96,6 +100,25 @@ def test_ctx_window_inferred_from_observed_tokens():
     assert saikai._ctx_window_for(719_882) == 1_000_000     # this repo's real session
     assert saikai._ctx_window_for(1_200_000) == 1_000_000   # clamp to top tier
     assert saikai._ctx_window_for(50_000, override=500_000) == 500_000
+
+
+def test_ctx_window_model_capacity():
+    # A 1M-capable model (opus-4 / sonnet-4 families) defaults to the 1M window even
+    # under 200K: a 1M session reading 150K is 15%, not the 75% the bare tier
+    # inference shows. The base model id can't prove [1m] was on, but 1M is the
+    # common mode now, so default to it (SAIKAI_CTX_WINDOW pins a 200K-mode session).
+    assert saikai._model_supports_1m("claude-opus-4-8")
+    assert saikai._model_supports_1m("claude-sonnet-4-6")
+    assert not saikai._model_supports_1m("claude-haiku-4-5")
+    assert not saikai._model_supports_1m(None)
+    assert not saikai._model_supports_1m("")
+    assert saikai._ctx_window_for(150_000, model="claude-opus-4-8") == 1_000_000
+    assert saikai._ctx_window_for(150_000, model="claude-sonnet-4-6") == 1_000_000
+    # non-1M / unknown / None model -> smallest-fitting tier (unchanged)
+    assert saikai._ctx_window_for(150_000, model="claude-haiku-4-5") == 200_000
+    assert saikai._ctx_window_for(150_000, model=None) == 200_000
+    # override still wins over the model default
+    assert saikai._ctx_window_for(150_000, model="claude-opus-4-8", override=200_000) == 200_000
 
 
 def test_lineage_sidecar_roundtrip():
@@ -409,6 +432,8 @@ if __name__ == "__main__":
     print("PASS test_ctx_tokens_reads_last_usage_block")
     test_ctx_window_inferred_from_observed_tokens()
     print("PASS test_ctx_window_inferred_from_observed_tokens")
+    test_ctx_window_model_capacity()
+    print("PASS test_ctx_window_model_capacity")
     test_ctx_gauge_segment_formats_and_colours()
     print("PASS test_ctx_gauge_segment_formats_and_colours")
     test_lineage_sidecar_roundtrip()
