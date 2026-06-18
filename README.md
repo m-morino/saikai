@@ -83,6 +83,8 @@ The leading glyph is the session's status:
 live pane, no reply due · `@` open elsewhere · `+` active · `.` recent · `*` favorite ·
 `x` hidden
 
+![The list grouped by date, with a ★ favorite, status markers, and the sort/group state in the status bar](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-browse.svg)
+
 ## Install
 
 Requires **Python ≥ 3.11**. The easiest path is
@@ -169,6 +171,8 @@ SAIKAI_MIRROR=1 SAIKAI_MIRROR_HOST=192.168.1.50 saikai   # reachable on your LAN
 
 On launch saikai shows a scannable **QR code** (and copies the URL); press `F12`
 to bring it back anytime. The URL carries a per-run access token.
+
+![saikai's F12 web-mirror screen: a scannable QR and the tokened LAN URL to open the session on another device](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-mirror.png)
 
 The mirror is **read-only by default**. Press **`Shift+F12`** (a local-only key)
 to toggle browser **control** on — then the browser drives saikai with:
