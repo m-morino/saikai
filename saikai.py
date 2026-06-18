@@ -5225,23 +5225,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     fit = min(fit, max(0, self._live.max_live - cnt))   # MAX_LIVE backstop
                     live_str = f"{sep}" + _live_ram_segment(
                         cnt, _att, _ms, fit, per, float(_kw.get("max_load") or 85.0))
-                # Context-fill gauge for the FOCUSED live pane (ground-truth tokens).
-                _ft = self._focused_terminal()
-                if _ft is not None:
-                    # A b2 checkpoint re-points the RUNNING pane at the fresh child
-                    # session (same PTY, new sid minted on /clear), so prefer that
-                    # transcript — otherwise the gauge keeps reading the frozen
-                    # parent and stays red after a successful lean reset.
-                    _jp = (getattr(_ft, "_live_jsonl", None)
-                           or (self._sid_index.get(getattr(_ft, "sid", None)) or {}).get("jsonl_path"))
-                    if _jp:
-                        _tok, _model = _ctx_usage_from_jsonl(_jp)
-                        if _tok is not None:
-                            _seg = _ctx_gauge_segment(_tok, _ctx_window_for(
-                                _tok, model=_model,
-                                override=_cfg("context", "window", "SAIKAI_CTX_WINDOW", 0, int) or None))
-                            if _seg:
-                                live_str += f"{sep}{_seg}"
             # Search: when the on-demand bar is hidden, surface the active text
             # query (so a filtered list isn't mistaken for "sessions missing");
             # otherwise hint how to open it.
@@ -5278,9 +5261,28 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if _mc:
                 _kb_parts.insert(0, f"[b]\N{GLOBE WITH MERIDIANS} {_mc}[/b]")
             _kb = " · ".join(_kb_parts)
+            # Context-fill gauge (ground-truth tokens): the FOCUSED live pane if any,
+            # else the CURSOR session — so it's visible whether you're typing in a
+            # pane or just browsing the list. A b2 checkpoint re-points the running
+            # pane at its fresh child, so prefer the pane's live jsonl.
+            ctx_str = ""
+            _cft = self._focused_terminal() if self._live is not None else None
+            if _cft is not None:
+                _cjp = (getattr(_cft, "_live_jsonl", None)
+                        or (self._sid_index.get(getattr(_cft, "sid", None)) or {}).get("jsonl_path"))
+            else:
+                _cjp = (self._sid_index.get(self._cursor_sid()) or {}).get("jsonl_path")
+            if _cjp:
+                _ctok, _cmodel = _ctx_usage_from_jsonl(_cjp)
+                if _ctok is not None:
+                    _cseg = _ctx_gauge_segment(_ctok, _ctx_window_for(
+                        _ctok, model=_cmodel,
+                        override=_cfg("context", "window", "SAIKAI_CTX_WINDOW", 0, int) or None))
+                    if _cseg:
+                        ctx_str = f"{sep}{_cseg}"
             text = (f"  {n} sessions{search_str}{sort_str}"
                     f"{scope_str}{group_str}{filt_str}{tree_str}"
-                    f"{live_str}{sep}{_kb}")
+                    f"{live_str}{ctx_str}{sep}{_kb}")
             self.query_one("#statusbar", Static).update(text)
 
         def _cursor_sid(self) -> str | None:
