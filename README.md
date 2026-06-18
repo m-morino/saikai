@@ -8,106 +8,80 @@
 
 **English** | [日本語](https://github.com/m-morino/saikai/blob/master/README.ja.md)
 
-> **Mission control for every Claude Code session** — every session across every
-> repo as a live pane, instant switching, grouped by what needs you. **And the
-> dreaded reset of a session that's grown bloated and dumb is now one safe keystroke.**
+> **Find, resume, and supervise every Claude Code session from one terminal** —
+> one searchable list across all your repos and worktrees, with the session you
+> pick running live right beside it.
 
 ![saikai demo](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-demo.gif)
 
-<sub>The demo uses fictional, leak-checked data. The current GIF is a
-deterministic UI recording; see [the recording guide](https://github.com/m-morino/saikai/blob/master/docs/demo-recording.md)
-for how public recordings are isolated and audited.</sub>
+## Who it's for
 
-saikai is keyboard-first mission control for all your Claude Code sessions. Run
-many as live `claude` panes, switch between them instantly, and group/sort them
-by status — working `~`, waiting for you `?`, finished and awaiting your reply
-`!` — so you always know which one needs a human. Find and resume any session
-across every repo and worktree. It reads Claude's own transcript files directly
-— no daemon, no database.
+`claude --resume` (`-r`) is great for picking up the session in the folder
+you're in. But once your work is spread across repos and worktrees, it can't
+help you *recognize* the one you want: there's no searching the conversation, no
+glance at what you last said, no way to flag the sessions you keep coming back
+to. That gap is the whole reason saikai exists. You'll want it if you'd like to:
+
+- find a session across any repo or worktree without remembering where it started;
+- recognize past work by its content — search the transcript, skim a preview,
+  diff the changes — not just by its title;
+- favorite the sessions you return to and reopen them instantly;
+- run several `claude` sessions at once and see at a glance which is working,
+  waiting, or done;
+- close the terminal and bring the whole working set back later.
+
+Why a terminal app? Claude Code is CLI-first — new features tend to land there
+first — and a terminal is far lighter than a desktop app. saikai puts a Claude
+Desktop-style, cross-session list right where you already work.
+
+## Features
+
+The screen is two panes: **the session list on the left, the Claude session you
+picked on the right** (saikai calls this *split-live*; on by default).
+
+![Split-live: the session list on the left with a live claude pane on the right](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-split-live.svg)
+
+> **Back and forth:** `Enter` opens the selected session on the right · `Ctrl+]`
+> returns to the list · `F2`/`F3` switch panes.
+
+- **Every session, one searchable screen.** Browse and search across all your
+  repos and worktrees by title, conversation text, or session ID, then resume
+  from where each one started.
+- **Run sessions live, switch instantly.** Open the one you pick as a real
+  `claude` process beside the list, and move between them with a keystroke.
+- **Grouped by status — jump to what needs you.** `~` working · `?` waiting ·
+  `!` finished and awaiting your reply; group/sort by it and hop to the next pane
+  that needs a human.
+- **Favorites and previews to tell sessions apart.** Star the ones you return to
+  (`f`); preview the conversation, diff the changes, reuse a prompt, follow
+  inferred parent/child chains.
+- **Quit without losing your work.** Reopen the same working set later with
+  `Shift+F4`. No daemon, no database — it just reads Claude's own history files
+  (AI summaries are opt-in).
+- **★ (experimental) Reset a bloated session in one keystroke.** Each pane shows
+  its real context fill — the actual numbers Claude records, not a `chars/4`
+  guess (`ctx 662K/1.0M (66%)`, green/yellow/red). `Shift+F11` drops a `/compact`;
+  **Checkpoint** (`Space` `c`) has the session write a handoff, shows you the
+  reseed prompt to approve, and only on your Enter clears + reseeds a fresh, lean
+  session (`Shift+F6` jumps back to the parent). Still experimental.
+- **Mirror to your phone / another browser** (experimental, token-authenticated,
+  off by default) — see [Web mirror](#web-mirror-experimental).
 
 ```bash
 uv tool install saikai
 saikai
 ```
 
-**The bloated-session problem.** A long session quietly fills its context window
-and gets dumber — but the fix is a chore: reset, and you re-explain everything,
-so you ride auto-compact on a degraded session instead. saikai surfaces the
-problem and makes the fix trivial. Every live pane shows its **real** context
-fill read straight from the transcript — `ctx 662K/1.0M (66%)`, green → yellow →
-red — so you can see *which* session has grown heavy. Then **`Shift+F11`** drops
-a `/compact` in place for everyday leanness, and **`Space` `c`** (Checkpoint)
-does the full, safe reset: saikai has the session write a handoff, shows you the
-paste-ready `NEW SESSION PROMPT` to approve, and only on your **Enter** clears +
-reseeds a fresh, lean session — with **`Shift+F6`** to jump back to the parent.
-It never `/clear`s on its own. (Claude owns the context window; saikai surfaces
-the fill and drives the standard commands.)
+### Reading the list
 
-#### Why not just `claude --resume`?
-
-`claude --resume` only sees the current working directory, so once your work
-spreads across repositories and worktrees the right session gets tedious to
-find. saikai gives you one cross-project view — and runs the sessions you pick
-as live panes beside the list.
-
-### How to read the list
-
-By default, sessions from the same project share a title color, so related
-work stays recognizable when the project column is hidden in the narrow split
-view. Set `display.color_by` to `worktree`, `topic`, or `none` to change the grouping.
+By default, sessions from the same project share a title color, so related work
+stays recognizable when the project column is hidden in the narrow split view.
+Set `display.color_by` to `worktree`, `topic`, or `none` to change the grouping.
+The leading glyph is the session's status:
 
 `~` working · `?` waiting for you · `!` finished, awaiting your reply · `=` idle
 live pane, no reply due · `@` open elsewhere · `+` active · `.` recent · `*` favorite ·
 `x` hidden
-
-## Features
-
-- **Every session, one screen.** Browse and search Claude Code history across all
-  your repositories and worktrees, then resume from the cwd where each session
-  started.
-- **Live panes, instant switching.** Run several real `claude` sessions in
-  split-live tabs and move between them with a keystroke.
-- **Status at a glance — and jump to what needs you.** `~` working · `?` waiting ·
-  `!` finished and awaiting your reply; group/sort by it and hop straight to the
-  next pane that needs a human.
-- **Quit without losing your panes.** Reopen the same working set later with
-  `Shift+F4`. No daemon, no database — it reads Claude's own transcripts (AI
-  summaries are opt-in).
-- **Preview, diff, reuse, and trace.** Preview transcripts, compare changes,
-  reuse prompts, and follow inferred parent/child session chains.
-- **★ See which session is bloated — and reset it safely in one keystroke.** Each
-  pane shows its real token count from the transcript (`ctx 662K/1.0M (66%)`, not
-  a `chars/4` guess), coloured green/yellow/red. `Shift+F11` injects `/compact` in
-  place; **Checkpoint** (`Space` `c`) has the session write a handoff, shows you
-  the exact reseed prompt to approve, then on your Enter clears + reseeds a fresh,
-  lean session (marking the row `↻` while it works) — `Shift+F6` jumps back to the
-  parent.
-- **Mirror to your phone / another browser** (opt-in, token-authenticated,
-  read-only by default) — see [Web mirror](#web-mirror-opt-in) below.
-
-## Who it is for
-
-What I wanted was a TUI session manager that could keep several Claude Code
-sessions on one screen and let me move between them. It is especially useful
-for:
-
-- finding sessions spread across repositories and worktrees without remembering
-  each original cwd;
-- running several `claude` processes in parallel and seeing which are working,
-  waiting, or finished;
-- closing the terminal and later restoring the same working set;
-- getting a Claude Desktop-style session list inside the usual terminal,
-  without keeping a desktop app running;
-- finding older work from conversation text, changes, or previous prompts
-  rather than from titles alone.
-
-The implementation is a few focused Python modules on
-[Textual](https://github.com/Textualize/textual), with a RAM gate that warns
-before another live pane would push the machine into thrashing.
-
-> The live pane uses ConPTY on Windows and a POSIX PTY elsewhere — see
-> [Platform support](#platform-support) for the per-OS verification status
-> (Windows is the verified platform today).
 
 ## Install
 
@@ -133,9 +107,9 @@ pipx install saikai   # isolated + on PATH
 pip install saikai   # into the active environment
 ```
 
-The split-live pane needs the PTY deps (`pyte`, and `pywinpty` on Windows /
+Live panes need a couple of extra deps (`pyte`, and `pywinpty` on Windows /
 `ptyprocess` elsewhere); they install automatically with any command above. If
-they're somehow missing, saikai still runs in list-only mode (see below).
+they're missing, saikai still runs in list-only mode (see below).
 
 ## Usage
 
@@ -147,89 +121,46 @@ saikai --table         # static, non-interactive table
 saikai --help
 ```
 
-### Keys — learn three things
+### Keys
 
-Everything else is on screen (the footer, the dropdowns, and the `␣` menu
-that pops up when you pause).
+Start with the way out. **`Ctrl+]` returns from a pane to the list**, and
+**`Esc` steps back one level** (search → list → quit). Know those two and you
+can't get stuck; everything else is on screen (the footer, `?` for the full
+list, and the `␣` menu that pops up when you pause).
 
-1. **Keys you already know.** `↑` `↓` move · `Enter` resumes · `/` or just
-   typing searches · `Tab` toggles the preview · `?` full key list · within
-   saikai controls, `Esc` leaves the current context (search → list → quit).
-   From a live pane, use `Ctrl+]` to return to the list.
-2. **`Space` is the menu.** Press `Space` in the list, then one mnemonic
-   letter. Hesitate after `Space` and the whole menu appears in place,
-   grouped by family (which-key style) — nothing to memorise:
+The everyday keys are the ones you'd guess: `↑` `↓` move · `Enter` open/resume ·
+`F2`/`F3` switch panes · `Shift+F3` jump to the next pane needing attention · `/`
+or any character searches · `Tab` toggles the preview.
 
-   | Session | View | Panes |
-   |---|---|---|
-   | `f` ★ favorite | `s` cycle **s**ort column | `n` new session |
-   | `h` hide | `o` flip sort **o**rder | `p` restore panes |
-   | `e` rename (edit) | `g` cycle grouping | `z` freeze pane |
-   | `y` copy prompt (yank) | `t` tree | `a` next attention |
-   | `d` diff (changes) | `l` hide/show list | `x` close tab · `[` `]` tabs |
-   | `r` refresh | `,` settings · `/` hide/show bar | `Space` mark for batch launch |
+**`Space` is the menu.** Press `Space` in the list, then one mnemonic letter;
+pause and the whole menu appears in place, grouped by family (which-key style —
+nothing to memorize). Every other session and pane action lives here:
 
-   Space is a deliberate menu key, not a claim that every TUI should use a
-   Space leader. It does not take Space from search fields, dropdowns, or live
-   agent panes. It also avoids taking a letter away from type-to-search. The
-   trade-off is that list marking becomes
-   `Space Space`; set `[keys] leader = "none"` if conventional Space-to-mark is
-   more important to you.
+| Session | View | Panes |
+|---|---|---|
+| `f` ★ favorite | `s` cycle **s**ort column | `n` new session |
+| `h` hide | `o` flip sort **o**rder | `p` restore panes |
+| `e` rename (edit) | `g` cycle grouping | `z` freeze pane |
+| `y` copy prompt (yank) | `t` tree | `a` next attention |
+| `d` diff (changes) | `l` hide/show list | `x` close tab · `[` `]` tabs |
+| `r` refresh | `,` settings · `/` hide/show bar | `Space` mark for batch launch |
 
-3. **`Ctrl+]` returns focus** from a live claude pane to the list (the pane
-   receives ordinary editing keys; saikai's documented F-key shortcuts remain
-   available).
+Search tokens `:fav` `:hidden` `:open` `:active` `:recent` (combine with text),
+`Alt+←/→` to nudge the list/pane divider, full mouse support (column sort, row
+click, drag-to-copy inside a pane), and key/leader remaps via `config.toml`'s
+`[keys]` — all covered by `?` and [Configuration](#configuration-environment-variables).
 
-**Search tokens** (combine with text and each other): `:fav` `:hidden` `:open`
-`:active` `:recent`. The filter bar — search box plus the Group / Sort /
-Status / Age dropdowns — is visible by default: `Tab`/`Shift+Tab` walk into
-the dropdowns, `Enter` opens one, `␣/` reclaims the rows (persists).
+If the PTY deps aren't available, saikai automatically drops to a **list-only
+mode** (`Enter` resumes the selected session full-screen). Search, previews, and
+favorites all still work, so it's a perfectly good picker without live panes. To
+start list-only on purpose: `SAIKAI_SPLIT_LIVE=0 saikai`.
 
-More keyboard parity: `Alt+←/→` nudges the list/pane divider (persists, like
-dragging it). Most session and pane actions also have F-key aliases; `?` shows
-the available aliases and your `[keys]` remaps.
+## Web mirror (experimental)
 
-Don't like the defaults? In `config.toml`: `[keys] leader = "none"` turns the
-mode off (Space then marks directly, as before), `leader = "ctrl+g"` moves it,
-`leader_defaults = false` empties the map, and any `action = "x"` single-letter
-entry remaps one sequence. Mouse support includes column-header sorting, divider
-dragging, rows, dropdowns, and drag-selection for copying arbitrary live-pane
-text. The main session-management flow remains keyboard-accessible.
-
-### Split-live (default)
-
-![Split-live: the session list on the left with a live claude pane running on the right](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-split-live.svg)
-
-saikai runs real interactive `claude` processes in tabs beside the list whenever
-its PTY deps (`pyte`, `pywinpty`/`ptyprocess`) are present — they ship as
-dependencies, so this is the default. To opt out and use the lightweight
-list-only browser (`Enter` = full-screen takeover resume), set the env var:
-
-```bash
-SAIKAI_SPLIT_LIVE=0 saikai     # also: false / no / off
-```
-
-| Key | Action |
-|-----|--------|
-| `Enter` | open / focus a live pane for the selected session |
-| `Shift+F8` | start a NEW claude session in any folder / git worktree |
-| `Shift+F4` | reopen the panes from your last session (snapshot + resume) — anytime |
-| `F2` / `F3` | previous / next live tab |
-| `Shift+F3` | jump to the next pane needing attention (`?` waiting / `!` finished) |
-| `F4` | hide / show the session list (full-width pane) |
-| `Ctrl+]` | return focus from a pane back to the list (`SAIKAI_RELEASE_KEY` to change) |
-| `F10` / `Shift+F10` | close the active tab / close all tabs (explicit close — *not* restored) |
-| `Esc` from the list | quit: snapshot the open panes, then kill them all (`Shift+F4` reopens them next launch) |
-| `Ctrl+C` | interrupt claude in a focused live pane; from saikai controls, quit all |
-| scroll up | freeze the pane (copy mode): select/copy while claude keeps running |
-
-Press `?` inside saikai for the active color rule and marker legend.
-
-## Web mirror (opt-in)
-
-saikai can mirror its live UI to a phone or another browser — to glance at
-what's running, or to drive a session from across the room. It is **off by
-default** and **token-authenticated**.
+**Experimental.** Launch with `SAIKAI_MIRROR=1` and saikai mirrors its live UI
+to a phone or another browser — to glance at what's running, or drive a session
+from across the room. Off by default, and each run is authenticated with its own
+unique token.
 
 ```bash
 SAIKAI_MIRROR=1 saikai                                   # loopback only (127.0.0.1)
@@ -298,18 +229,13 @@ extension boundary, but Codex is not selectable until its history discovery and
 live-state integration are complete. Claude history discovery respects
 `CLAUDE_CONFIG_DIR`.
 
-## Ecosystem
-
-saikai focuses on finding, resuming, and supervising sessions over time.
-[ccmanager](https://github.com/kbwo/ccmanager) focuses on coordinating a live
-multi-agent roster. The two solve adjacent problems rather than competing for
-the same workflow.
-
 ## Platform support
 
 **Verified support is deliberately bounded to Windows 10 / 11 on Python ≥
-3.11.** Linux, WSL2, and macOS remain implemented but experimental until their
-real PTY paths receive sustained native testing. Other platforms are unsupported.
+3.11.** Linux and WSL2 are implemented and experimental — they share the POSIX
+PTY path and can be verified, so reviewers are welcome. macOS is **unverified**: I develop on Windows and have no Mac to test on, so it
+isn't a claimed target — verification reports would be very welcome. Other
+platforms are unsupported.
 
 Most of saikai is Python + Textual. Split-live is the platform-sensitive part:
 real PTYs, clipboard access, process teardown, key input, and rendering can vary
@@ -319,7 +245,7 @@ by OS and host terminal. Honest status:
 |---|---|---|---|---|
 | **Windows** 10 / 11 | ConPTY (`pywinpty`) | Win32 `CF_UNICODETEXT` (codepage-safe) | `GlobalMemoryStatusEx` | ✅ **developed & daily-driven** (on WezTerm) |
 | **Linux** *(incl. WSL2)* | POSIX PTY (`ptyprocess`) | OSC-52 *(terminal / tmux / SSH policy must allow it)* | `/proc/meminfo` + PSI + overcommit mode | ⚠️ **experimental; native reviewers wanted** |
-| **macOS** | POSIX PTY (`ptyprocess`) | local `pbcopy`; OSC-52 fallback for remote-capable terminals | `vm_stat` + memory-pressure sysctl *(no commit limit)* | ⚠️ **experimental; macOS reviewers wanted** |
+| **macOS** | POSIX PTY (`ptyprocess`) | local `pbcopy`; OSC-52 fallback for remote-capable terminals | `vm_stat` + memory-pressure sysctl *(no commit limit)* | ⚠️ **unverified** — no Mac to test on; reports welcome |
 
 - On Windows, WezTerm and Windows Terminal use the same ConPTY and Win32
   clipboard paths. That does not guarantee identical key handling, cell widths,
@@ -334,8 +260,9 @@ by OS and host terminal. Honest status:
   for t in tests/test_*.py; do uv run python "$t"; done
   ```
 
-- Linux/WSL2/macOS reviewers are wanted. Please report the terminal, local vs
-  SSH/tmux setup, PTY teardown result, key quirks, and clipboard behavior.
+- Linux/WSL2/macOS reviewers are wanted — I develop on Windows and have no Mac,
+  so macOS verification is especially welcome. Please report the terminal, local
+  vs SSH/tmux setup, PTY teardown result, key quirks, and clipboard behavior.
 - CI installs each OS's real PTY backend and smoke-tests spawn, resize, output,
   and EOF on Windows, Linux, and macOS. This is not a substitute for interactive
   review across terminal emulators, SSH, tmux, IMEs, and clipboard policies.
