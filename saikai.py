@@ -2471,14 +2471,19 @@ _MARKER_BLANK = " "
 # reliably probe that, so columns drifted whenever the user's terminal didn't
 # match the static assumption. Letters trade a bit of visual flair for
 # reliable column alignment everywhere.
+_TABLE_NA_CACHE: dict = {}   # mtime-keyed reply-due cache for the --table activity column
+
+
 def _activity_marker(s: dict) -> str:
-    """Activity column: open-busy / open-idle / active / recent."""
+    """Activity column: open-busy / open-idle / active / reply-due / recent."""
     if s.get("is_open"):
         if s.get("session_status") == "busy":
             return _c("@", CYAN, BOLD)   # open & currently responding
         return _c("@", GREEN, BOLD)      # open & idle in another Claude window
     if s.get("is_active"):
         return _c("+", GREEN)
+    if _needs_attention(s, _TABLE_NA_CACHE):
+        return _c("!", YELLOW, BOLD)     # dormant: your last turn is unanswered
     if s.get("is_recent"):
         return _c(".", YELLOW)
     return _MARKER_BLANK
@@ -5026,7 +5031,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # does not clear !. ASCII keeps the marker column aligned.
                     marker_a = "!" if s["id"] in getattr(self, "_unread", ()) else "="
                 else:
+                    # ! here = a DORMANT session whose last turn was yours and is
+                    # still unanswered — the same "reply due" idea as the live ! above,
+                    # but for a not-running session (resume it to get the reply). Ranks
+                    # below + (just-touched) and above . (merely recent).
                     marker_a = ("@" if s.get("is_open") else "+" if s.get("is_active")
+                                else "!" if _needs_attention(s, self._na_cache)
                                 else "." if s.get("is_recent") else " ")
                 marker_s = ("*" if s["id"] in favorites
                             else "x" if is_hidden else " ")
