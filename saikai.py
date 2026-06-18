@@ -4088,6 +4088,37 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def action_cancel(self) -> None:
             self.dismiss(False)
 
+    class OpenElsewhereScreen(ModalScreen):
+        """Guard for resuming a session already open in ANOTHER Claude
+        window/instance (the @ marker). A second `claude --resume` on the same
+        transcript can interleave and corrupt it, so gate the spawn: Enter resumes
+        anyway, Esc cancels."""
+        CSS = """
+        OpenElsewhereScreen { align: center middle; }
+        #oe-box { background: $panel; border: solid $warning; padding: 1 2;
+                  width: 78; max-width: 96%; height: auto; }
+        """
+        BINDINGS = [Binding("enter", "proceed", show=False),
+                    Binding("escape", "cancel", show=False)]
+
+        def __init__(self, title: str):
+            super().__init__()
+            self._title = title or "this session"
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="oe-box"):
+                yield Static("[bold yellow]Already open elsewhere[/bold yellow]")
+                yield Static(f"[dim]'{self._title}' is open in another Claude "
+                             "window. Resuming starts a SECOND Claude on the same "
+                             "conversation — they can clobber each other's writes.[/dim]")
+                yield Static("[dim]Enter resumes anyway · Esc cancels[/dim]")
+
+        def action_proceed(self) -> None:
+            self.dismiss(True)
+
+        def action_cancel(self) -> None:
+            self.dismiss(False)
+
     class NotificationsScreen(ModalScreen):
         """Recent-notifications recall (F11). Toasts auto-dismiss; this lists the
         ones that already vanished — newest first, with time + severity colour —
@@ -4497,6 +4528,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._leader_key = ""          # resolved leader key; "" = off
             self._leader_actions = {}      # {letter: action_name} reached via the leader
             self._leader_pending = False   # waiting for the post-leader key
+            self._leader_gen = 0           # bumps each arm; a stale timer no-ops on mismatch
             self._applied_keymap = {}      # direct rebinds applied (shown in ? help)
             try:
                 _kc = _load_config().get("keys", {})
@@ -5417,12 +5449,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _tbl = None
                 if event.key == self._leader_key and self.focused is _tbl:
                     self._leader_pending = True
+                    self._leader_gen += 1
+                    _g = self._leader_gen
                     # which-key style: hint only on HESITATION (no second key
                     # within 0.6 s). Fast fingers (Space-f, double-Space mark
                     # sprees) never see a toast; a user who pauses gets the map,
                     # grouped by family — every time, not just the first three.
-                    self.set_timer(0.6, self._show_leader_hint)
-                    self.set_timer(2.5, self._cancel_leader)
+                    # _g tags both timers so a stale one from an earlier press
+                    # (Space-h then Space) can't cancel/redraw THIS session's menu.
+                    self.set_timer(0.6, lambda: self._show_leader_hint(_g))
+                    self.set_timer(6.0, lambda: self._cancel_leader(_g))
                     event.stop()
                     return
             # search-as-you-type: typing while the table is focused redirects into the
@@ -5475,9 +5511,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 table.focus()
                 event.stop()
 
-        def _cancel_leader(self) -> None:
+        def _cancel_leader(self, gen=None) -> None:
             """Leader timed out / cancelled — drop the pending state (the next key
-            types normally again)."""
+            types normally again). `gen` guards a STALE timer from an earlier press
+            (Space-h then Space) from cancelling a newer, still-open session."""
+            if gen is not None and gen != self._leader_gen:
+                return
             self._leader_pending = False
             self._set_leader_hint(None)
 
@@ -5494,8 +5533,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     or isinstance(self.focused, (Input, Select))):
                 return
             self._leader_pending = True
-            self.set_timer(0.6, self._show_leader_hint)
-            self.set_timer(2.5, self._cancel_leader)
+            self._leader_gen += 1
+            _g = self._leader_gen
+            self.set_timer(0.6, lambda: self._show_leader_hint(_g))
+            self.set_timer(6.0, lambda: self._cancel_leader(_g))
 
         def _set_leader_hint(self, lines: "list[str] | None") -> None:
             """Show the which-key panel with `lines` (a dedicated bottom-docked
@@ -5512,11 +5553,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             else:
                 panel.display = False
 
-        def _show_leader_hint(self) -> None:
+        def _show_leader_hint(self, gen=None) -> None:
             """Deferred which-key panel: fires 0.6 s after the leader press, and
             only if the sequence is STILL pending — the user hesitated, so show the
             map grouped by family. Completed / cancelled sequences (and a
-            double-Space mark spree) never see it."""
+            double-Space mark spree) never see it. `gen` ignores a stale timer from
+            an earlier press so it can't redraw over a newer session's menu."""
+            if gen is not None and gen != self._leader_gen:
+                return
             if not self._leader_pending or not self._leader_actions:
                 self._set_leader_hint(None)
                 return
@@ -5787,14 +5831,24 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # focuses it once mounted.
                 return
             s = self._sid_index.get(sid)
-            try:
-                argv, cwd, env = _build_resume_invocation(sid, all_sessions)
-            except Exception as e:
-                self.notify(f"could not build resume command: {e!r}",
-                            severity="error", timeout=8)
-                return
             title = _pane_title(s, sid)
-            self._spawn_live_pane(sid, argv, cwd, env, title, refresh=refresh)
+
+            def _spawn() -> None:
+                try:
+                    argv, cwd, env = _build_resume_invocation(sid, all_sessions)
+                except Exception as e:
+                    self.notify(f"could not build resume command: {e!r}",
+                                severity="error", timeout=8)
+                    return
+                self._spawn_live_pane(sid, argv, cwd, env, title, refresh=refresh)
+
+            # Already open in another Claude window/instance (the @ marker): a second
+            # `claude --resume` on the same JSONL can interleave/corrupt it. Confirm.
+            if s and s.get("is_open"):
+                self.push_screen(OpenElsewhereScreen(title),
+                                 lambda ok: _spawn() if ok else None)
+                return
+            _spawn()
 
         def _open_new_live(self, target_cwd: str) -> None:
             """Start a FRESH claude session in target_cwd as a live pane. A
