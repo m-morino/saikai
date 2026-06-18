@@ -347,15 +347,23 @@ def test_no_app_binding_steals_a_readline_ctrl_key():
     """saikai must never bind an app action to a bare Ctrl+<letter>: those are
     readline editing keys the user types in the search box and inside live claude
     panes (and claude itself binds Ctrl+R/T/L). App shortcuts live on FUNCTION
-    keys instead. Ctrl+C (quit) is the sole allowed bare-Ctrl binding. Regression
-    for the Ctrl+K close-all that wiped every live pane (2026-06). Scans the
-    source so it runs without textual (the App/Binding class needs textual)."""
+    keys instead. Ctrl+C (quit) is the sole allowed bare-Ctrl binding. A binding
+    active only while a MODAL is up — no live pane is focused then, so it can't
+    steal the key from claude — may opt out with a `# readline-exempt` comment on
+    its line (e.g. Ctrl+S to save in the checkpoint editor). Regression for the
+    Ctrl+K close-all that wiped every live pane (2026-06). Scans the source so it
+    runs without textual (the App/Binding class needs textual)."""
     import re
     from pathlib import Path
     src = Path(__file__).resolve().parent.parent.joinpath("saikai.py").read_text(encoding="utf-8")
     keys = re.findall(r'Binding\(\s*"([^"]+)"', src)
     assert keys, "no Binding(...) entries found — regex/structure changed?"
-    offenders = [k for k in keys if re.fullmatch(r"ctrl\+[a-z]", k) and k != "ctrl+c"]
+    offenders = []
+    for line in src.splitlines():
+        if "readline-exempt" in line:        # documented modal-only exception
+            continue
+        offenders += [k for k in re.findall(r'Binding\(\s*"([^"]+)"', line)
+                      if re.fullmatch(r"ctrl\+[a-z]", k) and k != "ctrl+c"]
     assert not offenders, f"app bindings on readline Ctrl+letter keys: {offenders}"
     # the function keys we relocated them onto must actually be bound
     for must in ("f5", "f6", "f7", "f8", "f9", "f10", "shift+f10"):

@@ -4069,7 +4069,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                        width: 96; max-width: 96%; height: auto; max-height: 80%; }
         #confref-prompt { height: auto; min-height: 6; max-height: 24; margin: 1 0; }
         """
-        BINDINGS = [Binding("ctrl+s", "proceed", show=False, priority=True),
+        # ctrl+s save is safe here: this modal is up only when NO live claude pane
+        # is focused, so it can't steal the readline key — see the
+        # test_no_app_binding_steals_a_readline_ctrl_key guard.
+        BINDINGS = [Binding("ctrl+s", "proceed", show=False, priority=True),  # readline-exempt
                     Binding("escape", "cancel", show=False, priority=True)]
 
         def __init__(self, prompt: str):
