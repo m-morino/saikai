@@ -5,7 +5,7 @@ drives the real PickerApp under Textual's run_test harness, and saves SVG
 screenshots. The split-live shot runs scripts/mock_claude.py through the real
 PTY/pyte pipeline instead of a real `claude` (nothing private can leak).
 
-Usage:  uv run scripts/make_screenshots.py
+Usage:  uv run --with pillow scripts/make_screenshots.py
 """
 import asyncio
 import os
@@ -77,6 +77,9 @@ import saikai  # noqa: E402
 
 saikai._build_resume_invocation = lambda full_id, sessions: (
     [sys.executable, str(MOCK_CLAUDE)], str(fixture.hero_repo), dict(os.environ))
+# Clean screenshots: pin a healthy memory reading so the host's real load never
+# leaks an "⚠ 82% RAM" warning into the statusbar.
+saikai._mem_status = lambda: saikai._MemStatus(44.0, 8600.0, 12000.0, 16384.0, 0.0)
 
 from textual.app import App  # noqa: E402
 
@@ -99,6 +102,21 @@ def fake_run(self, *a, **kw):
             for _ in range(40):                 # wait for the PTY to paint
                 await pilot.pause(0.1)
             self.save_screenshot(filename="saikai-split-live.svg", path=str(ASSETS))
+            # The F12 web-mirror modal: a scannable QR + the tokened LAN URL. Attach
+            # a loopback hub directly (production wires it via a driver_class that
+            # run_test swaps in) and pin a FIXED illustrative URL so the QR is
+            # reproducible. The server stays on loopback; nothing is ever exposed.
+            import saikai_mirror as _mir
+            _hub = _mir.MirrorHub(token="demo", host="127.0.0.1", port=0,
+                                  cols=SIZE[0], rows=SIZE[1])
+            _hub.serve()
+            _hub.url = lambda: "http://192.168.1.50:8771/?token=Hk3sP9q-demo"
+            self._mirror_hub = _hub
+            self.action_mirror_info()            # F12 — show the QR modal
+            await pilot.pause(0.8)
+            self.save_screenshot(filename="saikai-mirror.svg", path=str(ASSETS))
+            await pilot.press("escape")
+            await pilot.pause(0.3)
     asyncio.run(go())
 
 
@@ -116,9 +134,40 @@ try:
     suspicious.add(os.getlogin().lower())
 except OSError:
     pass
-for svg in ("saikai-browse.svg", "saikai-split-live.svg"):
+for svg in ("saikai-browse.svg", "saikai-split-live.svg", "saikai-mirror.svg"):
     text = (ASSETS / svg).read_text(encoding="utf-8").lower()
     hits = sorted(w for w in suspicious if len(w) >= 4 and w in text)
     if hits:
         raise SystemExit(f"LEAK in {svg}: {hits} — screenshot NOT safe to publish")
     print(f"saved (leak-checked): {ASSETS / svg}")
+
+# The F12 mirror modal, rendered CRISP for the README. saikai's terminal QR uses
+# half-block glyphs that look jagged at 1x in an SVG export, so supersample: render
+# the modal SVG at 3x device-scale, then downscale to 2x. This keeps the real
+# saikai UI (the "scan to connect" box + tokened URL), not a context-free bare QR.
+import re  # noqa: E402
+import subprocess  # noqa: E402
+from PIL import Image  # noqa: E402
+
+_edge = next((c for c in (
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe") if Path(c).is_file()), None)
+if _edge:
+    _msvg = (ASSETS / "saikai-mirror.svg").read_text(encoding="utf-8")
+    _vb = re.search(r'viewBox="0 0 ([\d.]+) ([\d.]+)"', _msvg)
+    _w, _h = int(float(_vb.group(1))), int(float(_vb.group(2)))
+    _html = ASSETS / "_mirror.html"
+    _html.write_text("<!doctype html><html><head><meta charset='utf-8'>"
+                     "<style>html,body{margin:0;padding:0}</style></head><body>"
+                     + _msvg + "</body></html>", encoding="utf-8")
+    _big = ASSETS / "_mirror_big.png"
+    subprocess.run([_edge, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+                    "--force-device-scale-factor=3", f"--window-size={_w},{_h}",
+                    f"--screenshot={_big}", _html.as_uri()],
+                   check=True, capture_output=True, timeout=120)
+    Image.open(_big).resize((_w * 2, _h * 2), Image.LANCZOS).save(ASSETS / "saikai-mirror.png")
+    _html.unlink()
+    _big.unlink()
+    print(f"saved (3x->2x crisp): {ASSETS / 'saikai-mirror.png'}")
+else:
+    print("Edge not found — skipped saikai-mirror.png")

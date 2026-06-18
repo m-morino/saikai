@@ -63,12 +63,13 @@ def _resume(full_id, sessions):
         return ([sys.executable, str(MOCK_CLAUDE), "checkpoint", disp,
                  str(fixture.bloated_project_dir), str(fixture.bloated_sid)],
                 str(fixture.hero_repo), dict(os.environ))
-    # The reseeded CHILD: a session minted in the bloated project dir that is NOT
-    # the bloated session itself (b2's /clear created it). It has a low usage, so
-    # opening it shows the GREEN gauge — the honest "resumed lean" frame.
-    _jp = s.get("jsonl_path")
-    if (full_id != fixture.bloated_sid and _jp is not None
-            and Path(_jp).parent == Path(str(fixture.bloated_project_dir))):
+    # The reseeded CHILD is the session b2 actually RECORDED in the lineage (minted
+    # by /clear during the checkpoint arc). Keying off the lineage — not "any
+    # session sharing the bloated project dir" — is essential: the api-server
+    # project also holds "Fix N+1 queries", which must play needs-you (-> ?), not
+    # fresh. The lineage is empty when that session opens (beat 4) and only carries
+    # the real child once b2 has run (beat 11).
+    if full_id != fixture.bloated_sid and full_id in saikai._load_lineage():
         return ([sys.executable, str(MOCK_CLAUDE), "fresh", disp],
                 str(fixture.hero_repo), dict(os.environ))
     sc = "idle" if "auth" in (s.get("ai_title") or "").lower() else "needs-you"
@@ -77,6 +78,10 @@ def _resume(full_id, sessions):
 
 
 saikai._build_resume_invocation = _resume
+# Clean demo state: don't let the host's real memory load leak into the recording
+# (an "⚠ 82% RAM" warning intruding on the statusbar). Pin a healthy reading so the
+# RAM-aware capacity feature still shows, just not alarmingly.
+saikai._mem_status = lambda: saikai._MemStatus(44.0, 8600.0, 12000.0, 16384.0, 0.0)
 
 from textual.app import App  # noqa: E402
 
@@ -100,72 +105,43 @@ def fake_run(self, *a, **kw):
     async def go():
         async with self.run_test(size=SIZE) as pilot:
             await pilot.pause(0.8)
-            # Attach a loopback mirror hub so the F12 beat shows a real QR. (The
-            # production start path wires the mirror through a custom driver_class
-            # that Textual's run_test replaces, so do it directly here.)
-            import secrets as _sec
-            import saikai_mirror as _m
-            _tok = _sec.token_urlsafe(16)
-            _hub = _m.MirrorHub(token=_tok, host="127.0.0.1",
-                                port=0, cols=SIZE[0], rows=SIZE[1])
-            _hub.serve()
-            # The real server stays on loopback (the demo never exposes anything),
-            # but show a plausible LAN URL in the QR — 127.0.0.1 would read as
-            # "a phone could never reach that".
-            _hub.url = lambda: f"http://192.168.1.50:8771/?token={_tok}"
-            self._mirror_hub = _hub
             # Beat 1 — HOOK: the whole cross-project list (the value shot).
-            await snap(pilot, 3000)
-            # Beat 2 — RESUME the cursored auth session live (faithful pane).
+            await snap(pilot, 1800)
+            # Beat 2 — SEARCH: filter the whole list by title / body / id. Drive the
+            # search Input directly (its Changed handler re-filters) — robust to key
+            # routing like the dropdown beats, and focus stays on the table so the
+            # next Enter still resumes.
+            self.query_one("#search").value = "auth"
+            await pilot.pause(0.6)
+            await snap(pilot, 1900)              # filtered list + the query in the bar
+            self.query_one("#search").value = ""   # clear -> the full list again
+            await pilot.pause(0.5)
+            # Beat 3 — RESUME the cursored session live (faithful pane).
             await pilot.press("enter")
             for _ in range(22):                  # let the PTY paint
                 await pilot.pause(0.1)
-            await snap(pilot, 2400)
-            # Beat 3 — open a SECOND session and flip between the two panes.
+            await snap(pilot, 1900)
+            # Beat 4 — open a SECOND session: two live panes, flip with F2 / F3.
             await pilot.press("ctrl+right_square_bracket")   # back to the list
             await pilot.pause(0.4)
-            await pilot.press("down")                        # to the api-server session
+            await pilot.press("down")                        # to the next session
             await pilot.press("enter")                       # open it ("working" => ~)
             for _ in range(24):                  # let the 2nd pane paint
                 await pilot.pause(0.1)
-            await snap(pilot, 1700)              # two live panes
-            await pilot.press("f2")              # flip tabs
+            await pilot.press("f2")              # flip to the other pane
             await pilot.pause(0.6)
-            await snap(pilot, 1500)
-            # Beat 4 — back on the list: the second pane is ~ working...
-            await pilot.press("ctrl+right_square_bracket")
-            await pilot.pause(0.6)
-            await snap(pilot, 1600)
-            # ...and a moment later its marker has changed to ? (needs you).
-            for _ in range(36):                  # mock transitions (5 s) + 1.5 s poll
-                await pilot.pause(0.1)
-            await snap(pilot, 2600)
-            # Beat 5 — jump straight to the pane that needs you.
+            await snap(pilot, 1700)              # two panes, just flipped
+            # Beat 5 — back on the list, let the mock flip its marker
+            # ~ (working) -> ? (needs you): the supervise story in one shot.
+            await pilot.press("ctrl+right_square_bracket")   # back to the list
+            for _ in range(70):                  # wait out the mock ~ -> ? transition
+                await pilot.pause(0.1)            # (+ the 2-tick debounce settling to ?)
+            await snap(pilot, 1900)              # the ? (needs-you) marker on the list
+            # Beat 6 — jump straight to the pane that needs you.
             await pilot.press("shift+f3")        # next-attention
             for _ in range(8):
                 await pilot.pause(0.1)
-            await snap(pilot, 2400)
-            # Beats 6-7 — organize the list: GROUP then SORT. Set the dropdown
-            # values directly (Select.Changed applies them and keeps the dropdown
-            # consistent) — the keyboard cyclers either don't sync the Select
-            # (sort) or risk a stray key landing in the search box.
-            await pilot.press("ctrl+right_square_bracket")    # back to the list
-            await pilot.pause(0.5)
-            self.query_one("#groupsel").value = "date"        # group by date
-            await pilot.pause(0.7)
-            await snap(pilot, 2600)
-            self.query_one("#sortsel").value = "title"        # sort A->Z
-            await pilot.pause(0.7)
-            await snap(pilot, 2600)
-            # Beat 8 — mirror to ANOTHER DEVICE via the scannable QR. Call F12's
-            # action directly (key routing depends on focus; this does not).
-            # We're already on the list after the sort beat.
-            self.action_mirror_info()            # F12's action — show the QR
-            await pilot.pause(0.8)
-            await snap(pilot, 3000)
-            await pilot.press("escape")          # close the QR modal
-            await pilot.pause(0.4)
-
+            await snap(pilot, 1800)
             # ── Context-lifecycle arc (the standout). Drive the REAL b2 machine
             # on the deliberately bloated session: red gauge → Checkpoint → the
             # confirm gate → /clear+reseed → green gauge → Shift+F6 back. The
@@ -216,12 +192,12 @@ def fake_run(self, *a, **kw):
                         pass
                     await pilot.pause(0.2)
 
-            # Beat 9 — RESUME the bloated session live + FOCUS it; the statusbar
+            # Beat 7 — RESUME the bloated session live + FOCUS it; the statusbar
             # context gauge reads its transcript and shows RED (~86%).
             await open_and_focus(fixture.bloated_sid)
             await pilot.pause(0.4)
-            await snap(pilot, 3000)              # RED ctx gauge in the statusbar
-            # Beat 10 — Space-c Checkpoint: drafts the handoff, then HOLDS on the
+            await snap(pilot, 2400)              # RED ctx gauge in the statusbar
+            # Beat 8 — Space-c Checkpoint: drafts the handoff, then HOLDS on the
             # confirm modal showing the extracted NEW SESSION PROMPT (the trust
             # beat). run_action drives it regardless of key routing.
             await pilot.app.run_action("checkpoint")
@@ -230,8 +206,8 @@ def fake_run(self, *a, **kw):
                 if type(self.screen).__name__ == "ConfirmRefreshScreen":
                     break
             await pilot.pause(0.4)
-            await snap(pilot, 3400)             # the confirm modal — HOLD
-            # Beat 11 — Enter: the REAL b2 machine runs /clear, the mock mints the
+            await snap(pilot, 2800)             # the confirm modal — HOLD
+            # Beat 9 — Enter: the REAL b2 machine runs /clear, the mock mints the
             # fresh child transcript (low usage), b2 binds it + records lineage +
             # pastes the reseed prompt. Then re-scan (F5) so the new child session
             # is indexed, open + focus it, and snap its GREEN gauge (the child
@@ -251,8 +227,8 @@ def fake_run(self, *a, **kw):
             if _child is not None and _child in self._sid_index:
                 await open_and_focus(_child)        # open the reseeded child live
             await pilot.pause(0.4)
-            await snap(pilot, 3400)             # GREEN ctx gauge on the reseeded pane
-            # Beat 12 — Shift+F6: the parent (pre-clear) session is still there. The
+            await snap(pilot, 2500)             # GREEN ctx gauge on the reseeded pane
+            # Beat 10 — Shift+F6: the parent (pre-clear) session is still there. The
             # list cursor is on the child (lineage child→parent), so open_parent
             # jumps the cursor to the parent row. Release focus to the list so the
             # parent row is highlighted under the cursor.
@@ -262,7 +238,7 @@ def fake_run(self, *a, **kw):
             await pilot.pause(0.4)
             await pilot.app.run_action("open_parent")        # Shift+F6
             await pilot.pause(0.7)
-            await snap(pilot, 3000)
+            await snap(pilot, 2200)
     asyncio.run(go())
 
 
@@ -416,42 +392,38 @@ def _callout(im, text, anchor, tail, font):
 
 
 # Per-beat (text, bubble top-left, tail target) as W/H fractions; positions are
-# shared between languages, only the wording differs.
-_POS = [(0.40, 0.71, 0.17, 0.28), (0.42, 0.72, 0.72, 0.42), (0.43, 0.40, 0.56, 0.17),
-        None, (0.04, 0.60, 0.02, 0.225), (0.04, 0.60, 0.02, 0.225),
-        (0.42, 0.72, 0.72, 0.42),
-        (0.30, 0.30, 0.40, 0.09), (0.42, 0.30, 0.55, 0.09),
-        (0.63, 0.38, 0.54, 0.42),
-        # 9 RED gauge + 11 GREEN gauge: tail → the ctx segment in the TOP status
-        # row (right side, y≈0.13). 10 confirm modal (centre). 12 parent (list).
-        (0.34, 0.40, 0.88, 0.135), (0.28, 0.20, 0.50, 0.32),
-        (0.34, 0.40, 0.88, 0.135), (0.40, 0.70, 0.18, 0.30)]
+# shared between languages, only the wording differs. Index matches the snap order
+# in go(): 0 list, 1 search (tail → the top search bar), 2 resume, 3 two-panes
+# (tail → the right-pane tabs), 4 needs-you list, 5 jump, then the context-lifecycle
+# arc — 6 RED gauge + 8 GREEN gauge tail → the ctx segment in the statusbar (it now
+# sits mid-bar: Sort/Group only echo there when the dropdown row is hidden);
+# 7 confirm modal (centre); 9 parent (list). NOTE positions are eyeballed — re-tune
+# against the rendered GIF if a tail misses.
+_POS = [(0.40, 0.71, 0.17, 0.28), (0.30, 0.44, 0.05, 0.064),
+        (0.42, 0.72, 0.72, 0.42), (0.12, 0.42, 0.42, 0.144),
+        (0.04, 0.60, 0.02, 0.198), (0.42, 0.72, 0.72, 0.42),
+        (0.30, 0.40, 0.66, 0.117), (0.28, 0.20, 0.50, 0.32),
+        (0.30, 0.40, 0.66, 0.117), (0.40, 0.70, 0.18, 0.304)]
 _EN = ["Every Claude Code session — across every repo, one screen",
+       "Search every session — by title, body, or id",
        "Resume it live — real Claude Code, in its own directory",
-       "Run several at once — flip between them", None,
-       "Watch the left column — ~ means working",
-       "~ → ? — now it needs your reply",
+       "Run several at once — F2 / F3 to flip between panes",
+       "~ → ? : saikai flags the ones waiting on you",
        "Jump straight to the one that needs you",
-       "Group by State, Project, or Date",
-       "Sort by Recency, Created, or A–Z",
-       "Scan to mirror & control it from another device",
-       "Real context fill per pane — this one's bloated, getting dumber",
-       "Space then c: it shows the new prompt before anything clears — you decide",
-       "Enter → /clear → fresh, lean session, auto-seeded",
-       "Shift+F6 → back to the old session. Nothing lost"]
+       "1. This session is full — and a full session's answers degrade",
+       "2. Space c = Checkpoint: it writes a handoff, shows it, then Enter runs it",
+       "3. Enter ran it -> /clear -> that handoff reseeds a fresh session, green again",
+       "4. The old full session stays too — Shift+F6 hops back anytime"]
 _JA = ["全リポジトリの Claude Code を1画面に",
+       "タイトル・本文・ID で全セッションを検索",
        "元のディレクトリでそのまま再開",
-       "複数を同時に動かして行き来", None,
-       "左の ~ は作業中",
-       "~ が ? になったら返信待ち",
+       "複数を同時に — F2 / F3 でペイン切替",
+       "~ → ? 返信待ちを自動で検知",
        "要対応のセッションへジャンプ",
-       "State・Project・Date でグループ分け",
-       "Recency・Created・A–Z で並べ替え",
-       "QR を読むだけで別の端末から操作",
-       "ペインごとに実際のコンテキスト量 — これは肥大化して劣化中",
-       "Space → c：消す前に新プロンプトを提示。判断はあなた",
-       "Enter → /clear → 軽い新セッションを自動で種まき",
-       "Shift+F6 で元のセッションへ。失うものなし"]
+       "1. 満杯のセッション — コンテキストが限界で回答が劣化",
+       "2. Space → c ＝ Checkpoint：引き継ぎを書き出して提示 → Enter で実行",
+       "3. Enter 実行 → /clear → さっきの引き継ぎで続きを再開（新セッション・緑）",
+       "4. 元の満杯セッションも残る — Shift+F6 で行き来"]
 
 
 def _callouts(texts):
@@ -467,6 +439,9 @@ def build_gif(texts, font, big_font, tagline, sub, out_gif):
         if co:
             im = _callout(im, co[0], co[1], co[2], font)
         imgs.append(im)
+        if os.environ.get("SAIKAI_DEMO_DUMP"):
+            _dd = ASSETS / "_debug"; _dd.mkdir(parents=True, exist_ok=True)
+            im.save(_dd / f"{out_gif.stem}-{idx + 1:02d}.png")
     end = Image.new("RGB", imgs[0].size, (16, 16, 20))
     ed = ImageDraw.Draw(end)
     ed.text(((end.width - ed.textlength(tagline, font=big_font)) // 2,
@@ -484,7 +459,7 @@ def build_gif(texts, font, big_font, tagline, sub, out_gif):
 
 build_gif(_EN, _font(27), _font(48),
           "Find it.  Resume it.  Know what needs you.",
-          "saikai — mission control for Claude Code", GIF_OUT)
+          "uv tool install saikai", GIF_OUT)
 build_gif(_JA, _font(28, jp=True), _font(44, jp=True),
           "Claude Code のセッションを、まとめて管理",
-          "saikai", GIF_OUT_JA)
+          "uv tool install saikai", GIF_OUT_JA)

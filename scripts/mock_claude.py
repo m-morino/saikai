@@ -69,12 +69,14 @@ def emit(lines):
 
 
 def header(model_tail):
+    # Matches the REAL Claude Code startup (captured 2026-06-18, v2.1.181): logo +
+    # version, "Opus 4.8 (1M context) with max effort", the cwd, then two blanks —
+    # NO "Using … from settings.json /model" line (that was never in the real UI).
     return [
-        f"{ACCENT}{LOGO[0]:<9}{RESET}  {BOLD}{WHITE}Claude Code{RESET} {DIM}v2.1.177{RESET}",
-        f"{ACCENT}{LOGO[1]:<9}{RESET}  {WHITE}Opus 4.8 (1M context){RESET}{model_tail}",
+        f"{ACCENT}{LOGO[0]:<9}{RESET}  {BOLD}{WHITE}Claude Code{RESET} {DIM}v2.1.181{RESET}",
+        f"{ACCENT}{LOGO[1]:<9}{RESET}  {WHITE}Opus 4.8 (1M context){RESET} {DIM}with max effort{RESET}{model_tail}",
         f"{ACCENT}{LOGO[2]:<9}{RESET}  {DIM}{cwd}{RESET}",
         "",
-        f" {DIM}▎ Using Opus 4.8 (1M context) (from .claude/settings.json) · /model{RESET}",
         "",
     ]
 
@@ -83,11 +85,14 @@ def prompt_box(placeholder):
     """The faithful idle input box (the ❯ prompt). Its presence with a ✳ title
     is what saikai classifies as idle/ready — and what makes the pane look like
     claude waiting at its prompt for the next turn."""
+    _foot_l = "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"
+    _pad = " " * max(2, WIDTH - len(_foot_l) - len("◈ max · /effort"))
     return [
         rule,
         f"{WHITE}❯{RESET} {DIM}{placeholder}{RESET}",
         rule,
-        f"  {GOLD}⏵⏵ auto mode on{RESET} {DIM}(shift+tab to cycle) · ← for agents{RESET}",
+        (f"  {GOLD}⏵⏵ auto mode on{RESET} {DIM}(shift+tab to cycle) · ← for agents{RESET}"
+         f"{_pad}{DIM}◈ max · /effort{RESET}"),
     ]
 
 
@@ -189,7 +194,8 @@ if scenario == "needs-you":
         f"{ACCENT}●{RESET} {BOLD}Update{RESET}(api/orders.py)",
         f"  {GOLD}Working…{RESET} {DIM}(esc to interrupt){RESET}",
     ])
-    time.sleep(5.0)            # keep working while the demo opens/flips panes
+    time.sleep(2.5)            # brief "working" then settle to the prompt (the demo
+                               # snaps the ? end-state, so the prompt must be up early)
     # Re-title to ✳ (no longer a spinner) + show a permission prompt => waiting.
     title("✳ api-server")
     emit([
@@ -200,6 +206,10 @@ if scenario == "needs-you":
         f"  {ACCENT}❯ 1.{RESET} {WHITE}Yes{RESET}",
         f"    {DIM}2. No, explain the change first{RESET}",
     ])
+    # HOLD at the permission prompt so the list marker stays ? (waiting) — without
+    # this the script exits, the pane dies, and the marker falls back to = (idle).
+    while True:
+        time.sleep(3600)
 elif scenario == "fresh":
     # ── A freshly reseeded session: lean context, idle at its prompt. Used to
     # show the GREEN gauge on the post-/clear child (which has a low usage). ───
@@ -304,7 +314,7 @@ elif scenario == "checkpoint":
 else:
     # ── The faithful auth-fix transcript; settles idle (✳). ───────────────────
     title("✳ webapp")
-    emit(header(f" {DIM}with max effort{RESET}") + [
+    emit(header("") + [
         f"{DIM}>{RESET} Fix the flaky auth token refresh test",
         "",
         f"{ACCENT}●{RESET} I'll read the failing test first to understand the race.",
