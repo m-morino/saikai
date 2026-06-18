@@ -4318,7 +4318,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         # only a runaway backstop; set SAIKAI_MAX_LIVE for a stricter hard cap.
         MAX_LIVE = _cfg("limits", "max_live", "SAIKAI_MAX_LIVE", 64, int)
         CSS = """
-        Screen { layout: vertical; }
+        Screen { layout: vertical; layers: base notif; }
         #searchrow { dock: top; height: 3; }   /* visible by default (the dropdowns ARE the discoverability); Space / toggles it and the last state persists */
         /* 1fr so it still shrinks on narrow terminals, but capped — without the
            cap it swallows the whole bar and dwarfs the filter dropdowns. */
@@ -4339,7 +4339,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                       padding: 0 1; display: none; }
         /* Transient toasts move to the TOP-RIGHT — Textual defaults to bottom-right,
            which covers the live pane's input line. */
-        ToastRack { dock: top; align: right top; }
+        /* notif layer so toasts render OVER the search row / status bar / pane
+           tabs instead of being clipped behind them (they share the top edge). */
+        ToastRack { dock: top; align: right top; layer: notif; }
         #main { layout: horizontal; height: 1fr; }
         #table { width: 60%; }                /* default; inline style overrides on mount/drag */
         #main.split #table { width: 34%; }    /* split-live: give the live pane the room */
@@ -4955,10 +4957,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         # tail-read, which would defeat the mtime cache every
                         # refresh (resource #6).
                         _s["_state"] = "Open"
-                    elif _needs_attention(_s, self._na_cache):
-                        _s["_state"] = "Needs input"   # idle session: stable mtime -> cached
                     elif _s.get("is_active") or _s.get("is_recent"):
-                        _s["_state"] = "Recent"
+                        # "Needs input" is reserved for a LIVE pane actually waiting
+                        # on you. A dormant session whose last turn was yours is
+                        # bucketed by recency instead — giving it a "Needs input"
+                        # header read as "live + waiting on me", which it isn't.
+                        _s["_state"] = "Recent"   # touched <30 min ago (not live)
                     else:
                         _s["_state"] = "Idle"
             # Claude-Desktop-style sections: partition the (already sorted) rows
@@ -4975,7 +4979,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if not _vis:
                     continue
                 if _hdr is not None:
-                    header_before[_vis[0]["id"]] = f"{_hdr} ({len(_vis)})"
+                    # State grouping's "Recent" is the <30 min bucket — spell out the
+                    # window so it doesn't read as a vague "recent" (Date grouping
+                    # already gives Today / Yesterday for time-based browsing).
+                    _lbl = "Within 30 min" if _hdr == "Recent" else _hdr
+                    header_before[_vis[0]["id"]] = f"{_lbl} ({len(_vis)})"
                 flat.extend(_vis)
             visible = flat
 
