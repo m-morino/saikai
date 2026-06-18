@@ -638,6 +638,8 @@ def test_agent_terminal_on_key_release_encode_and_dead():
     t._pty = _FakePty()
     t.is_dead = False
     t._frozen = False
+    t._lock = threading.Lock()
+    t._scroll = 0
     t.post_message = lambda m: posted.append(m)
 
     # Release key -> hand focus back to the list; nothing written to claude.
@@ -758,6 +760,8 @@ def test_paste_text_wraps_and_submits():
     t._pty = type("P", (), {"write": lambda self, d: writes.append(d)})()
     t.is_dead = False
     t._bracketed_paste = True
+    t._lock = threading.Lock()
+    t._scroll = 0
     t.paste_text("/handoff")
     assert writes == ["\x1b[200~/handoff\x1b[201~"], writes
     writes.clear(); t._bracketed_paste = False
@@ -769,6 +773,60 @@ def test_paste_text_wraps_and_submits():
     writes.clear(); t.is_dead = True
     t.paste_text("x"); t.submit()
     assert writes == [], writes
+
+
+def test_input_snaps_scrolled_back_pane_to_live():
+    """A scrolled-back pane (_scroll > 0) pins its view to history, and the reader
+    repaints ONLY at _scroll == 0 (bumping _scroll to keep the pin as output streams
+    in). So typing into a scrolled-back pane left the agent's reply invisible until
+    the user wheeled all the way back down. Like every terminal, INPUT must snap the
+    view to the live bottom: on_key / paste_text / submit reset _scroll to 0. The
+    release key (Ctrl+]) is NOT input — it hands focus to the host and must leave
+    scrollback untouched."""
+    writes = []
+
+    class _Ev:
+        def __init__(self, key, character=None):
+            self.key = key
+            self.character = character
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    def _mk():
+        t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+        t._pty = type("P", (), {"write": lambda self, d: writes.append(d)})()
+        t.is_dead = False
+        t._frozen = False
+        t._bracketed_paste = False
+        t._lock = threading.Lock()
+        t._scroll = 7                 # user wheeled back 7 lines
+        t.post_message = lambda m: None
+        return t
+
+    # Typing snaps to the live bottom AND still sends the key to the agent.
+    t = _mk()
+    t.on_key(_Ev("a", "a"))
+    assert writes == ["a"], writes
+    assert t._scroll == 0, f"typing must snap to live, got _scroll={t._scroll}"
+
+    # Ctrl+] (release focus) is not input: scrollback preserved, nothing written.
+    writes.clear()
+    t = _mk()
+    t.on_key(_Ev(rt.RELEASE_FOCUS_KEY))
+    assert writes == [], writes
+    assert t._scroll == 7, f"Ctrl+] must not disturb scrollback, got {t._scroll}"
+
+    # paste_text and submit are input too -> snap.
+    writes.clear()
+    t = _mk()
+    t.paste_text("hi")
+    assert t._scroll == 0 and writes == ["hi"], (t._scroll, writes)
+    writes.clear()
+    t = _mk()
+    t.submit()
+    assert t._scroll == 0 and writes == ["\r"], (t._scroll, writes)
 
 
 if __name__ == "__main__":
@@ -834,3 +892,5 @@ if __name__ == "__main__":
     print("PASS test_copy_to_host_clipboard_picks_tool_and_reports")
     test_paste_text_wraps_and_submits()
     print("PASS test_paste_text_wraps_and_submits")
+    test_input_snaps_scrolled_back_pane_to_live()
+    print("PASS test_input_snaps_scrolled_back_pane_to_live")

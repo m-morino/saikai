@@ -861,6 +861,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         data = encode_key(event.key, getattr(event, "character", None))
         if data is None:
             return
+        self._snap_to_live()   # typing returns the view to the live bottom
         try:
             self._pty.write(data)
         except Exception:
@@ -911,6 +912,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # embedded newline submits the line and a multi-line paste runs early.
             if getattr(self, "_bracketed_paste", False):
                 text = "\x1b[200~" + text + "\x1b[201~"
+            self._snap_to_live()   # pasting returns the view to the live bottom
             try:
                 self._pty.write(text)
             except Exception:
@@ -924,6 +926,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         if getattr(self, "_bracketed_paste", False):
             text = "\x1b[200~" + text + "\x1b[201~"
+        self._snap_to_live()   # injected input returns the view to the live bottom
         try:
             self._pty.write(text)
         except Exception:
@@ -933,6 +936,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         """Send a single Enter (\\r) to submit the current input. UI-thread only."""
         if self._pty is None or self.is_dead:
             return
+        self._snap_to_live()   # submitting returns the view to the live bottom
         try:
             self._pty.write("\r")
         except Exception:
@@ -961,6 +965,24 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             event.stop()
         except Exception:
             pass
+
+    def _snap_to_live(self) -> None:
+        """Return the view to the live bottom (_scroll = 0) so new output shows at
+        once. Called from the INPUT paths (on_key / on_paste / paste_text / submit):
+        typing into a scrolled-back pane must jump to the live view like every
+        terminal — the reader repaints ONLY at _scroll == 0 (and bumps _scroll to
+        keep a scrolled-back view pinned as output streams in), so without this the
+        agent's reply stayed invisible until the user wheeled all the way back down.
+        _scroll is guarded by _lock (the reader bumps it in _consume); refresh() runs
+        OUTSIDE the lock (render_line takes it). UI-thread caller."""
+        with self._lock:
+            changed = self._scroll != 0
+            self._scroll = 0
+        if changed:
+            try:
+                self.refresh()
+            except Exception:
+                pass
 
     # ── saikai-owned text selection (drag) ─────────────────────────────────────
     # The host terminal's native Shift+drag can't anchor to a TUI widget — saikai
