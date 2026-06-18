@@ -4334,7 +4334,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         /* which-key panel (Space-leader): a dedicated bottom-docked, ALIGNED
            Static — not a toast — so the family columns line up and it never sits
            over the live pane's bottom-right. Hidden until armed + hesitating. */
-        #leaderhint { dock: bottom; height: auto; max-height: 12;
+        /* margin-bottom lifts the panel clear of the 1-row Footer: two
+           dock:bottom siblings don't stack — both pin to the screen edge and the
+           hint would otherwise paint over the "tab Preview" footer row. */
+        #leaderhint { dock: bottom; height: auto; max-height: 12; margin-bottom: 1;
                       background: $panel; color: $text; border-top: solid $accent;
                       padding: 0 1; display: none; }
         /* Transient toasts move to the TOP-RIGHT — Textual defaults to bottom-right,
@@ -6296,6 +6299,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if getattr(self, "_leader_pending", False):
                     if getattr(event, "widget", None) is not self.query_one("#table", DataTable):
                         self._leader_pending = False
+                        self._leader_gen += 1          # kill the pending show/cancel timers
+                        self._set_leader_hint(None)    # hide the panel NOW, so it can't linger
+                                                       # over the footer until the cancel timeout
             except Exception:
                 pass
             # Keep the mirror control banner's "typing into" target in sync with
