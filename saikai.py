@@ -4284,12 +4284,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         #main.nolist #table { display: none; }
         #main.nolist #grip { display: none; }
         #preview { padding: 0 1; height: 1fr; }
-        /* Always-present border (same thickness focused/unfocused -> no PTY resize
-           on a focus toggle); the colour brightens on focus so the ACTIVE pane is
-           obvious when several are open. self.size already excludes the border, so
-           pyte gets the inner region. */
-        AgentTerminal { width: 1fr; height: 1fr; border: round $panel; }
-        AgentTerminal:focus { border: round $accent; }
+        /* No border on the live pane: a box around it makes the embedded claude
+           look unlike a real terminal session, and the pane already signals focus
+           by SHOWING its cursor only when focused (see AgentTerminal.render_line).
+           Focus visibility lives on the search box (#search:focus) + the statusbar
+           release-key hint instead. */
+        AgentTerminal { width: 1fr; height: 1fr; }
         """
 
         preview_mode = "summary"   # "summary" or "full"
