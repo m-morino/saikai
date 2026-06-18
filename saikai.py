@@ -336,7 +336,7 @@ def _leader_map(letters_cfg, id_to_action):
 DEFAULT_LEADER_KEY = "space"
 DEFAULT_LEADER_LETTERS = {           # action id -> letter (config orientation)
     "favorite": "f", "hide": "h", "rename": "e", "refresh": "r",
-    "diff": "d", "copy": "y", "sort": "s", "order": "o",
+    "diff": "d", "copy": "y", "copy_summary": "i", "sort": "s", "order": "o",
     "group": "g", "tree": "t", "new": "n",
     "restore": "p", "freeze": "z", "attention": "a", "toggle_list": "l",
     "close": "x", "prev_tab": "[", "next_tab": "]", "mark": " ",
@@ -352,7 +352,8 @@ DEFAULT_LEADER_LETTERS = {           # action id -> letter (config orientation)
 LEADER_VIRTUAL_ACTIONS = {"sort": "sort", "order": "order", "mark": "toggle_mark",
                           "settings": "settings",
                           "search_bar": "toggle_search_bar",
-                          "checkpoint": "checkpoint"}
+                          "checkpoint": "checkpoint",
+                          "copy_summary": "copy_summary"}
 
 # Leader families: action name -> family, in display order. The which-key hint
 # and the ? help render the map grouped this way (Session / View / Panes)
@@ -362,7 +363,8 @@ LEADER_VIRTUAL_ACTIONS = {"sort": "sort", "order": "order", "mark": "toggle_mark
 LEADER_FAMILY_ORDER = ("Session", "View", "Panes")
 LEADER_FAMILY_OF = {
     "toggle_fav": "Session", "toggle_hide": "Session", "rename": "Session",
-    "copy_prompt": "Session", "preview_changes": "Session", "refresh": "Session",
+    "copy_prompt": "Session", "copy_summary": "Session",
+    "preview_changes": "Session", "refresh": "Session",
     "sort": "View", "order": "View", "cycle_group": "View",
     "toggle_tree": "View", "toggle_list": "View",
     "settings": "View", "toggle_search_bar": "View",
@@ -423,7 +425,8 @@ def _leader_label(action: str) -> str:
     """Short human label for a leader hint / help row, derived from the action
     name (toggle_fav → fav, preview_changes → diff, next_attention → next!)."""
     special = {"toggle_fav": "fav", "preview_changes": "diff",
-               "copy_prompt": "copy", "next_attention": "next!",
+               "copy_prompt": "copy", "copy_summary": "copy text",
+               "next_attention": "next!",
                "new_session": "new", "restore_panes": "restore",
                "freeze_pane": "freeze", "close_live": "close",
                "prev_tab": "tab◀", "next_tab": "tab▶",
@@ -6832,6 +6835,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self._status_refresh_pending = True
                 else:
                     self._request_refresh()
+
+        def action_copy_summary(self) -> None:
+            """Leader ␣i — copy the cursor session's preview/summary text to the
+            host clipboard (the preview pane can't be mouse-selected in a TUI)."""
+            sid = self._cursor_sid()
+            if not sid:
+                return
+            s = self._sid_index.get(sid)
+            text = _render_preview(s) if s else ""
+            if not (text or "").strip():
+                self.notify("no preview text to copy", timeout=3)
+                return
+            if _copy_to_host_clipboard(text):
+                self.notify("preview copied to clipboard", timeout=3)
+            else:
+                self.notify("could not copy the preview", severity="warning", timeout=3)
 
         def action_copy_prompt(self) -> None:
             # F9: copy the selected session's opening user prompt to the
