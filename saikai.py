@@ -1014,7 +1014,7 @@ def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
         buckets = {}
         for s in rest:
             buckets.setdefault(s.get("_state") or "Idle", []).append(s)
-        for l in ("Needs input", "Running", "Open", "Recent", "Idle", "Archived"):
+        for l in ("Needs input", "Running", "Open", "Idle", "Archived"):
             if buckets.get(l):
                 groups.append((l, buckets[l]))
     else:  # project
@@ -4960,13 +4960,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         # tail-read, which would defeat the mtime cache every
                         # refresh (resource #6).
                         _s["_state"] = "Open"
-                    elif _s.get("is_active") or _s.get("is_recent"):
-                        # "Needs input" is reserved for a LIVE pane actually waiting
-                        # on you. A dormant session whose last turn was yours is
-                        # bucketed by recency instead — giving it a "Needs input"
-                        # header read as "live + waiting on me", which it isn't.
-                        _s["_state"] = "Recent"   # touched <30 min ago (not live)
                     else:
+                        # Not live → "Idle". The State lens groups by ACTIONABILITY
+                        # (Needs input / Running / Open); recency is shown by the
+                        # row's +/. marker and is what Date grouping is for, so a
+                        # dormant session isn't sub-split by a 30-min window. ("Needs
+                        # input" is also reserved for a LIVE pane truly waiting on you
+                        # — never a dormant transcript whose last turn was yours.)
                         _s["_state"] = "Idle"
             # Claude-Desktop-style sections: partition the (already sorted) rows
             # into Pinned + date/project/state groups, then remember which row
@@ -4982,11 +4982,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if not _vis:
                     continue
                 if _hdr is not None:
-                    # State grouping's "Recent" is the <30 min bucket — spell out the
-                    # window so it doesn't read as a vague "recent" (Date grouping
-                    # already gives Today / Yesterday for time-based browsing).
-                    _lbl = "Within 30 min" if _hdr == "Recent" else _hdr
-                    header_before[_vis[0]["id"]] = f"{_lbl} ({len(_vis)})"
+                    header_before[_vis[0]["id"]] = f"{_hdr} ({len(_vis)})"
                 flat.extend(_vis)
             visible = flat
 
