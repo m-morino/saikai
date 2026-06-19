@@ -2490,6 +2490,19 @@ def preview_session_full(session_id: str) -> None:
 
 _MARKER_BLANK = " "
 
+# Per-state colour for the TUI list's activity marker (the ? ~ ! = @ + . glyph),
+# which was distinguished by GLYPH only. Tint it so state reads at a glance, using
+# the SAME palette as the toast severities ($warning≈yellow, $success≈green) and
+# the CLI --table _activity_marker — so the colour language is consistent across
+# the list, the CLI, and notifications. Markers not listed stay the default colour.
+_MARKER_COLOR = {
+    "?": "red",      # waiting on you (needs input) — matches the statusbar ?N badge
+    "!": "yellow",   # reply due — your last turn is unanswered (statusbar !M)
+    "~": "cyan",     # busy / running
+    "@": "green",    # opened in another window
+    "+": "green",    # recently active
+}
+
 
 # Markers are intentionally ASCII (1 cell, terminal-width-independent). The
 # previous Unicode glyphs (◉●○★✗) were East-Asian-Ambiguous, which made their
@@ -4372,7 +4385,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         # only a runaway backstop; set SAIKAI_MAX_LIVE for a stricter hard cap.
         MAX_LIVE = _cfg("limits", "max_live", "SAIKAI_MAX_LIVE", 64, int)
         CSS = """
-        Screen { layout: vertical; layers: base notif; }
+        Screen { layout: vertical; }
         #searchrow { dock: top; height: 3; }   /* visible by default (the dropdowns ARE the discoverability); Space / toggles it and the last state persists */
         /* 1fr so it still shrinks on narrow terminals, but capped — without the
            cap it swallows the whole bar and dwarfs the filter dropdowns. */
@@ -4399,10 +4412,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                       background: $panel; color: $text; border-top: solid $accent;
                       padding: 0 1; display: none; }
         /* Transient toasts move to the TOP-RIGHT — Textual defaults to bottom-right,
-           which covers the live pane's input line. */
-        /* notif layer so toasts render OVER the search row / status bar / pane
-           tabs instead of being clipped behind them (they share the top edge). */
-        ToastRack { dock: top; align: right top; layer: notif; }
+           which covers the live pane's input line. KEEP Textual's native
+           `_toastrack` layer (auto-appended as the top-most layer in screen.py):
+           overriding it with a custom layer lost the top-most + hit-test handling,
+           so toasts clipped on hover, fell behind other widgets, and didn't dismiss
+           on click. Override the dock/align only — never the layer. Click-to-dismiss
+           is then Textual's built-in Toast `@on(Click)` behaviour. */
+        ToastRack { dock: top; align: right top; }
         #main { layout: horizontal; height: 1fr; }
         #table { width: 60%; }                /* default; inline style overrides on mount/drag */
         #main.split #table { width: 34%; }    /* split-live: give the live pane the room */
@@ -5090,6 +5106,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 marker_s = ("*" if s["id"] in favorites
                             else "x" if is_hidden else " ")
                 marker = f"{marker_a}{marker_s}"
+                # Tint the marker by its activity state (marker_a); the fav/hidden
+                # suffix rides the same colour. Glyph stays the alignment anchor.
+                marker_cell = Text(marker, style=_MARKER_COLOR.get(marker_a, ""))
                 # Plain title; collapse any newline/tab so a multi-line ai_title
                 # doesn't push the row to multiple terminal lines. _list_title uses
                 # claude's own ai-title / first msg / project — never `claude -p` —
@@ -5109,14 +5128,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _tstyle = _title_color.get(_color_key_for(s, _color_by), "")  # [display] color_by
                 if narrow:
                     # marker · relative-Last · title (title tinted per color_by).
-                    row = [marker, fmt_last_active(s), Text(raw_title, style=_tstyle)]
+                    row = [marker_cell, fmt_last_active(s), Text(raw_title, style=_tstyle)]
                     table.add_row(*row, key=s["id"])
                     if first_session_row is None:
                         first_session_row = n
                     n += 1
                     n_sessions += 1
                     continue
-                row = [marker, fmt_ts(s["first_ts"]), fmt_last_active(s)]
+                row = [marker_cell, fmt_ts(s["first_ts"]), fmt_last_active(s)]
                 if show_proj_col:
                     proj_txt = project_short(s.get("project_name") or "")
                     row.append(Text(proj_txt, style=project_color.get(proj_txt, "")))
@@ -6901,6 +6920,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 title = (sess.get("ai_title") or _first_msg(sess) or sid[:8])[:50]
                 if st == "waiting" and prev_st != "waiting":
                     self.notify(f"needs input: {title}", title="saikai", timeout=8)
+                    # Audible nudge so a backgrounded session needing input is
+                    # noticed even when you're not watching the screen. Fires once
+                    # per transition (guarded above); silent if the terminal bell
+                    # is off. SAIKAI_NO_BELL=1 opts out.
+                    if not os.environ.get("SAIKAI_NO_BELL"):
+                        try:
+                            self.bell()
+                        except Exception:
+                            pass
                 elif st == "idle" and sid in self._busy_seen:
                     # A backgrounded pane just FINISHED its turn (busy→idle) — toast
                     # so you notice WHAT completed without watching every tab. Keyed
