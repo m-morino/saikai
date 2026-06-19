@@ -121,10 +121,15 @@ def fake_run(self, *a, **kw):
             for _ in range(22):                  # let the PTY paint
                 await pilot.pause(0.1)
             await snap(pilot, 1900)
-            # Beat 4 — open a SECOND session: two live panes, flip with F2 / F3.
+            # Beat 4 — KEYBOARD NAV (the core loop): Ctrl+] hops back to the list,
+            # ↑↓ moves the cursor to switch which session is selected — snap the
+            # moved cursor, THEN open it as a second live pane (F2 / F3 to flip).
             await pilot.press("ctrl+right_square_bracket")   # back to the list
             await pilot.pause(0.4)
-            await pilot.press("down")                        # to the next session
+            await pilot.press("down")                        # cursor switches sessions
+            await pilot.pause(0.4)
+            await snap(pilot, 1700)              # the list, cursor moved — keyboard switch
+            await pilot.press("down")                        # to another session
             await pilot.press("enter")                       # open it ("working" => ~)
             for _ in range(24):                  # let the 2nd pane paint
                 await pilot.pause(0.1)
@@ -393,20 +398,22 @@ def _callout(im, text, anchor, tail, font):
 
 # Per-beat (text, bubble top-left, tail target) as W/H fractions; positions are
 # shared between languages, only the wording differs. Index matches the snap order
-# in go(): 0 list, 1 search (tail → the top search bar), 2 resume, 3 two-panes
-# (tail → the right-pane tabs), 4 needs-you list, 5 jump, then the context-lifecycle
-# arc — 6 RED gauge + 8 GREEN gauge tail → the ctx segment in the statusbar (it now
-# sits mid-bar: Sort/Group only echo there when the dropdown row is hidden);
-# 7 confirm modal (centre); 9 parent (list). NOTE positions are eyeballed — re-tune
-# against the rendered GIF if a tail misses.
+# in go(): 0 list, 1 search (tail → the top search bar), 2 resume, 3 keyboard-nav
+# (tail → the moved list cursor), 4 two-panes (tail → the right-pane tabs),
+# 5 needs-you list, 6 jump, then the context-lifecycle arc — 7 RED gauge + 9 GREEN
+# gauge tail → the ctx segment in the statusbar (it sits mid-bar); 8 confirm modal
+# (centre); 10 parent (list). NOTE positions are eyeballed — re-tune against the
+# rendered GIF if a tail misses.
 _POS = [(0.40, 0.71, 0.17, 0.28), (0.30, 0.44, 0.05, 0.064),
-        (0.42, 0.72, 0.72, 0.42), (0.12, 0.42, 0.42, 0.144),
+        (0.42, 0.72, 0.72, 0.42), (0.34, 0.24, 0.07, 0.30),
+        (0.12, 0.42, 0.42, 0.144),
         (0.04, 0.60, 0.02, 0.198), (0.42, 0.72, 0.72, 0.42),
         (0.30, 0.40, 0.66, 0.117), (0.28, 0.20, 0.50, 0.32),
         (0.30, 0.40, 0.66, 0.117), (0.40, 0.70, 0.18, 0.304)]
 _EN = ["Every Claude Code session — across every repo, one screen",
        "Search every session — by title, body, or id",
        "Resume it live — real Claude Code, in its own directory",
+       "Ctrl+] back to the list · ↑↓ to switch sessions — keyboard-first",
        "Run several at once — F2 / F3 to flip between panes",
        "~ → ? : saikai flags the ones waiting on you",
        "Jump straight to the one that needs you",
@@ -417,6 +424,7 @@ _EN = ["Every Claude Code session — across every repo, one screen",
 _JA = ["全リポジトリの Claude Code を1画面に",
        "タイトル・本文・ID で全セッションを検索",
        "元のディレクトリでそのまま再開",
+       "Ctrl+] でリストへ戻り ↑↓ でセッション切替 — キーボードだけで",
        "複数を同時に — F2 / F3 でペイン切替",
        "~ → ? 返信待ちを自動で検知",
        "要対応のセッションへジャンプ",
