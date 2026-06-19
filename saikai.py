@@ -5828,6 +5828,47 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return foc
             return None
 
+        def _visible_terminal(self):
+            """The AgentTerminal in the active live tab, regardless of keyboard
+            focus — so a paste (e.g. a file dragged onto the pane) reaches claude
+            even while the session list, not the pane, has focus. None if split-
+            live isn't up or the active tab has no live terminal."""
+            if _LIVE_TERM is None or self._live is None:
+                return None
+            from textual.widgets import TabbedContent
+            try:
+                tabs = self.query_one("#right", TabbedContent)
+                pane = tabs.get_pane(tabs.active) if tabs.active else None
+                term = pane.query_one(_LIVE_TERM.AgentTerminal) if pane else None
+            except Exception:
+                return None
+            if term is not None and not getattr(term, "is_dead", False):
+                return term
+            return None
+
+        def on_paste(self, event) -> None:
+            """Route a paste that no focused text input consumed to the VISIBLE
+            live pane, so a file dragged onto the claude pane pastes its path into
+            claude even while the session list has keyboard focus. A focused live
+            pane already handled it (AgentTerminal.on_paste stops the event, so
+            this never fires for it); a focused Input/TextArea (search box,
+            checkpoint editor) keeps its own paste; the list falls through to
+            claude, and focus moves to the pane so the user can keep typing."""
+            text = getattr(event, "text", "")
+            if not text:
+                return
+            from textual.widgets import Input, TextArea
+            if isinstance(self.focused, (Input, TextArea)):
+                return
+            term = self._visible_terminal()
+            if term is not None:
+                term.paste_text(text)
+                try:
+                    term.focus()
+                except Exception:
+                    pass
+                event.stop()
+
         def _focus_live_pane(self, sid: str) -> None:
             """Focus a live pane's terminal (deferred from open) so cursor keys go
             to claude; consume the just-opened marker."""
