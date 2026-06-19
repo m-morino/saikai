@@ -1447,13 +1447,39 @@ def _start_terminal_watchdog(poll_sec: float = 12.0) -> None:
     self_pid = os.getpid()
 
     def _watch() -> None:
+        misses = 0
         while True:
             time.sleep(poll_sec)
             if _is_pid_alive(anchor):
+                misses = 0
                 continue
-            # Tab/window closed → emulate SIGHUP: kill our OWN subtree (the
-            # resumed claude child included), then exit hard so a daemon thread
-            # blocked elsewhere can't keep the interpreter alive.
+            # The anchor PID looks gone — but a SINGLE poll must NOT hard-kill a
+            # live session. os._exit (below) bypasses atexit AND Textual teardown,
+            # so a false positive (a transient PID-query failure, or an anchor PID
+            # that was wrong/reused while the tab is fine) would silently kill a
+            # healthy saikai and leave the terminal stuck in mouse/paste mode (the
+            # "sudden crash + stray chars on scroll" report). Guard twice before
+            # killing: (1) re-walk for ANY live shell ancestor — confirms the tab is
+            # really gone, not just that one stale PID; (2) require consecutive
+            # confirmations so a one-off poll glitch can't trigger the kill.
+            try:
+                if _find_terminal_anchor(_win_pid_index(), self_pid):
+                    misses = 0
+                    continue
+            except Exception:
+                pass
+            misses += 1
+            if misses < 3:
+                continue
+            # Genuinely orphaned (tab/window closed) → emulate SIGHUP. Restore the
+            # terminal modes FIRST so even a residual false positive can't leave
+            # mouse tracking on, THEN kill our OWN subtree (the resumed claude child
+            # included) and exit hard so a daemon thread blocked elsewhere can't
+            # keep the interpreter alive.
+            try:
+                _reset_terminal_modes()
+            except Exception:
+                pass
             try:
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(self_pid)],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
