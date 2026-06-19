@@ -218,6 +218,27 @@ def test_refresh_status_skips_stable_idle_pane():
     assert calls == [1], "busy pane must be re-classified to catch the idle flip"
 
 
+def test_refresh_status_polls_pending_flip_on_static_screen():
+    """A non-busy flip mid-debounce must still be re-classified by the poll, so it
+    gets its debounce 2nd tick. Regression: the trust-folder gate classifies
+    'waiting' once, then claude goes silent (scr_ver stops changing) — a static
+    screen used to starve the pending 'waiting' (it never committed, so the pane
+    never reached 'Needs input' until something redrew)."""
+    ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    ct._lock = threading.Lock()
+    ct.is_dead = False
+    ct._screen = object()
+    ct._scr_ver = 3
+    ct._last_poll_ver = 3                  # screen unchanged since the last poll
+    ct._status = "idle"
+    ct._pending_status = "waiting"         # a 'waiting' flip is mid-debounce
+    calls = []
+    ct._current_screen = lambda: (calls.append(1), ("", ""))[1]
+    ct._update_status = lambda new: None
+    ct.refresh_status()
+    assert calls == [1], "a pending non-busy flip must be re-classified, not skipped"
+
+
 def test_classify_pty_status_basics():
     """Guard the busy/waiting/idle classifier (and the slice-before-strip tail
     handling) so the per-chunk perf trim didn't change its verdicts."""
@@ -850,6 +871,8 @@ if __name__ == "__main__":
     print("PASS test_current_screen_caches_by_version")
     test_refresh_status_skips_stable_idle_pane()
     print("PASS test_refresh_status_skips_stable_idle_pane")
+    test_refresh_status_polls_pending_flip_on_static_screen()
+    print("PASS test_refresh_status_polls_pending_flip_on_static_screen")
     test_classify_pty_status_basics()
     print("PASS test_classify_pty_status_basics")
     test_classify_trust_folder_dialog_is_waiting()

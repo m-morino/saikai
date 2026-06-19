@@ -1271,10 +1271,14 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if self._screen is None or self.is_dead:
             return
         # Skip the screen-join + classify for a STABLE pane that produced no
-        # output since the last poll — UNLESS it is still 'busy', which must keep
-        # being re-checked so it can flip to idle (the debounce's 2nd tick) when
-        # claude stops without emitting anything further.
-        if self._scr_ver == self._last_poll_ver and self._status != "busy":
+        # output since the last poll — UNLESS it is still 'busy' (must keep being
+        # re-checked so it can flip to idle on the debounce's 2nd tick when claude
+        # stops without emitting anything further) OR a non-busy flip is mid-
+        # debounce (_pending_status set): the trust-folder gate classifies
+        # 'waiting' once, then claude goes silent, so without the pending check the
+        # 'waiting' never gets its 2nd tick and the pane never shows "Needs input".
+        if (self._scr_ver == self._last_poll_ver and self._status != "busy"
+                and getattr(self, "_pending_status", None) is None):
             return
         self._last_poll_ver = self._scr_ver
         txt, title = self._current_screen()
