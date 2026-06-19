@@ -6240,6 +6240,18 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             """Coalesce frequent table-refresh requests (live status flips, the
             1.5s poll) into ~one rebuild per frame, so a streaming claude can't
             trigger a full-DataTable-rebuild storm on the UI thread."""
+            # If the user is FILTERING (search box focused), a background rebuild
+            # fires a queued RowHighlighted a frame later — by then the rebuild may
+            # have momentarily taken focus off the search box, so the foreground
+            # guard's `self.focused is #search` check reads False and the 0.5s
+            # keystroke window may have lapsed. Re-arm the window on EVERY refresh
+            # request while searching, so on_data_table_row_highlighted still treats
+            # it as filter-engaged and doesn't switch the foreground pane out.
+            try:
+                if self.focused is self.query_one("#search"):
+                    self._filter_active_until = time.monotonic() + 0.5
+            except Exception:
+                pass
             if getattr(self, "_refresh_req_pending", False):
                 return
             self._refresh_req_pending = True
