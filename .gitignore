@@ -10,6 +10,7 @@ uv.lock
 docs/assets/saikai-demo.mp4
 docs/assets/*.cast
 docs/assets/*-raw.mp4
+docs/assets/_debug/
 .demo-work/
 .superpowers/
 .serena/
