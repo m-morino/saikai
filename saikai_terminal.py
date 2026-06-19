@@ -85,6 +85,16 @@ def _log(msg: str) -> None:
         pass
 
 
+# SAIKAI_IME_DEBUG=1 logs IME-anchor moves + pane focus/blur to ~/.cache/saikai/
+# saikai.log, so the cursor/IME behaviour on a given terminal can be inspected
+# after the fact. The IME candidate window anchors to wherever app.cursor_position
+# parks the hardware cursor (Windows Terminal reads the cursor CELL, not its
+# visibility) — these lines show that cell as it changes, plus when the pane gains
+# or loses focus, so a post-mortem can tell whether the anchor was correct/current.
+_IME_DEBUG = str(os.environ.get("SAIKAI_IME_DEBUG", "")).strip().lower() in (
+    "1", "true", "yes", "on")
+
+
 def _ime_anchor_xy(cursor_x, cursor_y, rx, ry, rw, rh):
     """Pure geometry for the terminal-cursor / IME anchor: map claude's grid cursor
     (cursor_x, cursor_y) inside a content region at screen origin (rx, ry) sized
@@ -1372,6 +1382,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
 
     def on_focus(self, event=None) -> None:
         # Anchor the IME the moment the pane is focused (don't wait for a repaint).
+        if _IME_DEBUG:
+            _log(f"on_focus sid={getattr(self, 'sid', None)} "
+                 f"WT={bool(os.environ.get('WT_SESSION'))}")
         self._sync_terminal_cursor()
 
     def _sync_terminal_cursor(self) -> None:
@@ -1408,8 +1421,19 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             xy = _ime_anchor_xy(cx, cy, region.x, region.y, region.width, region.height)
             if xy is not None:
                 app.cursor_position = Offset(*xy)
+                if _IME_DEBUG and xy != getattr(self, "_ime_log_xy", None):
+                    self._ime_log_xy = xy
+                    _log(f"ime anchor sid={getattr(self, 'sid', None)} cell={xy} "
+                         f"claude=({cx},{cy}) "
+                         f"region=({region.x},{region.y},{region.width}x{region.height})")
         except Exception:
             pass
+
+    def on_blur(self, event=None) -> None:
+        # Logging only (gated): record when the pane loses focus, so the IME log
+        # shows focus transitions. No behaviour change — Textual handles the rest.
+        if _IME_DEBUG:
+            _log(f"on_blur sid={getattr(self, 'sid', None)}")
 
     # ── thread → UI marshaling (defensive) ─────────────────────────────────────
     def _marshal(self, fn: Callable) -> None:
