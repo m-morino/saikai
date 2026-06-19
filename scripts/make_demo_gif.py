@@ -458,7 +458,7 @@ def build_gif(texts, font, big_font, tagline, sub, out_gif):
     ed.text(((end.width - ed.textlength(sub, font=font)) // 2,
              int(end.height * 0.42) + 78), sub, font=font, fill=(226, 124, 88))
     imgs.append(end)
-    durations = [int(ms * 1.35) for _, ms in FRAMES] + [3400]   # slower switching
+    durations = [int(ms * 1.7) for _, ms in FRAMES] + [3400]   # hold each beat longer to read
     imgs = [im.quantize(colors=128, dither=Image.Dither.NONE) for im in imgs]
     ASSETS.mkdir(parents=True, exist_ok=True)
     imgs[0].save(out_gif, save_all=True, append_images=imgs[1:],
