@@ -3747,6 +3747,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.app._commit_split_ratio()
                 event.stop()
 
+    class SearchClear(Static):
+        """A clickable X at the right of the search box that clears it. Hidden
+        (display:none) unless the box has text — toggled in on_input_changed.
+        can_focus stays False so it never steals keyboard focus from the list."""
+        can_focus = False
+
+        def on_click(self, event) -> None:
+            event.stop()
+            try:
+                inp = self.app.query_one("#search")
+                inp.value = ""   # fires Input.Changed -> on_input_changed -> hides me + unfilters
+                inp.focus()
+            except Exception:
+                pass
+
     class HelpScreen(ModalScreen):
         CSS = """
         HelpScreen { align: center middle; }
@@ -4337,6 +4352,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
            cap it swallows the whole bar and dwarfs the filter dropdowns. */
         #search { width: 1fr; max-width: 42; border: tall $panel; }
         #search:focus { border: tall $accent; }   /* focus visible: dim panel -> accent */
+        /* Clear (X) button: shown only while the search box has text (toggled in
+           on_input_changed); can_focus False so it never steals list focus. */
+        #search-clear { display: none; width: 3; height: 3; content-align: center middle; color: $text-muted; }
+        #search-clear:hover { color: $text; background: $panel; }
         /* widths sized for the LONGEST option + Select border/chevron overhead
            (~6 cols): "Alphabetically"=14, "Archived"/"All time"=8, "Project"=7 */
         #groupsel { width: 16; }
@@ -4391,6 +4410,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 yield Input(placeholder="Search title / msg / SID / proj    "
                                         "•  :fav  :hidden  :open  :active  :recent",
                             id="search")
+                yield SearchClear("✕", id="search-clear")
                 # Initialise each dropdown to the persisted selection so the box
                 # shows what is actually applied (the choices ARE remembered on
                 # disk + applied at startup; without value= the box just showed
@@ -6684,6 +6704,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # runs the search box may have momentarily lost focus — _filter_is_engaged
             # reads this window so the foreground live pane isn't switched out under
             # the filter (see on_data_table_row_highlighted).
+            if getattr(event.input, "id", None) == "search":
+                try:
+                    self.query_one("#search-clear").display = bool(event.value)
+                except Exception:
+                    pass
             self._filter_active_until = time.monotonic() + 0.5
             self._request_refresh()
 

@@ -210,6 +210,55 @@ def test_pilot_space_leader_and_divider():
     assert facts.get("bar_shown"), facts
 
 
+def test_pilot_search_clear_button():
+    """The clear (X) button: hidden when the search box is empty, shown once it
+    has text, and clicking it clears the box. Verifies on_click fires on the
+    custom Static subclass and the on_input_changed display toggle."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_search_clear_button (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                facts["hidden_empty"] = self.query_one("#search-clear").display
+                self.query_one("#search").focus()
+                await pilot.pause(0.1)
+                await pilot.press("a", "b", "c")
+                await pilot.pause(0.3)
+                facts["typed"] = self.query_one("#search").value
+                facts["shown"] = self.query_one("#search-clear").display
+                await pilot.click("#search-clear")
+                await pilot.pause(0.3)
+                facts["cleared"] = self.query_one("#search").value
+                facts["hidden_after"] = self.query_one("#search-clear").display
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("hidden_empty") is False, f"clear X hidden when empty: {facts}"
+    assert facts.get("typed") == "abc", f"typing fills the search box: {facts}"
+    assert facts.get("shown") is True, f"clear X shown once text present: {facts}"
+    assert facts.get("cleared") == "", f"clicking X clears the search: {facts}"
+    assert facts.get("hidden_after") is False, f"clear X hidden after clear: {facts}"
+
+
 def test_pilot_custom_leader_does_not_leave_space_as_menu():
     """When leader moves to Ctrl+G, Space must retain its normal table action."""
     try:
@@ -1935,6 +1984,8 @@ if __name__ == "__main__":
     print("PASS test_leader_hint_item_separates_key_from_action")
     test_pilot_space_leader_and_divider()
     print("PASS test_pilot_space_leader_and_divider")
+    test_pilot_search_clear_button()
+    print("PASS test_pilot_search_clear_button")
     test_pilot_custom_leader_does_not_leave_space_as_menu()
     print("PASS test_pilot_custom_leader_does_not_leave_space_as_menu")
     test_pilot_settings_screen()
