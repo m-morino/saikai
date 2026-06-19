@@ -217,7 +217,8 @@ def fake_run(self, *a, **kw):
             # pastes the reseed prompt. Then re-scan (F5) so the new child session
             # is indexed, open + focus it, and snap its GREEN gauge (the child
             # transcript's real low context — nothing faked).
-            await pilot.press("enter")           # confirm the destructive step
+            await pilot.press("ctrl+s")          # Ctrl+S = proceed (the prompt is an
+            #                                      editable TextArea now; Enter is a newline)
             for _ in range(90):                  # ~9s: /clear → detect child → reseed
                 await pilot.pause(0.1)
                 if getattr(self, "_b2", None) is None:
@@ -418,8 +419,8 @@ _EN = ["Every Claude Code session — across every repo, one screen",
        "~ → ? : saikai flags the ones waiting on you",
        "Jump straight to the one that needs you",
        "1. This session is full — and a full session's answers degrade",
-       "2. Space c = Checkpoint: it writes a handoff, shows it, then Enter runs it",
-       "3. Enter ran it -> /clear -> that handoff reseeds a fresh session, green again",
+       "2. Space c = Checkpoint: it writes a handoff, shows it — Ctrl+S runs it",
+       "3. Ctrl+S runs /clear -> a fresh, lean session resumes from that handoff (green)",
        "4. The old full session stays too — Shift+F6 hops back anytime"]
 _JA = ["全リポジトリの Claude Code を1画面に",
        "タイトル・本文・ID で全セッションを検索",
@@ -429,8 +430,8 @@ _JA = ["全リポジトリの Claude Code を1画面に",
        "~ → ? 返信待ちを自動で検知",
        "要対応のセッションへジャンプ",
        "1. 満杯のセッション — コンテキストが限界で回答が劣化",
-       "2. Space → c ＝ Checkpoint：引き継ぎを書き出して提示 → Enter で実行",
-       "3. Enter 実行 → /clear → さっきの引き継ぎで続きを再開（新セッション・緑）",
+       "2. Space → c ＝ Checkpoint：引き継ぎを書き出して提示 → Ctrl+S で実行",
+       "3. Ctrl+S で /clear → 引き継ぎから新しい軽量セッションを再開（緑）",
        "4. 元の満杯セッションも残る — Shift+F6 で行き来"]
 
 
