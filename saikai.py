@@ -9111,11 +9111,82 @@ def _session_surface_model(jsonl: Path) -> tuple:
     return ep, model
 
 
+def _desktop_default_model(idx: Path) -> str | None:
+    """Model of the account's most-recently-written Desktop entry.
+
+    Used as the fallback when a session's transcript carries no assistant model
+    to read (e.g. a session with no assistant turn yet): mirror the account's
+    OWN current model rather than fabricate a hardcoded version string that
+    would misrepresent which model the session ran on. Returns None when no
+    existing entry carries a model, in which case the caller omits the field and
+    lets Desktop apply its own default. (#8953)"""
+    best_mtime = -1.0
+    model = None
+    for p in idx.glob("local_*.json"):
+        m = _read_json(p, {}).get("model")
+        if not m:
+            continue
+        try:
+            mt = p.stat().st_mtime
+        except OSError:
+            continue
+        if mt > best_mtime:
+            best_mtime, model = mt, m
+    return model
+
+
+def _desktop_entry(s: dict, model: str | None) -> dict:
+    """Build one Desktop local_* session entry from a saikai session row.
+
+    `model` is the already-resolved model (the transcript's model, else the
+    account default); when falsy the `model` key is OMITTED rather than
+    fabricated (#8953). titleSource is "auto" because saikai's title is always
+    derived (ai-title or first message), never user-typed."""
+    sid = s["id"]
+    cwd = s.get("cwd") or s.get("origin_cwd") or str(Path.home())
+    title = (s.get("ai_title")
+             or (s["real_msgs"][0] if s.get("real_msgs") else "")
+             or f"({sid[:8]})")[:80]
+    created_ms = _iso_to_ms(s.get("first_ts"))
+    # last activity = the later of last-message ts and file mtime, matching
+    # saikai's Recency column (untimed ai-title/permission-mode appends bump
+    # mtime but not last_ts) so Desktop orders these sessions the same way.
+    active_ms = (max(_iso_to_ms(s.get("last_ts")),
+                     int((s.get("mtime") or 0) * 1000))
+                 or created_ms)
+    entry = {
+        "sessionId": "local_" + str(uuid.uuid4()),
+        "cliSessionId": sid,
+        "cwd": cwd,
+        "originCwd": s.get("origin_cwd") or cwd,
+        "createdAt": created_ms,
+        "lastActivityAt": active_ms,
+        "lastFocusedAt": active_ms,
+        "effort": "max",
+        "isArchived": False,
+        "title": title,
+        "titleSource": "auto",
+        "permissionMode": "default",
+        "enabledMcpTools": {},
+        "remoteMcpServersConfig": [],
+        "chromePermissionMode": "skip_all_permission_checks",
+        "completedTurns": 0,
+        "alwaysAllowedReasons": [],
+        "sessionPermissionUpdates": [],
+        "classifierSummaryEnabled": True,
+    }
+    if model:
+        entry["model"] = model
+    return entry
+
+
 def cmd_sync_desktop() -> None:
     """Surface Terminal/VS Code sessions in Claude Desktop's session list.
 
     Additive (writes only new local_<uuid>.json entries into Desktop's own store)
-    and idempotent (sessions already linked by cliSessionId are skipped).
+    and idempotent (sessions already linked by cliSessionId are skipped). The
+    model is read from each transcript and, when absent, mirrors the account's
+    current model rather than being fabricated (#8953).
     """
     idx = _desktop_index_dir()
     if idx is None:
@@ -9138,6 +9209,7 @@ def cmd_sync_desktop() -> None:
         c = _read_json(p, {}).get("cliSessionId")
         if c:
             known.add(c)
+    default_model = _desktop_default_model(idx)
     created = skipped = 0
     for d in _project_dirs(PROJECTS_ROOT):
         for s in load_sessions_in_dir(d, None):
@@ -9151,42 +9223,14 @@ def cmd_sync_desktop() -> None:
             surface, model = _session_surface_model(jsonl)
             if surface not in ("cli", "claude-vscode"):
                 continue   # only Terminal / VS Code sessions
-            cwd = s.get("cwd") or s.get("origin_cwd") or str(Path.home())
-            title = (s.get("ai_title")
-                     or (s["real_msgs"][0] if s.get("real_msgs") else "")
-                     or f"({sid[:8]})")[:80]
-            created_ms = _iso_to_ms(s.get("first_ts"))
-            # last activity = the later of last-message ts and file mtime, matching
-            # saikai's Recency column (untimed ai-title/permission-mode appends bump
-            # mtime but not last_ts) so Desktop orders these sessions the same way.
-            active_ms = (max(_iso_to_ms(s.get("last_ts")),
-                             int((s.get("mtime") or 0) * 1000))
-                         or created_ms)
-            entry = {
-                "sessionId": "local_" + str(uuid.uuid4()),
-                "cliSessionId": sid,
-                "cwd": cwd,
-                "originCwd": s.get("origin_cwd") or cwd,
-                "createdAt": created_ms,
-                "lastActivityAt": active_ms,
-                "lastFocusedAt": active_ms,
-                "model": model or "claude-opus-4-8",
-                "effort": "max",
-                "isArchived": False,
-                "title": title,
-                "titleSource": "user",
-                "permissionMode": "default",
-                "enabledMcpTools": {},
-                "remoteMcpServersConfig": [],
-                "chromePermissionMode": "skip_all_permission_checks",
-                "completedTurns": 0,
-                "alwaysAllowedReasons": [],
-                "sessionPermissionUpdates": [],
-                "classifierSummaryEnabled": True,
-            }
+            entry = _desktop_entry(s, model or default_model)
             try:
                 _write_json(idx / (entry["sessionId"] + ".json"), entry)
                 created += 1
+                # Mark linked NOW so a sid yielded twice in one run (e.g. the same
+                # id living in two case-variant project dirs) can't spawn a second
+                # entry — `known` was otherwise only seeded from pre-existing files. (#8916)
+                known.add(sid)
             except Exception as e:
                 print(_c(f"  failed writing entry for {sid[:8]}: {e}", RED), file=sys.stderr)
     print(_c(f"  Claude Desktop sync: +{created} new, {skipped} already present.",
@@ -9290,8 +9334,10 @@ def main():
                    help="Reset all sort priorities to defaults (recency desc, then none).")
     p.add_argument("--sync-desktop", action="store_true",
                    help="Create Claude Desktop session-list entries for Terminal/VS Code "
-                        "sessions missing from it. Additive + idempotent; never modifies "
-                        "~/.claude/projects. Restart Desktop afterwards to see them.")
+                        "sessions missing from it. NOTE: this WRITES into Claude Desktop's "
+                        "own session store, whose format is internal/undocumented; the write "
+                        "is additive + idempotent and never touches ~/.claude/projects. "
+                        "Restart Desktop afterwards to see them.")
     p.add_argument("--related", metavar="SESSION_ID",
                    help="Show sessions related to SESSION_ID with confidence scores and reasons")
     p.add_argument("--tree", action="store_true",

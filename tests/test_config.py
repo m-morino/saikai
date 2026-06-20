@@ -3,6 +3,7 @@ degradation), and the env > config > default precedence resolver.
 
 Run:  python tests/test_config.py
 """
+import json
 import os
 import sys
 import tempfile
@@ -401,6 +402,71 @@ def test_save_options_preserves_others_on_unreadable_and_nondict():
         saikai.OPTIONS_FILE = old_file
 
 
+def test_desktop_entry_omits_unknown_model_and_marks_title_auto():
+    """A Desktop entry must NOT fabricate a model: when the resolved model is
+    None the `model` key is omitted (Desktop picks), and titleSource is "auto"
+    because saikai's title is always derived, never user-typed. (#8953)"""
+    s = {"id": "sid-abc", "real_msgs": ["hello there"], "cwd": "/c/work"}
+    e = saikai._desktop_entry(s, None)
+    assert "model" not in e, "unknown model must be omitted, not hardcoded"
+    assert e["titleSource"] == "auto"
+    assert e["cliSessionId"] == "sid-abc"
+    assert e["sessionId"].startswith("local_")
+    assert e["title"] == "hello there"
+    # A resolved model is carried through verbatim.
+    e2 = saikai._desktop_entry(s, "claude-sonnet-4-6")
+    assert e2["model"] == "claude-sonnet-4-6"
+
+
+def test_desktop_default_model_mirrors_newest_account_entry():
+    """The fallback model mirrors the account's most-recently-written entry that
+    carries a model — not a hardcoded version, and skipping model-less entries. (#8953)"""
+    idx = Path(tempfile.mkdtemp())
+    older = idx / "local_old.json"
+    older.write_text(json.dumps({"model": "claude-opus-4-7[1m]"}), encoding="utf-8")
+    os.utime(older, (1_000_000, 1_000_000))
+    modelless = idx / "local_none.json"                 # newest, but no model → ignored
+    modelless.write_text(json.dumps({"cliSessionId": "x"}), encoding="utf-8")
+    os.utime(modelless, (3_000_000, 3_000_000))
+    newer = idx / "local_new.json"
+    newer.write_text(json.dumps({"model": "claude-sonnet-4-6"}), encoding="utf-8")
+    os.utime(newer, (2_000_000, 2_000_000))
+    assert saikai._desktop_default_model(idx) == "claude-sonnet-4-6"
+    assert saikai._desktop_default_model(Path(tempfile.mkdtemp())) is None  # empty store
+
+
+def test_sync_desktop_dedups_within_run_and_mirrors_model():
+    """One sync run must create at most ONE entry per cliSessionId even when the
+    same sid is yielded from two project dirs (#8916), and an unknown transcript
+    model must mirror the account's existing model, never the old hardcoded
+    opus-4-8 (#8953)."""
+    root = Path(tempfile.mkdtemp()) / "claude-code-sessions"
+    idx = root / "orgA" / "userA"
+    idx.mkdir(parents=True)
+    pre = idx / "local_pre.json"                         # account's current model = sonnet
+    pre.write_text(json.dumps({"cliSessionId": "old", "model": "claude-sonnet-4-6"}),
+                   encoding="utf-8")
+    dup = {"id": "dup-sid", "real_msgs": ["hi"], "cwd": "/c/x",
+           "first_ts": None, "jsonl_path": "x"}
+    saved = (saikai.DESKTOP_SESSIONS_ROOT, saikai.PROJECTS_ROOT,
+             saikai._project_dirs, saikai.load_sessions_in_dir, saikai._session_surface_model)
+    try:
+        saikai.DESKTOP_SESSIONS_ROOT = root
+        saikai.PROJECTS_ROOT = Path(tempfile.mkdtemp())
+        saikai._project_dirs = lambda _root: ["d1", "d2"]          # two dirs…
+        saikai.load_sessions_in_dir = lambda _d, _days: [dict(dup)]  # …both yield the SAME sid
+        saikai._session_surface_model = lambda _j: ("cli", None)   # no model in transcript
+        saikai.cmd_sync_desktop()
+    finally:
+        (saikai.DESKTOP_SESSIONS_ROOT, saikai.PROJECTS_ROOT,
+         saikai._project_dirs, saikai.load_sessions_in_dir,
+         saikai._session_surface_model) = saved
+    made = [json.loads(p.read_text(encoding="utf-8")) for p in idx.glob("local_*.json")]
+    dups = [m for m in made if m.get("cliSessionId") == "dup-sid"]
+    assert len(dups) == 1, f"expected exactly one entry for the dup sid, got {len(dups)}"
+    assert dups[0]["model"] == "claude-sonnet-4-6", "must mirror account model, not fabricate"
+
+
 if __name__ == "__main__":
     test_config_path_honors_env()
     print("PASS test_config_path_honors_env")
@@ -436,6 +502,12 @@ if __name__ == "__main__":
     print("PASS test_activity_marker_bg_agent_distinct_from_open")
     test_desktop_index_dir_prefers_recent_over_most_entries()
     print("PASS test_desktop_index_dir_prefers_recent_over_most_entries")
+    test_desktop_entry_omits_unknown_model_and_marks_title_auto()
+    print("PASS test_desktop_entry_omits_unknown_model_and_marks_title_auto")
+    test_desktop_default_model_mirrors_newest_account_entry()
+    print("PASS test_desktop_default_model_mirrors_newest_account_entry")
+    test_sync_desktop_dedups_within_run_and_mirrors_model()
+    print("PASS test_sync_desktop_dedups_within_run_and_mirrors_model")
     test_dedup_sessions_by_id_keeps_newest()
     print("PASS test_dedup_sessions_by_id_keeps_newest")
     test_ctx_usage_skips_synthetic_and_zero_records()
