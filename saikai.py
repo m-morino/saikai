@@ -1556,16 +1556,20 @@ def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
 
 
 _active_sessions_cache: dict[str, str] | None = None
+_active_kinds_cache: "dict[str, str] | None" = None   # sid -> kind ("interactive" | "bg" | …)
 
 
 def _load_active_sessions() -> dict[str, str]:
     """Read Claude Code's `~/.claude/sessions/<pid>.json` registry and return
-    {sessionId: status} for every PID still alive.  Claude Code writes one
-    file per running interactive session with `status` = "busy" | "idle"."""
-    global _active_sessions_cache
+    {sessionId: status} for every PID still alive. Claude Code writes one file per
+    running session with `status` = "busy" | "idle" AND `kind` = "interactive" |
+    "bg" (a headless background agent/job) | … — the kind is exposed separately via
+    _active_session_kinds (a `bg` session is live but NOT resumable / attachable)."""
+    global _active_sessions_cache, _active_kinds_cache
     if _active_sessions_cache is not None:
         return _active_sessions_cache
     out: dict[str, str] = {}
+    kinds: dict[str, str] = {}
     sessions_dir = Path.home() / ".claude" / "sessions"
     scanned_ok = False
     try:
@@ -1578,6 +1582,7 @@ def _load_active_sessions() -> dict[str, str]:
                     status = d.get("status", "")
                     if pid and sid and _is_pid_alive(int(pid)):
                         out[sid] = status
+                        kinds[sid] = d.get("kind", "")
                 except Exception:
                     continue
             scanned_ok = True
@@ -1589,7 +1594,15 @@ def _load_active_sessions() -> dict[str, str]:
     # live panes render as dead. Leave the cache unset so the next call retries.
     if scanned_ok:
         _active_sessions_cache = out
+        _active_kinds_cache = kinds
     return out
+
+
+def _active_session_kinds() -> dict:
+    """sid -> kind ('interactive' | 'bg' | …) for the live registry entries,
+    populated alongside _load_active_sessions; {} until that has run cleanly."""
+    _load_active_sessions()
+    return _active_kinds_cache or {}
 
 
 def _invalidate_active_sessions() -> None:
@@ -1597,8 +1610,9 @@ def _invalidate_active_sessions() -> None:
     re-reads ~/.claude/sessions. Called on reload — otherwise is_open / is_active
     stay frozen at the launch-time snapshot for the whole picker lifetime (a
     session that exited elsewhere keeps showing Open/Running)."""
-    global _active_sessions_cache
+    global _active_sessions_cache, _active_kinds_cache
     _active_sessions_cache = None
+    _active_kinds_cache = None
 
 
 def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> dict:
@@ -1633,6 +1647,7 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
         "origin_cwd": origin_cwd,
         "git_branch": parsed.get("git_branch", ""),
         "is_open": sid in active,
+        "is_bg": _active_session_kinds().get(sid) == "bg",   # headless background agent/job (live, not resumable)
         "session_status": active.get(sid, ""),
         "is_active": (sid in active) or age_sec < 300,
         "is_recent": age_sec < 1800,
@@ -2574,11 +2589,12 @@ _LIVE_MARKER = {
 # markers. Markers not listed stay the default colour.
 _MARKER_COLOR = {_g: _c for _g, _c in _LIVE_MARKER.values()}
 _MARKER_COLOR.update({
-    "!": "yellow",   # reply due — your last turn is unanswered (statusbar !M)
-    "@": "green",    # opened in another window
-    "+": "green",    # recently active
-    ".": "yellow",   # recent (dormant) — matches the CLI --table '.' tint so the
-    #                  comment's "same palette as the CLI" claim actually holds
+    "!": "yellow",    # reply due — your last turn is unanswered (statusbar !M)
+    "@": "green",     # opened in another window
+    "&": "magenta",   # running background agent/job (headless; not resumable while live)
+    "+": "green",     # recently active
+    ".": "yellow",    # recent (dormant) — matches the CLI --table '.' tint so the
+    #                   comment's "same palette as the CLI" claim actually holds
 })
 
 
@@ -2593,6 +2609,8 @@ _TABLE_NA_CACHE: dict = {}   # mtime-keyed reply-due cache for the --table activ
 
 def _activity_marker(s: dict) -> str:
     """Activity column: open-busy / open-idle / active / reply-due / recent."""
+    if s.get("is_bg"):
+        return _c("&", MAGENTA, BOLD)    # running background agent/job (headless)
     if s.get("is_open"):
         if s.get("session_status") == "busy":
             return _c("@", CYAN, BOLD)   # open & currently responding
@@ -3991,7 +4009,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  Age       last 1d / 3d / 7d / 30d / All time\n"
                 "  Search    [yellow]/[/yellow] or type to open the bar; tokens AND with text + each other —\n"
                 "            :fav  :hidden  :open  :active  :recent   (Esc clears)\n"
-                "  Markers   @ open elsewhere · + active · . recent · live ~ busy · ? waiting · ! reply due · = idle · * fav · x hidden\n"
+                "  Markers   @ open elsewhere · & bg agent · + active · . recent · live ~ busy · ? waiting · ! reply due · = idle · * fav · x hidden\n"
                 "  [yellow]/[/yellow] shows the bar with the dropdowns; [yellow]Tab[/yellow]/[yellow]Shift-Tab[/yellow] walk into them, [yellow]Enter[/yellow]\n"
                 "  opens one. Leader [yellow]s[/yellow]/[yellow]o[/yellow] cycles the sort column / direction without the bar\n"
                 "  (a column-header click still sorts too)\n\n"
@@ -5224,7 +5242,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # still unanswered — the same "reply due" idea as the live ! above,
                     # but for a not-running session (resume it to get the reply). Ranks
                     # below + (just-touched) and above . (merely recent).
-                    marker_a = ("@" if s.get("is_open") else "+" if s.get("is_active")
+                    marker_a = ("&" if s.get("is_bg") else "@" if s.get("is_open")
+                                else "+" if s.get("is_active")
                                 else "!" if _needs_attention(s, self._na_cache)
                                 else "." if s.get("is_recent") else " ")
                 marker_s = ("*" if s["id"] in favorites
@@ -6129,6 +6148,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     return
                 self._spawn_live_pane(sid, argv, cwd, env, title, refresh=refresh)
 
+            # A running BACKGROUND agent/job (kind=bg, the & marker): it's a headless
+            # live session owned by its bg process — there is no interactive window to
+            # attach to, and `claude --resume` on a live session conflicts with the
+            # owner. Refuse with a clear reason; it becomes resumable once the bg job
+            # finishes and its registry entry drops (is_bg → False on the next scan).
+            if s and s.get("is_bg"):
+                self.notify("running background agent — can't resume a live session "
+                            "(resume it after the bg job finishes)",
+                            severity="warning", title="saikai", timeout=8)
+                return
             # Already open in another Claude window/instance (the @ marker): a second
             # `claude --resume` on the same JSONL can interleave/corrupt it. Confirm.
             if s and s.get("is_open"):

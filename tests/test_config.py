@@ -284,6 +284,17 @@ def test_child_spawn_env_strips_virtualenv_from_var_and_path():
     assert "/usr/bin" in env["PATH"].split(sep)
 
 
+def test_activity_marker_bg_agent_distinct_from_open():
+    """A running background agent (registry kind=bg) gets the '&' marker, distinct
+    from the '@' of an interactive session open elsewhere — so saikai doesn't mistake
+    a headless, non-resumable bg job for an attachable window. is_bg wins even though
+    a bg session is also is_open. (#bg)"""
+    assert "&" in saikai._activity_marker({"is_bg": True})
+    assert "&" in saikai._activity_marker({"is_bg": True, "is_open": True})
+    assert "@" in saikai._activity_marker({"is_open": True})
+    assert "&" not in saikai._activity_marker({"is_open": True})
+
+
 def test_desktop_index_dir_prefers_recent_over_most_entries():
     """The sync target is the account Desktop is CURRENTLY writing to (newest
     local_*.json), not the one with the most history — else sync lands in a
@@ -421,6 +432,8 @@ if __name__ == "__main__":
     print("PASS test_child_spawn_env_strips_parent_session_markers")
     test_child_spawn_env_strips_virtualenv_from_var_and_path()
     print("PASS test_child_spawn_env_strips_virtualenv_from_var_and_path")
+    test_activity_marker_bg_agent_distinct_from_open()
+    print("PASS test_activity_marker_bg_agent_distinct_from_open")
     test_desktop_index_dir_prefers_recent_over_most_entries()
     print("PASS test_desktop_index_dir_prefers_recent_over_most_entries")
     test_dedup_sessions_by_id_keeps_newest()
