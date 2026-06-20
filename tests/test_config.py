@@ -568,6 +568,31 @@ def test_new_session_stub_preserves_drive_letter_case():
     assert not s["project_name"].startswith("c-")
 
 
+def test_session_pid_live_rejects_reused_pid():
+    """A registered PID counts as live only if the snapshot shows it's a Claude
+    process; a recycled PID owned by something else is rejected. (#audit-pidreuse)"""
+    assert saikai._is_session_pid_live(os.getpid(), None) is True   # no snapshot → bare liveness
+    idx = {111: ("claude.exe", 1), 222: ("explorer.exe", 1), 444: ("node.exe", 1)}
+    assert saikai._is_session_pid_live(111, idx) is True
+    assert saikai._is_session_pid_live(444, idx) is True
+    assert saikai._is_session_pid_live(222, idx) is False           # reused → unrelated proc
+    assert saikai._is_session_pid_live(333, idx) is False           # not in snapshot at all
+
+
+def test_resolve_resume_cwd_prefers_recent_sibling():
+    """When the selected session's own cwds are gone, the sibling fallback picks the
+    MOST-RECENT sibling cwd, not the first in (sort-dependent) list order. (#audit-sibling-cwd)"""
+    d1 = Path(tempfile.mkdtemp())
+    d2 = Path(tempfile.mkdtemp())
+    proj = Path("/fake/projects/key")
+    selected = {"id": "sel", "origin_cwd": "/no/such/dir1", "cwd": "/no/such/dir2",
+                "jsonl_path": proj / "sel.jsonl"}
+    older = {"id": "o1", "origin_cwd": str(d1), "jsonl_path": proj / "o1.jsonl", "mtime": 100.0}
+    newer = {"id": "o2", "origin_cwd": str(d2), "jsonl_path": proj / "o2.jsonl", "mtime": 200.0}
+    out = saikai._resolve_resume_cwd("sel", [selected, older, newer])  # older first in list
+    assert out == str(d2), "should pick the most-recent sibling cwd, not list-order first"
+
+
 def test_desktop_entry_omits_unknown_model_and_marks_title_auto():
     """A Desktop entry must NOT fabricate a model: when the resolved model is
     None the `model` key is omitted (Desktop picks), and titleSource is "auto"
@@ -688,6 +713,10 @@ if __name__ == "__main__":
     print("PASS test_set_lineage_refuses_to_wipe_on_unreadable_file")
     test_new_session_stub_preserves_drive_letter_case()
     print("PASS test_new_session_stub_preserves_drive_letter_case")
+    test_session_pid_live_rejects_reused_pid()
+    print("PASS test_session_pid_live_rejects_reused_pid")
+    test_resolve_resume_cwd_prefers_recent_sibling()
+    print("PASS test_resolve_resume_cwd_prefers_recent_sibling")
     test_desktop_entry_omits_unknown_model_and_marks_title_auto()
     print("PASS test_desktop_entry_omits_unknown_model_and_marks_title_auto")
     test_desktop_default_model_mirrors_newest_account_entry()

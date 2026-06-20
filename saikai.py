@@ -1398,6 +1398,25 @@ def _is_pid_alive(pid: int) -> bool:
         return False
 
 
+_CLAUDE_PROC_NAMES = frozenset({"claude.exe", "node.exe"})
+
+
+def _is_session_pid_live(pid: int, pid_index: "dict | None") -> bool:
+    """A registered session PID counts as live only if it's alive AND actually a
+    Claude process. Guards against Windows PID reuse: the `~/.claude/sessions/<pid>.json`
+    registry has no TTL, so a stale entry whose PID the OS has recycled to an
+    unrelated process would otherwise read as a live (is_open) session. With no
+    process snapshot (POSIX, or a failed snapshot) fall back to a bare liveness
+    check. (#audit-pidreuse)"""
+    if pid_index is None:
+        return _is_pid_alive(pid)
+    info = pid_index.get(pid)
+    if info is None:
+        return False
+    name = info[0]
+    return name in _CLAUDE_PROC_NAMES or "claude" in name or "node" in name
+
+
 # ── Terminal-death watchdog (Windows SIGHUP emulation) ───────────────────────
 # POSIX delivers SIGHUP to the foreground process group when the controlling
 # terminal closes, so saikai and any resumed `claude --resume` child die with the
@@ -1586,6 +1605,13 @@ def _load_active_sessions() -> dict[str, str]:
     kinds: dict[str, str] = {}
     sessions_dir = Path.home() / ".claude" / "sessions"
     scanned_ok = False
+    # One fast process snapshot (no subprocess) to validate registered PIDs are
+    # still Claude processes — defends against Windows PID reuse. Empty snapshot =
+    # failure → None so _is_session_pid_live falls back to a bare liveness check
+    # rather than marking every session dead. (#audit-pidreuse)
+    pid_index = _win_pid_index() if sys.platform == "win32" else None
+    if not pid_index:
+        pid_index = None
     try:
         if sessions_dir.exists():
             for f in sessions_dir.glob("*.json"):
@@ -1594,7 +1620,7 @@ def _load_active_sessions() -> dict[str, str]:
                     pid = d.get("pid")
                     sid = d.get("sessionId")
                     status = d.get("status", "")
-                    if pid and sid and _is_pid_alive(int(pid)):
+                    if pid and sid and _is_session_pid_live(int(pid), pid_index):
                         out[sid] = status
                         kinds[sid] = d.get("kind", "")
                 except Exception:
@@ -1888,7 +1914,14 @@ def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
     _ext = _cfg("summary", "command", "SAIKAI_SUMMARIZE_CMD", "", str)
     if _ext:
         return call_external_summarizer(_ext, prompt, timeout=timeout, raw=raw)
+    # Pre-assign the session id so a run KILLED on timeout (before we can parse the
+    # id from stdout) still leaves a DELETABLE orphan. --no-session-persistence
+    # cleans up on graceful exit, but a killed claude can leave an in-progress
+    # transcript under PROJECTS_ROOT that saikai's own scan would rescan as a
+    # phantom session — the old finally ran with session_id='' (a no-op). (#audit-summarizer-leak)
+    session_id = str(uuid.uuid4())
     cmd = ["claude", "-p", "--model", model or _summary_model(),
+           "--session-id", session_id,
            "--setting-sources", "",
            "--strict-mcp-config",
            "--disable-slash-commands",
@@ -1898,7 +1931,7 @@ def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
     if sys.platform == "win32":
         extra["creationflags"] = NO_WINDOW  # no inherited console handles
 
-    session_id = ""
+    _payload_sid = ""
     try:
         with subprocess.Popen(cmd, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1920,7 +1953,7 @@ def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
             return ""
         try:
             payload = json.loads(raw_text)
-            session_id = payload.get("session_id", "") or ""
+            _payload_sid = payload.get("session_id", "") or ""
             text = (payload.get("result") or "").strip()
         except Exception:
             text = raw_text.strip()
@@ -1944,6 +1977,9 @@ def call_claude_haiku(prompt: str, timeout: int = 45, raw: bool = False,
         return ""
     finally:
         _delete_session_files(session_id)
+        # If claude reported a different id than the one we forced, clean that too.
+        if _payload_sid and _payload_sid != session_id:
+            _delete_session_files(_payload_sid)
 
 
 def call_external_summarizer(cmd_str: str, prompt: str, timeout: int = 45,
@@ -8324,12 +8360,19 @@ def _resolve_resume_cwd(full_id: str, sessions: list[dict]) -> str | None:
                 candidates.append(v)
         if not candidates and selected.get("jsonl_path"):
             project_dir = selected["jsonl_path"].parent
+            sibs: list[tuple[float, str]] = []
             for other in sessions:
                 if other.get("jsonl_path") and other["jsonl_path"].parent == project_dir:
                     v = other.get("origin_cwd") or other.get("cwd")
                     if v and Path(v).is_dir():
-                        candidates.append(v)
-                        break
+                        sibs.append((other.get("mtime") or 0.0, v))
+            if sibs:
+                # Most-recently-active sibling wins: list order tracks the user's
+                # active UI sort column (none of which is cwd-validity), so the old
+                # first-in-order pick was arbitrary when a project dir legitimately
+                # holds several distinct cwds (worktree moves). (#audit-sibling-cwd)
+                sibs.sort(key=lambda t: -t[0])
+                candidates.append(sibs[0][1])
     return candidates[0] if candidates else None
 
 
