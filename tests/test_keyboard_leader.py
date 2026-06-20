@@ -1963,6 +1963,57 @@ def test_pilot_cycle_tab_skips_dead_pane():
         f"cycling onto a dead pane must focus the list: {facts}"
 
 
+def test_pilot_double_space_does_not_leave_leader_armed():
+    """Double-Space (the mark gesture) must dispatch and NOT leave the leader armed:
+    event.stop() doesn't block the App's own space→arm_leader binding, which would
+    re-arm with _leader_pending already reset and hijack the next key. (#H10)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_double_space_does_not_leave_leader_armed (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+    from textual.widgets import Input
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                self.query_one("#table").focus()
+                await pilot.pause(0.1)
+                await pilot.press("space")          # arm the leader…
+                await pilot.pause(0.1)
+                await pilot.press("space")          # …double-Space = mark; must NOT re-arm
+                await pilot.pause(0.2)
+                facts["pending_after_double"] = getattr(self, "_leader_pending", None)
+                await pilot.press("a")              # next key must reach search, not be hijacked
+                await pilot.pause(0.2)
+                try:
+                    facts["search"] = self.query_one("#search", Input).value
+                except Exception as e:              # noqa: BLE001
+                    facts["error"] = repr(e)
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("pending_after_double") is False, \
+        f"leader left armed after double-Space: {facts}"
+    assert facts.get("search") == "a", \
+        f"key after double-Space was hijacked instead of reaching search: {facts}"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -2024,6 +2075,8 @@ if __name__ == "__main__":
     test_pilot_filter_engaged_window_survives_focus_move()
     test_pilot_checkpoint_marker_on_row()
     test_pilot_cycle_tab_skips_dead_pane()
+    test_pilot_double_space_does_not_leave_leader_armed()
+    print("PASS test_pilot_double_space_does_not_leave_leader_armed")
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("PASS test_pilot_ctx_gauge_in_statusbar")
     print("PASS test_pilot_open_parent")

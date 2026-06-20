@@ -4702,6 +4702,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._leader_actions = {}      # {letter: action_name} reached via the leader
             self._leader_pending = False   # waiting for the post-leader key
             self._leader_gen = 0           # bumps each arm; a stale timer no-ops on mismatch
+            self._suppress_arm = False     # eat the spurious arm_leader after a leader-key dispatch (#H10)
             self._applied_keymap = {}      # direct rebinds applied (shown in ? help)
             try:
                 _kc = _load_config().get("keys", {})
@@ -5584,6 +5585,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             return time.monotonic() < getattr(self, "_filter_active_until", 0.0)
 
         def on_key(self, event) -> None:
+            # Clear the one-shot arm-suppress at the START of every key event: it is
+            # set only by a leader-key dispatch below and consumed by the
+            # action_arm_leader binding that fires AFTER this handler in the SAME
+            # event. Clearing it here (next event) keeps it from lingering on a
+            # platform where event.stop() DID block the binding. (#H10)
+            self._suppress_arm = False
             # Ctrl+C reaching the App means the LIST or search box is focused (a
             # focused live terminal consumes Ctrl+C first, to interrupt claude).
             # Route it through the double-press guard, then our force-quit
@@ -5621,6 +5628,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self._leader_pending = False
                     self._set_leader_hint(None)
                     event.stop()
+                    if event.key == self._leader_key:
+                        # event.stop() does NOT block the App's OWN non-priority
+                        # space→arm_leader binding, which fires AFTER this dispatch
+                        # with _leader_pending now False and re-arms — leaving the
+                        # leader stuck after a double-Space mark, so the next key is
+                        # hijacked. Eat that one spurious arm. (#H10)
+                        self._suppress_arm = True
                     if event.key != "escape":
                         _act = self._leader_actions.get((event.character or "").lower())
                         _fn = getattr(self, "action_" + _act, None) if _act else None
@@ -5714,6 +5728,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             already stopped the event), so no double-arm and no stolen keys."""
             if self._leader_key != "space":
                 raise SkipAction()
+            if self._suppress_arm:
+                # This arm is the spurious one firing right after a leader-key
+                # dispatch (double-Space) — eat it so the leader doesn't re-arm. (#H10)
+                return
             if self._leader_pending:
                 return
             if (self._focused_terminal() is not None
