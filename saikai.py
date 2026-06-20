@@ -2560,6 +2560,8 @@ _MARKER_COLOR.update({
     "!": "yellow",   # reply due — your last turn is unanswered (statusbar !M)
     "@": "green",    # opened in another window
     "+": "green",    # recently active
+    ".": "yellow",   # recent (dormant) — matches the CLI --table '.' tint so the
+    #                  comment's "same palette as the CLI" claim actually holds
 })
 
 
@@ -4502,7 +4504,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         preview_mode = "summary"   # "summary" or "full"
         _sid_index: dict = {}      # sid -> session; populated in on_mount
         _na_cache: dict = {}       # sid -> (mtime, needs_attention); Group-by-State
-        _last_status: dict = {}    # sid -> last live status; for waiting toasts
+        # _last_status is NOT declared here: it is a per-instance dict set in
+        # __init__ (the shared class-attr default would leak one PickerApp's
+        # statuses into a second instance — see the #8 fix at its init site).
         _b2: "dict | None" = None  # b2 (Task 11) checkpoint state machine; None = idle
         _b2_timer = None           # the self-cancelling tick interval handle
 
