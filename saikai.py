@@ -8338,6 +8338,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         "SAIKAI_MIRROR_ALLOW_LAN_INPUT", "")).strip().lower() in (
                         "1", "true", "yes", "on")
                     _hub.allow_lan_input = _allow_lan_in
+                    # LAN input is the flood-risk path: enforce a default accepted-
+                    # input rate cap (~50/s) unless the user set an explicit gap via
+                    # SAIKAI_MIRROR_MIN_ACCEPT_GAP. (#audit-mirror-ratecap)
+                    if _allow_lan_in and _hub._min_accept_gap <= 0:
+                        _hub._min_accept_gap = 0.02
                     _hub.serve()
                     atexit.register(_hub.stop)
                     _Drv = _mirror.make_mirror_driver(_mirror._base_driver_class(), _hub)

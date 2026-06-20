@@ -135,8 +135,65 @@ def test_page_injects_terminal_size():
         hub.stop()
 
 
+def test_broadcast_overflow_flags_resync():
+    """On ingest overflow broadcast() must flag a resync (not splice): the whole
+    stale backlog is dropped and _ingest_overflow is set so the drain requests a
+    full repaint. (#audit-mirror-broadcast-splice)"""
+    hub = m.MirrorHub(token="t", ingest_cap=4)
+    assert hub._ingest_overflow is False
+    for i in range(10):           # no drain thread → forces overflow
+        hub.broadcast(f"f{i}")
+    assert hub._ingest_overflow is True
+    assert hub._ingest.qsize() <= 4
+
+
+def test_resync_client_replaces_backlog_with_snapshot_and_control():
+    """_resync_client drops a fallen-behind client's stale diffs and leaves it
+    exactly [snapshot, control] — one clean repaint, not corruption. (#audit-mirror-sse-drop)"""
+    import queue as _q
+    cq = _q.Queue(256)
+    for k in range(5):
+        cq.put_nowait(f"stale-diff-{k}")
+    ctrl = m._Control('{"on": true}')
+    m.MirrorHub._resync_client(cq, "FULL-SNAPSHOT", ctrl)
+    got = []
+    while not cq.empty():
+        got.append(cq.get_nowait())
+    assert got == ["FULL-SNAPSHOT", ctrl], got
+
+
+def test_bad_key_lockout_enforced_and_resets():
+    """The bad-key counter must actually LOCK OUT input at the threshold (was a
+    write-only counter) and auto-reset after the cooldown. (#audit-mirror-ratecap)"""
+    hub = m.MirrorHub(token="t")
+    assert hub._input_locked_out() is False
+    for _ in range(m._BAD_KEY_LOCKOUT_THRESHOLD):
+        hub._note_bad_key()
+    assert hub._input_locked_out() is True, "threshold of bad keys must lock out input"
+    # Simulate the cooldown elapsing → auto-reset, input allowed again.
+    hub._bad_key_lockout_until = 1.0          # far in the past (monotonic)
+    assert hub._input_locked_out() is False
+    assert hub._bad_key_count == 0
+
+
+def test_min_accept_gap_reads_env():
+    """The accepted-input rate cap must be REACHABLE at runtime (was hardcoded 0.0
+    → the documented flood control never engaged). (#audit-mirror-ratecap)"""
+    os.environ["SAIKAI_MIRROR_MIN_ACCEPT_GAP"] = "0.05"
+    try:
+        hub = m.MirrorHub(token="t")
+        assert abs(hub._min_accept_gap - 0.05) < 1e-9
+    finally:
+        os.environ.pop("SAIKAI_MIRROR_MIN_ACCEPT_GAP", None)
+    assert m.MirrorHub(token="t")._min_accept_gap == 0.0   # absent → off (no regression)
+
+
 if __name__ == "__main__":
     test_broadcast_is_nonblocking_and_drops_oldest()
+    test_broadcast_overflow_flags_resync()
+    test_resync_client_replaces_backlog_with_snapshot_and_control()
+    test_bad_key_lockout_enforced_and_resets()
+    test_min_accept_gap_reads_env()
     test_server_rejects_bad_token_and_streams_with_good_token()
     test_env_gate_default_off()
     test_url_includes_token_and_resolves_wildcard_host()

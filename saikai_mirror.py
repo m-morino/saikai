@@ -12,6 +12,7 @@ import collections
 import hmac
 import http.server
 import json
+import os
 import queue
 import socketserver
 import sys
@@ -23,6 +24,11 @@ from typing import Optional
 # A control frame travels over the SAME per-client queue as output frames, but
 # wrapped so _stream can send it as a named SSE event instead of base64 output.
 _Control = collections.namedtuple("_Control", ["json"])
+
+# Brute-force throttle for the SSE write-key: after this many bad attempts,
+# refuse input for a cooldown so a lost/guessed key can't be hammered. (#audit-mirror-ratecap)
+_BAD_KEY_LOCKOUT_THRESHOLD = 20
+_BAD_KEY_LOCKOUT_SECS = 30.0
 
 
 # pyte stores a colour as: a basic name, a "bright"+name, a 6-hex string
@@ -160,8 +166,16 @@ class MirrorHub:
         self._idle_timer = None
         self._idle_lock = threading.Lock()
         self._bad_key_count = 0
+        self._bad_key_lockout_until = 0.0   # monotonic; input refused until then
         self._last_accept_t = 0.0
-        self._min_accept_gap = 0.0    # accepted-input rate cap (seconds between)
+        # Accepted-input rate cap (seconds between accepted injects). Now actually
+        # REACHABLE at runtime via env (was hardcoded 0.0 → the documented flood
+        # control never engaged); the LAN opt-in also sets a default floor. (#audit-mirror-ratecap)
+        try:
+            self._min_accept_gap = max(0.0, float(os.environ.get("SAIKAI_MIRROR_MIN_ACCEPT_GAP", "0") or 0))
+        except (TypeError, ValueError):
+            self._min_accept_gap = 0.0
+        self._ingest_overflow = False  # set by broadcast() on overflow → drain requests a resync
         self.allow_lan_input = False  # set True only via the launch opt-in
 
     def _feed(self, data: str) -> None:
@@ -171,6 +185,43 @@ class MirrorHub:
     def _snapshot(self) -> str:
         with self._mirror_lock:
             return _synth_full_frame(self._screen, self._cols, self._rows)
+
+    @staticmethod
+    def _resync_client(cq, snapshot, control=None) -> None:
+        """Replace a fallen-behind client's backlog with a single full repaint
+        (+ the current control frame), so a dropped incremental diff becomes ONE
+        clean resync instead of permanent visual corruption / a stale banner. The
+        browser has no gap detection, so drop-oldest there is unrecoverable.
+        (#audit-mirror-sse-drop / #audit-mirror-control-loss)"""
+        try:
+            while True:
+                cq.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            cq.put_nowait(snapshot)
+            if control is not None:
+                cq.put_nowait(control)
+        except queue.Full:
+            pass
+
+    def _note_bad_key(self) -> None:
+        """Count a bad write-key attempt; arm a cooldown lockout at the threshold."""
+        self._bad_key_count += 1
+        if self._bad_key_count >= _BAD_KEY_LOCKOUT_THRESHOLD:
+            import time as _t
+            self._bad_key_lockout_until = _t.monotonic() + _BAD_KEY_LOCKOUT_SECS
+
+    def _input_locked_out(self) -> bool:
+        """True while the bad-key cooldown is active; auto-resets afterwards."""
+        if self._bad_key_lockout_until <= 0.0:
+            return False
+        import time as _t
+        if _t.monotonic() < self._bad_key_lockout_until:
+            return True
+        self._bad_key_lockout_until = 0.0
+        self._bad_key_count = 0
+        return False
 
     def broadcast(self, data: str) -> None:
         """Called from Textual's UI thread (MirrorDriver.write). MUST NOT block.
@@ -182,10 +233,18 @@ class MirrorHub:
         try:
             self._ingest.put_nowait(data)
         except queue.Full:
+            # The drain (pyte feed) has fallen behind. Do NOT drop a single oldest
+            # chunk: Textual splits one logical frame into multiple chunks, so
+            # dropping a MIDDLE chunk splices two unrelated byte ranges and
+            # permanently corrupts the server pyte mirror. Discard the whole stale
+            # backlog and flag a resync — the drain loop requests a full repaint
+            # that resets pyte cleanly. (#audit-mirror-broadcast-splice)
             try:
-                self._ingest.get_nowait()   # drop oldest
+                while True:
+                    self._ingest.get_nowait()
             except queue.Empty:
                 pass
+            self._ingest_overflow = True
             try:
                 self._ingest.put_nowait(data)
             except queue.Full:
@@ -242,14 +301,32 @@ class MirrorHub:
                 self._stream.feed(data)
                 with self._clients_lock:
                     targets = list(self._clients)
-            for cq in targets:
-                try:
-                    cq.put_nowait(data)
-                except queue.Full:
+                snapshot = None      # computed lazily, under the lock, for resyncs
+                ctrl = None
+                for cq in targets:
                     try:
-                        cq.get_nowait()
                         cq.put_nowait(data)
-                    except (queue.Empty, queue.Full):
+                    except queue.Full:
+                        # Fallen behind: resync with a full repaint instead of
+                        # drop-oldest (which splices the diff stream into permanent
+                        # corruption). (#audit-mirror-sse-drop)
+                        if snapshot is None:
+                            snapshot = _synth_full_frame(self._screen, self._cols, self._rows)
+                            if self._control_enabled:
+                                ctrl = _Control(json.dumps(
+                                    {"on": True, "target": self._control_target}))
+                        self._resync_client(cq, snapshot, ctrl)
+            # Server pyte may have lost data on an ingest overflow → ask the app for
+            # a full repaint so a clean frame resets it. Done OFF the mirror lock and
+            # from the drain thread (broadcast() on the UI thread can't call
+            # _repaint_request, which marshals via call_from_thread). (#audit-mirror-broadcast-splice)
+            if self._ingest_overflow:
+                self._ingest_overflow = False
+                fn = self._repaint_request
+                if fn is not None:
+                    try:
+                        fn()
+                    except Exception:
                         pass
 
     def serve(self) -> int:
@@ -323,15 +400,17 @@ class MirrorHub:
             {"on": self._control_enabled, "target": self._control_target}))
         with self._clients_lock:
             targets = list(self._clients)
+        snap = None
         for cq in targets:
             try:
                 cq.put_nowait(frame)
             except queue.Full:
-                try:
-                    cq.get_nowait()
-                    cq.put_nowait(frame)
-                except (queue.Empty, queue.Full):
-                    pass
+                # Fallen behind: resync (full repaint + this control frame) rather
+                # than drop-oldest, which could evict an unconsumed control frame
+                # and leave the browser banner stale. (#audit-mirror-control-loss)
+                if snap is None:
+                    snap = self._snapshot()
+                self._resync_client(cq, snap, frame)
         if self._control_enabled:
             self._arm_idle_timer()
         else:
@@ -349,15 +428,14 @@ class MirrorHub:
         frame = _Control(json.dumps({"on": True, "target": self._control_target}))
         with self._clients_lock:
             targets = list(self._clients)
+        snap = None
         for cq in targets:
             try:
                 cq.put_nowait(frame)
             except queue.Full:
-                try:
-                    cq.get_nowait()
-                    cq.put_nowait(frame)
-                except (queue.Empty, queue.Full):
-                    pass
+                if snap is None:                    # resync, don't drop-oldest (#audit-mirror-control-loss)
+                    snap = self._snapshot()
+                self._resync_client(cq, snap, frame)
 
     def _arm_idle_timer(self) -> None:
         with self._idle_lock:
@@ -968,10 +1046,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         return hmac.compare_digest(got, self.server.hub._token)
 
     def _write_key_ok(self) -> bool:
+        hub = self.server.hub
+        # Enforce the bad-key cooldown (was a write-only counter): a lost/guessed
+        # write-key can't be hammered once the threshold trips. (#audit-mirror-ratecap)
+        if hub._input_locked_out():
+            return False
         got = self.headers.get("X-Mirror-Write-Key", "")
-        ok = hmac.compare_digest(got, self.server.hub._write_key)
-        if not ok:
-            self.server.hub._bad_key_count += 1     # GIL-atomic increment
+        ok = hmac.compare_digest(got, hub._write_key)
+        if ok:
+            hub._bad_key_count = 0                    # legit key → clear the streak
+        else:
+            hub._note_bad_key()
         return ok
 
     def _allowed_hosts(self) -> set:
