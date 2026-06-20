@@ -238,6 +238,52 @@ def test_reset_terminal_modes_guarded_and_emits():
     assert out.endswith("\033[?25h")
 
 
+def test_child_spawn_env_strips_parent_session_markers():
+    """A child agent saikai spawns must boot as its OWN session: the parent Claude
+    session markers (esp. CLAUDE_NO_SESSION_PERSISTENCE, which otherwise suppresses
+    the child's transcript and breaks discovery/checkpoint) are stripped, while a
+    user's CLAUDE_CONFIG_DIR override and auth are preserved. base is not mutated."""
+    base = {
+        "CLAUDE_NO_SESSION_PERSISTENCE": "true",
+        "CLAUDECODE": "1",
+        "CLAUDE_CODE_SESSION_ID": "parent-sid",
+        "CLAUDE_CODE_CHILD_SESSION": "1",
+        "CLAUDE_CODE_ENTRYPOINT": "cli",
+        "CLAUDE_PROJECT_DIR": "/parent/project",
+        "TEXTUAL_LOG": "saikai.log",
+        "CLAUDE_CONFIG_DIR": "/custom/.claude",      # user override → preserved
+        "CLAUDE_CODE_GIT_BASH_PATH": "C:/git/bash",  # config the child needs → preserved
+        "ANTHROPIC_API_KEY": "sk-xxx",               # auth → preserved
+        "PATH": "/usr/bin",
+    }
+    env = saikai._child_spawn_env(base)
+    for k in ("CLAUDE_NO_SESSION_PERSISTENCE", "CLAUDECODE", "CLAUDE_CODE_SESSION_ID",
+              "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PROJECT_DIR",
+              "TEXTUAL_LOG"):
+        assert k not in env, f"{k} must be stripped from the child env"
+    assert env.get("CLAUDE_CONFIG_DIR") == "/custom/.claude", "user config-dir override dropped"
+    assert env.get("CLAUDE_CODE_GIT_BASH_PATH") == "C:/git/bash", "git-bash config dropped"
+    assert env.get("ANTHROPIC_API_KEY") == "sk-xxx", "auth must be preserved"
+    assert "CLAUDE_NO_SESSION_PERSISTENCE" in base, "base must NOT be mutated"
+
+
+def test_child_spawn_env_strips_virtualenv_from_var_and_path():
+    """uv's ephemeral VIRTUAL_ENV is removed from both the var and PATH so the
+    child's `uv` doesn't warn about a stale venv."""
+    sep = os.pathsep
+    venv = "/proj/.venv"
+    bindir = "Scripts" if sys.platform == "win32" else "bin"
+    base = {
+        "VIRTUAL_ENV": venv,
+        "VIRTUAL_ENV_PROMPT": "(.venv)",
+        "PATH": sep.join([str(Path(venv) / bindir), "/usr/bin"]),
+    }
+    env = saikai._child_spawn_env(base)
+    assert "VIRTUAL_ENV" not in env and "VIRTUAL_ENV_PROMPT" not in env
+    assert str(Path(venv) / bindir) not in env["PATH"].split(sep)
+    assert "/usr/bin" in env["PATH"].split(sep)
+
+
 if __name__ == "__main__":
     test_config_path_honors_env()
     print("PASS test_config_path_honors_env")
@@ -265,4 +311,8 @@ if __name__ == "__main__":
     print("PASS test_removed_cluster_mode_has_no_dangling_runtime_references")
     test_reset_terminal_modes_guarded_and_emits()
     print("PASS test_reset_terminal_modes_guarded_and_emits")
+    test_child_spawn_env_strips_parent_session_markers()
+    print("PASS test_child_spawn_env_strips_parent_session_markers")
+    test_child_spawn_env_strips_virtualenv_from_var_and_path()
+    print("PASS test_child_spawn_env_strips_virtualenv_from_var_and_path")
     print("ALL PASS")

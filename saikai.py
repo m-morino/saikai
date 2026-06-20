@@ -8128,6 +8128,49 @@ def _resolve_resume_cwd(full_id: str, sessions: list[dict]) -> str | None:
     return candidates[0] if candidates else None
 
 
+# Parent Claude-session markers that MUST be stripped from a child agent's
+# environment so it boots as its OWN standalone session. CLAUDE_NO_SESSION_PERSISTENCE
+# is the critical one: inherited, the spawned `claude` writes NO transcript JSONL, so
+# saikai's discovery (transcript-based) and /clear child-detection silently fail — the
+# supervisor's core feature breaks whenever saikai is itself launched from inside a
+# Claude session (the lifecycle spec mandates this strip). The CLAUDE_CODE_* /
+# CLAUDECODE markers are the "you are nested" signals a fresh claude re-injects on its
+# own; CLAUDE_PROJECT_DIR would point the child at the parent's history root. NOT
+# stripped: CLAUDE_CONFIG_DIR (a user override saikai itself honors) and
+# CLAUDE_CODE_GIT_BASH_PATH (config the child needs); auth (ANTHROPIC_*) is untouched.
+_CHILD_ENV_STRIP = frozenset({
+    "CLAUDE_NO_SESSION_PERSISTENCE",
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EFFORT_LEVEL",
+    "CLAUDE_PROJECT_DIR",
+    "TEXTUAL_LOG",   # saikai's own Textual debug log — must not leak to the child
+})
+
+
+def _child_spawn_env(base: "dict | None" = None) -> dict:
+    """Environment for a child agent process saikai spawns: a copy of `base`
+    (os.environ by default) with the parent Claude-session markers (_CHILD_ENV_STRIP)
+    stripped so the child boots standalone, plus uv's ephemeral VIRTUAL_ENV removed
+    from both the var and PATH (so the child's `uv` doesn't warn about a stale venv).
+    Single source of "which parent vars are unsafe for a child"; pure + unit-tested,
+    does NOT mutate `base`."""
+    env = dict(os.environ if base is None else base)
+    for _k in _CHILD_ENV_STRIP:
+        env.pop(_k, None)
+    leaked_venv = env.pop("VIRTUAL_ENV", None)
+    env.pop("VIRTUAL_ENV_PROMPT", None)
+    if leaked_venv:
+        bin_dir = "Scripts" if sys.platform == "win32" else "bin"
+        venv_bin = str(Path(leaked_venv) / bin_dir)
+        cmp = (lambda p: p.lower()) if sys.platform == "win32" else (lambda p: p)
+        parts = [p for p in env.get("PATH", "").split(os.pathsep) if cmp(p) != cmp(venv_bin)]
+        env["PATH"] = os.pathsep.join(parts)
+    return env
+
+
 def _build_claude_invocation(
     session_args: list[str], target_cwd: str | None, sessions: list[dict]
 ) -> tuple[list[str], str | None, dict]:
@@ -8151,18 +8194,11 @@ def _build_claude_invocation(
             and _canonical_workspace(target_cwd) in _frequent_cwds(sessions)):
         extra_args = ["--permission-mode", "auto"]
 
-    env = os.environ.copy()
+    # Child env: parent Claude-session markers stripped (so the child boots its OWN
+    # session — esp. CLAUDE_NO_SESSION_PERSISTENCE, else it writes no transcript and
+    # discovery/checkpoint break) + VIRTUAL_ENV cleaned. See _child_spawn_env.
+    env = _child_spawn_env()
     env["SAIKAI_RESUME"] = "1"   # signal to teams-notify.py: suppress the first idle_prompt
-    # Strip uv's ephemeral VIRTUAL_ENV so the launched session's `uv` doesn't
-    # warn about a stale venv.
-    leaked_venv = env.pop("VIRTUAL_ENV", None)
-    env.pop("VIRTUAL_ENV_PROMPT", None)
-    if leaked_venv:
-        bin_dir = "Scripts" if sys.platform == "win32" else "bin"
-        venv_bin = str(Path(leaked_venv) / bin_dir)
-        cmp = (lambda p: p.lower()) if sys.platform == "win32" else (lambda p: p)
-        parts = [p for p in env.get("PATH", "").split(os.pathsep) if cmp(p) != cmp(venv_bin)]
-        env["PATH"] = os.pathsep.join(parts)
 
     if len(session_args) == 2 and session_args[0] == "--resume":
         spec = _ACTIVE_PROVIDER.build_resume(
