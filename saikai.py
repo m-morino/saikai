@@ -166,6 +166,40 @@ def _read_json(path: Path, default):
         return default
 
 
+_PREF_CACHE: dict = {}    # path-str -> (mtime, parsed value)
+
+
+def _pref_cached(path: Path, parse, default):
+    """Serve a small pref file's parsed value from an mtime-keyed cache. The list
+    rebuild (_do_refresh_table) reads ~half a dozen of these single-value config
+    files (hidden / favorites / view-mode / tree / group-by / sort / age / status)
+    EVERY time, and the live poll rebuilds ~continuously while a session is busy —
+    so uncached this cost ~8-10 stat+open+read syscalls per rebuild on the UI
+    thread. Re-read only when the mtime changes; the _save_*/_set_*/_toggle_*
+    writers also _invalidate_pref() so a write + an immediate re-read can't be
+    masked by a coarse filesystem mtime resolution. (#14)"""
+    try:
+        m = path.stat().st_mtime
+    except OSError:
+        _PREF_CACHE.pop(str(path), None)
+        return default
+    key = str(path)
+    hit = _PREF_CACHE.get(key)
+    if hit is not None and hit[0] == m:
+        return hit[1]
+    try:
+        v = parse()
+    except Exception:
+        return default
+    _PREF_CACHE[key] = (m, v)
+    return v
+
+
+def _invalidate_pref(path: Path) -> None:
+    """Drop a pref's cache entry right after writing it (see _pref_cached)."""
+    _PREF_CACHE.pop(str(path), None)
+
+
 # ── TOML config (opt-in; env vars still win) ─────────────────────────────────
 def _config_path() -> Path:
     """Resolve the config file path: $SAIKAI_CONFIG, else the platform config dir
@@ -718,11 +752,12 @@ def _set_lineage(child: str, parent: str, parent_jsonl: str) -> None:
 
 
 def _load_set(path: Path) -> set[str]:
-    return set(_read_json(path, []))
+    return set(_pref_cached(path, lambda: _read_json(path, []), []))
 
 
 def _save_set(path: Path, ids: set[str]) -> None:
     _write_json(path, sorted(ids))
+    _invalidate_pref(path)
 
 
 def _toggle_in_set(path: Path, sid: str) -> bool:
@@ -758,31 +793,31 @@ def _load_favorites() -> set[str]:
 
 
 def _get_view_mode() -> str:
-    try:
-        return VIEW_MODE_FILE.read_text(encoding="utf-8").strip() or "default"
-    except Exception:
-        return "default"
+    return _pref_cached(VIEW_MODE_FILE,
+                        lambda: VIEW_MODE_FILE.read_text(encoding="utf-8").strip(),
+                        "default") or "default"
 
 
 def _toggle_view_mode() -> str:
     new_mode = "show-hidden" if _get_view_mode() == "default" else "default"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     VIEW_MODE_FILE.write_text(new_mode, encoding="utf-8")
+    _invalidate_pref(VIEW_MODE_FILE)
     return new_mode
 
 
 def _get_tree_mode() -> bool:
     """Saved nested-tree display preference. False (flat) by default."""
-    try:
-        return TREE_MODE_FILE.read_text(encoding="utf-8").strip() == "on"
-    except Exception:
-        return False
+    return _pref_cached(TREE_MODE_FILE,
+                        lambda: TREE_MODE_FILE.read_text(encoding="utf-8").strip(),
+                        "") == "on"
 
 
 def _toggle_tree_mode() -> bool:
     new = not _get_tree_mode()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     TREE_MODE_FILE.write_text("on" if new else "off", encoding="utf-8")
+    _invalidate_pref(TREE_MODE_FILE)
     return new
 
 
@@ -792,11 +827,9 @@ def _get_group_by() -> str:
     and the State sections (Needs input / Running / Open / Recent / Idle /
     Archived) answer it at a glance — Date is one ␣g away. An explicit choice —
     including 'none' — is persisted by _set_group_by and wins from then on."""
-    try:
-        v = GROUP_BY_FILE.read_text(encoding="utf-8").strip()
-        return v if v in ("none", "date", "project", "state") else "state"
-    except Exception:
-        return "state"
+    v = _pref_cached(GROUP_BY_FILE,
+                     lambda: GROUP_BY_FILE.read_text(encoding="utf-8").strip(), "")
+    return v if v in ("none", "date", "project", "state") else "state"
 
 
 def _set_group_by(value: str) -> None:
@@ -804,6 +837,7 @@ def _set_group_by(value: str) -> None:
         value = "none"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     GROUP_BY_FILE.write_text(value, encoding="utf-8")
+    _invalidate_pref(GROUP_BY_FILE)
 
 
 def _get_split_ratio() -> float:
@@ -830,11 +864,9 @@ def _set_split_ratio(v: float) -> None:
 def _get_status_filter() -> str:
     """Claude-Desktop 'Status' filter: 'active' (non-archived, default) |
     'archived' (only hidden/archived) | 'all'."""
-    try:
-        v = STATUS_FILTER_FILE.read_text(encoding="utf-8").strip()
-        return v if v in ("active", "archived", "all") else "active"
-    except Exception:
-        return "active"
+    v = _pref_cached(STATUS_FILTER_FILE,
+                     lambda: STATUS_FILTER_FILE.read_text(encoding="utf-8").strip(), "")
+    return v if v in ("active", "archived", "all") else "active"
 
 
 def _set_status_filter(value: str) -> None:
@@ -842,6 +874,7 @@ def _set_status_filter(value: str) -> None:
         value = "active"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     STATUS_FILTER_FILE.write_text(value, encoding="utf-8")
+    _invalidate_pref(STATUS_FILTER_FILE)
 
 
 def _get_lastact_days() -> int:
@@ -849,16 +882,15 @@ def _get_lastact_days() -> int:
     Clamped to the dropdown option set — a stray/negative persisted value (e.g.
     -3 makes the cutoff a FUTURE time that hides EVERY row) must not silently
     empty the list, and the box must not show a value it can't represent."""
-    try:
-        v = int(LASTACT_FILTER_FILE.read_text(encoding="utf-8").strip())
-    except Exception:
-        return 0
+    v = _pref_cached(LASTACT_FILTER_FILE,
+                     lambda: int(LASTACT_FILTER_FILE.read_text(encoding="utf-8").strip()), 0)
     return v if v in (0, 1, 3, 7, 30) else 0
 
 
 def _set_lastact_days(days: int) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     LASTACT_FILTER_FILE.write_text(str(int(days)), encoding="utf-8")
+    _invalidate_pref(LASTACT_FILTER_FILE)
 
 
 def _iso_dt(ts_iso: str):
@@ -1102,7 +1134,7 @@ def _load_sort() -> list[dict]:
     """Load the 3-level sort spec from disk, or fall back to defaults.
     Always returns exactly 3 entries; bad/missing entries get filled from the
     defaults so the rest of the code doesn't have to defensively check."""
-    raw = _read_json(SORT_FILE, None)
+    raw = _pref_cached(SORT_FILE, lambda: _read_json(SORT_FILE, None), None)
     out = [dict(d) for d in SORT_DEFAULT]   # mutable copies
     if isinstance(raw, list):
         for i, entry in enumerate(raw[:3]):
@@ -1131,6 +1163,7 @@ def _sort_select_value():
 def _save_sort(keys: list[dict]) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     _write_json(SORT_FILE, keys[:3])
+    _invalidate_pref(SORT_FILE)
 
 
 def _cycle_sort_col(priority: int) -> dict:
@@ -4591,6 +4624,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._opening_live_sid = None     # sid whose pane should grab focus on open
             self._unread: set = set()         # live panes finished (idle) but not yet responded to → ! marker
             self._busy_seen: set = set()      # sids observed busy since their last "done" toast (catches tasks shorter than the poll)
+            self._last_status: dict = {}      # sid -> last poll status snapshot — per INSTANCE: the class-attr default is a shared mutable dict, so a 2nd PickerApp (headless tests, a future multi-window) would otherwise read the first app's statuses on its first poll (#8)
             self._opened_sids: set = set()    # sids opened + kept this session (snapshot source)
             self._opening_sids: set = set()   # opens in flight (register deferred to the mount worker) — counted by the capacity gate + has() dedup
             self._last_cursor_row = -1        # prior cursor row → header-skip direction
