@@ -1331,21 +1331,45 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         with self._lock:
             top_before = len(self._screen.history.top)
             try:
-                pos = 0
-                for m in _ALT_ANY_RE.finditer(chunk):
-                    seg = chunk[pos:m.start()]
-                    if seg:
-                        self._stream.feed(seg)
-                    entering = m.group().endswith("h")
-                    if entering != self._alt.in_alt:
-                        self._alt.in_alt = entering
+                marks = list(_ALT_ANY_RE.finditer(chunk))
+                if len(marks) <= 1:
+                    # 0 or 1 transition — the normal case; feed exactly as before.
+                    pos = 0
+                    for m in marks:
+                        seg = chunk[pos:m.start()]
+                        if seg:
+                            self._stream.feed(seg)
+                        entering = m.group().endswith("h")
+                        if entering != self._alt.in_alt:
+                            self._alt.in_alt = entering
+                            self._screen.reset()
+                            self._scroll = 0
+                        self._stream.feed(m.group())
+                        pos = m.end()
+                    rest = chunk[pos:]
+                    if rest:
+                        self._stream.feed(rest)
+                else:
+                    # >1 transition in one chunk: collapse the reset amplification.
+                    # Nothing renders mid-_consume and each reset() (a full pyte
+                    # buffer reallocation, here under self._lock) discards the prior
+                    # buffer, so only the content AFTER the LAST state-changing toggle
+                    # is ever visible. Simulate to find that toggle, reset ONCE, and
+                    # feed from there — behaviourally identical, but O(1) resets. (#audit-altscreen-reset)
+                    sim = self._alt.in_alt
+                    last_reset = None
+                    for m in marks:
+                        entering = m.group().endswith("h")
+                        if entering != sim:
+                            sim = entering
+                            last_reset = m.start()
+                    if last_reset is None:
+                        self._stream.feed(chunk)      # every marker was a no-op
+                    else:
                         self._screen.reset()
+                        self._alt.in_alt = sim
                         self._scroll = 0
-                    self._stream.feed(m.group())
-                    pos = m.end()
-                rest = chunk[pos:]
-                if rest:
-                    self._stream.feed(rest)
+                        self._stream.feed(chunk[last_reset:])
             except Exception:
                 # A malformed sequence must not kill the reader; drop rather than crash.
                 pass
@@ -1461,8 +1485,15 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # A pane frozen for copy/select (Shift+F9) that then dies must not stay
         # pinned to its stale snapshot — clear freeze so the final live frame shows
         # (on_key early-returns for a dead pane before its resume-unfreeze line).
-        self._frozen = False
-        self._frozen_buf = None
+        # BUT do not clobber an ACTIVE drag-selection's pinned snapshot: if the
+        # child exits mid-drag, on_mouse_up still needs _frozen_buf to extract the
+        # selection (else it falls back to the live/dead buffer). is_dead is set
+        # ABOVE, so no NEW drag can start (on_mouse_down bails on is_dead); only an
+        # in-progress drag (sel_anchor set) is preserved, and its own on_mouse_up
+        # restores the state. (#audit-finalize-race)
+        if self._sel_anchor is None:
+            self._frozen = False
+            self._frozen_buf = None
         if self._status != "dead":
             self._status = "dead"
             if self._on_status and self.sid:

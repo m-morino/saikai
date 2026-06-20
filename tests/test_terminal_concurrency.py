@@ -917,7 +917,67 @@ def test_input_snaps_scrolled_back_pane_to_live():
     assert t._scroll == 0 and writes == ["\r"], (t._scroll, writes)
 
 
+def test_consume_collapses_alt_screen_reset_amplification():
+    """A chunk that ALTERNATES alt-screen enter/leave must end on the LAST
+    context's content with the correct in_alt — identical to the per-transition
+    reset loop, but without N buffer reallocations under the lock. (#audit-altscreen-reset)"""
+    import pyte
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t._lock = threading.Lock()
+    t._screen = pyte.HistoryScreen(20, 4, history=50)
+    t._stream = pyte.Stream(t._screen)
+    t._alt = rt.AltScreenTracker()
+    t._scroll = 0
+    t._scr_ver = 0
+    t._esc_carry = ""
+    t._bracketed_paste = False
+    t._mouse_reporting = False
+    t._mouse_sgr = False
+    t._in_sync_update = False
+    t._sync_started = 0.0
+    t._current_screen = lambda: ("", "")
+    t._update_status = lambda s: None
+    t._status_classifier = lambda txt, title: "idle"
+    # AAA(normal) → [enter]BBB → [leave]CCC → [enter]DDD : 3 transitions in one chunk.
+    t._consume("AAA\x1b[?1049hBBB\x1b[?1049lCCC\x1b[?1049hDDD")
+    line0 = "".join(t._screen.buffer[0][x].data for x in range(20)).rstrip()
+    assert t._alt.in_alt is True, t._alt.in_alt        # last toggle entered alt
+    assert line0 == "DDD", repr(line0)                 # only the final context is visible
+    # A single transition still works (the unchanged common path).
+    t._consume("\x1b[?1049lZZZ")
+    line0b = "".join(t._screen.buffer[0][x].data for x in range(20)).rstrip()
+    assert t._alt.in_alt is False and line0b == "ZZZ", (t._alt.in_alt, repr(line0b))
+
+
+def test_finalize_preserves_active_drag_snapshot():
+    """A child exiting mid-drag must NOT drop the pinned selection snapshot —
+    on_mouse_up still needs _frozen_buf to extract the selection. With no drag,
+    freeze is cleared so the final live frame shows. (#audit-finalize-race)"""
+    def _mk():
+        t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+        t.is_dead = False
+        t._status = "busy"
+        t._on_status = None
+        t._on_exit = None
+        t.sid = "s"
+        t._marshal = lambda fn: None
+        t.refresh = lambda: None
+        t._frozen = True
+        t._frozen_buf = {0: ["pinned"]}
+        return t
+    t = _mk(); t._sel_anchor = (0, 0)          # drag in progress
+    t._finalize()
+    assert t._frozen is True and t._frozen_buf is not None, "mid-drag snapshot was dropped"
+    t = _mk(); t._sel_anchor = None            # no drag
+    t._finalize()
+    assert t._frozen is False and t._frozen_buf is None
+
+
 if __name__ == "__main__":
+    test_consume_collapses_alt_screen_reset_amplification()
+    print("PASS test_consume_collapses_alt_screen_reset_amplification")
+    test_finalize_preserves_active_drag_snapshot()
+    print("PASS test_finalize_preserves_active_drag_snapshot")
     test_update_status_marshals_outside_lock()
     print("PASS test_update_status_marshals_outside_lock")
     test_ime_anchor_xy_maps_cursor_into_region()
