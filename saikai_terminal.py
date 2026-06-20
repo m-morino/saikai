@@ -1720,9 +1720,12 @@ class LiveSessionManager:
             self.join_reaps()
 
 
-# Status → a compact glyph for the DataTable marker / tab label. Loud on
-# "waiting" so a session needing input is visible even when its tab isn't
-# focused; calm on idle.
+# Status → a compact glyph for the tab label. Loud on "waiting" so a session
+# needing input is visible even when its tab isn't focused; calm on idle. The
+# session LIST in saikai.py renders these SAME live states in its own ASCII marker
+# vocabulary (_LIVE_MARKER: waiting "?", busy "~", idle "="/"!"); the two are
+# deliberately distinct glyph sets, so keep both in step when adding/renaming a
+# status. "dead" → ✓ here; the list drops a dead pane to its dormant file markers.
 STATUS_GLYPH = {
     "busy": "◐",      # ◐ working
     "waiting": "⏳",   # ⏳ needs input

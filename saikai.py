@@ -2531,18 +2531,31 @@ def preview_session_full(session_id: str) -> None:
 
 _MARKER_BLANK = " "
 
+# Single source for the LIVE-status markers in the session list — glyph + colour
+# together, so the activity column and its tint can't drift. The SAME live states
+# are also rendered by the tab labels (saikai_terminal.STATUS_GLYPH) in a separate
+# calm/loud glyph vocabulary; the two can't share one constant (STATUS_GLYPH is in
+# the terminal module and loads after this), so cross-check both when adding or
+# renaming a status. "idle" is intentionally absent: the list resolves it to "!"
+# (reply-due) vs "=" from app state in _refresh_table, not from the raw status.
+_LIVE_MARKER = {
+    "waiting": ("?", "red"),    # needs input — matches the statusbar ?N badge
+    "busy":    ("~", "cyan"),   # working / running
+}
+
 # Per-state colour for the TUI list's activity marker (the ? ~ ! = @ + . glyph),
 # which was distinguished by GLYPH only. Tint it so state reads at a glance, using
 # the SAME palette as the toast severities ($warning≈yellow, $success≈green) and
 # the CLI --table _activity_marker — so the colour language is consistent across
-# the list, the CLI, and notifications. Markers not listed stay the default colour.
-_MARKER_COLOR = {
-    "?": "red",      # waiting on you (needs input) — matches the statusbar ?N badge
+# the list, the CLI, and notifications. The live-state colours come from
+# _LIVE_MARKER (single source); the rest are list-only reply-due / file-registry
+# markers. Markers not listed stay the default colour.
+_MARKER_COLOR = {_g: _c for _g, _c in _LIVE_MARKER.values()}
+_MARKER_COLOR.update({
     "!": "yellow",   # reply due — your last turn is unanswered (statusbar !M)
-    "~": "cyan",     # busy / running
     "@": "green",    # opened in another window
     "+": "green",    # recently active
-}
+})
 
 
 # Markers are intentionally ASCII (1 cell, terminal-width-independent). The
@@ -5128,10 +5141,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # the file-registry open/active/recent markers otherwise.
                 live_status = (self._live.status(s["id"])
                                if self._live is not None else "")
-                if live_status == "waiting":
-                    marker_a = "?"
-                elif live_status == "busy":
-                    marker_a = "~"
+                if live_status in _LIVE_MARKER:      # waiting → ?, busy → ~ (shared glyphs)
+                    marker_a = _LIVE_MARKER[live_status][0]
                 elif live_status == "idle":
                     # ! = claude finished and the user has not responded yet;
                     # = = idle live pane with no response due. Merely viewing a tab
