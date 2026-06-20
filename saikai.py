@@ -5094,7 +5094,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # ! = claude finished and the user has not responded yet;
                     # = = idle live pane with no response due. Merely viewing a tab
                     # does not clear !. ASCII keeps the marker column aligned.
-                    marker_a = "!" if s["id"] in getattr(self, "_unread", ()) else "="
+                    # _reply_due is the SAME predicate the statusbar !M uses.
+                    marker_a = "!" if self._reply_due(s["id"]) else "="
                 else:
                     # ! here = a DORMANT session whose last turn was yours and is
                     # still unanswered — the same "reply due" idea as the live ! above,
@@ -5272,10 +5273,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # !M = panes that finished and you haven't responded to yet.
                 _st = self._live.statuses()
                 _wait = sum(1 for v in _st.values() if v == "waiting")
-                # Intersect with live sids so a just-closed/dead pane (forgotten from
-                # statuses, but cleared from _unread only later by the reader's exit
-                # callback) doesn't inflate the count — matches action_next_attention.
-                _done = len(getattr(self, "_unread", set()) & set(_st))
+                # !M = live panes that are reply-due, via the SAME _reply_due
+                # predicate the per-row "!" uses, so the badge and the markers can
+                # never disagree. Iterating _st (live sids only) also keeps a
+                # just-closed pane — forgotten from statuses but cleared from
+                # _unread only later by the reader's exit callback — from inflating
+                # the count (matches action_next_attention).
+                _done = sum(1 for sid in _st if self._reply_due(sid))
                 _att = ""
                 if _wait:
                     _att += f"  [red]?{_wait}[/red]"
@@ -6271,6 +6275,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if self._live is None or not self._live.has(sid):
                 return   # ignore a callback that lands after the pane was closed
             self._live.set_status(sid, status)
+            self._apply_live_status(sid, status)
+            # Mirror onto the DataTable marker so a backgrounded waiting session
+            # is loud even when its tab isn't focused. Coalesced: a streaming
+            # claude flips status many times/sec and each full rebuild is costly.
+            self._request_refresh()
+
+        def _apply_live_status(self, sid: str, status: str) -> None:
+            """The _unread / _busy_seen bookkeeping + tab-glyph repaint a status
+            change implies. Shared by _on_live_status (reader-marshalled, once per
+            transition) AND _poll_live_status: the 1.5s poll runs on the app's OWN
+            thread, where the reader's call_from_thread marshal is a silent no-op,
+            so when the poll is the only thing that noticed a flip (the reader
+            stayed blocked in read() with no final chunk) it must replay these
+            side-effects itself — otherwise the '!' reply-due marker, the !M badge,
+            and the tab glyph never update for a backgrounded pane that finished
+            its turn (exactly the case this poll exists to catch)."""
             # "!" = claude FINISHED its turn (went idle) and you haven't sent input
             # since. Flagged in the list EVEN for the currently-displayed tab — you
             # might be looking at the list or another pane, so you'd otherwise miss
@@ -6284,7 +6304,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 #                            shorter than the poll) → the "done" toast
                 #                            in _poll_live_status keys off this, not a
                 #                            1-tick prev-status snapshot it can miss.
-            # Update the tab label.
+            # Update the tab label glyph.
             try:
                 tabs = self.query_one("#right", TabbedContent)
                 s = self._sid_index.get(sid)
@@ -6294,10 +6314,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     pane.label = _LIVE_TERM.tab_label(title, status)
             except Exception:
                 pass
-            # Mirror onto the DataTable marker so a backgrounded waiting session
-            # is loud even when its tab isn't focused. Coalesced: a streaming
-            # claude flips status many times/sec and each full rebuild is costly.
-            self._request_refresh()
+
+        def _reply_due(self, sid: str) -> bool:
+            """A LIVE pane is 'reply due' — the row marker '!' and the statusbar !M
+            — when it has FINISHED its turn (idle) and you haven't responded since
+            (still in _unread). A waiting pane shows '?' (counted in ?N) and a busy
+            pane was discarded from _unread; neither is reply-due. Single source of
+            truth so the per-row '!' and the !M badge can never disagree."""
+            return (self._live is not None
+                    and self._live.status(sid) == "idle"
+                    and sid in getattr(self, "_unread", ()))
 
         def on_tabbed_content_tab_activated(self, event) -> None:
             # A live tab became active (F2/F3, Shift+F3, click) → move the list
@@ -6905,7 +6931,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # dict directly from the term's freshly classified status here,
                     # else a pane that went idle/waiting with no new output never
                     # updates its marker (the whole point of this poll).
-                    self._live.set_status(term.sid, getattr(term, "_status", ""))
+                    _ts = getattr(term, "_status", "")
+                    # Don't propagate the teardown "dead" sentinel (set by the
+                    # reader's _finalize before the marshalled _on_live_exit gets
+                    # to forget the sid): the list marker logic has no "dead"
+                    # branch and would flash the dormant @/+/! file markers for a
+                    # frame. Leave the last live status until the pane is forgotten.
+                    if _ts and _ts != "dead":
+                        self._live.set_status(term.sid, _ts)
                 except Exception:
                     pass
             try:
@@ -6918,8 +6951,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 active = ""
             for sid, st in cur.items():
-                if st == "busy":
-                    self._busy_seen.add(sid)   # record even for the active pane
+                prev_st = prev.get(sid)
+                if st != prev_st:
+                    # The reader marshals _on_live_status once per transition, but
+                    # when this poll is the only thing that noticed the flip (the
+                    # reader stayed blocked in read() with no final chunk), that
+                    # marshal no-ops on our own thread — so replay the
+                    # _unread/_busy_seen/tab-glyph bookkeeping here, else the "!"
+                    # reply-due marker, the !M badge, and the tab glyph never
+                    # update for a backgrounded pane that just finished its turn.
+                    self._apply_live_status(sid, st)
                 if self._live.pane_id(sid) == active:
                     # You're looking at this pane — its tab/marker suffice; if it just
                     # settled, drop the "done" debt so switching away later doesn't
@@ -6927,7 +6968,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     if st != "busy":
                         self._busy_seen.discard(sid)
                     continue
-                prev_st = prev.get(sid)
                 sess = self._sid_index.get(sid) or {}
                 title = (sess.get("ai_title") or _first_msg(sess) or sid[:8])[:50]
                 if st == "waiting" and prev_st != "waiting":
