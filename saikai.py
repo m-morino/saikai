@@ -3645,7 +3645,19 @@ class _MirrorControl:
             except Exception:
                 pass
             return
+        now = time.monotonic()
         parser = getattr(self, "_mirror_parser", None)
+        # Stale-partial guard: the parser reassembles a key sequence split across
+        # /input batches, but a real split arrives in ONE rapid burst. If >0.5s
+        # elapsed since the last batch, a still-buffered partial is an ABANDONED
+        # incomplete escape (a lone Esc, or an Alt+<char> the browser sent as
+        # ESC+char), NOT a split about to continue — DROP it so it can't concatenate
+        # onto THIS batch and fire a phantom key (a typed 'A' read as 'ctrl+up', the
+        # cross-batch poison the audit found). The real driver's escape-timeout does
+        # the equivalent flush. (Reassembly within a burst still works: <0.5s.) (#H9)
+        if parser and (now - getattr(self, "_mirror_parser_ts", 0.0)) > 0.5:
+            parser = None
+            self._mirror_parser = None
         if parser is None:
             try:
                 from textual._xterm_parser import XTermParser
@@ -3653,6 +3665,7 @@ class _MirrorControl:
             except Exception:
                 parser = False                 # parser API gone: remember + fall back
             self._mirror_parser = parser
+        self._mirror_parser_ts = now
         if parser:
             try:
                 tokens = list(parser.feed(data))
@@ -7544,6 +7557,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if _hub is None:
                 return
             self._control_enabled = not self._control_enabled
+            # Reset the input parser on every toggle so a partial escape buffered in a
+            # PRIOR control session can't survive an OFF→ON and complete against the
+            # first key of the new session as a phantom. (#H9)
+            self._mirror_parser = None
             # Designate a control target only while enabling; disabling clears it
             # (matches the hub's own `target if enabled else None` normalisation).
             t = self._focused_terminal() if self._control_enabled else None

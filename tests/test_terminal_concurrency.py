@@ -742,6 +742,23 @@ def test_mirror_inject_input_parses_full_terminal_keys():
     assert posted == [], "gate OFF must not route keys"
 
 
+def test_mirror_inject_stale_partial_discarded_no_phantom():
+    """A buffered incomplete escape from an earlier batch must NOT concatenate onto a
+    later, unrelated key and fire a phantom (the cross-batch poison the audit found).
+    After a >0.5s gap the stale partial is dropped and a fresh parser handles the new
+    key cleanly; a within-burst split (<0.5s) still reassembles. (#H9)"""
+    posted = []
+    app = saikai._MirrorControl.__new__(saikai._MirrorControl)
+    app._control_enabled = True
+    app.post_message = lambda ev: posted.append(ev)
+    app._mirror_inject_input("\x1b[1;5")          # incomplete CSI → buffers, no token yet
+    assert posted == [], posted
+    app._mirror_parser_ts -= 1.0                   # simulate a >0.5s pause (abandoned)
+    app._mirror_inject_input("A")                  # later key must be ITSELF, not ctrl+up
+    keys = [getattr(e, "key", None) for e in posted]
+    assert keys == ["A"], f"stale CSI poisoned the next key: {keys}"
+
+
 def test_copy_to_host_clipboard_picks_tool_and_reports():
     """_copy_to_host_clipboard runs the platform clip tool with the text on stdin
     and reports success by exit code, so the QR screen (F12) can copy the URL
@@ -922,6 +939,8 @@ if __name__ == "__main__":
     print("PASS test_agent_terminal_on_key_release_encode_and_dead")
     test_mirror_inject_input_parses_full_terminal_keys()
     print("PASS test_mirror_inject_input_parses_full_terminal_keys")
+    test_mirror_inject_stale_partial_discarded_no_phantom()
+    print("PASS test_mirror_inject_stale_partial_discarded_no_phantom")
     test_copy_to_host_clipboard_picks_tool_and_reports()
     print("PASS test_copy_to_host_clipboard_picks_tool_and_reports")
     test_paste_text_wraps_and_submits()
