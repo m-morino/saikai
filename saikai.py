@@ -6493,12 +6493,39 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # re-adds it via _open_or_attach_live. Persist the trimmed snapshot now.
             self._opened_sids.discard(sid)
             self._save_open_panes()
+            self._prune_dead_panes()   # bound retained ✓ dead-pane memory (#H6)
             self._refresh_table()
             if _was_focused:
                 try:
                     self.query_one("#table", DataTable).focus()
                 except Exception:
                     pass
+
+        def _prune_dead_panes(self) -> None:
+            """Unmount the OLDEST dead (✓) panes so their pyte buffers are freed. A
+            dead pane is kept mounted to show its final frame, but it's forgotten
+            from self._live, so the MAX_LIVE gate doesn't count it — without a cap,
+            letting claude exit repeatedly (without F10) grows memory unbounded (each
+            AgentTerminal pins its full pyte HistoryScreen, tens of MB). Keep only the
+            most-recent few; never remove the currently-active tab. (#H6)"""
+            if self._live is None:
+                return
+            keep = _cfg("limits", "max_dead_panes", "SAIKAI_MAX_DEAD_PANES", 3, int)
+            try:
+                tabs = self.query_one("#right", TabbedContent)
+                alive = {self._live.pane_id(x) for x in self._live.statuses()}
+                active = tabs.active or ""
+                dead = [pid for pid in self._live_pane_ids() if pid not in alive]
+                if len(dead) <= keep:
+                    return
+                for pid in dead[:len(dead) - keep]:   # oldest-first (DOM order)
+                    if pid != active:
+                        try:
+                            tabs.remove_pane(pid)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         def on_agent_terminal_focus_released(self, event) -> None:
             """The terminal's Ctrl+] (SAIKAI_RELEASE_KEY) escape hatch: refocus the list."""
