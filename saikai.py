@@ -6979,16 +6979,27 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 sess = self._sid_index.get(sid) or {}
                 title = (sess.get("ai_title") or _first_msg(sess) or sid[:8])[:50]
                 if st == "waiting" and prev_st != "waiting":
-                    self.notify(f"needs input: {title}", title="saikai", timeout=8)
-                    # Audible nudge so a backgrounded session needing input is
-                    # noticed even when you're not watching the screen. Fires once
-                    # per transition (guarded above); silent if the terminal bell
-                    # is off. SAIKAI_NO_BELL=1 opts out.
-                    if not os.environ.get("SAIKAI_NO_BELL"):
-                        try:
-                            self.bell()
-                        except Exception:
-                            pass
+                    # Alert only for a pane that actually DID work and now needs you
+                    # (it was busy at some point → in _busy_seen). A freshly-opened
+                    # pane's "trust this folder?" gate also classifies as waiting,
+                    # but you just created that prompt by opening the session — it
+                    # was never busy, so it stays silent instead of toasting+belling
+                    # a burst when you batch-open several sessions. (#4)
+                    if sid in self._busy_seen:
+                        self.notify(f"needs input: {title}", title="saikai", timeout=8)
+                        # Audible nudge so a backgrounded session needing input is
+                        # noticed even when you're not watching the screen. Fires
+                        # once per transition (guarded above); silent if the terminal
+                        # bell is off. SAIKAI_NO_BELL=1 opts out.
+                        if not os.environ.get("SAIKAI_NO_BELL"):
+                            try:
+                                self.bell()
+                            except Exception:
+                                pass
+                    # You're now engaged with this prompt; drop the busy debt so a
+                    # later waiting→idle (you answered) can't fire a spurious "done"
+                    # toast for a turn you already saw prompt and resolve. (#7)
+                    self._busy_seen.discard(sid)
                 elif st == "idle" and sid in self._busy_seen:
                     # A backgrounded pane just FINISHED its turn (busy→idle) — toast
                     # so you notice WHAT completed without watching every tab. Keyed
