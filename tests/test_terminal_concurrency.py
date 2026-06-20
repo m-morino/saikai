@@ -311,6 +311,11 @@ def test_encode_key_meta_and_release():
     assert rt.encode_key("ctrl+right", None) == "\x1b[1;5C"
     assert rt.encode_key("ctrl+shift+up", None) == "\x1b[1;6A"
     assert rt.encode_key("shift+delete", None) == "\x1b[3;2~"
+    # Modified Enter (newline-in-prompt gesture) must NOT be silently dropped:
+    # emit the CSI-u (kitty) form claude negotiates. mod = 1+shift+2*alt+4*ctrl.
+    assert rt.encode_key("shift+enter", None) == "\x1b[13;2u"
+    assert rt.encode_key("alt+enter", None) == "\x1b[13;3u"
+    assert rt.encode_key("ctrl+enter", None) == "\x1b[13;5u"
     assert rt._normalize_key("ctrl+]") == "ctrl+right_square_bracket"
     if not os.environ.get("SAIKAI_RELEASE_KEY"):
         assert rt.RELEASE_FOCUS_KEY == "ctrl+right_square_bracket"
@@ -788,6 +793,12 @@ def test_paste_text_wraps_and_submits():
     writes.clear(); t._bracketed_paste = False
     t.paste_text("/compact")
     assert writes == ["/compact"], writes
+    # Bracketed-paste breakout: an embedded ESC[201~ in the pasted text must be
+    # STRIPPED before wrapping, else it ends paste mode early and the bytes after
+    # it run as typed-and-submitted input. (#H3)
+    writes.clear(); t._bracketed_paste = True
+    t.paste_text("safe\x1b[201~\rmalicious")
+    assert writes == ["\x1b[200~safe\rmalicious\x1b[201~"], writes
     writes.clear(); t.submit()
     assert writes == ["\r"], writes
     # dead pane: no write

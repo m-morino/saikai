@@ -488,6 +488,14 @@ def encode_key(key: str, character: Optional[str]) -> Optional[str]:
             return f"\x1b[1;{mod}{_MODIFIED_CSI_FINALS[base]}"
         if base in _MODIFIED_TILDE_KEYS:
             return f"\x1b[{_MODIFIED_TILDE_KEYS[base]};{mod}~"
+        if base in ("enter", "return"):
+            # Modified Enter (shift/alt/ctrl+enter) — the "newline in the prompt
+            # without submitting" gesture. The legacy encoding can't represent it,
+            # so it was returning None and being SILENTLY swallowed. Emit the CSI-u
+            # (kitty keyboard) form claude negotiates; 13 = Enter's codepoint. A
+            # terminal only delivers a DISTINCT modified-enter under a modern
+            # protocol, so the child is kitty-aware here.
+            return f"\x1b[13;{mod}u"
     # Meta / Alt = ESC prefix — readline word ops (alt+b/f/d backward/forward/
     # kill-word, alt+. , alt+backspace = backward-kill-word) must reach claude too.
     if key.startswith("alt+"):
@@ -533,6 +541,16 @@ _KITTY_KBD_RE = re.compile(r"\x1b\[[<>=?][0-9;:]*u")
 # output stream and re-wrap pastes (\x1b[200~ … \x1b[201~) in on_paste — otherwise
 # claude treats a multi-line paste as typed lines and submits on each newline.
 _BRACKETED_RE = re.compile(r"\x1b\[\?2004([hl])")
+# Embedded paste markers in text we are about to wrap in bracketed paste: an
+# embedded ESC[201~ would END paste mode early so the bytes after it run as
+# typed-and-submitted input (the classic bracketed-paste breakout). Strip both
+# markers from the content first, exactly as real terminals sanitize a paste.
+_PASTE_MARKER_RE = re.compile(r"\x1b\[20[01]~")
+
+
+def _wrap_bracketed_paste(text: str) -> str:
+    """Wrap text in bracketed-paste markers after stripping any embedded ones."""
+    return "\x1b[200~" + _PASTE_MARKER_RE.sub("", text) + "\x1b[201~"
 
 
 def _scroll_row_index(hist_len: int, scroll: int, y: int) -> int:
@@ -920,8 +938,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # Re-wrap in bracketed-paste markers when claude enabled the mode
             # (?2004h, tracked in _consume) so it knows this is a PASTE — else each
             # embedded newline submits the line and a multi-line paste runs early.
+            # _wrap_bracketed_paste strips any embedded markers to block breakout.
             if getattr(self, "_bracketed_paste", False):
-                text = "\x1b[200~" + text + "\x1b[201~"
+                text = _wrap_bracketed_paste(text)
             self._snap_to_live()   # pasting returns the view to the live bottom
             try:
                 self._pty.write(text)
@@ -935,7 +954,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if self._pty is None or self.is_dead or not text:
             return
         if getattr(self, "_bracketed_paste", False):
-            text = "\x1b[200~" + text + "\x1b[201~"
+            text = _wrap_bracketed_paste(text)   # strips embedded markers (breakout)
         self._snap_to_live()   # injected input returns the view to the live bottom
         try:
             self._pty.write(text)
