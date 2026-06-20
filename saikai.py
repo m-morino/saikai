@@ -8336,6 +8336,22 @@ def _project_dirs(projects_root: Path) -> list[Path]:
         return []
 
 
+def _dedup_sessions_by_id(sessions: list[dict]) -> list[dict]:
+    """Collapse sessions sharing an id to one (newest mtime wins). A case-insensitive
+    filesystem can hold TWO case-variant encoded project dirs for one repo (e.g. a
+    'C--…-repo' dir from PowerShell vs a 'c--…-repo' dir from Git Bash, differing only
+    in the drive-letter case), each holding the SAME session files; the cross-project
+    scan would then list a sid twice and table.add_row(key=sid) raises DuplicateKey,
+    breaking the whole list. Dedup by sid (not dir name) so the fix is correct on
+    case-sensitive filesystems too. (#H2)"""
+    by_id: dict = {}
+    for s in sessions:
+        prev = by_id.get(s["id"])
+        if prev is None or (s.get("mtime") or 0) >= (prev.get("mtime") or 0):
+            by_id[s["id"]] = s
+    return list(by_id.values()) if len(by_id) != len(sessions) else sessions
+
+
 def _path_to_key(p: Path) -> str:
     s = str(p.resolve()).lower()
     return re.sub(r"[\\/:.\-]+", "-", s).strip("-")
@@ -9350,6 +9366,9 @@ def main():
                 if extra:
                     sessions.extend(extra)
 
+    # Collapse any sid that surfaced from >1 project dir (case-variant encoded dirs
+    # on a case-insensitive FS) BEFORE the table keys rows by sid — else DuplicateKey. (#H2)
+    sessions = _dedup_sessions_by_id(sessions)
     # Initial chronological sort gives _build_forest a deterministic order; the
     # user-configurable sort spec is applied AFTER forest building so it controls
     # only the displayed order.

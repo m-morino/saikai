@@ -284,6 +284,22 @@ def test_child_spawn_env_strips_virtualenv_from_var_and_path():
     assert "/usr/bin" in env["PATH"].split(sep)
 
 
+def test_dedup_sessions_by_id_keeps_newest():
+    """Two case-variant project dirs holding the same sid must collapse to one row
+    (newest mtime), so the sid-keyed table can't raise DuplicateKey. (#H2)"""
+    a = {"id": "sid1", "mtime": 100.0, "via": "C--dir"}
+    b = {"id": "sid1", "mtime": 200.0, "via": "c--dir"}   # same sid, newer
+    c = {"id": "sid2", "mtime": 50.0}
+    out = saikai._dedup_sessions_by_id([a, b, c])
+    ids = sorted(s["id"] for s in out)
+    assert ids == ["sid1", "sid2"], ids
+    kept = next(s for s in out if s["id"] == "sid1")
+    assert kept["via"] == "c--dir", "newest-mtime variant should win"
+    # No duplicates → same list object back (no needless copy)
+    uniq = [{"id": "x", "mtime": 1.0}, {"id": "y", "mtime": 2.0}]
+    assert saikai._dedup_sessions_by_id(uniq) is uniq
+
+
 def test_ctx_usage_skips_synthetic_and_zero_records():
     """The context gauge must read the last REAL usage, not a <synthetic>/all-zero
     interrupt record (Esc/abort/API error) — accepting one would report 0K/empty and
@@ -357,6 +373,8 @@ if __name__ == "__main__":
     print("PASS test_child_spawn_env_strips_parent_session_markers")
     test_child_spawn_env_strips_virtualenv_from_var_and_path()
     print("PASS test_child_spawn_env_strips_virtualenv_from_var_and_path")
+    test_dedup_sessions_by_id_keeps_newest()
+    print("PASS test_dedup_sessions_by_id_keeps_newest")
     test_ctx_usage_skips_synthetic_and_zero_records()
     print("PASS test_ctx_usage_skips_synthetic_and_zero_records")
     test_save_options_preserves_others_on_unreadable_and_nondict()
