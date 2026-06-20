@@ -284,6 +284,48 @@ def test_child_spawn_env_strips_virtualenv_from_var_and_path():
     assert "/usr/bin" in env["PATH"].split(sep)
 
 
+def test_ctx_usage_skips_synthetic_and_zero_records():
+    """The context gauge must read the last REAL usage, not a <synthetic>/all-zero
+    interrupt record (Esc/abort/API error) — accepting one would report 0K/empty and
+    mask a near-full window, inverting the checkpoint-relevant fill reading. (#H5)"""
+    d = Path(tempfile.mkdtemp())
+    p = d / "sess.jsonl"
+    real = ('{"message": {"model": "claude-opus-4-8", "usage": '
+            '{"input_tokens": 5, "cache_read_input_tokens": 277000, '
+            '"cache_creation_input_tokens": 0}}}')
+    synth = ('{"message": {"model": "<synthetic>", "usage": '
+             '{"input_tokens": 0, "cache_read_input_tokens": 0, '
+             '"cache_creation_input_tokens": 0}}}')
+    p.write_text(real + "\n" + synth + "\n", encoding="utf-8")
+    tokens, model = saikai._ctx_usage_from_jsonl(p)
+    assert tokens == 277005, tokens             # the REAL usage, not the synthetic 0
+    assert model == "claude-opus-4-8", model    # window inference keeps the real model
+
+
+def test_save_options_preserves_others_on_unreadable_and_nondict():
+    """_save_options must not wipe the other persisted options when the existing
+    file is present-but-unreadable, and must not crash on a non-dict JSON file. (#H7)"""
+    d = Path(tempfile.mkdtemp())
+    opt = d / "options.json"
+    old_file = saikai.OPTIONS_FILE
+    try:
+        saikai.OPTIONS_FILE = opt
+        saikai._save_options({"search_bar": True})              # absent → first write
+        assert saikai._read_json(opt, {}) == {"search_bar": True}
+        saikai._save_options({"split_ratio": 0.4})              # readable dict → merge
+        got = saikai._read_json(opt, {})
+        assert got.get("search_bar") is True and got.get("split_ratio") == 0.4
+        opt.write_text("{ corrupt = =", encoding="utf-8")       # present + UNREADABLE
+        saikai._save_options({"days": 7})
+        assert opt.read_text(encoding="utf-8").startswith("{ corrupt"), \
+            "corrupt options file was overwritten — other options would be wiped"
+        opt.write_text("[]", encoding="utf-8")                  # non-dict valid JSON
+        saikai._save_options({"scope": "all"})                  # must not crash
+        assert saikai._read_json(opt, {}) == {"scope": "all"}
+    finally:
+        saikai.OPTIONS_FILE = old_file
+
+
 if __name__ == "__main__":
     test_config_path_honors_env()
     print("PASS test_config_path_honors_env")
@@ -315,4 +357,8 @@ if __name__ == "__main__":
     print("PASS test_child_spawn_env_strips_parent_session_markers")
     test_child_spawn_env_strips_virtualenv_from_var_and_path()
     print("PASS test_child_spawn_env_strips_virtualenv_from_var_and_path")
+    test_ctx_usage_skips_synthetic_and_zero_records()
+    print("PASS test_ctx_usage_skips_synthetic_and_zero_records")
+    test_save_options_preserves_others_on_unreadable_and_nondict()
+    print("PASS test_save_options_preserves_others_on_unreadable_and_nondict")
     print("ALL PASS")

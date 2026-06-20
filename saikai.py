@@ -645,8 +645,25 @@ def _load_options() -> dict:
 
 def _save_options(opts: dict) -> None:
     """Merge `opts` into the persisted options so future fields aren't dropped
-    by an older saikai version that doesn't know about them."""
-    merged = _load_options()
+    by an older saikai version that doesn't know about them.
+
+    Erase-guarded: if the existing file is PRESENT but unreadable (corrupt, locked,
+    or mid-write by another instance), _load_options would return {} and the merge
+    would persist ONLY the one field just set — silently wiping every other option
+    (search_bar/split_ratio/days/scope). So distinguish absent (legit empty) from
+    unreadable (skip the write, don't erase). A non-dict-but-valid-JSON file (e.g.
+    `[]`) is treated as empty rather than crashing on .update. (#H7 + the non-dict
+    AttributeError sibling)."""
+    if OPTIONS_FILE.exists():
+        try:
+            existing = json.loads(OPTIONS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            _log("save options skipped: existing options file present but unreadable "
+                 "(not erasing the other saved options)")
+            return
+        merged = existing if isinstance(existing, dict) else {}
+    else:
+        merged = {}
     merged.update(opts)
     _write_json(OPTIONS_FILE, merged)
 
@@ -3100,8 +3117,20 @@ def _ctx_usage_from_jsonl(path) -> "tuple[int | None, str | None]":
         except Exception:
             continue
         if isinstance(u, dict) and "input_tokens" in u:
+            _model = msg.get("model") if isinstance(msg, dict) else None
+            _toks = (int(u.get("input_tokens", 0))
+                     + int(u.get("cache_read_input_tokens", 0))
+                     + int(u.get("cache_creation_input_tokens", 0)))
+            # Skip <synthetic> / all-zero interrupt records (written on Esc / abort /
+            # API error): they carry a usage block but 0 tokens, so accepting one as
+            # the "last usage" would make the gauge read 0K (empty/green) and MASK a
+            # nearly-full window — inverting the safety-relevant context-fill reading
+            # that informs checkpoint decisions. Keep the last REAL usage + its model
+            # (so window inference isn't degraded to the synthetic 200K default). (#H5)
+            if _toks <= 0 or _model == "<synthetic>":
+                continue
             last = u
-            last_model = msg.get("model") if isinstance(msg, dict) else None
+            last_model = _model
     if last is None:
         return None, None
     tokens = (int(last.get("input_tokens", 0))
