@@ -1208,7 +1208,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if _m is not None and (len(chunk) - _m.start()) < 32:
             self._esc_carry = chunk[_m.start():]
             chunk = chunk[:_m.start()]
-        chunk = chunk.replace("0011Ignore", "")
+        if _IS_WIN:
+            # pywinpty 3.x keepalive sentinel — Windows-only noise. On the POSIX
+            # (ptyprocess) byte stream "0011Ignore" is ordinary output, so scrubbing
+            # it on every backend would silently corrupt a child that legitimately
+            # prints that string (a log line, a hex dump, a test fixture). (#12)
+            chunk = chunk.replace("0011Ignore", "")
         chunk = _PRIVATE_SGR_RE.sub("", chunk)   # drop XTMODKEYS \x1b[>4;2m etc. (pyte misreads as SGR-4 underline)
         chunk = _KITTY_KBD_RE.sub("", chunk)     # drop Kitty-keyboard CSI-u (pyte leaks the trailing 'u' into the grid)
         _bp = _BRACKETED_RE.findall(chunk)       # track claude's bracketed-paste mode for on_paste (last h/l wins)
@@ -1540,10 +1545,29 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if pty is None or _safe_isalive(pty):
             _post_signal(pid, "SIGKILL")
         if pty is not None:
-            try:
-                pty.close(force=True)
-            except Exception:
-                pass
+            # close() takes the BufferedRWPair reader lock that the reader holds in
+            # read1() until the master EOFs. The child's death normally EOFs it and
+            # close() returns at once — but a grandchild that survived and kept the
+            # slave fd open means no EOF, so close() would block THIS reap thread
+            # forever (and join_reaps at quit would only time out, leaking it). We
+            # can't SIGKILL to force the EOF: the child PID may have been recycled
+            # (test_posix_kill_signals_only). So run close() on a throwaway daemon
+            # and stop waiting after a bound — normally it returns instantly; in the
+            # stuck case this reap still completes and the fd leaks only until
+            # process exit (reclaimed by the OS), instead of hanging forever. (#9)
+            _closed = threading.Event()
+
+            def _do_close(_p=pty):
+                try:
+                    _p.close(force=True)
+                except Exception:
+                    pass
+                finally:
+                    _closed.set()
+
+            threading.Thread(target=_do_close, name=f"reap-close-{pid or 'pty'}",
+                             daemon=True).start()
+            _closed.wait(timeout=2.0)
 
     # ── messages ────────────────────────────────────────────────────────────────
     if events is not None:  # only define when textual present
