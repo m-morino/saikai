@@ -342,6 +342,30 @@ def test_ctx_usage_skips_synthetic_and_zero_records():
     assert model == "claude-opus-4-8", model    # window inference keeps the real model
 
 
+def test_ctx_usage_caches_on_mtime_size():
+    """The gauge reads this on every cursor move, so it must serve a (mtime,size)
+    cache and only re-read when the transcript actually changes. (#H5 / audit I3)"""
+    d = Path(tempfile.mkdtemp())
+    p = d / "s.jsonl"
+    rec = ('{"message": {"model": "claude-opus-4-8", "usage": {"input_tokens": 10, '
+           '"cache_read_input_tokens": 100, "cache_creation_input_tokens": 0}}}')
+    p.write_text(rec + "\n", encoding="utf-8")
+    saikai._CTX_USAGE_CACHE.clear()
+    assert saikai._ctx_usage_from_jsonl(p) == (110, "claude-opus-4-8")
+    assert str(p) in saikai._CTX_USAGE_CACHE
+    # Poison the cached RESULT (same mtime/size) → an unchanged file serves it.
+    mtime, size, _ = saikai._CTX_USAGE_CACHE[str(p)]
+    saikai._CTX_USAGE_CACHE[str(p)] = (mtime, size, (999, "cached-sentinel"))
+    assert saikai._ctx_usage_from_jsonl(p) == (999, "cached-sentinel"), "unchanged file must hit cache"
+    # Append + bump mtime → cache invalidated → fresh read of the new last usage.
+    rec2 = ('{"message": {"model": "claude-opus-4-8", "usage": {"input_tokens": 20, '
+            '"cache_read_input_tokens": 500, "cache_creation_input_tokens": 0}}}')
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(rec2 + "\n")
+    os.utime(p, (3_000_000, 3_000_000))
+    assert saikai._ctx_usage_from_jsonl(p) == (520, "claude-opus-4-8"), "changed file must re-read"
+
+
 def test_save_options_preserves_others_on_unreadable_and_nondict():
     """_save_options must not wipe the other persisted options when the existing
     file is present-but-unreadable, and must not crash on a non-dict JSON file. (#H7)"""
@@ -403,6 +427,8 @@ if __name__ == "__main__":
     print("PASS test_dedup_sessions_by_id_keeps_newest")
     test_ctx_usage_skips_synthetic_and_zero_records()
     print("PASS test_ctx_usage_skips_synthetic_and_zero_records")
+    test_ctx_usage_caches_on_mtime_size()
+    print("PASS test_ctx_usage_caches_on_mtime_size")
     test_save_options_preserves_others_on_unreadable_and_nondict()
     print("PASS test_save_options_preserves_others_on_unreadable_and_nondict")
     print("ALL PASS")

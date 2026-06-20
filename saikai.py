@@ -3091,15 +3091,30 @@ def _ram_per_pane_mb() -> float:
     return _cfg("limits", "per_pane_mb", "SAIKAI_CLAUDE_MB", 600.0, float)
 
 
+_CTX_USAGE_CACHE: dict = {}    # str(path) -> (mtime, size, (tokens, model))
+
+
 def _ctx_usage_from_jsonl(path) -> "tuple[int | None, str | None]":
     """(live context size, model id) from the LAST transcript record that carries a
     usage block: tokens = input + cache_read + cache_creation input tokens (the
     number `/context` shows), model = that turn's message.model. Ground truth, no
     estimation. (None, None) if the file is unreadable or has no usage yet. Reads
-    only the tail (transcripts are large)."""
+    only the tail (transcripts are large).
+
+    Cached on (mtime, size): the statusbar gauge re-reads this on every list rebuild
+    AND on every cursor move, so a 400 KB tail re-read + json parse per call would
+    jank the UI (the context-lifecycle spec mandates this (mtime,size) cache)."""
     try:
         import os
-        size = os.path.getsize(path)
+        st = os.stat(path)
+        size, mtime = st.st_size, st.st_mtime
+    except (OSError, ValueError, TypeError):
+        return None, None
+    key = str(path)
+    hit = _CTX_USAGE_CACHE.get(key)
+    if hit is not None and hit[0] == mtime and hit[1] == size:
+        return hit[2]
+    try:
         with open(path, "rb") as f:
             f.seek(max(0, size - 400_000))      # tail: the last usage is near the end
             chunk = f.read().decode("utf-8", "replace")
@@ -3132,11 +3147,14 @@ def _ctx_usage_from_jsonl(path) -> "tuple[int | None, str | None]":
             last = u
             last_model = _model
     if last is None:
-        return None, None
-    tokens = (int(last.get("input_tokens", 0))
-              + int(last.get("cache_read_input_tokens", 0))
-              + int(last.get("cache_creation_input_tokens", 0)))
-    return tokens, last_model
+        result = (None, None)
+    else:
+        tokens = (int(last.get("input_tokens", 0))
+                  + int(last.get("cache_read_input_tokens", 0))
+                  + int(last.get("cache_creation_input_tokens", 0)))
+        result = (tokens, last_model)
+    _CTX_USAGE_CACHE[key] = (mtime, size, result)   # cache the (None,None) too
+    return result
 
 
 def _ctx_tokens_from_jsonl(path) -> "int | None":
@@ -5882,6 +5900,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # which way we're traveling.
             try:
                 self._last_cursor_row = self.query_one("#table", DataTable).cursor_row
+            except Exception:
+                pass
+            # Keep the context-fill gauge tracking the CURSOR. When no live pane is
+            # focused the gauge reads the CURSOR session's transcript, but it was only
+            # recomputed on a full rebuild — so arrow-browsing the list left it frozen
+            # on the startup row's value, looking unrelated to the highlighted session.
+            # Refresh it on every real cursor landing (cheap: _ctx_usage_from_jsonl is
+            # now (mtime,size)-cached, so this is a dict hit, not a transcript re-read).
+            try:
+                self._update_subtitle()
             except Exception:
                 pass
             # Filtering must NOT yank the foreground. While the search box is
