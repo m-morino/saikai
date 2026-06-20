@@ -3557,22 +3557,19 @@ def _parse_iso_aware(s):
     return dt.astimezone() if dt.tzinfo is None else dt
 
 
-def _bind_cleared_child(project_dir, pre_existing_sids, pane_cwd, clear_ts):
-    """Falsifiably bind the child session minted by /clear (spike finding #6).
+def _cleared_child_candidates(project_dir, pre_existing_sids, pane_cwd, clear_ts) -> list:
+    """ALL post-/clear candidate child sids (the falsifiable filter, minus the
+    single-survivor collapse) so callers can apply stability/confirmation logic.
 
-    `/clear` mints exactly ONE new `<sid>.jsonl`, but unrelated new transcripts
-    also appear in the same project dir from other lifecycle events (a sibling
-    pane's first turn, a session flushing on exit). So: among the *.jsonl whose
-    stem is NOT in the pre-/clear snapshot, keep only those whose first-record
-    cwd matches the pane AND whose first timestamp post-dates the clear. Return
-    the single survivor, or None on 0 or ≥2 candidates — record NO lineage and
-    toast rather than guess. Pure (filesystem read only); unit-tested."""
+    Among the *.jsonl whose stem is NOT in the pre-/clear snapshot, keep only
+    those whose first-record cwd matches the pane AND whose first timestamp
+    post-dates the clear. Pure (filesystem read only)."""
     try:
         from pathlib import Path as _P
         pd = _P(project_dir)
         present = {p.stem: p for p in pd.glob("*.jsonl")}
     except Exception:
-        return None
+        return []
     pre = set(pre_existing_sids or ())
     candidates = []
     for stem, p in present.items():
@@ -3594,6 +3591,20 @@ def _bind_cleared_child(project_dir, pre_existing_sids, pane_cwd, clear_ts):
             if _cdt and _tdt and _tdt < _cdt:
                 continue
         candidates.append(stem)
+    return candidates
+
+
+def _bind_cleared_child(project_dir, pre_existing_sids, pane_cwd, clear_ts):
+    """Falsifiably bind the child session minted by /clear (spike finding #6).
+
+    `/clear` mints exactly ONE new `<sid>.jsonl`, but unrelated new transcripts
+    also appear in the same project dir from other lifecycle events (a sibling
+    pane's first turn, a session flushing on exit). Return the single survivor,
+    or None on 0 or ≥2 candidates — record NO lineage and toast rather than
+    guess. Pure (filesystem read only); unit-tested. (The b2 detect_child caller
+    additionally requires the single survivor to be STABLE across consecutive
+    ticks before binding, to defeat a contaminant-lands-first TOCTOU race.)"""
+    candidates = _cleared_child_candidates(project_dir, pre_existing_sids, pane_cwd, clear_ts)
     return candidates[0] if len(candidates) == 1 else None
 
 
@@ -6889,6 +6900,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # it (Shift+F10 is deliberate), which is why all-panes-vanished is gone.
             if self._live is None:
                 return
+            # Abort any in-flight checkpoint FIRST: kill_all() nulls the PTYs but the
+            # reader sets is_dead only later (async), so _b2_tick would keep advancing
+            # against a corpse — detecting a "child" + writing lineage for a pane you
+            # just closed. Mirrors the single-pane _close_live_sid guard. (#audit-b2-closeall)
+            if getattr(self, "_b2", None) is not None:
+                self._b2_finish("checkpoint aborted — all panes closed", "warning")
             tabs = self.query_one("#right", TabbedContent)
             ids = self._live_pane_ids()
             if not ids:
@@ -7844,6 +7861,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         # which stays /compact-only). The destructive /clear is gated behind the
         # ConfirmRefreshScreen — it is sent ONLY after the user presses Enter.
         _B2_DETECT_TICKS = 34          # ~10s at 0.3s/tick: child sid visible in 2.5-4s
+        _B2_CHILD_CONFIRM_TICKS = 3    # a single child candidate must persist this many
+                                       # consecutive ticks (~0.9s) before binding, so a
+                                       # contaminant landing BEFORE the real child can't
+                                       # be mis-bound (the real child arriving later then
+                                       # makes it ≥2 → ambiguous → reset). (#audit-b2-toctou)
         _B2_SETTLE_TICKS = 2           # let a just-injected turn register as busy
         _B2_CLEAR_SETTLE_TICKS = 2     # ~0.6s between /clear paste and its CR (spike #5)
         _B2_HANDOFF_IDLE_TICKS = 1000  # ~5min ceiling for the handoff turn to finish
@@ -7889,7 +7911,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "term": t,
                 "parent_jsonl": str(jp),
                 "project_dir": str(jp.parent),
-                "pane_cwd": s.get("origin_cwd") or s.get("cwd") or "",
+                # cwd-LAST (current), not origin_cwd (first): the /clear child is
+                # minted in the pane's CURRENT dir, so after a mid-session worktree/
+                # branch cd, origin_cwd != current and the child's first cwd would
+                # fail _bind_cleared_child's equality filter → real child dropped. (#audit-b2-panecwd)
+                "pane_cwd": s.get("cwd") or s.get("origin_cwd") or "",
                 "prompt": None,
                 "pre_sids": set(),
                 "child": None,
@@ -7926,6 +7952,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self._b2_timer = None
             had_state = self._b2 is not None
             self._b2 = None
+            # Dismiss the confirm modal if we're tearing down while it's still up
+            # (pane died / closed / close-all while parked in awaiting_confirm) —
+            # otherwise it orphans: its _resume early-returns on the cleared state,
+            # so Ctrl+S/Esc become no-ops and the modal is stuck. (The normal
+            # Esc/Ctrl+S path already dismissed it before calling here, so the
+            # isinstance check makes this a no-op then — no double-pop.) (#audit-b2-modal)
+            try:
+                if isinstance(self.screen, ConfirmRefreshScreen):
+                    self.pop_screen()
+            except Exception:
+                pass
             if had_state:
                 # Clear the ↻ checkpoint marker. _b2_mark_dirty defers the repaint
                 # while a live pane is focused (a CONTINUOUS poll rebuild during
@@ -8010,7 +8047,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if term is not None:
                     try:
                         term.refresh_status()
-                        self._live.set_status(b2["sid"], getattr(term, "_status", ""))
+                        _ts = getattr(term, "_status", "")
+                        self._live.set_status(b2["sid"], _ts)
+                        # Route through _apply_live_status (not a raw set_status) so the
+                        # _unread / _busy_seen bookkeeping stays consistent while the
+                        # handoff turn drives the parent busy→idle — else the parent is
+                        # left busy+in_unread, a state the normal flow never produces and
+                        # which mis-counts in Shift+F3 / the !M badge. (#audit-b2-setstatus)
+                        self._apply_live_status(b2["sid"], _ts)
                     except Exception:
                         pass
                 status = (self._live.statuses().get(b2["sid"])
@@ -8101,10 +8145,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
 
             if st == "detect_child":
-                child = _bind_cleared_child(
+                cands = _cleared_child_candidates(
                     b2["project_dir"], b2["pre_sids"], b2["pane_cwd"], b2["clear_ts"])
-                if child:
-                    b2["child"] = child
+                # Bind only a STABLE single candidate. A contaminant can land BEFORE
+                # the real child; binding eagerly on the first len==1 would mis-bind
+                # it (the real child arriving later never trips a >=2 guard once we've
+                # moved on). Require the SAME single sid for _B2_CHILD_CONFIRM_TICKS
+                # consecutive ticks; a 2nd candidate appearing resets the streak. (#audit-b2-toctou)
+                if len(cands) == 1 and b2.get("_cand") == cands[0]:
+                    b2["_cand_n"] = b2.get("_cand_n", 0) + 1
+                elif len(cands) == 1:
+                    b2["_cand"], b2["_cand_n"] = cands[0], 1
+                else:
+                    b2["_cand"], b2["_cand_n"] = None, 0
+                if len(cands) == 1 and b2.get("_cand_n", 0) >= self._B2_CHILD_CONFIRM_TICKS:
+                    b2["child"] = cands[0]
                     b2["state"] = "inject_reseed"
                     return
                 # Defensive re-send: one extra CR partway through the window in
