@@ -556,6 +556,12 @@ _BRACKETED_RE = re.compile(r"\x1b\[\?2004([hl])")
 # (which is empty in the alt-screen such a TUI runs in → the wheel "did nothing").
 _MOUSE_REPORT_RE = re.compile(r"\x1b\[\?(?:1000|1002|1003)([hl])")
 _MOUSE_SGR_RE = re.compile(r"\x1b\[\?1006([hl])")
+# Synchronized output (DEC mode 2026, BSU/ESU): a TUI brackets a full frame's writes
+# in ?2026h … ?2026l so the terminal presents the COMPLETE frame, not the half-drawn
+# intermediate. saikai feeds pyte continuously but DEFERS the pane repaint until the
+# block closes (or a safety timeout), so an agent UI's redraw doesn't tear ("layout
+# looks broken"). pyte ignores ?2026, so it's tracked here purely for repaint timing.
+_SYNC_RE = re.compile(r"\x1b\[\?2026([hl])")
 # Embedded paste markers in text we are about to wrap in bracketed paste: an
 # embedded ESC[201~ would END paste mode early so the bytes after it run as
 # typed-and-submitted input (the classic bracketed-paste breakout). Strip both
@@ -1231,6 +1237,15 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self.refresh()
 
     # ── (4) background reader -> feed pyte -> repaint on the UI thread ─────────
+    def _sync_deferring(self) -> bool:
+        """True while honouring a synchronized-update block (?2026h…?2026l): the
+        pane repaint is held so a half-drawn frame isn't shown (the tearing the user
+        saw as "layout looks broken"). A safety timeout forces the repaint if the
+        block never closes, so a buggy/stuck child can't freeze the pane."""
+        if not getattr(self, "_in_sync_update", False):
+            return False
+        return (time.monotonic() - getattr(self, "_sync_started", 0.0)) <= 0.2
+
     def _read_loop(self) -> None:
         pty = self._pty
         assert pty is not None
@@ -1258,7 +1273,10 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 # for nothing AND clear a WezTerm Shift+drag selection. Skip it —
                 # scrolling up thus "freezes" the pane so the user can select/copy;
                 # scrolling back to the bottom (_scroll == 0) resumes live repaint.
-                if self._scroll == 0 and not self._frozen:
+                # Defer the repaint inside a synchronized-update block (?2026) so a
+                # half-drawn agent-UI frame isn't shown; the closing ?2026l (or the
+                # safety timeout) lets the next chunk paint the COMPLETE frame.
+                if self._scroll == 0 and not self._frozen and not self._sync_deferring():
                     self._schedule_pane_refresh()
         finally:
             self._finalize()
@@ -1303,6 +1321,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         _msgr = _MOUSE_SGR_RE.findall(chunk)     # …in SGR extended encoding?
         if _msgr:
             self._mouse_sgr = (_msgr[-1] == "h")
+        _su = _SYNC_RE.findall(chunk)            # synchronized-update block open/close
+        if _su:
+            self._in_sync_update = (_su[-1] == "h")
+            if self._in_sync_update:
+                self._sync_started = time.monotonic()
         if not chunk:
             return
         with self._lock:

@@ -845,6 +845,21 @@ def test_forward_wheel_only_when_mouse_reporting():
     assert t._forward_wheel(ev, up=True) is False and writes == []
 
 
+def test_sync_update_defers_repaint_until_close():
+    """A synchronized-update block (?2026h…?2026l) defers the pane repaint so a
+    half-drawn frame isn't shown; not-in-sync or a timed-out block repaints. (#2026)"""
+    import time as _t
+    assert rt._SYNC_RE.findall("\x1b[?2026hXY\x1b[?2026l") == ["h", "l"]
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t._in_sync_update = False
+    assert t._sync_deferring() is False                  # not in sync → repaint
+    t._in_sync_update = True
+    t._sync_started = _t.monotonic()
+    assert t._sync_deferring() is True                   # mid-frame → defer the repaint
+    t._sync_started = _t.monotonic() - 1.0               # block held open too long
+    assert t._sync_deferring() is False                  # safety timeout → repaint anyway
+
+
 def test_input_snaps_scrolled_back_pane_to_live():
     """A scrolled-back pane (_scroll > 0) pins its view to history, and the reader
     repaints ONLY at _scroll == 0 (bumping _scroll to keep the pin as output streams
@@ -968,5 +983,7 @@ if __name__ == "__main__":
     print("PASS test_paste_text_wraps_and_submits")
     test_forward_wheel_only_when_mouse_reporting()
     print("PASS test_forward_wheel_only_when_mouse_reporting")
+    test_sync_update_defers_repaint_until_close()
+    print("PASS test_sync_update_defers_repaint_until_close")
     test_input_snaps_scrolled_back_pane_to_live()
     print("PASS test_input_snaps_scrolled_back_pane_to_live")
