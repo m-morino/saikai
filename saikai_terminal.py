@@ -548,6 +548,14 @@ _KITTY_KBD_RE = re.compile(r"\x1b\[[<>=?][0-9;:]*u")
 # output stream and re-wrap pastes (\x1b[200~ … \x1b[201~) in on_paste — otherwise
 # claude treats a multi-line paste as typed lines and submits on each newline.
 _BRACKETED_RE = re.compile(r"\x1b\[\?2004([hl])")
+# Mouse reporting (?1000 click / ?1002 button-drag / ?1003 any-motion) + the SGR
+# extended-coordinate encoding (?1006). A full-screen child TUI (e.g. an agent
+# picker) enables these to receive mouse events ITSELF — including the WHEEL, which
+# it uses to scroll its OWN view. saikai tracks the mode so on_mouse_scroll can
+# FORWARD the wheel to the child instead of consuming it for saikai's own scrollback
+# (which is empty in the alt-screen such a TUI runs in → the wheel "did nothing").
+_MOUSE_REPORT_RE = re.compile(r"\x1b\[\?(?:1000|1002|1003)([hl])")
+_MOUSE_SGR_RE = re.compile(r"\x1b\[\?1006([hl])")
 # Embedded paste markers in text we are about to wrap in bracketed paste: an
 # embedded ESC[201~ would END paste mode early so the bytes after it run as
 # typed-and-submitted input (the classic bracketed-paste breakout). Strip both
@@ -985,7 +993,33 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             pass
 
     # ── mouse wheel -> scroll back through history.top ─────────────────────────
+    def _forward_wheel(self, event, up: bool) -> bool:
+        """When the child enabled mouse reporting, send it a WHEEL event so a
+        full-screen TUI scrolls its OWN view — instead of saikai's scrollback, which
+        is empty in the alt-screen such a TUI runs in (so the wheel did nothing).
+        SGR (?1006) encoding when negotiated, else legacy X10. Returns True if sent."""
+        if not getattr(self, "_mouse_reporting", False) or self._pty is None or self.is_dead:
+            return False
+        try:
+            col = max(1, int(getattr(event, "x", 0)) + 1)   # event coords → 1-based cell
+            row = max(1, int(getattr(event, "y", 0)) + 1)
+            btn = 64 if up else 65                           # SGR wheel: 64 = up, 65 = down
+            if getattr(self, "_mouse_sgr", False):
+                seq = f"\x1b[<{btn};{col};{row}M"
+            else:                                            # legacy X10 (cells capped at 223)
+                seq = "\x1b[M" + chr(32 + btn) + chr(32 + min(col, 223)) + chr(32 + min(row, 223))
+            self._pty.write(seq)
+            return True
+        except Exception:
+            return False
+
     def on_mouse_scroll_up(self, event) -> None:    # events.MouseScrollUp
+        if self._forward_wheel(event, up=True):     # child owns the wheel (mouse mode on)
+            try:
+                event.stop()
+            except Exception:
+                pass
+            return
         if self._screen is None:
             return
         with self._lock:   # same lock the reader uses to bump _scroll in _consume
@@ -997,6 +1031,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self.refresh()
 
     def on_mouse_scroll_down(self, event) -> None:  # events.MouseScrollDown
+        if self._forward_wheel(event, up=False):    # child owns the wheel (mouse mode on)
+            try:
+                event.stop()
+            except Exception:
+                pass
+            return
         with self._lock:
             moved = self._scroll > 0
             if moved:
@@ -1257,6 +1297,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         _bp = _BRACKETED_RE.findall(chunk)       # track claude's bracketed-paste mode for on_paste (last h/l wins)
         if _bp:
             self._bracketed_paste = (_bp[-1] == "h")
+        _mr = _MOUSE_REPORT_RE.findall(chunk)    # child wants mouse events (incl. wheel)?
+        if _mr:
+            self._mouse_reporting = (_mr[-1] == "h")
+        _msgr = _MOUSE_SGR_RE.findall(chunk)     # …in SGR extended encoding?
+        if _msgr:
+            self._mouse_sgr = (_msgr[-1] == "h")
         if not chunk:
             return
         with self._lock:

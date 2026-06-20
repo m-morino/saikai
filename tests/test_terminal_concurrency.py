@@ -824,6 +824,27 @@ def test_paste_text_wraps_and_submits():
     assert writes == [], writes
 
 
+def test_forward_wheel_only_when_mouse_reporting():
+    """A full-screen child that enabled mouse reporting receives the WHEEL (scrolls
+    its OWN view); otherwise saikai keeps its own scrollback. SGR encoding: 64=up,
+    65=down; event x/y → 1-based cell; never writes to a dead pane. (#wheel)"""
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    writes = []
+    t._pty = type("P", (), {"write": lambda self, d: writes.append(d)})()
+    t.is_dead = False
+    ev = type("E", (), {"x": 4, "y": 2})()
+    t._mouse_reporting = False                         # OFF → not forwarded
+    assert t._forward_wheel(ev, up=True) is False and writes == []
+    t._mouse_reporting = True; t._mouse_sgr = True     # ON + SGR → forwarded
+    assert t._forward_wheel(ev, up=True) is True
+    assert writes == ["\x1b[<64;5;3M"], writes
+    writes.clear()
+    assert t._forward_wheel(ev, up=False) is True
+    assert writes == ["\x1b[<65;5;3M"], writes
+    writes.clear(); t.is_dead = True                   # dead pane → never writes
+    assert t._forward_wheel(ev, up=True) is False and writes == []
+
+
 def test_input_snaps_scrolled_back_pane_to_live():
     """A scrolled-back pane (_scroll > 0) pins its view to history, and the reader
     repaints ONLY at _scroll == 0 (bumping _scroll to keep the pin as output streams
@@ -945,5 +966,7 @@ if __name__ == "__main__":
     print("PASS test_copy_to_host_clipboard_picks_tool_and_reports")
     test_paste_text_wraps_and_submits()
     print("PASS test_paste_text_wraps_and_submits")
+    test_forward_wheel_only_when_mouse_reporting()
+    print("PASS test_forward_wheel_only_when_mouse_reporting")
     test_input_snaps_scrolled_back_pane_to_live()
     print("PASS test_input_snaps_scrolled_back_pane_to_live")
