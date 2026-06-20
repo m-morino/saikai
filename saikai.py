@@ -8970,14 +8970,25 @@ DESKTOP_SESSIONS_ROOT = _DESKTOP_APPDATA / "Claude" / "claude-code-sessions"
 
 
 def _desktop_index_dir() -> Path | None:
-    """The <org>/<user> dir holding Desktop's local_*.json session entries."""
+    """The <org>/<user> dir holding Desktop's local_*.json session entries.
+
+    Pick the dir with the MOST-RECENTLY-written entry (the account Desktop is
+    currently writing to), NOT the one with the most entries: a former account can
+    have far more history yet be signed out, and the old most_common() heuristic
+    would then sync into the stale account — writing entries the logged-in Desktop
+    never shows while reporting success. Recency is schema-independent; the fully
+    authoritative source would be the current-account guid in Desktop's own
+    config.json, but that couples us to its config format. (#H8)"""
     if not DESKTOP_SESSIONS_ROOT.exists():
         return None
     locs = list(DESKTOP_SESSIONS_ROOT.rglob("local_*.json"))
     if not locs:
         return None
-    # the dir with the most entries is the active org/user
-    return Counter(p.parent for p in locs).most_common(1)[0][0]
+    try:
+        return max(locs, key=lambda p: p.stat().st_mtime).parent
+    except OSError:
+        # stat race → fall back to the most-entries heuristic rather than fail.
+        return Counter(p.parent for p in locs).most_common(1)[0][0]
 
 
 def _iso_to_ms(s) -> int:

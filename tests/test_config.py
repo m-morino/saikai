@@ -284,6 +284,30 @@ def test_child_spawn_env_strips_virtualenv_from_var_and_path():
     assert "/usr/bin" in env["PATH"].split(sep)
 
 
+def test_desktop_index_dir_prefers_recent_over_most_entries():
+    """The sync target is the account Desktop is CURRENTLY writing to (newest
+    local_*.json), not the one with the most history — else sync lands in a
+    signed-out account and the logged-in Desktop shows nothing. (#H8)"""
+    root = Path(tempfile.mkdtemp()) / "claude-code-sessions"
+    big_old = root / "orgA" / "userA"
+    small_new = root / "orgB" / "userB"
+    big_old.mkdir(parents=True)
+    small_new.mkdir(parents=True)
+    for i in range(3):                                   # more entries, OLDER
+        f = big_old / f"local_{i}.json"
+        f.write_text("{}", encoding="utf-8")
+        os.utime(f, (1_000_000, 1_000_000))
+    f = small_new / "local_x.json"                       # fewer entries, NEWER
+    f.write_text("{}", encoding="utf-8")
+    os.utime(f, (2_000_000, 2_000_000))
+    old_root = saikai.DESKTOP_SESSIONS_ROOT
+    try:
+        saikai.DESKTOP_SESSIONS_ROOT = root
+        assert saikai._desktop_index_dir() == small_new, "should pick the recently-written account"
+    finally:
+        saikai.DESKTOP_SESSIONS_ROOT = old_root
+
+
 def test_dedup_sessions_by_id_keeps_newest():
     """Two case-variant project dirs holding the same sid must collapse to one row
     (newest mtime), so the sid-keyed table can't raise DuplicateKey. (#H2)"""
@@ -373,6 +397,8 @@ if __name__ == "__main__":
     print("PASS test_child_spawn_env_strips_parent_session_markers")
     test_child_spawn_env_strips_virtualenv_from_var_and_path()
     print("PASS test_child_spawn_env_strips_virtualenv_from_var_and_path")
+    test_desktop_index_dir_prefers_recent_over_most_entries()
+    print("PASS test_desktop_index_dir_prefers_recent_over_most_entries")
     test_dedup_sessions_by_id_keeps_newest()
     print("PASS test_dedup_sessions_by_id_keeps_newest")
     test_ctx_usage_skips_synthetic_and_zero_records()
