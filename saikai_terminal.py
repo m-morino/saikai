@@ -94,6 +94,13 @@ def _log(msg: str) -> None:
 _IME_DEBUG = str(os.environ.get("SAIKAI_IME_DEBUG", "")).strip().lower() in (
     "1", "true", "yes", "on")
 
+# Opt-in raw-PTY capture: when SAIKAI_PTY_CAPTURE names a file, every decoded chunk
+# the reader feeds is appended as repr() (escape sequences visible) — for diagnosing
+# how a child renders, e.g. whether an agent TUI drives ?1049 alt-screen, ?2026
+# synchronized output, or ?1000/?1006 mouse reporting (which terminal scrollback and
+# saikai's pyte mirror handle differently). Off by default; debug only.
+_PTY_CAPTURE = os.environ.get("SAIKAI_PTY_CAPTURE", "").strip()
+
 
 def _ime_anchor_xy(cursor_x, cursor_y, rx, ry, rw, rh):
     """Pure geometry for the terminal-cursor / IME anchor: map claude's grid cursor
@@ -1219,6 +1226,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     def _consume(self, chunk: str) -> None:
         """Feed a decoded chunk to pyte (handling alt-screen resets) and update
         the rolling tail + status. Runs on the reader thread."""
+        if _PTY_CAPTURE:
+            try:
+                with open(_PTY_CAPTURE, "a", encoding="utf-8") as _cf:
+                    _cf.write(repr(chunk) + "\n")   # raw chunk, escape seqs visible
+            except Exception:
+                pass
         # pywinpty already decoded to str → feed pyte.Stream directly (no
         # re-encode round-trip). Scrub pywinpty 3.x's "0011Ignore" keepalive
         # sentinel, then split the feed at each alt-screen enter/leave boundary,
