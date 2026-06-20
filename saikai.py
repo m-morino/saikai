@@ -1495,8 +1495,13 @@ def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
             try:
                 alive = bool(_find_terminal_anchor(_win_pid_index(), self_pid))
             except Exception:
-                # A transient process-enumeration failure is inconclusive, NOT a
-                # death — don't count it toward the kill; re-check next tick.
+                # A transient enumeration failure is inconclusive — neither alive
+                # nor dead. RESET the miss streak: otherwise a failure sitting
+                # BETWEEN two real misses (miss→1, fail→continue@1, miss→2) lets
+                # two NON-consecutive misses reach the kill, defeating the "2
+                # consecutive confirmations" contract and os._exit-ing a healthy
+                # saikai. Erring toward a delayed reap is far safer than a false kill.
+                misses = 0
                 continue
             if alive:
                 misses = 0

@@ -1565,8 +1565,14 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 finally:
                     _closed.set()
 
-            threading.Thread(target=_do_close, name=f"reap-close-{pid or 'pty'}",
-                             daemon=True).start()
+            _ct = threading.Thread(target=_do_close, name=f"reap-close-{pid or 'pty'}",
+                                   daemon=True)
+            _ct.start()
+            # TRACK it: join_reaps awaits every tracked reap at quit/atexit, so a
+            # close() wedged by a process-group-escaping grandchild that holds the
+            # slave fd is an ACCOUNTED, bounded-at-exit thread — not an untracked
+            # one that escapes the join-everything invariant and leaks silently.
+            _track_reap(_ct)
             _closed.wait(timeout=2.0)
 
     # ── messages ────────────────────────────────────────────────────────────────
