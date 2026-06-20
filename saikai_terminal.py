@@ -820,6 +820,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # vanish for a frame (no display row matches y == cursor_y).
             cursor_x = max(0, min(screen.cursor.x, cols - 1))
             cursor_y = max(0, min(screen.cursor.y, screen.lines - 1))
+            # Honour DECTCEM (?25l/?25h): a full-screen TUI (e.g. an agent picker)
+            # HIDES the cursor while it repaints, then shows it. pyte tracks this as
+            # cursor.hidden; without checking it we drew saikai's reversed cursor cell
+            # throughout the repaint — a stray cursor flickering over the half-drawn
+            # layout ("the screen-update cursor is visible / layout looks broken").
+            cursor_hidden = bool(getattr(screen.cursor, "hidden", False))
             s = self._scroll
             buf = self._buf_for_row(screen, s, y)
             cells = [buf[x] for x in range(cols)] if buf is not None else None
@@ -828,7 +834,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return Strip.blank(width)
         # Cursor only in the live view (it lives at the bottom, not in history).
         show_cursor = (s == 0 and self.has_focus and y == cursor_y
-                       and not self.is_dead)
+                       and not self.is_dead and not cursor_hidden)
         _has_sel = self._sel_anchor is not None and self._sel_head is not None
         segments = []
         run_chars: list[str] = []
