@@ -1432,7 +1432,7 @@ def _find_terminal_anchor(pid_index: dict[int, tuple[str, int]], start_pid: int,
     return anchor
 
 
-def _start_terminal_watchdog(poll_sec: float = 12.0) -> None:
+def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
     """Start the Windows terminal-death watchdog. No-op on POSIX (real SIGHUP),
     when no tab shell is found (headless), or when SAIKAI_NO_TERMINAL_WATCHDOG is
     set. See the module comment above _SHELL_ANCESTOR_NAMES for the why."""
@@ -1450,26 +1450,34 @@ def _start_terminal_watchdog(poll_sec: float = 12.0) -> None:
         misses = 0
         while True:
             time.sleep(poll_sec)
-            if _is_pid_alive(anchor):
+            # AUTHORITATIVE liveness check: re-walk the process tree from our OWN
+            # pid for ANY live shell ancestor below the terminal emulator. Doing the
+            # full re-walk every poll — rather than a cheap _is_pid_alive(anchor)
+            # fast-path — is deliberate: Windows recycles PIDs, so if the original
+            # anchor PID gets reused by an unrelated process, _is_pid_alive(anchor)
+            # stays True forever and a genuinely orphaned tab is never reaped. The
+            # old fast-path also short-circuited (misses=0; continue) BEFORE this
+            # re-walk, so on PID reuse the re-walk never ran at all. A live anchor
+            # here → the tab/window is still open.
+            try:
+                alive = bool(_find_terminal_anchor(_win_pid_index(), self_pid))
+            except Exception:
+                # A transient process-enumeration failure is inconclusive, NOT a
+                # death — don't count it toward the kill; re-check next tick.
+                continue
+            if alive:
                 misses = 0
                 continue
-            # The anchor PID looks gone — but a SINGLE poll must NOT hard-kill a
-            # live session. os._exit (below) bypasses atexit AND Textual teardown,
-            # so a false positive (a transient PID-query failure, or an anchor PID
-            # that was wrong/reused while the tab is fine) would silently kill a
+            # No live terminal ancestor → likely orphaned. os._exit (below) bypasses
+            # atexit AND Textual teardown, so a false positive would silently kill a
             # healthy saikai and leave the terminal stuck in mouse/paste mode (the
-            # "sudden crash + stray chars on scroll" report). Guard twice before
-            # killing: (1) re-walk for ANY live shell ancestor — confirms the tab is
-            # really gone, not just that one stale PID; (2) require consecutive
-            # confirmations so a one-off poll glitch can't trigger the kill.
-            try:
-                if _find_terminal_anchor(_win_pid_index(), self_pid):
-                    misses = 0
-                    continue
-            except Exception:
-                pass
+            # "sudden crash + stray chars on scroll" report). Require 2 consecutive
+            # confirmations so a one-off snapshot glitch (the shell momentarily
+            # absent during heavy process churn) can't trigger the kill — ~16s at
+            # the 8s cadence, a middle ground between the old trigger-happy single
+            # poll and the over-cautious 3-miss (~36s) debounce.
             misses += 1
-            if misses < 3:
+            if misses < 2:
                 continue
             # Genuinely orphaned (tab/window closed) → emulate SIGHUP. Restore the
             # terminal modes FIRST so even a residual false positive can't leave
