@@ -6504,6 +6504,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if self._live is None or sid is None:
                 return
             _log(f"live close: {sid[:8]}")
+            # If a checkpoint (b2) is mid-flight on THIS pane, tear it down first:
+            # kill() below nulls the PTY but the reader sets is_dead only later
+            # (async _finalize), so _b2_tick's is_dead guard wouldn't fire yet and
+            # the machine would keep advancing against a corpse — injecting nothing
+            # but still detecting a "child" + writing lineage for a pane you closed.
+            _b2 = getattr(self, "_b2", None)
+            if _b2 is not None and _b2.get("sid") == sid:
+                self._b2_finish("checkpoint aborted — pane closed", "warning")
             t = self._live.get(sid)
             if t is not None:
                 try:
@@ -7570,7 +7578,25 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             had_state = self._b2 is not None
             self._b2 = None
             if had_state:
-                self._b2_mark_dirty()  # clear the ↻ checkpoint marker (focus-safe)
+                # Clear the ↻ checkpoint marker. _b2_mark_dirty defers the repaint
+                # while a live pane is focused (a CONTINUOUS poll rebuild during
+                # typing flickers), and that deferred flag only drains when focus
+                # leaves every pane — so when the checkpoint was run from its own
+                # pane and focus stays there (the common case), the ↻ lingered in
+                # the list. b2-finish is a DISCRETE event, so when the repaint got
+                # deferred, force it with focus saved + restored: the refocus is
+                # synchronous in this handler (no queued keystroke can land on the
+                # list first) and _refresh_table preserves the cursor/scroll.
+                foc = self.focused
+                self._b2_mark_dirty()
+                if getattr(self, "_status_refresh_pending", False):
+                    self._status_refresh_pending = False
+                    try:
+                        self._refresh_table()
+                        if foc is not None and foc is not self.focused:
+                            foc.focus()
+                    except Exception:
+                        self._status_refresh_pending = True
             if msg:
                 self.notify(msg, severity=severity, timeout=5)
 
@@ -7783,6 +7809,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self._live.rekey(parent_sid, child_sid)
                 except Exception:
                     pass
+                # rekey moved the live pane parent->child in the manager, but the
+                # App-level attention sets are keyed by sid too. The parent is no
+                # longer a live pane (it's the pre-/clear session), so drop it from
+                # both — otherwise every checkpoint leaves a dead parent sid lodged
+                # in _unread/_busy_seen forever. The child is a FRESH post-/clear
+                # session (about to go busy on the reseed) and picks up its own
+                # bookkeeping via the normal status flow; nothing to migrate. (#5)
+                self._unread.discard(parent_sid)
+                self._busy_seen.discard(parent_sid)
                 try:
                     term.sid = child_sid
                 except Exception:
