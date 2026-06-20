@@ -402,6 +402,104 @@ def test_save_options_preserves_others_on_unreadable_and_nondict():
         saikai.OPTIONS_FILE = old_file
 
 
+def test_parse_session_survives_nondict_line_and_message():
+    """A bare non-dict JSON line and a truthy non-dict `message` must NOT abort the
+    parse loop — later records (ts, cwd, real prompts) must still be collected. (#audit-parse-msg)"""
+    d = Path(tempfile.mkdtemp())
+    jsonl = d / "sid-parse.jsonl"
+    lines = [
+        '{"type":"user","timestamp":"2026-06-01T00:00:00Z","cwd":"/c/work",'
+        '"message":{"role":"user","content":"first real prompt"}}',
+        '["a","bare","array","line"]',                         # non-dict line
+        '{"type":"user","message":"a non-dict message string"}',  # truthy non-dict message
+        '{"type":"user","timestamp":"2026-06-01T01:00:00Z",'
+        '"message":{"role":"user","content":"second real prompt"}}',
+    ]
+    jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    old_parsed = saikai.PARSED_DIR
+    try:
+        saikai.PARSED_DIR = d / "parsed"
+        saikai.PARSED_DIR.mkdir(parents=True, exist_ok=True)
+        s = saikai.parse_session(jsonl)
+    finally:
+        saikai.PARSED_DIR = old_parsed
+    assert s is not None
+    assert "first real prompt" in s["real_msgs"]
+    assert "second real prompt" in s["real_msgs"], "record after the bad lines was lost"
+    assert s["last_ts"] == "2026-06-01T01:00:00Z", "last_ts must advance past the bad lines"
+
+
+def test_parse_cache_misses_on_append_within_mtime_tolerance():
+    """An append that lands inside the 0.5s mtime tolerance must still re-parse
+    because the byte size changed — no stale cache HIT. (#audit-parsecache)"""
+    d = Path(tempfile.mkdtemp())
+    jsonl = d / "sid-cache.jsonl"
+    jsonl.write_text('{"type":"user","timestamp":"2026-06-01T00:00:00Z",'
+                     '"message":{"content":"first prompt alpha"}}\n', encoding="utf-8")
+    old_parsed = saikai.PARSED_DIR
+    try:
+        saikai.PARSED_DIR = d / "parsed"
+        saikai.PARSED_DIR.mkdir(parents=True, exist_ok=True)
+        s1 = saikai.parse_session(jsonl)
+        assert "first prompt alpha" in s1["real_msgs"]
+        with open(jsonl, "a", encoding="utf-8") as f:
+            f.write('{"type":"user","timestamp":"2026-06-01T00:00:00Z",'
+                    '"message":{"content":"second prompt beta"}}\n')
+        os.utime(jsonl, (s1["mtime"], s1["mtime"]))   # SAME mtime → only size differs
+        s2 = saikai.parse_session(jsonl)
+        assert "second prompt beta" in s2["real_msgs"], \
+            "append within mtime tolerance was served from stale cache"
+    finally:
+        saikai.PARSED_DIR = old_parsed
+
+
+def test_ctx_usage_splits_on_newline_only():
+    """A usage record whose neighbour line contains U+2028 must still parse — the
+    tail reader splits on '\\n' only, not str.splitlines(). (#audit-splitlines)"""
+    d = Path(tempfile.mkdtemp())
+    p = d / "u.jsonl"
+    rec = ('{"message": {"model": "claude-opus-4-8", "content": "para break", '
+           '"usage": {"input_tokens": 7, "cache_read_input_tokens": 100, '
+           '"cache_creation_input_tokens": 0}}}')
+    p.write_text(rec + "\n", encoding="utf-8")
+    saikai._CTX_USAGE_CACHE.clear()
+    assert saikai._ctx_usage_from_jsonl(p) == (107, "claude-opus-4-8")
+
+
+def test_last_assistant_falls_back_to_whole_file_for_huge_final_turn():
+    """A final assistant turn larger than the 400 KB tail window must still be
+    returned via the whole-file fallback. (#audit-tailseek)"""
+    d = Path(tempfile.mkdtemp())
+    p = d / "h.jsonl"
+    big = "X" * 500_000
+    rec = json.dumps({"type": "assistant",
+                      "message": {"role": "assistant",
+                                  "content": [{"type": "text", "text": big}]}})
+    p.write_text(rec + "\n", encoding="utf-8")
+    out = saikai._last_assistant_text_from_jsonl(p)
+    assert out == big, "huge final assistant turn was dropped by the tail seek"
+
+
+def test_find_project_dir_requires_segment_boundary():
+    """A candidate key matching only MID-segment must not win; an exact / boundary
+    match must. (#audit-projdir-substr)"""
+    fake = [Path("c--users-me-aidas"), Path("c--users-me-cli-saikai")]
+    saved = (saikai._project_dirs, saikai.PROJECTS_ROOT)
+    try:
+        saikai._project_dirs = lambda _root: fake
+        saikai.PROJECTS_ROOT = Path(tempfile.mkdtemp())
+        # cwd key 'c-users-me-cli-saikai' contains 'aidas' nowhere on a boundary,
+        # but the substring 'aida' appears inside no segment → only saikai matches.
+        got = saikai.find_project_dir(Path("/c/users/me/cli/saikai"))
+        assert got == Path("c--users-me-cli-saikai")
+        # A genuinely unrelated cwd whose key embeds 'aidas' mid a longer segment
+        # ('aidaszone') must NOT match the 'aidas' project dir.
+        none_or_other = saikai.find_project_dir(Path("/c/users/me/aidaszone"))
+        assert none_or_other != Path("c--users-me-aidas"), "mid-segment substring wrongly matched"
+    finally:
+        saikai._project_dirs, saikai.PROJECTS_ROOT = saved
+
+
 def test_desktop_entry_omits_unknown_model_and_marks_title_auto():
     """A Desktop entry must NOT fabricate a model: when the resolved model is
     None the `model` key is omitted (Desktop picks), and titleSource is "auto"
@@ -502,6 +600,16 @@ if __name__ == "__main__":
     print("PASS test_activity_marker_bg_agent_distinct_from_open")
     test_desktop_index_dir_prefers_recent_over_most_entries()
     print("PASS test_desktop_index_dir_prefers_recent_over_most_entries")
+    test_parse_session_survives_nondict_line_and_message()
+    print("PASS test_parse_session_survives_nondict_line_and_message")
+    test_parse_cache_misses_on_append_within_mtime_tolerance()
+    print("PASS test_parse_cache_misses_on_append_within_mtime_tolerance")
+    test_ctx_usage_splits_on_newline_only()
+    print("PASS test_ctx_usage_splits_on_newline_only")
+    test_last_assistant_falls_back_to_whole_file_for_huge_final_turn()
+    print("PASS test_last_assistant_falls_back_to_whole_file_for_huge_final_turn")
+    test_find_project_dir_requires_segment_boundary()
+    print("PASS test_find_project_dir_requires_segment_boundary")
     test_desktop_entry_omits_unknown_model_and_marks_title_auto()
     print("PASS test_desktop_entry_omits_unknown_model_and_marks_title_auto")
     test_desktop_default_model_mirrors_newest_account_entry()

@@ -1660,15 +1660,21 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
 
 def parse_session(jsonl_path: Path) -> dict | None:
     sid = jsonl_path.stem
-    mtime = jsonl_path.stat().st_mtime
+    _st = jsonl_path.stat()
+    mtime, size = _st.st_mtime, _st.st_size
     cache_file = PARSED_DIR / f"{sid}.json"
 
     # Disk cache: skip JSONL re-parsing if mtime is unchanged AND schema is current.
     # `origin_cwd` was added 2026-04-30 to fix `claude --resume` for sessions
     # whose cwd changed mid-flight (e.g. moved into a worktree). Caches predating
     # that field force a re-parse.
+    # SIZE must also match: the 0.5s mtime tolerance (kept for coarse-mtime
+    # filesystems) otherwise treats an append landing within that window as a
+    # HIT, serving stale content — exactly what the summary cache was migrated
+    # off. A real append always changes the byte size. (#audit-parsecache)
     cached = _read_json(cache_file, None)
     if (cached and abs(cached.get("mtime", 0) - mtime) < 0.5
+            and cached.get("size") == size
             and "origin_cwd" in cached):
         if _is_hook_session(cached.get("real_msgs", []), len(cached.get("real_msgs") or [])):
             return None
@@ -1696,6 +1702,8 @@ def parse_session(jsonl_path: Path) -> dict | None:
                     obj = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(obj, dict):
+                    continue   # a bare JSON array/string/number line carries no fields
                 t = obj.get("type", "")
                 ts = obj.get("timestamp", "")
                 if ts:
@@ -1715,7 +1723,12 @@ def parse_session(jsonl_path: Path) -> dict | None:
                 if t == "ai-title":
                     ai_title = obj.get("aiTitle", "") or ai_title
                 if t == "user":
-                    text = _extract_text((obj.get("message") or {}).get("content", ""))
+                    # message can be a truthy non-dict (a JSON string, or a list) on
+                    # some records; guard so .get() can't raise and abort the whole
+                    # `for line in f` loop, which would lose every later record's
+                    # ts / cwd / ai_title / turns. (#audit-parse-msg)
+                    msg = obj.get("message")
+                    text = _extract_text(msg.get("content", "")) if isinstance(msg, dict) else ""
                     if _is_real_user_msg(text):
                         real_msgs.append(text[:800].replace("\n", " "))
     except Exception:
@@ -1733,6 +1746,7 @@ def parse_session(jsonl_path: Path) -> dict | None:
 
     parsed = {
         "mtime": mtime,
+        "size": size,
         "first_ts": first_ts,
         "last_ts": last_ts or first_ts,
         "ai_title": ai_title or "",
@@ -3140,7 +3154,10 @@ def _ctx_usage_from_jsonl(path) -> "tuple[int | None, str | None]":
         return None, None
     last = None
     last_model = None
-    for ln in chunk.splitlines():
+    # split on '\n' ONLY: str.splitlines() also breaks on U+2028/U+2029/U+0085,
+    # which Claude writes verbatim inside message content (ensure_ascii=False),
+    # fragmenting a record so json.loads fails and the usage is silently dropped.
+    for ln in chunk.split("\n"):
         ln = ln.strip()
         if not ln.startswith("{") or '"usage"' not in ln:
             continue
@@ -3366,26 +3383,36 @@ def _last_assistant_text_from_jsonl(path) -> "str | None":
     try:
         import os
         size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(max(0, size - 400_000))      # tail: the handoff reply is near the end
-            chunk = f.read().decode("utf-8", "replace")
     except (OSError, ValueError):
         return None
-    last = None
-    for ln in chunk.splitlines():
-        ln = ln.strip()
-        if not ln.startswith("{") or '"assistant"' not in ln:
-            continue
+    # Tail-read first (transcripts are large). A final assistant turn bigger than
+    # the window (e.g. a long /handoff reply) would land the seek INSIDE that line,
+    # so its truncated fragment fails the prefilter and the whole turn is lost —
+    # fall back to a whole-file read only when the tail found nothing. (#audit-tailseek)
+    for window in (400_000, size):
         try:
-            obj = json.loads(ln)
-        except Exception:
-            continue
-        if obj.get("type") != "assistant":
-            continue
-        msg = obj.get("message") or {}
-        txt = _extract_text(msg.get("content", "")) if isinstance(msg, dict) else ""
-        if txt:
-            last = txt
+            with open(path, "rb") as f:
+                f.seek(max(0, size - window))
+                chunk = f.read().decode("utf-8", "replace")
+        except (OSError, ValueError):
+            return None
+        last = None
+        for ln in chunk.split("\n"):       # '\n' only (see _ctx_usage_from_jsonl)
+            ln = ln.strip()
+            if not ln.startswith("{") or '"assistant"' not in ln:
+                continue
+            try:
+                obj = json.loads(ln)
+            except Exception:
+                continue
+            if obj.get("type") != "assistant":
+                continue
+            msg = obj.get("message") or {}
+            txt = _extract_text(msg.get("content", "")) if isinstance(msg, dict) else ""
+            if txt:
+                last = txt
+        if last is not None or window >= size:
+            return last
     return last
 
 
@@ -8480,9 +8507,14 @@ def find_project_dir(cwd: Path) -> Path | None:
     projects_root = PROJECTS_ROOT
     cwd_key = _path_to_key(cwd)
     best, best_len = None, 0
+    # Match on dash-delimited path-segment boundaries, not a raw substring: a
+    # bare ancestor/segment-fragment (e.g. an unrelated dir whose key happens to
+    # appear MID-segment) must not match. Wrapping both keys in dashes makes the
+    # containment test align on segment edges. (#audit-projdir-substr)
+    padded_cwd = "-" + cwd_key + "-"
     for cand in _project_dirs(projects_root):
         cand_key = re.sub(r"[\-\.]+", "-", cand.name.lower()).strip("-")
-        if cwd_key.endswith(cand_key) or cand_key in cwd_key:
+        if cand_key and ("-" + cand_key + "-") in padded_cwd:
             if len(cand_key) > best_len:
                 best, best_len = cand, len(cand_key)
     return best
