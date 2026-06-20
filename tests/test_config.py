@@ -500,6 +500,74 @@ def test_find_project_dir_requires_segment_boundary():
         saikai._project_dirs, saikai.PROJECTS_ROOT = saved
 
 
+def test_cell_width_zero_for_combining_and_zwj():
+    """Combining marks and zero-width joiners overlay the previous cell → width 0,
+    so accented/ZWJ text doesn't over-count in the --table path. (#audit-cellwidth)"""
+    assert saikai._cell_width("a") == 1
+    assert saikai._cell_width("あ") == 2          # hiragana あ — wide
+    assert saikai._cell_width("́") == 0          # combining acute accent
+    assert saikai._cell_width("‍") == 0          # ZWJ
+    assert saikai._cell_width("﻿") == 0          # BOM / ZWNBSP
+
+
+def test_extract_topics_parses_newline_and_bullets():
+    """raw=True replies that are newline- or bullet-separated must yield multiple
+    topics, not collapse to one truncated line. (#audit-topics-raw)"""
+    saved = saikai.call_claude_haiku
+    try:
+        saikai.call_claude_haiku = lambda *a, **k: "- alpha\n- beta\n* gamma"
+        out = saikai._extract_topics_haiku({"ai_title": "x", "real_msgs": ["hello world"]})
+    finally:
+        saikai.call_claude_haiku = saved
+    assert out == ["alpha", "beta", "gamma"], out
+
+
+def test_empty_topics_are_persisted():
+    """An empty topic result must be cached (key present) so _get_cached_topics
+    returns [] not None and the Haiku call isn't re-paid every run. (#audit-topics-empty)"""
+    d = Path(tempfile.mkdtemp())
+    old_parsed = saikai.PARSED_DIR
+    try:
+        saikai.PARSED_DIR = d
+        (d / "sid-t.json").write_text(json.dumps({"mtime": 1.0, "origin_cwd": "/c"}),
+                                      encoding="utf-8")
+        saikai._save_topics_to_cache("sid-t", [])
+        assert saikai._get_cached_topics("sid-t") == []   # present, not None
+    finally:
+        saikai.PARSED_DIR = old_parsed
+
+
+def test_set_lineage_refuses_to_wipe_on_unreadable_file():
+    """A present-but-unreadable lineage file must make _set_lineage RAISE rather
+    than collapse the whole map to one entry. (#audit-lineage)"""
+    d = Path(tempfile.mkdtemp())
+    lf = d / "lineage.json"
+    saved = (saikai.LINEAGE_FILE, saikai._LINEAGE_CACHE, saikai._LINEAGE_MTIME)
+    try:
+        saikai.LINEAGE_FILE = lf
+        saikai._LINEAGE_CACHE, saikai._LINEAGE_MTIME = None, None
+        saikai._set_lineage("child1", "parent1", "/c/p1.jsonl")     # first write OK
+        assert "child1" in json.loads(lf.read_text(encoding="utf-8"))
+        lf.write_text("{ corrupt = =", encoding="utf-8")            # now unreadable
+        try:
+            saikai._set_lineage("child2", "parent2", "/c/p2.jsonl")
+            assert False, "expected RuntimeError on unreadable lineage file"
+        except RuntimeError:
+            pass
+        assert lf.read_text(encoding="utf-8").startswith("{ corrupt"), \
+            "unreadable lineage file was overwritten — child1 would be wiped"
+    finally:
+        saikai.LINEAGE_FILE, saikai._LINEAGE_CACHE, saikai._LINEAGE_MTIME = saved
+
+
+def test_new_session_stub_preserves_drive_letter_case():
+    """The placeholder project key must preserve the cwd drive-letter casing
+    (real dirs are uppercase 'C--…'), not force-lowercase it. (#audit-drivecase)"""
+    s = saikai._new_session_stub("sid-x", "C:/work/repo", "title")
+    assert s["project_name"].startswith("C-"), s["project_name"]
+    assert not s["project_name"].startswith("c-")
+
+
 def test_desktop_entry_omits_unknown_model_and_marks_title_auto():
     """A Desktop entry must NOT fabricate a model: when the resolved model is
     None the `model` key is omitted (Desktop picks), and titleSource is "auto"
@@ -610,6 +678,16 @@ if __name__ == "__main__":
     print("PASS test_last_assistant_falls_back_to_whole_file_for_huge_final_turn")
     test_find_project_dir_requires_segment_boundary()
     print("PASS test_find_project_dir_requires_segment_boundary")
+    test_cell_width_zero_for_combining_and_zwj()
+    print("PASS test_cell_width_zero_for_combining_and_zwj")
+    test_extract_topics_parses_newline_and_bullets()
+    print("PASS test_extract_topics_parses_newline_and_bullets")
+    test_empty_topics_are_persisted()
+    print("PASS test_empty_topics_are_persisted")
+    test_set_lineage_refuses_to_wipe_on_unreadable_file()
+    print("PASS test_set_lineage_refuses_to_wipe_on_unreadable_file")
+    test_new_session_stub_preserves_drive_letter_case()
+    print("PASS test_new_session_stub_preserves_drive_letter_case")
     test_desktop_entry_omits_unknown_model_and_marks_title_auto()
     print("PASS test_desktop_entry_omits_unknown_model_and_marks_title_auto")
     test_desktop_default_model_mirrors_newest_account_entry()

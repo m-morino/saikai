@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import unicodedata
 import uuid
 from collections import Counter, defaultdict, namedtuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -758,10 +759,23 @@ def _load_lineage() -> dict:
 
 def _set_lineage(child: str, parent: str, parent_jsonl: str) -> None:
     """Record that `child` was forked/cleared from `parent`. Atomic write;
-    cache invalidated so the next _load_lineage re-reads from disk."""
+    cache invalidated so the next _load_lineage re-reads from disk.
+
+    Strict read of the existing file (raise on present-but-unreadable) so a
+    transient read failure / locked file doesn't collapse the whole lineage map
+    to this one entry — mirrors _set_custom_title / _toggle_in_set. (#audit-lineage)"""
     global _LINEAGE_CACHE, _LINEAGE_MTIME
     import time
-    d = dict(_load_lineage())
+    if LINEAGE_FILE.exists():
+        try:
+            raw = json.loads(LINEAGE_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise RuntimeError(
+                f"{LINEAGE_FILE.name} exists but is unreadable ({e!r}); "
+                f"not writing (won't risk erasing recovery lineage)") from e
+        d = dict(raw) if isinstance(raw, dict) else {}
+    else:
+        d = {}
     d[child] = {"parent": parent, "parent_jsonl": parent_jsonl,
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
     _write_json(LINEAGE_FILE, d)
@@ -2182,8 +2196,17 @@ def _cell_width(ch: str) -> int:
     WezTerm/Windows Terminal default to narrow for them, and treating them
     as 2 cells caused favorite/activity rows to mis-align relative to empty
     rows (the empty placeholder `\\u3000` would always be 2 cells, but
-    `★` would be 1 cell, so columns drifted by 1)."""
-    return 2 if ord(ch) > 0x2E80 else 1
+    `★` would be 1 cell, so columns drifted by 1).
+
+    Combining marks / zero-width joiners overlay the previous cell and count 0,
+    so accented or ZWJ text doesn't over-count in the plain-text --table path.
+    (Multi-codepoint grapheme clusters — flags, VS16 emoji — still can't be
+    measured by a per-char function; that needs grapheme segmentation.) (#audit-cellwidth)"""
+    o = ord(ch)
+    # ZWSP/ZWNJ/ZWJ/BOM and combining marks are zero-width.
+    if o in (0x200B, 0x200C, 0x200D, 0xFEFF) or unicodedata.combining(ch):
+        return 0
+    return 2 if o > 0x2E80 else 1
 
 
 def visible_len(s: str) -> int:
@@ -2264,9 +2287,12 @@ def _new_session_stub(sid: str, cwd: str, title: str) -> dict:
     render / sort / group / forest paths don't choke."""
     now = time.time()
     iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    # Preserve the cwd's drive-letter casing: Claude transliterates whatever
+    # casing the cwd string carries, and real project dirs are predominantly
+    # UPPERCASE 'C--…' (Path.cwd() yields 'C:'). The old force-lowercase pointed
+    # jsonl_path / project_name at a dir that doesn't exist. Self-heals on the
+    # next scan either way, but matching now avoids a transient mismatch. (#audit-drivecase)
     enc = re.sub(r"[:/\\.]", "-", str(cwd))
-    if sys.platform == "win32" and len(enc) >= 2 and enc[0].isalpha() and enc[1] == "-":
-        enc = enc[0].lower() + enc[1:]   # Claude lowercases the Windows drive letter
     s = {
         "id": sid, "provider": _ACTIVE_PROVIDER.id,
         "first_ts": iso, "last_ts": iso, "ai_title": "",
@@ -5465,7 +5491,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     fit, _ = _ram_fit(_ms, per, **_kw)
                     fit = min(fit, max(0, self._live.max_live - cnt))   # MAX_LIVE backstop
                     live_str = f"{sep}" + _live_ram_segment(
-                        cnt, _att, _ms, fit, per, float(_kw.get("max_load") or 85.0))
+                        cnt, _att, _ms, fit, per,
+                        float(_kw.get("max_load", _DEFAULT_MAX_LOAD)))
             # Search: when the on-demand bar is hidden, surface the active text
             # query (so a filtered list isn't mistaken for "sessions missing");
             # otherwise hint how to open it.
@@ -7249,7 +7276,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if cur:
                 try:
                     _ms = _mem_status()
-                    _maxl = float(_ram_gate_kwargs().get("max_load") or 85.0)
+                    # NOT `or 85.0`: a configured max_load of 0 is a real value the
+                    # gate honours (blocks every pane); the falsy-fallback would show
+                    # green/ok and fire the toast at 85% instead. (#audit-maxload)
+                    _maxl = float(_ram_gate_kwargs().get("max_load", _DEFAULT_MAX_LOAD))
                     if _ms is not None and _ms.load is not None:
                         if _ms.load >= _maxl and not self._mem_pressure_warned:
                             self._mem_pressure_warned = True
@@ -8651,10 +8681,15 @@ def _extract_topics_haiku(s: dict) -> list[str]:
         "from this Claude Code session. Reply with ONLY comma-separated keywords, nothing else.\n"
         f"Title: {title}\nMessages: {msgs[:400]}"
     )
-    raw = call_claude_haiku(prompt, timeout=30)
+    # raw=True: the default raw=False path returns only the FIRST non-fence line
+    # truncated to 100 chars, which cuts a comma-joined keyword list mid-word and
+    # collapses a newline/bulleted reply to one topic. (#audit-topics-raw)
+    raw = call_claude_haiku(prompt, timeout=30, raw=True)
     if not raw:
         return []
-    return [t.strip().lower() for t in raw.split(",") if t.strip()][:5]
+    # Accept comma- OR newline/bullet-separated replies.
+    parts = re.split(r"[,\n]", raw)
+    return [re.sub(r"^[\s\-*•]+", "", t).strip().lower() for t in parts if t.strip()][:5]
 
 
 def batch_ensure_topics(sessions: list[dict], show_progress: bool = False) -> None:
@@ -8678,8 +8713,11 @@ def batch_ensure_topics(sessions: list[dict], show_progress: bool = False) -> No
     def extract_one(s: dict) -> None:
         topics = _extract_topics_haiku(s)
         s["topics"] = topics if topics else []
-        if topics:
-            _save_topics_to_cache(s["id"], topics)
+        # Persist even an EMPTY result: _get_cached_topics treats a missing key as
+        # "never extracted" and returns None, so gating the save on `if topics`
+        # re-pays the full Haiku call (up to RELATION_TOP_K sessions × 30s) on
+        # every --related/forest run for every empty-result session. (#audit-topics-empty)
+        _save_topics_to_cache(s["id"], s["topics"])
         done_count[0] += 1
         if show_progress and done_count[0] % 10 == 0:
             print(f"\r  [{done_count[0]}/{len(missing)}] ", end="", file=sys.stderr, flush=True)
@@ -8837,6 +8875,13 @@ def cmd_related(target_id_prefix: str, sessions: list[dict]) -> None:
 
     prefiltered.sort(key=lambda x: -x[1])
     top_candidates = [s for s, _ in prefiltered[:RELATION_TOP_K]]
+    if len(prefiltered) > RELATION_TOP_K:
+        # Ranked by the optimistic topic=1 ceiling, so a dropped candidate's REAL
+        # score could in principle exceed a kept one's — surface the cap rather
+        # than silently bound recall. (#audit-relation-topk)
+        print(_c(f"  note: scored the top {RELATION_TOP_K} of {len(prefiltered)} "
+                 f"candidates (SAIKAI cap); {len(prefiltered) - RELATION_TOP_K} "
+                 f"lower-ceiling sessions not topic-scored.", DIM), file=sys.stderr)
     if top_candidates:
         batch_ensure_topics([target] + top_candidates, show_progress=True)
 
@@ -9493,6 +9538,10 @@ def main():
                     YELLOW), file=sys.stderr)
         args.all_scope = True
         args.here = False
+        # Also clear the time window: --related must find the target "wherever it
+        # lives", but a saved --days default would drop an older target from the
+        # scanned list and the lookup would exit 1. (#audit-related-days)
+        args.days = 0
 
     # Resolve --days / --here / --all from CLI vs saved defaults.
     # CLI args are ONE-SHOT: they only become the new default if the user passes
@@ -9522,7 +9571,13 @@ def main():
                 YELLOW), file=sys.stderr)
     args.all_projects = not (args.here or args.project)
 
-    if args.refresh_summary and CACHE_DIR.exists():
+    # Gate the wipe on summaries actually being enabled: deleting unconditionally
+    # before the gate (summaries are opt-in/off by default, and --no-summary forces
+    # them off) wipes the cache but skips Phase-2 regeneration, leaving the flag's
+    # "discard and regenerate" promise unfulfilled in the common/default case.
+    # _set_summary_forced_off runs later, so check args.no_summary explicitly. (#audit-refresh-summary)
+    if (args.refresh_summary and CACHE_DIR.exists()
+            and not args.no_summary and _summary_enabled()):
         # Delete ONLY the per-session summary caches (named <session-uuid>.json).
         # Match UUID cache names instead of maintaining an allowlist so every
         # settings file — current or future — is safe.
