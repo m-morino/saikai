@@ -9,6 +9,9 @@ import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Headless harness: no terminal to watch, and the watchdog's os._exit on a
+# false-positive orphan detection would kill the test process. (production-only)
+os.environ["SAIKAI_NO_TERMINAL_WATCHDOG"] = "1"
 import saikai_terminal as rt
 import saikai
 

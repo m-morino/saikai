@@ -1479,11 +1479,20 @@ def _win_pid_index() -> dict[int, tuple[str, int]]:
     try:
         entry = PROCESSENTRY32()
         entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
-        ok = k32.Process32First(snap, ctypes.byref(entry))
+        # ctypes.pointer (not byref): with argtypes = POINTER(PROCESSENTRY32),
+        # strict ctypes rejects byref's lightweight ref ("expected LP_… instance
+        # instead of pointer to …"). pointer() yields a real LP_PROCESSENTRY32.
+        ok = k32.Process32First(snap, ctypes.pointer(entry))
         while ok:
             name = entry.szExeFile.decode("ascii", "replace").lower()
             out[int(entry.th32ProcessID)] = (name, int(entry.th32ParentProcessID))
-            ok = k32.Process32Next(snap, ctypes.byref(entry))
+            ok = k32.Process32Next(snap, ctypes.pointer(entry))
+    except Exception:
+        # Honour the documented "{} on any failure" contract — the snapshot-walk
+        # must never raise into callers (the watchdog AND the live-session reader
+        # both treat {} as "no info"). Previously only snapshot CREATION was
+        # guarded, so a ctypes mismatch escaped. (#audit-pidreuse)
+        return {}
     finally:
         k32.CloseHandle(snap)
     return out
@@ -5283,8 +5292,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             header_before: dict[str, str] = {}
             flat: list[dict] = []
             for _hdr, _members in groups:
+                # Pinned (favorites) stay visible regardless of the hidden filter —
+                # same "pinned stays regardless" guarantee the Age cut honours. Else
+                # a fav+hidden row was hoisted into Pinned, then dropped by the hidden
+                # filter, landing in NO group and vanishing entirely. (#audit-fav-hidden)
+                _is_pinned = (_hdr == "Pinned")
                 _vis = [m for m in _members
-                        if not (m["id"] in hidden and not show_hidden)
+                        if (_is_pinned or not (m["id"] in hidden and not show_hidden))
                         and not (_status == "archived" and m["id"] not in hidden)]
                 if not _vis:
                     continue
@@ -6431,12 +6445,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             them after a restart/upgrade (cwd lets an out-of-scope session resume in
             the right dir). Best-effort; never blocks the UI."""
             try:
-                rows = []
-                for sid in sorted(self._opened_sids):
+                # Read-merge instead of clobber: two concurrent saikai instances
+                # share ONE OPEN_PANES_FILE, so a blind overwrite drops the other
+                # instance's panes (last-writer-wins). Keep existing entries that
+                # are STILL LIVE in another instance (so they aren't lost) but not
+                # ones this instance closed (killed → absent from active → dropped,
+                # so a closed pane doesn't resurrect). (#audit-openpanes-clobber)
+                merged: dict[str, dict] = {}
+                active = _load_active_sessions()
+                for row in (_read_json(OPEN_PANES_FILE, []) or []):
+                    if isinstance(row, dict) and row.get("id") in active:
+                        merged[row["id"]] = row
+                for sid in self._opened_sids:
                     s = self._sid_index.get(sid) or {}
-                    rows.append({"id": sid,
-                                 "cwd": s.get("origin_cwd") or s.get("cwd") or ""})
-                _write_json(OPEN_PANES_FILE, rows)
+                    merged[sid] = {"id": sid,
+                                   "cwd": s.get("origin_cwd") or s.get("cwd") or ""}
+                _write_json(OPEN_PANES_FILE, [merged[k] for k in sorted(merged)])
             except Exception:
                 pass
 
@@ -6702,6 +6726,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                             tabs.remove_pane(pid)
                         except Exception:
                             pass
+            except Exception:
+                pass
+
+        def on_descendant_focus(self) -> None:
+            # Refresh the header-skip baseline whenever focus lands on the list.
+            # Focus can return to the table WITHOUT a RowHighlighted event (Esc-back
+            # / Ctrl+] from a pane, a pane close), which would otherwise leave
+            # _last_cursor_row frozen at its pre-pane value and send the next
+            # header-skip the wrong way. One central point covers every path. (#audit-header-skip)
+            try:
+                w = self.focused
+                if getattr(w, "id", None) == "table":
+                    self._last_cursor_row = w.cursor_row
             except Exception:
                 pass
 
@@ -7405,14 +7442,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     return
             self.notify(f"copied opening prompt ({len(text)} chars)", timeout=3)
 
-        def _apply_fresh_sessions(self, fresh) -> None:
+        def _apply_fresh_sessions(self, fresh, force: bool = False) -> None:
             nonlocal all_sessions
             # A re-scan that suddenly finds ZERO sessions while we currently HAVE
             # some is almost always transient (a glob race, a momentarily
             # unreadable projects dir, a project-resolution hiccup) — NOT the user
             # deleting everything. Refuse to clobber a populated list with an empty
-            # scan; that was the "all sessions suddenly vanished" bug.
-            if not fresh and all_sessions:
+            # scan; that was the "all sessions suddenly vanished" bug. `force`
+            # (explicit double-F5) overrides for a genuinely-empty store. (#audit-f5-empty)
+            if not fresh and all_sessions and not force:
                 _log(f"reload: 0 sessions returned — KEPT current {len(all_sessions)} (transient?)")
                 try:
                     self.notify("re-scan returned 0 sessions — kept the current "
@@ -7492,6 +7530,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                             title="saikai", timeout=6)
                 return
             _log(f"refresh reload: {len(fresh)} sessions")
+            # Escape hatch for a GENUINELY empty store: the guard refuses to clobber
+            # a populated list with a (usually transient) empty scan, but a second
+            # F5 within the arm window forces it through. (#audit-f5-empty)
+            if not fresh and all_sessions:
+                if getattr(self, "_empty_reload_armed", False):
+                    self._empty_reload_armed = False
+                    self._apply_fresh_sessions(fresh, force=True)
+                    self._refresh_table()
+                    self.notify("refreshed — 0 sessions (forced)", timeout=3)
+                    return
+                self._empty_reload_armed = True
+                self.notify("re-scan returned 0 sessions — kept the list. "
+                            "Press F5 again to confirm it's really empty.",
+                            severity="warning", timeout=6)
+                return
+            self._empty_reload_armed = False
             self._apply_fresh_sessions(fresh)
             self._refresh_table()
             self.notify(f"refreshed — {len(fresh)} sessions", timeout=3)

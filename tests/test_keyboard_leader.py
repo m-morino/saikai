@@ -20,6 +20,11 @@ for _var in ("USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME"
     os.environ[_var] = str(_FAKE_HOME)
 os.environ.pop("SAIKAI_CONFIG", None)
 os.environ["SAIKAI_SUMMARIZE_ENABLED"] = "0"
+# Disable the Windows terminal-death watchdog: it has no real terminal to watch
+# in a headless harness, and its os._exit on a (false-positive) orphan detection
+# would kill the test process mid-suite — silently, losing buffered output. The
+# watchdog is a production-only safety net; the env var is its designed off-switch.
+os.environ["SAIKAI_NO_TERMINAL_WATCHDOG"] = "1"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import saikai
