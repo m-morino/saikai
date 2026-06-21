@@ -1599,6 +1599,8 @@ def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
 
 _active_sessions_cache: dict[str, str] | None = None
 _active_kinds_cache: "dict[str, str] | None" = None   # sid -> kind ("interactive" | "bg" | …)
+_active_jobids_cache: "dict[str, str] | None" = None   # sid -> jobId (bg sessions → ~/.claude/jobs/<jobId>/)
+_JOB_STATE_CACHE: dict = {}    # job_id -> (mtime, parsed state.json | None)
 
 
 def _load_active_sessions() -> dict[str, str]:
@@ -1607,11 +1609,12 @@ def _load_active_sessions() -> dict[str, str]:
     running session with `status` = "busy" | "idle" AND `kind` = "interactive" |
     "bg" (a headless background agent/job) | … — the kind is exposed separately via
     _active_session_kinds (a `bg` session is live but NOT resumable / attachable)."""
-    global _active_sessions_cache, _active_kinds_cache
+    global _active_sessions_cache, _active_kinds_cache, _active_jobids_cache
     if _active_sessions_cache is not None:
         return _active_sessions_cache
     out: dict[str, str] = {}
     kinds: dict[str, str] = {}
+    jobids: dict[str, str] = {}
     sessions_dir = CLAUDE_CONFIG_ROOT / "sessions"
     scanned_ok = False
     # One fast process snapshot (no subprocess) to validate registered PIDs are
@@ -1632,6 +1635,9 @@ def _load_active_sessions() -> dict[str, str]:
                     if pid and sid and _is_session_pid_live(int(pid), pid_index):
                         out[sid] = status
                         kinds[sid] = d.get("kind", "")
+                        _jid = d.get("jobId")
+                        if _jid:
+                            jobids[sid] = str(_jid)
                 except Exception:
                     continue
             scanned_ok = True
@@ -1644,7 +1650,31 @@ def _load_active_sessions() -> dict[str, str]:
     if scanned_ok:
         _active_sessions_cache = out
         _active_kinds_cache = kinds
+        _active_jobids_cache = jobids
     return out
+
+
+def _job_state_for(sid: str) -> "dict | None":
+    """The bg job state for a live session, joined via its registry jobId →
+    CLAUDE_CONFIG_ROOT/jobs/<jobId>/state.json. (mtime,size)-cached; tolerant of a
+    job dir that has only tmp/ (no state.json yet). Read-only; never touches the
+    daemon control/auth keys. (#recon-bg-jobs)"""
+    _load_active_sessions()
+    job_id = (_active_jobids_cache or {}).get(sid)
+    if not job_id:
+        return None
+    p = CLAUDE_CONFIG_ROOT / "jobs" / job_id / "state.json"
+    try:
+        mt = p.stat().st_mtime
+    except OSError:
+        return None
+    hit = _JOB_STATE_CACHE.get(job_id)
+    if hit is not None and hit[0] == mt:
+        return hit[1]
+    d = _read_json(p, None)
+    val = d if isinstance(d, dict) else None
+    _JOB_STATE_CACHE[job_id] = (mt, val)
+    return val
 
 
 def _active_session_kinds() -> dict:
@@ -1659,9 +1689,10 @@ def _invalidate_active_sessions() -> None:
     re-reads ~/.claude/sessions. Called on reload — otherwise is_open / is_active
     stay frozen at the launch-time snapshot for the whole picker lifetime (a
     session that exited elsewhere keeps showing Open/Running)."""
-    global _active_sessions_cache, _active_kinds_cache
+    global _active_sessions_cache, _active_kinds_cache, _active_jobids_cache
     _active_sessions_cache = None
     _active_kinds_cache = None
+    _active_jobids_cache = None
 
 
 def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> dict:
@@ -1694,13 +1725,28 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
         "mtime": mtime,
         "cwd": cwd,
         "origin_cwd": origin_cwd,
+        "worktree_origin_cwd": parsed.get("worktree_origin_cwd", ""),
         "git_branch": parsed.get("git_branch", ""),
         "is_open": sid in active,
-        "is_bg": _active_session_kinds().get(sid) == "bg",   # headless background agent/job (live, not resumable)
+        # Default-DENY unknown live kinds: a session is non-attachable (is_bg) when
+        # it is LIVE with a non-empty kind other than "interactive". Only bg + an
+        # interactive kind exist today, but a future kind defaults to NOT-resumable
+        # (refusing resume is recoverable; resuming a live session corrupts it).
+        # A dormant session (absent from the registry) → kind None → not is_bg. (#recon-unknown-kind)
+        "is_bg": (lambda _k: bool(_k) and _k != "interactive")(_active_session_kinds().get(sid)),
         "session_status": active.get(sid, ""),
         "is_active": (sid in active) or age_sec < 300,
         "is_recent": age_sec < 1800,
     }
+    # Background-job status: bg sessions link to ~/.claude/jobs/<jobId>/state.json
+    # (state working|blocked|done|failed|stopped + a `needs` clarify prompt when
+    # blocked). Surface it so a bg agent waiting on YOU ("blocked") is visible. (#recon-bg-jobs)
+    if result["is_bg"]:
+        _js = _job_state_for(sid)
+        if _js:
+            result["job_state"] = _js.get("state") or ""
+            result["job_needs"] = _js.get("needs") or ""
+            result["job_detail"] = _js.get("detail") or ""
     result["last_active_dt"] = _compute_last_active_dt(result)
     if "topics" in parsed:
         result["topics"] = parsed["topics"]
@@ -1733,6 +1779,7 @@ def parse_session(jsonl_path: Path) -> dict | None:
     prior_topics = (cached or {}).get("topics") or []
 
     first_ts = last_ts = ai_title = cwd = origin_cwd = git_branch = None
+    worktree_origin_cwd = None    # worktree-state.worktreeSession.originalCwd (resume cwd)
     real_msgs: list[str] = []
 
     try:
@@ -1771,6 +1818,13 @@ def parse_session(jsonl_path: Path) -> dict | None:
                     git_branch = obj["gitBranch"]
                 if t == "ai-title":
                     ai_title = obj.get("aiTitle", "") or ai_title
+                elif t == "worktree-state":
+                    # A worktree session's AUTHORITATIVE origin cwd for `claude --resume`
+                    # (the repo root the user was in before entering the isolated worktree).
+                    # The plain `cwd` records may point at the .claude/worktrees/ dir. (#recon-worktree-cwd)
+                    _ws = obj.get("worktreeSession")
+                    if isinstance(_ws, dict) and isinstance(_ws.get("originalCwd"), str):
+                        worktree_origin_cwd = _ws["originalCwd"]
                 if t == "user":
                     # message can be a truthy non-dict (a JSON string, or a list) on
                     # some records; guard so .get() can't raise and abort the whole
@@ -1803,6 +1857,7 @@ def parse_session(jsonl_path: Path) -> dict | None:
         "n_turns": len(real_msgs),
         "cwd": cwd or "",
         "origin_cwd": origin_cwd or cwd or "",
+        "worktree_origin_cwd": worktree_origin_cwd or "",
         "git_branch": git_branch or "",
     }
     if prior_topics:
@@ -2683,7 +2738,7 @@ _MARKER_COLOR = {_g: _c for _g, _c in _LIVE_MARKER.values()}
 _MARKER_COLOR.update({
     "!": "yellow",    # reply due — your last turn is unanswered (statusbar !M)
     "@": "green",     # opened in another window
-    "&": "magenta",   # running background agent/job (headless; not resumable while live)
+    "&": "magenta",   # running bg agent/job (headless; colour = job state: yellow=blocked, red=failed, dim=done)
     "+": "green",     # recently active
     ".": "yellow",    # recent (dormant) — matches the CLI --table '.' tint so the
     #                   comment's "same palette as the CLI" claim actually holds
@@ -2702,7 +2757,16 @@ _TABLE_NA_CACHE: dict = {}   # mtime-keyed reply-due cache for the --table activ
 def _activity_marker(s: dict) -> str:
     """Activity column: open-busy / open-idle / active / reply-due / recent."""
     if s.get("is_bg"):
-        return _c("&", MAGENTA, BOLD)    # running background agent/job (headless)
+        # Same glyph '&' (no new marker — '?' already means live-waiting); the bg
+        # JOB state is conveyed by COLOUR so it can't collide with other markers.
+        _jst = s.get("job_state")
+        if s.get("job_needs"):
+            return _c("&", YELLOW, BOLD)     # bg agent BLOCKED — awaiting your clarification
+        if _jst in ("failed", "stopped"):
+            return _c("&", RED)              # bg job ended abnormally
+        if _jst == "done":
+            return _c("&", DIM)              # bg job finished
+        return _c("&", MAGENTA, BOLD)        # running background agent/job (headless)
     if s.get("is_open"):
         if s.get("session_status") == "busy":
             return _c("@", CYAN, BOLD)   # open & currently responding
@@ -4125,7 +4189,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  Age       last 1d / 3d / 7d / 30d / All time\n"
                 "  Search    [yellow]/[/yellow] or type to open the bar; tokens AND with text + each other —\n"
                 "            :fav  :hidden  :open  :active  :recent   (Esc clears)\n"
-                "  Markers   @ open elsewhere · & bg agent · + active · . recent · live ~ busy · ? waiting · ! reply due · = idle · * fav · x hidden\n"
+                "  Markers   @ open elsewhere · & bg agent (yellow=blocked/needs-you, red=failed, dim=done) · + active · . recent · live ~ busy · ? waiting · ! reply due · = idle · * fav · x hidden\n"
                 "  [yellow]/[/yellow] shows the bar with the dropdowns; [yellow]Tab[/yellow]/[yellow]Shift-Tab[/yellow] walk into them, [yellow]Enter[/yellow]\n"
                 "  opens one. Leader [yellow]s[/yellow]/[yellow]o[/yellow] cycles the sort column / direction without the bar\n"
                 "  (a column-header click still sorts too)\n\n"
@@ -8479,7 +8543,10 @@ def _resolve_resume_cwd(full_id: str, sessions: list[dict]) -> str | None:
     selected = next((s for s in sessions if s["id"] == full_id), None)
     candidates: list[str] = []
     if selected:
-        for k in ("origin_cwd", "cwd"):
+        # worktree_origin_cwd first: for a worktree session the worktree-state
+        # record's originalCwd is the authoritative dir Claude indexed under,
+        # whereas the plain origin_cwd may be the .claude/worktrees/ path. (#recon-worktree-cwd)
+        for k in ("worktree_origin_cwd", "origin_cwd", "cwd"):
             v = selected.get(k)
             if v and Path(v).is_dir():
                 candidates.append(v)

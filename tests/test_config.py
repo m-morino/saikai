@@ -596,6 +596,88 @@ def test_resolve_resume_cwd_prefers_recent_sibling():
     assert out == str(d2), "should pick the most-recent sibling cwd, not list-order first"
 
 
+def test_is_bg_default_denies_unknown_live_kind():
+    """A LIVE session whose kind is non-empty and != 'interactive' (bg OR a future
+    kind) is non-attachable (is_bg); a dormant session (absent from the registry)
+    and an interactive one are not. Default-deny: refusing resume is recoverable,
+    resuming a live session corrupts it. (#recon-unknown-kind)"""
+    saved = (saikai._active_sessions_cache, saikai._active_kinds_cache, saikai._active_jobids_cache)
+    try:
+        saikai._active_sessions_cache = {"i": "idle", "b": "busy", "u": "busy"}
+        saikai._active_kinds_cache = {"i": "interactive", "b": "bg", "u": "future-kind"}
+        saikai._active_jobids_cache = {}
+        def _bg(sid):
+            r = saikai._enrich_session(sid, {"first_ts": "t", "origin_cwd": "/c", "real_msgs": []},
+                                       Path("/c/x.jsonl"), 0.0)
+            return r["is_bg"]
+        assert _bg("i") is False, "interactive must be attachable"
+        assert _bg("b") is True, "bg must be non-attachable"
+        assert _bg("u") is True, "unknown live kind must default-deny"
+        assert _bg("dormant") is False, "dormant (not in registry) must not be is_bg"
+    finally:
+        (saikai._active_sessions_cache, saikai._active_kinds_cache, saikai._active_jobids_cache) = saved
+        saikai._invalidate_active_sessions()
+
+
+def test_bg_job_state_join_and_marker():
+    """A bg session joins jobs/<jobId>/state.json; a 'blocked' job (needs your
+    clarification) yields a distinct activity marker. (#recon-bg-jobs)"""
+    d = Path(tempfile.mkdtemp())
+    (d / "jobs" / "job1").mkdir(parents=True)
+    (d / "jobs" / "job1" / "state.json").write_text(
+        json.dumps({"state": "blocked", "needs": "clarify: continue or stop?",
+                    "detail": "awaiting"}), encoding="utf-8")
+    saved = (saikai.CLAUDE_CONFIG_ROOT, saikai._active_sessions_cache,
+             saikai._active_kinds_cache, saikai._active_jobids_cache)
+    try:
+        saikai.CLAUDE_CONFIG_ROOT = d
+        saikai._active_sessions_cache = {"bgsid": "busy"}
+        saikai._active_kinds_cache = {"bgsid": "bg"}
+        saikai._active_jobids_cache = {"bgsid": "job1"}
+        saikai._JOB_STATE_CACHE.clear()
+        js = saikai._job_state_for("bgsid")
+        assert js and js["state"] == "blocked" and js["needs"].startswith("clarify")
+        assert saikai._job_state_for("not-a-bg") is None    # no jobId → no join
+        # blocked marker reachable + glyph stays '&' (no new colliding marker)
+        m = saikai._activity_marker({"is_bg": True, "job_state": "blocked", "job_needs": "clarify: X?"})
+        assert "&" in m
+        assert "&" in saikai._activity_marker({"is_bg": True, "job_state": "done"})
+    finally:
+        (saikai.CLAUDE_CONFIG_ROOT, saikai._active_sessions_cache,
+         saikai._active_kinds_cache, saikai._active_jobids_cache) = saved
+        saikai._invalidate_active_sessions()
+
+
+def test_resolve_resume_cwd_prefers_worktree_origin():
+    """A worktree session's worktree-state.originalCwd outranks the plain origin_cwd
+    for resume (the latter may be the isolated .claude/worktrees/ path). (#recon-worktree-cwd)"""
+    real = Path(tempfile.mkdtemp())
+    sel = {"id": "s", "worktree_origin_cwd": str(real),
+           "origin_cwd": "/no/such/iso", "cwd": "/no/such/iso2",
+           "jsonl_path": Path("/p/s.jsonl")}
+    assert saikai._resolve_resume_cwd("s", [sel]) == str(real)
+
+
+def test_parse_session_captures_worktree_origin_cwd():
+    """parse_session records worktreeSession.originalCwd from a worktree-state line. (#recon-worktree-cwd)"""
+    d = Path(tempfile.mkdtemp())
+    jsonl = d / "sid-wt.jsonl"
+    jsonl.write_text("\n".join([
+        json.dumps({"type": "user", "timestamp": "2026-06-01T00:00:00Z", "cwd": "/c/wt/iso",
+                    "message": {"content": "hello prompt here"}}),
+        json.dumps({"type": "worktree-state",
+                    "worktreeSession": {"originalCwd": "/c/repo/root", "worktreePath": "/c/wt/iso"}}),
+    ]) + "\n", encoding="utf-8")
+    old = saikai.PARSED_DIR
+    try:
+        saikai.PARSED_DIR = d / "parsed"
+        saikai.PARSED_DIR.mkdir(parents=True, exist_ok=True)
+        s = saikai.parse_session(jsonl)
+        assert s["worktree_origin_cwd"] == "/c/repo/root", s.get("worktree_origin_cwd")
+    finally:
+        saikai.PARSED_DIR = old
+
+
 def test_load_active_sessions_honors_config_root():
     """The live-session registry must be read from the SAME root the provider uses
     for transcripts (CLAUDE_CONFIG_DIR or ~/.claude), not a hard-coded ~/.claude —
@@ -749,6 +831,14 @@ if __name__ == "__main__":
     print("PASS test_session_pid_live_rejects_reused_pid")
     test_resolve_resume_cwd_prefers_recent_sibling()
     print("PASS test_resolve_resume_cwd_prefers_recent_sibling")
+    test_is_bg_default_denies_unknown_live_kind()
+    print("PASS test_is_bg_default_denies_unknown_live_kind")
+    test_bg_job_state_join_and_marker()
+    print("PASS test_bg_job_state_join_and_marker")
+    test_resolve_resume_cwd_prefers_worktree_origin()
+    print("PASS test_resolve_resume_cwd_prefers_worktree_origin")
+    test_parse_session_captures_worktree_origin_cwd()
+    print("PASS test_parse_session_captures_worktree_origin_cwd")
     test_load_active_sessions_honors_config_root()
     print("PASS test_load_active_sessions_honors_config_root")
     test_desktop_entry_omits_unknown_model_and_marks_title_auto()
