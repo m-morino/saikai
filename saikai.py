@@ -2780,6 +2780,7 @@ _MARKER_COLOR.update({
     "!": "yellow",    # reply due — your last turn is unanswered (statusbar !M)
     "R": "cyan",      # Remote Control enabled in another Claude session
     "@": "green",     # opened in another window
+    "$": "yellow",    # open & running a shell command (registry status=="shell")
     "&": "magenta",   # running bg agent/job (headless; colour = job state: yellow=blocked, red=failed, dim=done)
     "+": "green",     # recently active
     ".": "yellow",    # recent (dormant) — matches the CLI --table '.' tint so the
@@ -2812,7 +2813,10 @@ def _activity_marker(s: dict) -> str:
     if s.get("is_remote_control"):
         return _c("R", CYAN, BOLD)       # open with Claude Remote Control enabled
     if s.get("is_open"):
-        if s.get("session_status") == "busy":
+        _ss = s.get("session_status")
+        if _ss == "shell":
+            return _c("$", YELLOW, BOLD)  # open & running a shell command (a Bash tool call)
+        if _ss == "busy":
             return _c("@", CYAN, BOLD)   # open & currently responding
         return _c("@", GREEN, BOLD)      # open & idle in another Claude window
     if s.get("is_active"):
@@ -2921,7 +2925,8 @@ def display_table(sessions: list[dict], repo: Path | None, show_project: bool,
     legend = (f"  {len(sessions)} sessions{mode_tag}  ·  "
               f"{_c('*', GOLD)} fav  {_c('+', GREEN)} active(<5m)  "
               f"{_c('.', YELLOW)} recent(<30m)  {_c('x', RED)} hidden  "
-              f"{_c('R', CYAN)} remote-control  {_c('@', GREEN)} open  ·  saikai to resume")
+              f"{_c('R', CYAN)} remote-control  {_c('@', GREEN)} open  "
+              f"{_c('$', YELLOW)} shell  ·  saikai to resume")
     print(_c(legend, DIM))
     print()
 
@@ -4233,7 +4238,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  Age       last 1d / 3d / 7d / 30d / All time\n"
                 "  Search    [yellow]/[/yellow] or type to open the bar; tokens AND with text + each other —\n"
                 "            :fav  :hidden  :open  :active  :recent   (Esc clears)\n"
-                "  Markers   R remote-control · @ open elsewhere · & bg agent (yellow=blocked/needs-you, red=failed, dim=done) · + active · . recent · live ~ busy · ? waiting · ! reply due · = idle · * fav · x hidden\n"
+                "  Markers   R remote-control · @ open elsewhere · $ open+running a shell · & bg agent (yellow=blocked/needs-you, red=failed, dim=done) · + active · . recent · live ~ busy · ? waiting · ! reply due · = idle · * fav · x hidden\n"
                 "  [yellow]/[/yellow] shows the bar with the dropdowns; [yellow]Tab[/yellow]/[yellow]Shift-Tab[/yellow] walk into them, [yellow]Enter[/yellow]\n"
                 "  opens one. Leader [yellow]s[/yellow]/[yellow]o[/yellow] cycles the sort column / direction without the bar\n"
                 "  (a column-header click still sorts too)\n\n"
@@ -5473,6 +5478,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # below + (just-touched) and above . (merely recent).
                     marker_a = ("&" if s.get("is_bg")
                                 else "R" if s.get("is_remote_control")
+                                else "$" if (s.get("is_open") and s.get("session_status") == "shell")
                                 else "@" if s.get("is_open")
                                 else "+" if s.get("is_active")
                                 else "!" if _needs_attention(s, self._na_cache)

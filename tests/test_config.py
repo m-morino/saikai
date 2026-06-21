@@ -299,6 +299,23 @@ def test_activity_marker_bg_agent_distinct_from_open():
     assert "&" not in saikai._activity_marker({"is_open": True})
 
 
+def test_activity_marker_shell_distinct_from_open():
+    """An open session whose registry status=="shell" (currently running a Bash
+    tool call) gets the '$' marker, distinct from the '@' of an idle-open window
+    and the cyan '@' of a thinking-busy one — so a session blocked in a shell
+    command reads at a glance. (#shell)"""
+    assert "$" in saikai._activity_marker({"is_open": True, "session_status": "shell"})
+    assert "@" not in saikai._activity_marker({"is_open": True, "session_status": "shell"})
+    # idle / busy keep '@'; only "shell" promotes to '$'
+    assert "@" in saikai._activity_marker({"is_open": True, "session_status": "idle"})
+    assert "@" in saikai._activity_marker({"is_open": True, "session_status": "busy"})
+    assert "$" not in saikai._activity_marker({"is_open": True, "session_status": "busy"})
+    # bg wins over shell (a bg agent is never an attachable shell window)
+    assert "&" in saikai._activity_marker({"is_bg": True, "is_open": True, "session_status": "shell"})
+    # '$' is colour-mapped for the TUI list marker too
+    assert saikai._MARKER_COLOR.get("$") == "yellow"
+
+
 def test_remote_control_registry_and_marker():
     """A live registry bridgeSessionId marks in-session Remote Control distinctly;
     stale/dead entries must never leak an R marker. Background kind still wins."""
@@ -924,6 +941,8 @@ if __name__ == "__main__":
     print("PASS test_child_spawn_env_strips_virtualenv_from_var_and_path")
     test_activity_marker_bg_agent_distinct_from_open()
     print("PASS test_activity_marker_bg_agent_distinct_from_open")
+    test_activity_marker_shell_distinct_from_open()
+    print("PASS test_activity_marker_shell_distinct_from_open")
     test_remote_control_registry_and_marker()
     print("PASS test_remote_control_registry_and_marker")
     test_desktop_index_dir_prefers_recent_over_most_entries()
