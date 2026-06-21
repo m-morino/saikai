@@ -193,6 +193,14 @@ So an unexpected viewer is always visible, saikai shows how many browsers are
 connected — a `🌐 N` count in the status bar, a toast when one connects, and the
 count on the F12 screen.
 
+**vs. `claude remote-control`.** Anthropic's first-party Remote Control relays
+one session through the cloud (claude.ai sign-in). saikai's mirror is different
+on purpose: it stays on your **LAN** — no cloud relay, works offline / on an
+air-gapped network — needs **no claude.ai OAuth**, and mirrors saikai's whole
+**multi-session** view rather than just the one session you launched. Reach for
+Remote Control to drive a session from outside your network; reach for saikai's
+mirror to watch *all* your local sessions from the couch.
+
 ## Configuration (environment variables)
 
 | Variable | Default | Meaning |
