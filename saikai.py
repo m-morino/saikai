@@ -8611,6 +8611,41 @@ def _child_spawn_env(base: "dict | None" = None) -> dict:
     return env
 
 
+def _bg_job_respawn_args(full_id: str) -> list[str]:
+    """Model/effort flags to REPLAY when resuming a session that originated as a
+    background job, so the resumed session keeps the bg job's tier (the job's
+    state.json records the exact respawnFlags Claude used). Scans
+    CLAUDE_CONFIG_ROOT/jobs/*/state.json for one whose sessionId/resumeSessionId
+    matches; returns ONLY --model / --effort pairs — NOT --permission-mode, whose
+    auto value would silently make a saikai-resumed session auto-accept (saikai's
+    own SAIKAI_AUTO_PERMISSION opt-in governs that). [] when none. (#recon-respawn)"""
+    if not full_id:
+        return []
+    try:
+        job_states = list((CLAUDE_CONFIG_ROOT / "jobs").glob("*/state.json"))
+    except OSError:
+        return []
+    flags = None
+    for sp in job_states:
+        d = _read_json(sp, None)
+        if isinstance(d, dict) and full_id in (d.get("sessionId"), d.get("resumeSessionId")):
+            rf = d.get("respawnFlags")
+            if isinstance(rf, list):
+                flags = rf
+            break
+    if not flags:
+        return []
+    out: list[str] = []
+    i = 0
+    while i < len(flags) - 1:
+        if flags[i] in ("--model", "--effort"):
+            out += [str(flags[i]), str(flags[i + 1])]
+            i += 2
+        else:
+            i += 1
+    return out
+
+
 def _build_claude_invocation(
     session_args: list[str], target_cwd: str | None, sessions: list[dict]
 ) -> tuple[list[str], str | None, dict]:
@@ -8641,6 +8676,9 @@ def _build_claude_invocation(
     env["SAIKAI_RESUME"] = "1"   # signal to teams-notify.py: suppress the first idle_prompt
 
     if len(session_args) == 2 and session_args[0] == "--resume":
+        # Replay a bg-origin session's model/effort so resuming it from saikai keeps
+        # the tier the background job ran at (else it falls back to the CLI default).
+        extra_args = _bg_job_respawn_args(session_args[1]) + extra_args
         spec = _ACTIVE_PROVIDER.build_resume(
             session_args[1], cwd=target_cwd, env=env, extra_args=extra_args)
     elif len(session_args) == 2 and session_args[0] == "--session-id":

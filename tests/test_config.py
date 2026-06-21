@@ -708,6 +708,28 @@ def test_parse_session_captures_worktree_origin_cwd():
         saikai.PARSED_DIR = old
 
 
+def test_bg_job_respawn_args_replays_model_effort_only():
+    """Resuming a bg-origin session replays --model/--effort from the job's
+    state.json respawnFlags, but NOT --permission-mode (whose 'auto' would make a
+    saikai-resumed session auto-accept). (#recon-respawn)"""
+    d = Path(tempfile.mkdtemp())
+    (d / "jobs" / "jobA").mkdir(parents=True)
+    (d / "jobs" / "jobA" / "state.json").write_text(json.dumps({
+        "sessionId": "bg-origin-sid",
+        "respawnFlags": ["--effort", "high", "--permission-mode", "auto",
+                         "--model", "claude-opus-4-8[1m]"]}), encoding="utf-8")
+    saved = saikai.CLAUDE_CONFIG_ROOT
+    try:
+        saikai.CLAUDE_CONFIG_ROOT = d
+        got = saikai._bg_job_respawn_args("bg-origin-sid")
+        assert got == ["--effort", "high", "--model", "claude-opus-4-8[1m]"], got
+        assert "--permission-mode" not in got                      # safety: not replayed
+        assert saikai._bg_job_respawn_args("unrelated-sid") == []   # no matching job
+        assert saikai._bg_job_respawn_args("") == []
+    finally:
+        saikai.CLAUDE_CONFIG_ROOT = saved
+
+
 def test_load_active_sessions_honors_config_root():
     """The live-session registry must be read from the SAME root the provider uses
     for transcripts (CLAUDE_CONFIG_DIR or ~/.claude), not a hard-coded ~/.claude —
@@ -869,6 +891,8 @@ if __name__ == "__main__":
     print("PASS test_resolve_resume_cwd_prefers_worktree_origin")
     test_parse_session_captures_worktree_origin_cwd()
     print("PASS test_parse_session_captures_worktree_origin_cwd")
+    test_bg_job_respawn_args_replays_model_effort_only()
+    print("PASS test_bg_job_respawn_args_replays_model_effort_only")
     test_load_active_sessions_honors_config_root()
     print("PASS test_load_active_sessions_honors_config_root")
     test_desktop_entry_omits_unknown_model_and_marks_title_auto()
