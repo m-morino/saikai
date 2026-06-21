@@ -596,6 +596,31 @@ def test_resolve_resume_cwd_prefers_recent_sibling():
     assert out == str(d2), "should pick the most-recent sibling cwd, not list-order first"
 
 
+def test_load_active_sessions_honors_config_root():
+    """The live-session registry must be read from the SAME root the provider uses
+    for transcripts (CLAUDE_CONFIG_DIR or ~/.claude), not a hard-coded ~/.claude —
+    else every session reads dead when CLAUDE_CONFIG_DIR relocates the store, which
+    the README/CHANGELOG already claim is supported. (#recon-configdir)"""
+    d = Path(tempfile.mkdtemp())
+    (d / "sessions").mkdir()
+    (d / "sessions" / "4242.json").write_text(
+        json.dumps({"pid": 4242, "sessionId": "cfgroot-sid",
+                    "status": "busy", "kind": "interactive"}),
+        encoding="utf-8")
+    saved_root = saikai.CLAUDE_CONFIG_ROOT
+    saved_live = saikai._is_session_pid_live
+    try:
+        saikai.CLAUDE_CONFIG_ROOT = d
+        saikai._is_session_pid_live = lambda pid, idx: True   # bypass real liveness
+        saikai._invalidate_active_sessions()
+        active = saikai._load_active_sessions()
+        assert active.get("cfgroot-sid") == "busy", active   # read from the relocated root
+    finally:
+        saikai.CLAUDE_CONFIG_ROOT = saved_root
+        saikai._is_session_pid_live = saved_live
+        saikai._invalidate_active_sessions()
+
+
 def test_desktop_entry_omits_unknown_model_and_marks_title_auto():
     """A Desktop entry must NOT fabricate a model: when the resolved model is
     None the `model` key is omitted (Desktop picks), and titleSource is "auto"
@@ -607,6 +632,10 @@ def test_desktop_entry_omits_unknown_model_and_marks_title_auto():
     assert e["cliSessionId"] == "sid-abc"
     assert e["sessionId"].startswith("local_")
     assert e["title"] == "hello there"
+    # Security-flavored optional keys must NOT be fabricated onto a synced row. (#recon-desktop-fab)
+    assert "chromePermissionMode" not in e
+    assert "classifierSummaryEnabled" not in e
+    assert e["permissionMode"] == "default"   # least-privilege, not fabricated "auto"
     # A resolved model is carried through verbatim.
     e2 = saikai._desktop_entry(s, "claude-sonnet-4-6")
     assert e2["model"] == "claude-sonnet-4-6"
@@ -720,6 +749,8 @@ if __name__ == "__main__":
     print("PASS test_session_pid_live_rejects_reused_pid")
     test_resolve_resume_cwd_prefers_recent_sibling()
     print("PASS test_resolve_resume_cwd_prefers_recent_sibling")
+    test_load_active_sessions_honors_config_root()
+    print("PASS test_load_active_sessions_honors_config_root")
     test_desktop_entry_omits_unknown_model_and_marks_title_auto()
     print("PASS test_desktop_entry_omits_unknown_model_and_marks_title_auto")
     test_desktop_default_model_mirrors_newest_account_entry()

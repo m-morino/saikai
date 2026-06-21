@@ -1612,7 +1612,7 @@ def _load_active_sessions() -> dict[str, str]:
         return _active_sessions_cache
     out: dict[str, str] = {}
     kinds: dict[str, str] = {}
-    sessions_dir = Path.home() / ".claude" / "sessions"
+    sessions_dir = CLAUDE_CONFIG_ROOT / "sessions"
     scanned_ok = False
     # One fast process snapshot (no subprocess) to validate registered PIDs are
     # still Claude processes — defends against Windows PID reuse. Empty snapshot =
@@ -1844,6 +1844,13 @@ def load_sessions_in_dir(project_dir: Path, since: datetime | None) -> list[dict
 
 # ── LLM summarization via claude -p ──────────────────────────────────────────
 PROJECTS_ROOT = _ACTIVE_PROVIDER.history_roots()[0]
+# The Claude config root (CLAUDE_CONFIG_DIR or ~/.claude), derived from the SAME
+# provider resolution as the transcripts root. The live-session registry lives
+# under it; reading the registry from a hard-coded ~/.claude while transcripts come
+# from a CLAUDE_CONFIG_DIR-relocated root split-brained discovery — every session
+# read as dead/closed, contradicting the documented CLAUDE_CONFIG_DIR support
+# (README / CHANGELOG). (#recon-configdir)
+CLAUDE_CONFIG_ROOT = PROJECTS_ROOT.parent
 
 
 # UUID v4 shape — prevents glob metacharacters in `claude -p` JSON output
@@ -8413,6 +8420,10 @@ def _persist_resume_id(full_id: str, target_cwd: str | None) -> Path:
     return RESUME_HISTORY_FILE
 
 
+# Deliberately ~/.claude/state (NOT CLAUDE_CONFIG_ROOT): this is a saikai→hook
+# contract file, and the notification hook that CONSUMES it reads a fixed
+# ~/.claude/state path (hook state is user-level, not config-dir-relative). Moving
+# it to CLAUDE_CONFIG_ROOT would desync writer and reader. (#recon-configdir)
 _SAIKAI_SUPPRESS_PATH = Path.home() / ".claude" / "state" / "_saikai_resume_oneshot.json"
 _SAIKAI_SUPPRESS_TTL = 3600.0  # 1h. teams-notify.py 側の SAIKAI_SUPPRESS_TTL と同期
 
@@ -9400,14 +9411,16 @@ def _desktop_entry(s: dict, model: str | None) -> dict:
         "isArchived": False,
         "title": title,
         "titleSource": "auto",
+        # "default" (NOT "auto"): a synced row's real permission posture is unknown,
+        # so assert least-privilege rather than imply auto-accept. The recon survey
+        # found native rows are mostly "auto" because the USER ran them that way —
+        # not a reason to fabricate auto on a surfaced CLI session. (#recon-desktop-fab)
         "permissionMode": "default",
         "enabledMcpTools": {},
         "remoteMcpServersConfig": [],
-        "chromePermissionMode": "skip_all_permission_checks",
         "completedTurns": 0,
         "alwaysAllowedReasons": [],
         "sessionPermissionUpdates": [],
-        "classifierSummaryEnabled": True,
     }
     if model:
         entry["model"] = model
