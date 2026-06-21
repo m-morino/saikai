@@ -9373,16 +9373,47 @@ else:
 DESKTOP_SESSIONS_ROOT = _DESKTOP_APPDATA / "Claude" / "claude-code-sessions"
 
 
+def _desktop_account_dir_from_config() -> Path | None:
+    """The AUTHORITATIVE <org>/<user> account dir from Desktop's own config files,
+    when resolvable: <org> = cowork-enabled-cli-ops.json's ownerAccountId, <user> =
+    the guid suffix of config.json's `dxt:allowlist*:<guid>` keys (newest by
+    allowlistLastUpdated if several accounts are present). Returns the dir only if
+    it actually exists; None otherwise so the caller falls back to recency. This
+    beats the mtime heuristic on a multi-account machine where a signed-out account
+    was written more recently by an unrelated process. (#recon-desktop-acct)"""
+    cfgdir = _DESKTOP_APPDATA / "Claude"
+    org = (_read_json(cfgdir / "cowork-enabled-cli-ops.json", {}) or {}).get("ownerAccountId")
+    if not org:
+        return None
+    cfg = _read_json(cfgdir / "config.json", {}) or {}
+    if not isinstance(cfg, dict):
+        return None
+    best_user, best_ts = None, ""
+    for k, v in cfg.items():
+        if not (isinstance(k, str) and k.startswith("dxt:allowlist") and ":" in k):
+            continue
+        guid = k.rsplit(":", 1)[-1]
+        if k.startswith("dxt:allowlistLastUpdated:") and isinstance(v, str) and v > best_ts:
+            best_ts, best_user = v, guid     # newest-updated account wins
+        elif best_user is None:
+            best_user = guid                 # no timestamp seen yet → tentative
+    if not best_user:
+        return None
+    d = DESKTOP_SESSIONS_ROOT / str(org) / str(best_user)
+    return d if d.is_dir() else None
+
+
 def _desktop_index_dir() -> Path | None:
     """The <org>/<user> dir holding Desktop's local_*.json session entries.
 
-    Pick the dir with the MOST-RECENTLY-written entry (the account Desktop is
-    currently writing to), NOT the one with the most entries: a former account can
-    have far more history yet be signed out, and the old most_common() heuristic
-    would then sync into the stale account — writing entries the logged-in Desktop
-    never shows while reporting success. Recency is schema-independent; the fully
-    authoritative source would be the current-account guid in Desktop's own
-    config.json, but that couples us to its config format. (#H8)"""
+    Prefer the AUTHORITATIVE account dir from Desktop's own config (org =
+    cowork-enabled-cli-ops.json ownerAccountId, user = config.json dxt: guid) so a
+    multi-account machine targets the live account deterministically. Fall back to
+    the dir with the MOST-RECENTLY-written entry (recency, NOT most-entries: a
+    signed-out former account can have more history). (#recon-desktop-acct / #H8)"""
+    auth = _desktop_account_dir_from_config()
+    if auth is not None:
+        return auth
     if not DESKTOP_SESSIONS_ROOT.exists():
         return None
     locs = list(DESKTOP_SESSIONS_ROOT.rglob("local_*.json"))

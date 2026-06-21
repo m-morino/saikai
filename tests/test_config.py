@@ -323,6 +323,36 @@ def test_desktop_index_dir_prefers_recent_over_most_entries():
         saikai.DESKTOP_SESSIONS_ROOT = old_root
 
 
+def test_desktop_index_dir_prefers_authoritative_account_over_recency():
+    """When Desktop's config resolves an existing <org>/<user> account dir, sync
+    targets THAT — even if a different (signed-out) account dir was written more
+    recently. Falls back to recency only when config can't resolve. (#recon-desktop-acct)"""
+    base = Path(tempfile.mkdtemp())
+    appdata = base / "appdata"
+    (appdata / "Claude").mkdir(parents=True)
+    (appdata / "Claude" / "cowork-enabled-cli-ops.json").write_text(
+        json.dumps({"ownerAccountId": "ORG"}), encoding="utf-8")
+    (appdata / "Claude" / "config.json").write_text(json.dumps({
+        "dxt:allowlistEnabled:USER": True,
+        "dxt:allowlistLastUpdated:USER": "2026-06-18T00:00:00Z"}), encoding="utf-8")
+    root = appdata / "Claude" / "claude-code-sessions"
+    auth = root / "ORG" / "USER"
+    auth.mkdir(parents=True)
+    (auth / "local_old.json").write_text("{}", encoding="utf-8")
+    os.utime(auth / "local_old.json", (1_000, 1_000))                 # OLD
+    stale = root / "ORGX" / "USERX"
+    stale.mkdir(parents=True)
+    (stale / "local_new.json").write_text("{}", encoding="utf-8")
+    os.utime(stale / "local_new.json", (9_000_000, 9_000_000))        # NEWEST mtime
+    saved = (saikai._DESKTOP_APPDATA, saikai.DESKTOP_SESSIONS_ROOT)
+    try:
+        saikai._DESKTOP_APPDATA = appdata
+        saikai.DESKTOP_SESSIONS_ROOT = root
+        assert saikai._desktop_index_dir() == auth, "authoritative account must beat recency"
+    finally:
+        saikai._DESKTOP_APPDATA, saikai.DESKTOP_SESSIONS_ROOT = saved
+
+
 def test_dedup_sessions_by_id_keeps_newest():
     """Two case-variant project dirs holding the same sid must collapse to one row
     (newest mtime), so the sid-keyed table can't raise DuplicateKey. (#H2)"""
@@ -847,6 +877,8 @@ if __name__ == "__main__":
     print("PASS test_desktop_default_model_mirrors_newest_account_entry")
     test_sync_desktop_dedups_within_run_and_mirrors_model()
     print("PASS test_sync_desktop_dedups_within_run_and_mirrors_model")
+    test_desktop_index_dir_prefers_authoritative_account_over_recency()
+    print("PASS test_desktop_index_dir_prefers_authoritative_account_over_recency")
     test_dedup_sessions_by_id_keeps_newest()
     print("PASS test_dedup_sessions_by_id_keeps_newest")
     test_ctx_usage_skips_synthetic_and_zero_records()
