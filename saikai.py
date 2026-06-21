@@ -88,8 +88,13 @@ def _list_title(s: dict) -> str:
     through native ai-title → first user message → project label → short id, so a
     freshly-opened session shows the project immediately (never blank) and fills
     in as claude writes the first message and its own ai-title.
-    (project_short / _first_msg resolved at call time.)"""
-    return (s.get("custom_title") or s.get("ai_title") or _first_msg(s)
+    (project_short / _first_msg resolved at call time.)
+
+    `claude_name` (Claude's OWN session name, from the live registry) sits just
+    below the user's Shift+F2 override so the list matches what Claude shows in
+    its session/agent switcher — instead of a divergent saikai-only title."""
+    return (s.get("custom_title") or s.get("claude_name") or s.get("ai_title")
+            or _first_msg(s)
             or project_short(s.get("project_name") or "")
             or (s.get("id") or "")[:8])
 
@@ -1601,6 +1606,7 @@ _active_sessions_cache: dict[str, str] | None = None
 _active_kinds_cache: "dict[str, str] | None" = None   # sid -> kind ("interactive" | "bg" | …)
 _active_jobids_cache: "dict[str, str] | None" = None   # sid -> jobId (bg sessions → ~/.claude/jobs/<jobId>/)
 _active_remote_cache: set[str] | None = None   # live sids with bridgeSessionId (Remote Control)
+_active_names_cache: "dict[str, str] | None" = None   # sid -> Claude's own session name (the switcher label)
 _JOB_STATE_CACHE: dict = {}    # job_id -> (mtime, parsed state.json | None)
 
 
@@ -1611,13 +1617,14 @@ def _load_active_sessions() -> dict[str, str]:
     "bg" (a headless background agent/job) | … — the kind is exposed separately via
     _active_session_kinds (a `bg` session is live but NOT resumable / attachable)."""
     global _active_sessions_cache, _active_kinds_cache, _active_jobids_cache
-    global _active_remote_cache
+    global _active_remote_cache, _active_names_cache
     if _active_sessions_cache is not None:
         return _active_sessions_cache
     out: dict[str, str] = {}
     kinds: dict[str, str] = {}
     jobids: dict[str, str] = {}
     remote: set[str] = set()
+    names: dict[str, str] = {}
     sessions_dir = CLAUDE_CONFIG_ROOT / "sessions"
     scanned_ok = False
     # One fast process snapshot (no subprocess) to validate registered PIDs are
@@ -1646,6 +1653,12 @@ def _load_active_sessions() -> dict[str, str]:
                         # liveness check above: stale registry files have no TTL.
                         if isinstance(d.get("bridgeSessionId"), str) and d["bridgeSessionId"]:
                             remote.add(sid)
+                        # Claude's OWN session name (the label shown in its
+                        # session/agent switcher) — so saikai's list matches what
+                        # the user named/sees there, not a divergent local title.
+                        _nm = d.get("name")
+                        if isinstance(_nm, str) and _nm.strip():
+                            names[sid] = _nm.strip()
                 except Exception:
                     continue
             scanned_ok = True
@@ -1660,7 +1673,15 @@ def _load_active_sessions() -> dict[str, str]:
         _active_kinds_cache = kinds
         _active_jobids_cache = jobids
         _active_remote_cache = remote
+        _active_names_cache = names
     return out
+
+
+def _active_session_names() -> dict:
+    """sid -> Claude's own session name (the switcher label) for live registry
+    entries; {} until _load_active_sessions has run cleanly."""
+    _load_active_sessions()
+    return _active_names_cache or {}
 
 
 def _job_state_for(sid: str) -> "dict | None":
@@ -1705,11 +1726,12 @@ def _invalidate_active_sessions() -> None:
     stay frozen at the launch-time snapshot for the whole picker lifetime (a
     session that exited elsewhere keeps showing Open/Running)."""
     global _active_sessions_cache, _active_kinds_cache, _active_jobids_cache
-    global _active_remote_cache
+    global _active_remote_cache, _active_names_cache
     _active_sessions_cache = None
     _active_kinds_cache = None
     _active_jobids_cache = None
     _active_remote_cache = None
+    _active_names_cache = None
 
 
 def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> dict:
@@ -1744,6 +1766,7 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
         "origin_cwd": origin_cwd,
         "worktree_origin_cwd": parsed.get("worktree_origin_cwd", ""),
         "git_branch": parsed.get("git_branch", ""),
+        "claude_name": _active_session_names().get(sid, ""),   # Claude's own switcher label (live sessions)
         "is_open": sid in active,
         "is_remote_control": sid in _active_remote_sessions(),
         # Default-DENY unknown live kinds: a session is non-attachable (is_bg) when
@@ -2387,13 +2410,13 @@ def label_for(s: dict) -> str:
 
 
 def _pane_title(s: "dict | None", sid: str, term=None) -> str:
-    """Human label for a live pane's tab — custom name (Shift+F2) → ai_title →
-    summary → first user message → the term's launch title (e.g. a new session's
-    folder name) → a short id only as a last resort, so a tab never shows just a
-    bare session id."""
+    """Human label for a live pane's tab — custom name (Shift+F2) → Claude's own
+    session name (switcher label) → ai_title → summary → first user message → the
+    term's launch title (e.g. a new session's folder name) → a short id only as a
+    last resort, so a tab never shows just a bare session id."""
     if s:
-        t = (s.get("custom_title") or s.get("ai_title") or s.get("summary")
-             or _first_msg(s) or "").strip()
+        t = (s.get("custom_title") or s.get("claude_name") or s.get("ai_title")
+             or s.get("summary") or _first_msg(s) or "").strip()
         if t:
             return t
     if term is not None:

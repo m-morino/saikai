@@ -660,6 +660,39 @@ def test_resolve_resume_cwd_prefers_recent_sibling():
     assert out == str(d2), "should pick the most-recent sibling cwd, not list-order first"
 
 
+def test_list_title_uses_claude_session_name_for_switcher_parity():
+    """saikai's list title should match Claude's OWN session name (the switcher
+    label, from the live registry) — below a user's Shift+F2 override, above the
+    saikai ai_title — so the same session reads the same in both tools."""
+    # Claude-named session → shows Claude's name (not the divergent ai_title).
+    assert saikai._list_title({"id": "s1", "claude_name": "ASCoM patent survey",
+                               "ai_title": "some local summary"}) == "ASCoM patent survey"
+    # User's Shift+F2 rename still wins over Claude's name.
+    assert saikai._list_title({"id": "s2", "custom_title": "my name",
+                               "claude_name": "claude name"}) == "my name"
+    # No Claude name (dormant / unnamed) → falls back to ai_title as before.
+    assert saikai._list_title({"id": "s3", "ai_title": "fallback title"}) == "fallback title"
+
+
+def test_enrich_session_carries_claude_name_from_registry():
+    """_enrich_session surfaces the live registry's session `name` as claude_name."""
+    saved = (saikai._active_sessions_cache, saikai._active_kinds_cache,
+             saikai._active_jobids_cache, saikai._active_names_cache)
+    try:
+        saikai._active_sessions_cache = {"sidN": "idle"}
+        saikai._active_kinds_cache = {"sidN": "interactive"}
+        saikai._active_jobids_cache = {}
+        saikai._active_names_cache = {"sidN": "Switcher Label"}
+        r = saikai._enrich_session("sidN", {"first_ts": "t", "origin_cwd": "/c", "real_msgs": []},
+                                   Path("/c/x.jsonl"), 0.0)
+        assert r["claude_name"] == "Switcher Label"
+        assert saikai._list_title(r) == "Switcher Label"
+    finally:
+        (saikai._active_sessions_cache, saikai._active_kinds_cache,
+         saikai._active_jobids_cache, saikai._active_names_cache) = saved
+        saikai._invalidate_active_sessions()
+
+
 def test_is_bg_default_denies_unknown_live_kind():
     """A LIVE session whose kind is non-empty and != 'interactive' (bg OR a future
     kind) is non-attachable (is_bg); a dormant session (absent from the registry)
@@ -919,6 +952,10 @@ if __name__ == "__main__":
     print("PASS test_session_pid_live_rejects_reused_pid")
     test_resolve_resume_cwd_prefers_recent_sibling()
     print("PASS test_resolve_resume_cwd_prefers_recent_sibling")
+    test_list_title_uses_claude_session_name_for_switcher_parity()
+    print("PASS test_list_title_uses_claude_session_name_for_switcher_parity")
+    test_enrich_session_carries_claude_name_from_registry()
+    print("PASS test_enrich_session_carries_claude_name_from_registry")
     test_is_bg_default_denies_unknown_live_kind()
     print("PASS test_is_bg_default_denies_unknown_live_kind")
     test_bg_job_state_join_and_marker()
