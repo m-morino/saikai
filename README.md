@@ -80,7 +80,7 @@ Set `display.color_by` to `worktree`, `topic`, or `none` to change the grouping.
 The leading glyph is the session's status:
 
 `~` working · `?` waiting for you · `!` finished, awaiting your reply · `=` idle
-live pane, no reply due · `@` open elsewhere · `+` active · `.` recent · `*` favorite ·
+live pane, no reply due · `R` Remote Control · `@` open elsewhere · `+` active · `.` recent · `*` favorite ·
 `x` hidden
 
 ![The list grouped by date, with a ★ favorite, status markers, and the sort/group state in the status bar](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-browse.svg)

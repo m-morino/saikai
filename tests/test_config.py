@@ -299,6 +299,40 @@ def test_activity_marker_bg_agent_distinct_from_open():
     assert "&" not in saikai._activity_marker({"is_open": True})
 
 
+def test_remote_control_registry_and_marker():
+    """A live registry bridgeSessionId marks in-session Remote Control distinctly;
+    stale/dead entries must never leak an R marker. Background kind still wins."""
+    d = Path(tempfile.mkdtemp())
+    (d / "sessions").mkdir()
+    (d / "sessions" / "101.json").write_text(json.dumps({
+        "pid": 101, "sessionId": "rc-live", "status": "busy",
+        "kind": "interactive", "bridgeSessionId": "session_abc",
+    }), encoding="utf-8")
+    (d / "sessions" / "102.json").write_text(json.dumps({
+        "pid": 102, "sessionId": "rc-dead", "status": "idle",
+        "kind": "interactive", "bridgeSessionId": "session_stale",
+    }), encoding="utf-8")
+    saved_root = saikai.CLAUDE_CONFIG_ROOT
+    saved_live = saikai._is_session_pid_live
+    try:
+        saikai.CLAUDE_CONFIG_ROOT = d
+        saikai._is_session_pid_live = lambda pid, idx: pid == 101
+        saikai._invalidate_active_sessions()
+        assert saikai._active_remote_sessions() == {"rc-live"}
+        parsed = {"first_ts": "t", "origin_cwd": "/c", "real_msgs": []}
+        live = saikai._enrich_session("rc-live", parsed, Path("/c/live.jsonl"), 0.0)
+        dead = saikai._enrich_session("rc-dead", parsed, Path("/c/dead.jsonl"), 0.0)
+        assert live["is_remote_control"] is True
+        assert dead["is_remote_control"] is False
+        assert "R" in saikai._activity_marker(live)
+        assert "R" not in saikai._activity_marker(dead)
+        assert "&" in saikai._activity_marker({"is_bg": True, "is_remote_control": True})
+    finally:
+        saikai.CLAUDE_CONFIG_ROOT = saved_root
+        saikai._is_session_pid_live = saved_live
+        saikai._invalidate_active_sessions()
+
+
 def test_desktop_index_dir_prefers_recent_over_most_entries():
     """The sync target is the account Desktop is CURRENTLY writing to (newest
     local_*.json), not the one with the most history — else sync lands in a
@@ -857,6 +891,8 @@ if __name__ == "__main__":
     print("PASS test_child_spawn_env_strips_virtualenv_from_var_and_path")
     test_activity_marker_bg_agent_distinct_from_open()
     print("PASS test_activity_marker_bg_agent_distinct_from_open")
+    test_remote_control_registry_and_marker()
+    print("PASS test_remote_control_registry_and_marker")
     test_desktop_index_dir_prefers_recent_over_most_entries()
     print("PASS test_desktop_index_dir_prefers_recent_over_most_entries")
     test_parse_session_survives_nondict_line_and_message()

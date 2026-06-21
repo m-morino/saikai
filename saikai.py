@@ -1600,6 +1600,7 @@ def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
 _active_sessions_cache: dict[str, str] | None = None
 _active_kinds_cache: "dict[str, str] | None" = None   # sid -> kind ("interactive" | "bg" | …)
 _active_jobids_cache: "dict[str, str] | None" = None   # sid -> jobId (bg sessions → ~/.claude/jobs/<jobId>/)
+_active_remote_cache: set[str] | None = None   # live sids with bridgeSessionId (Remote Control)
 _JOB_STATE_CACHE: dict = {}    # job_id -> (mtime, parsed state.json | None)
 
 
@@ -1610,11 +1611,13 @@ def _load_active_sessions() -> dict[str, str]:
     "bg" (a headless background agent/job) | … — the kind is exposed separately via
     _active_session_kinds (a `bg` session is live but NOT resumable / attachable)."""
     global _active_sessions_cache, _active_kinds_cache, _active_jobids_cache
+    global _active_remote_cache
     if _active_sessions_cache is not None:
         return _active_sessions_cache
     out: dict[str, str] = {}
     kinds: dict[str, str] = {}
     jobids: dict[str, str] = {}
+    remote: set[str] = set()
     sessions_dir = CLAUDE_CONFIG_ROOT / "sessions"
     scanned_ok = False
     # One fast process snapshot (no subprocess) to validate registered PIDs are
@@ -1638,6 +1641,11 @@ def _load_active_sessions() -> dict[str, str]:
                         _jid = d.get("jobId")
                         if _jid:
                             jobids[sid] = str(_jid)
+                        # In-session `/remote-control` adds bridgeSessionId to
+                        # this live registry entry. Only accept it after the PID
+                        # liveness check above: stale registry files have no TTL.
+                        if isinstance(d.get("bridgeSessionId"), str) and d["bridgeSessionId"]:
+                            remote.add(sid)
                 except Exception:
                     continue
             scanned_ok = True
@@ -1651,6 +1659,7 @@ def _load_active_sessions() -> dict[str, str]:
         _active_sessions_cache = out
         _active_kinds_cache = kinds
         _active_jobids_cache = jobids
+        _active_remote_cache = remote
     return out
 
 
@@ -1684,15 +1693,23 @@ def _active_session_kinds() -> dict:
     return _active_kinds_cache or {}
 
 
+def _active_remote_sessions() -> set[str]:
+    """Live session ids whose Claude registry entry has Remote Control enabled."""
+    _load_active_sessions()
+    return _active_remote_cache or set()
+
+
 def _invalidate_active_sessions() -> None:
     """Drop the memoised live-session registry so the next _load_active_sessions
     re-reads ~/.claude/sessions. Called on reload — otherwise is_open / is_active
     stay frozen at the launch-time snapshot for the whole picker lifetime (a
     session that exited elsewhere keeps showing Open/Running)."""
     global _active_sessions_cache, _active_kinds_cache, _active_jobids_cache
+    global _active_remote_cache
     _active_sessions_cache = None
     _active_kinds_cache = None
     _active_jobids_cache = None
+    _active_remote_cache = None
 
 
 def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> dict:
@@ -1728,6 +1745,7 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
         "worktree_origin_cwd": parsed.get("worktree_origin_cwd", ""),
         "git_branch": parsed.get("git_branch", ""),
         "is_open": sid in active,
+        "is_remote_control": sid in _active_remote_sessions(),
         # Default-DENY unknown live kinds: a session is non-attachable (is_bg) when
         # it is LIVE with a non-empty kind other than "interactive". Only bg + an
         # interactive kind exist today, but a future kind defaults to NOT-resumable
@@ -2727,7 +2745,7 @@ _LIVE_MARKER = {
     "busy":    ("~", "cyan"),   # working / running
 }
 
-# Per-state colour for the TUI list's activity marker (the ? ~ ! = @ + . glyph),
+# Per-state colour for the TUI list's activity marker (the ? ~ ! = R @ + . glyph),
 # which was distinguished by GLYPH only. Tint it so state reads at a glance, using
 # the SAME palette as the toast severities ($warning≈yellow, $success≈green) and
 # the CLI --table _activity_marker — so the colour language is consistent across
@@ -2737,6 +2755,7 @@ _LIVE_MARKER = {
 _MARKER_COLOR = {_g: _c for _g, _c in _LIVE_MARKER.values()}
 _MARKER_COLOR.update({
     "!": "yellow",    # reply due — your last turn is unanswered (statusbar !M)
+    "R": "cyan",      # Remote Control enabled in another Claude session
     "@": "green",     # opened in another window
     "&": "magenta",   # running bg agent/job (headless; colour = job state: yellow=blocked, red=failed, dim=done)
     "+": "green",     # recently active
@@ -2755,7 +2774,7 @@ _TABLE_NA_CACHE: dict = {}   # mtime-keyed reply-due cache for the --table activ
 
 
 def _activity_marker(s: dict) -> str:
-    """Activity column: open-busy / open-idle / active / reply-due / recent."""
+    """Activity column: bg / Remote Control / open / active / reply-due / recent."""
     if s.get("is_bg"):
         # Same glyph '&' (no new marker — '?' already means live-waiting); the bg
         # JOB state is conveyed by COLOUR so it can't collide with other markers.
@@ -2767,6 +2786,8 @@ def _activity_marker(s: dict) -> str:
         if _jst == "done":
             return _c("&", DIM)              # bg job finished
         return _c("&", MAGENTA, BOLD)        # running background agent/job (headless)
+    if s.get("is_remote_control"):
+        return _c("R", CYAN, BOLD)       # open with Claude Remote Control enabled
     if s.get("is_open"):
         if s.get("session_status") == "busy":
             return _c("@", CYAN, BOLD)   # open & currently responding
@@ -2877,7 +2898,7 @@ def display_table(sessions: list[dict], repo: Path | None, show_project: bool,
     legend = (f"  {len(sessions)} sessions{mode_tag}  ·  "
               f"{_c('*', GOLD)} fav  {_c('+', GREEN)} active(<5m)  "
               f"{_c('.', YELLOW)} recent(<30m)  {_c('x', RED)} hidden  "
-              f"{_c('@', CYAN)} open  ·  saikai to resume")
+              f"{_c('R', CYAN)} remote-control  {_c('@', GREEN)} open  ·  saikai to resume")
     print(_c(legend, DIM))
     print()
 
@@ -4189,7 +4210,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  Age       last 1d / 3d / 7d / 30d / All time\n"
                 "  Search    [yellow]/[/yellow] or type to open the bar; tokens AND with text + each other —\n"
                 "            :fav  :hidden  :open  :active  :recent   (Esc clears)\n"
-                "  Markers   @ open elsewhere · & bg agent (yellow=blocked/needs-you, red=failed, dim=done) · + active · . recent · live ~ busy · ? waiting · ! reply due · = idle · * fav · x hidden\n"
+                "  Markers   R remote-control · @ open elsewhere · & bg agent (yellow=blocked/needs-you, red=failed, dim=done) · + active · . recent · live ~ busy · ? waiting · ! reply due · = idle · * fav · x hidden\n"
                 "  [yellow]/[/yellow] shows the bar with the dropdowns; [yellow]Tab[/yellow]/[yellow]Shift-Tab[/yellow] walk into them, [yellow]Enter[/yellow]\n"
                 "  opens one. Leader [yellow]s[/yellow]/[yellow]o[/yellow] cycles the sort column / direction without the bar\n"
                 "  (a column-header click still sorts too)\n\n"
@@ -5427,7 +5448,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # still unanswered — the same "reply due" idea as the live ! above,
                     # but for a not-running session (resume it to get the reply). Ranks
                     # below + (just-touched) and above . (merely recent).
-                    marker_a = ("&" if s.get("is_bg") else "@" if s.get("is_open")
+                    marker_a = ("&" if s.get("is_bg")
+                                else "R" if s.get("is_remote_control")
+                                else "@" if s.get("is_open")
                                 else "+" if s.get("is_active")
                                 else "!" if _needs_attention(s, self._na_cache)
                                 else "." if s.get("is_recent") else " ")
