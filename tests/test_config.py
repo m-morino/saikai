@@ -316,6 +316,57 @@ def test_activity_marker_shell_distinct_from_open():
     assert saikai._MARKER_COLOR.get("$") == "yellow"
 
 
+def test_complete_dir_lists_and_filters_child_dirs():
+    """_complete_dir backs the NewSessionScreen path autocomplete: a trailing
+    separator lists a folder's child DIRECTORIES (never files), and a partial
+    last segment prefix-filters them case-insensitively. (#dir-complete)"""
+    with tempfile.TemporaryDirectory() as td:
+        for d in ("alpha", "alphabet", "beta", ".hidden"):
+            os.mkdir(os.path.join(td, d))
+        with open(os.path.join(td, "afile.txt"), "w") as f:
+            f.write("x")  # a FILE — must never appear in completions
+
+        # trailing sep → all child dirs, no files
+        all_full = {full for _lbl, full in saikai._complete_dir(td + os.sep)}
+        assert os.path.join(td, "alpha") in all_full
+        assert os.path.join(td, "beta") in all_full
+        assert os.path.join(td, ".hidden") in all_full
+        assert os.path.join(td, "afile.txt") not in all_full
+
+        # labels read as folders (name + separator)
+        labels = {lbl for lbl, _f in saikai._complete_dir(td + os.sep)}
+        assert ("alpha" + os.sep) in labels
+
+        # partial last segment → prefix filter (case-insensitive)
+        m = saikai._complete_dir(os.path.join(td, "ALP"))
+        names = sorted(full.rsplit(os.sep, 1)[-1] for _lbl, full in m)
+        assert names == ["alpha", "alphabet"]
+
+        # non-existent parent and empty input → [] (best-effort, no raise)
+        assert saikai._complete_dir(os.path.join(td, "nope", "deeper", "x")) == []
+        assert saikai._complete_dir("") == []
+        assert saikai._complete_dir("   ") == []
+
+
+def test_complete_dir_caches_scandir_per_parent():
+    """A cache dict memoises os.scandir per parent so per-keystroke typing in one
+    folder doesn't re-scan: the parent key is populated, and a later dir created
+    after the first call is NOT seen through the cache. (#dir-complete-cache)"""
+    with tempfile.TemporaryDirectory() as td:
+        os.mkdir(os.path.join(td, "one"))
+        cache: dict = {}
+        first = saikai._complete_dir(td + os.sep, cache)
+        assert any(full.endswith("one") for _l, full in first)
+        assert len(cache) == 1  # parent memoised
+        # create a new dir AFTER the cache is warm → cached call must not see it
+        os.mkdir(os.path.join(td, "two"))
+        cached = saikai._complete_dir(td + os.sep, cache)
+        assert not any(full.endswith("two") for _l, full in cached)
+        # a fresh (cache-less) call DOES see it
+        fresh = saikai._complete_dir(td + os.sep)
+        assert any(full.endswith("two") for _l, full in fresh)
+
+
 def test_remote_control_registry_and_marker():
     """A live registry bridgeSessionId marks in-session Remote Control distinctly;
     stale/dead entries must never leak an R marker. Background kind still wins."""
@@ -943,6 +994,10 @@ if __name__ == "__main__":
     print("PASS test_activity_marker_bg_agent_distinct_from_open")
     test_activity_marker_shell_distinct_from_open()
     print("PASS test_activity_marker_shell_distinct_from_open")
+    test_complete_dir_lists_and_filters_child_dirs()
+    print("PASS test_complete_dir_lists_and_filters_child_dirs")
+    test_complete_dir_caches_scandir_per_parent()
+    print("PASS test_complete_dir_caches_scandir_per_parent")
     test_remote_control_registry_and_marker()
     print("PASS test_remote_control_registry_and_marker")
     test_desktop_index_dir_prefers_recent_over_most_entries()

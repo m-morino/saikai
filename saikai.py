@@ -2456,6 +2456,47 @@ def _new_session_stub(sid: str, cwd: str, title: str) -> dict:
     return s
 
 
+def _complete_dir(val: str, cache: dict | None = None,
+                  limit: int = 50) -> list[tuple[str, str]]:
+    """Shell-style directory completion for the NewSessionScreen path Input.
+
+    Given a partially-typed path, return up to `limit` child directories of its
+    last segment's PARENT whose name matches the partial last segment — e.g.
+    "C:/Users/me/CLI/sai" → the dirs under .../CLI starting with "sai". A
+    trailing separator means "list this dir's children" (empty partial). Returns
+    [(label, full_path)] with label = name + os.sep so the list reads as folders.
+
+    `cache` (optional dict) memoises os.scandir per parent so per-keystroke
+    typing within one folder doesn't re-scan. Pure + Textual-free so it unit
+    tests without mounting the modal. Best-effort: [] on any error."""
+    val = os.path.expanduser((val or "").strip())
+    if not val:
+        return []
+    seps = (os.sep,) if not os.altsep else (os.sep, os.altsep)
+    if val[-1] in seps:
+        parent, partial = val, ""
+    else:
+        parent, partial = os.path.dirname(val), os.path.basename(val)
+    if not parent:
+        parent = "."
+    try:
+        key = os.path.normcase(os.path.abspath(parent))
+    except Exception:
+        return []
+    names = None if cache is None else cache.get(key)
+    if names is None:
+        try:
+            names = sorted((e.name for e in os.scandir(parent) if e.is_dir()),
+                           key=str.lower)
+        except Exception:
+            names = []
+        if cache is not None:
+            cache[key] = names
+    pl = partial.lower()
+    matches = [n for n in names if n.lower().startswith(pl)] if pl else names
+    return [(n + os.sep, os.path.join(parent, n)) for n in matches[:limit]]
+
+
 # ── Display ──────────────────────────────────────────────────────────────────
 def _find_session_jsonl(sid_prefix: str) -> Path | None:
     sid_prefix = _trim_sid(sid_prefix)
@@ -4396,50 +4437,126 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
     class NewSessionScreen(ModalScreen):
         """Pick a folder / git worktree, then start a FRESH claude session there.
-        Type a path + Enter to launch it, or pick a worktree / recent dir from the
-        list; Esc cancels. Returns the chosen path (or None) via dismiss()."""
+        Type a path (Tab completes child folders shell-style, ↓ picks from the
+        list), or select a recent dir; Enter launches, Esc cancels. Returns the
+        chosen path (or None) via dismiss()."""
         CSS = """
         NewSessionScreen { align: center middle; }
         #new-box { background: $panel; border: solid $accent; padding: 1 2;
                    width: 84; height: auto; max-height: 28; }
         #new-path { margin: 1 0; border: tall $accent; }
+        #new-hint { height: 1; }
         #new-dirs { height: auto; max-height: 16; }
         """
-        BINDINGS = [Binding("escape", "cancel", show=False)]
+        BINDINGS = [Binding("escape", "cancel", show=False),
+                    # Tab = shell-style path completion; intercept before the
+                    # default focus-next so typing a folder feels like a shell.
+                    Binding("tab", "complete", show=False, priority=True),
+                    Binding("down", "focus_list", show=False)]
 
         def __init__(self, base_dir, candidates):
             super().__init__()
             self._base_dir = base_dir
-            self._candidates = candidates           # list[(label, path)]
+            self._candidates = candidates           # list[(label, path)] recent dirs
+            self._scan_cache: dict = {}             # parent → child names (per-keystroke reuse)
+            self._opts: list = []                   # backs #new-dirs: (kind, path, label)
 
         def compose(self) -> ComposeResult:
             with Vertical(id="new-box"):
                 yield Static("[bold cyan]New claude session[/bold cyan]   "
-                             "[dim]type a folder + Enter, or pick a worktree / "
-                             "recent dir below · Esc cancels[/dim]")
+                             "[dim]type a folder · Tab completes · ↓ picks · "
+                             "Enter launches · Esc cancels[/dim]")
                 yield Input(value=self._base_dir, placeholder="folder path",
                             id="new-path")
-                if self._candidates:
-                    yield OptionList(*[Option(lbl) for lbl, _p in self._candidates],
-                                     id="new-dirs")
+                yield Static("", id="new-hint")
+                # Always present (even with no recent dirs) so completions can fill it.
+                yield OptionList(id="new-dirs")
 
         def on_mount(self) -> None:
+            self._populate(self._base_dir)
             try:
-                self.query_one("#new-path", Input).focus()
+                inp = self.query_one("#new-path", Input)
+                inp.focus()
+                inp.cursor_position = len(inp.value)
             except Exception:
                 pass
 
+        def _populate(self, val: str) -> None:
+            """Rebuild #new-dirs: recent dirs when the path is empty/unchanged,
+            else live shell-style directory completions for what's typed."""
+            v = (val or "").strip()
+            if not v or v == (self._base_dir or "").strip():
+                self._opts = [("recent", p, lbl) for lbl, p in self._candidates]
+                hint = "recent dirs" if self._candidates else ""
+            else:
+                self._opts = [("complete", full, lbl)
+                              for lbl, full in _complete_dir(v, self._scan_cache)]
+                hint = (f"{len(self._opts)} match{'' if len(self._opts) == 1 else 'es'}"
+                        if self._opts else "no matching folder")
+            try:
+                self.query_one("#new-hint", Static).update(f"[dim]{hint}[/dim]")
+                ol = self.query_one("#new-dirs", OptionList)
+                ol.clear_options()
+                if self._opts:
+                    ol.add_options([Option(lbl) for _k, _p, lbl in self._opts])
+            except Exception:
+                pass
+
+        def on_input_changed(self, event) -> None:
+            if getattr(event.input, "id", None) == "new-path":
+                self._populate(event.value)
+
         def action_cancel(self) -> None:
             self.dismiss(None)
+
+        def action_complete(self) -> None:
+            """Tab: extend the path to the longest common prefix of the matches
+            (or fully, when there's a single match). No-op when nothing extends."""
+            try:
+                inp = self.query_one("#new-path", Input)
+            except Exception:
+                return
+            comps = _complete_dir(inp.value, self._scan_cache)
+            if not comps:
+                return
+            new_val = (comps[0][1] + os.sep if len(comps) == 1
+                       else os.path.commonprefix([full for _lbl, full in comps]))
+            cur = os.path.expanduser((inp.value or "").strip())
+            if new_val and new_val != cur and len(new_val) >= len(cur):
+                inp.value = new_val
+                inp.cursor_position = len(new_val)
+                self._populate(new_val)
+
+        def action_focus_list(self) -> None:
+            try:
+                ol = self.query_one("#new-dirs", OptionList)
+                if ol.option_count:
+                    ol.focus()
+                    ol.highlighted = 0
+            except Exception:
+                pass
 
         def on_input_submitted(self, event) -> None:
             self.dismiss((event.value or "").strip() or None)
 
         def on_option_list_option_selected(self, event) -> None:
             try:
-                self.dismiss(self._candidates[event.option_index][1])
+                kind, path, _lbl = self._opts[event.option_index]
             except Exception:
                 self.dismiss(None)
+                return
+            if kind == "recent":
+                self.dismiss(path)                  # recent dir → launch immediately
+                return
+            # completion → drill into that folder, keeping the modal open to go deeper
+            try:
+                inp = self.query_one("#new-path", Input)
+                inp.value = path + os.sep
+                inp.cursor_position = len(inp.value)
+                inp.focus()
+                self._populate(inp.value)
+            except Exception:
+                pass
 
     class RenameScreen(ModalScreen):
         """Type a custom name for the selected session (Shift+F2). Enter saves;
