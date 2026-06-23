@@ -6474,6 +6474,24 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
 
+        def on_app_focus(self, event=None) -> None:
+            """The OS window regained focus (terminal FocusIn, ?1004). Textual
+            WIDGET focus did NOT change — the live pane still has it — so the
+            pane's own on_focus never fires, the cursor anchor goes stale, and WT
+            shows the IME disabled (×) on window switch until the next claude
+            redraw happens to re-anchor it (hence the intermittency: idle panes
+            stay ×, busy ones self-heal). Re-anchor the focused pane's cursor on
+            window focus-in, and again after the refresh Textual runs. (#ime-race)"""
+            w = getattr(self, "focused", None)
+            sync = getattr(w, "_sync_terminal_cursor", None)   # only AgentTerminal has it
+            if sync is None:
+                return
+            try:
+                sync(reason="focus")
+                self.call_after_refresh(lambda: sync(reason="focus"))
+            except Exception:
+                pass
+
         def _open_or_attach_live(self, sid: str, refresh: bool = True) -> None:
             """Resume an existing session as a live pane (or switch to it if it's
             already running)."""

@@ -1584,6 +1584,20 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             xy = _ime_anchor_xy(cx, cy, region.x, region.y, region.width, region.height)
             if xy is not None:
                 app.cursor_position = Offset(*xy)
+                # Textual only EMITS the cursor move/visibility to the real
+                # terminal during a CompositorUpdate (App._display). Setting
+                # cursor_position alone on an *idle* focus return never reaches
+                # the terminal, so WT keeps the IME disabled (×) until claude's
+                # next redraw pushes it — exactly the busy-OK / idle-× symptom.
+                # On a focus-triggered sync, force one repaint so the cursor is
+                # pushed to WT now. (Repaint-triggered syncs already ride a
+                # render, so we skip the refresh there to avoid a paint loop.)
+                # (#ime-race)
+                if reason == "focus":
+                    try:
+                        self.refresh(repaint=True)
+                    except Exception:
+                        pass
             # Log every focus-triggered sync (and any repaint that moves the anchor)
             # with the cursor-hidden state: if the × correlates with cursor_hidden
             # or xy=None, that pins the cause (blink-off vs region-not-ready). (#ime-race)
