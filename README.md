@@ -261,7 +261,11 @@ by OS and host terminal. Honest status:
 
 - On Windows, WezTerm and Windows Terminal use the same ConPTY and Win32
   clipboard paths. That does not guarantee identical key handling, cell widths,
-  IME behavior, or mouse behavior. WezTerm is the daily-driven terminal.
+  IME behavior, or mouse behavior. WezTerm is the daily-driven terminal; on
+  Windows Terminal the IME composition anchors at the claude prompt and the
+  cursor is re-pushed to the terminal on focus so IME stays enabled across
+  window/pane switches (Windows Terminal — unlike WezTerm — disables IME unless
+  the cursor was freshly positioned by a render).
 - **List-only mode** (`SAIKAI_SPLIT_LIVE=0`) avoids the PTY and live-pane
   clipboard paths, so it is the most portable way to use saikai.
 - Most regression tests can run without optional dependencies. Use `uv run` to

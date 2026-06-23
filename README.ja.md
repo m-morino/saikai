@@ -237,7 +237,11 @@ saikai 本体の大部分は Python + Textual ですが、実 PTY、クリップ
 
 - Windows の PTY とクリップボードは、WezTerm と Windows Terminal で同じ
   ConPTY / Win32 API 経路を通ります。ただし、キー入力、描画幅、IME、マウス操作
-  まで同一とは限りません。日常利用で確認しているのは WezTerm です。
+  まで同一とは限りません。日常利用で確認しているのは WezTerm です。Windows
+  Terminal では、IME 変換窓が claude プロンプト位置にアンカーし、フォーカス時に
+  カーソルを端末へ再 push してウィンドウ/ペイン切替後も IME を有効に保ちます
+  （WezTerm と違い Windows Terminal は、描画でカーソルが配置し直されないと IME を
+  無効化するため）。
 - **一覧専用モード**（`SAIKAI_SPLIT_LIVE=0`）では PTY とライブペインの
   クリップボード経路を使わないため、最も移植性の高い使い方です。
 - 多くの回帰テストは依存がなくても実行できますが、Textual Pilot と実 PTY
