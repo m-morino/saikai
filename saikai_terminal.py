@@ -1527,10 +1527,22 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # Anchor the IME the moment the pane is focused (don't wait for a repaint).
         if _IME_DEBUG:
             _log(f"on_focus sid={getattr(self, 'sid', None)} "
-                 f"WT={bool(os.environ.get('WT_SESSION'))}")
-        self._sync_terminal_cursor()
+                 f"WT={bool(os.environ.get('WT_SESSION'))} "
+                 f"has_focus={self.has_focus} scroll={self._scroll}")
+        self._sync_terminal_cursor(reason="focus")
+        # The immediate sync above can fire before layout settles — inside the
+        # focus event `content_region`/`has_focus` may not be valid yet, so the
+        # anchor silently skips and WT shows the IME disabled (×) on focus
+        # return, intermittently, depending on the layout/focus race. Re-anchor
+        # once the next refresh has settled geometry; idempotent when the
+        # immediate sync already landed. (#ime-race)
+        try:
+            self.call_after_refresh(
+                lambda: self._sync_terminal_cursor(reason="focus"))
+        except Exception:
+            pass
 
-    def _sync_terminal_cursor(self) -> None:
+    def _sync_terminal_cursor(self, reason: str = "repaint") -> None:
         """Anchor the real (hidden) terminal cursor at claude's cursor cell so the
         host terminal's IME / composition popup appears at the claude prompt — not
         wherever Textual last parked the cursor (e.g. the search box, which owns the
@@ -1543,6 +1555,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         the lock, then sets app.cursor_position OUTSIDE the lock (per the concurrency
         invariant — never marshal/block while holding self._lock)."""
         if Offset is None or self.is_dead or not self.has_focus or self._scroll != 0:
+            # Diagnostic: a focus-triggered sync that bails here is the suspected
+            # race — the pane regained focus but the cursor never got anchored,
+            # so WT may show the IME as disabled (×). (#ime-race)
+            if _IME_DEBUG and reason == "focus":
+                _log(f"ime SKIP sid={getattr(self, 'sid', None)} reason=focus "
+                     f"OffsetNone={Offset is None} dead={self.is_dead} "
+                     f"has_focus={self.has_focus} scroll={self._scroll}")
             return
         try:
             app = self.app
@@ -1557,6 +1576,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             try:
                 cx = int(screen.cursor.x)
                 cy = int(screen.cursor.y)
+                chid = bool(getattr(screen.cursor, "hidden", False))
             except Exception:
                 return
         try:
@@ -1564,11 +1584,15 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             xy = _ime_anchor_xy(cx, cy, region.x, region.y, region.width, region.height)
             if xy is not None:
                 app.cursor_position = Offset(*xy)
-                if _IME_DEBUG and xy != getattr(self, "_ime_log_xy", None):
-                    self._ime_log_xy = xy
-                    _log(f"ime anchor sid={getattr(self, 'sid', None)} cell={xy} "
-                         f"claude=({cx},{cy}) "
-                         f"region=({region.x},{region.y},{region.width}x{region.height})")
+            # Log every focus-triggered sync (and any repaint that moves the anchor)
+            # with the cursor-hidden state: if the × correlates with cursor_hidden
+            # or xy=None, that pins the cause (blink-off vs region-not-ready). (#ime-race)
+            if _IME_DEBUG and (reason == "focus" or xy != getattr(self, "_ime_log_xy", None)):
+                self._ime_log_xy = xy
+                _log(f"ime {'FOCUS' if reason == 'focus' else 'move'} "
+                     f"sid={getattr(self, 'sid', None)} cell={xy} "
+                     f"claude=({cx},{cy}) cursor_hidden={chid} "
+                     f"region=({region.x},{region.y},{region.width}x{region.height})")
         except Exception:
             pass
 
