@@ -113,10 +113,13 @@ def _color_key_for(s: dict, mode: str) -> str:
 
 def _color_legend(color_by: str) -> str:
     """Plain-language explanation shared by help and Settings."""
+    # Phrased as the guaranteed direction (same project → one stable colour);
+    # with a fixed palette two projects can share a hue, so we don't promise the
+    # reverse ("same colour = same project"). (#stable-hue)
     labels = {
-        "project": "Same title color = same project.",
-        "worktree": "Same title color = same worktree.",
-        "topic": "Same title color = same topic.",
+        "project": "Each project keeps one stable color.",
+        "worktree": "Each worktree keeps one stable color.",
+        "topic": "Each topic keeps one stable color.",
         "none": "Title colors are disabled.",
     }
     return labels.get(color_by, labels["project"]) + " Symbols show state."
@@ -3085,10 +3088,12 @@ _TOPIC_PALETTE = ("magenta", "cyan", "yellow", "green", "bright_blue",
 
 
 def _stable_color(value: str, palette) -> str:
-    """Hash-only fallback when no collision-resolving mapping is in play.
-    Prefer _build_color_map for the picker: it linearly probes the palette
-    so distinct values are guaranteed distinct colours when count ≤ palette
-    size."""
+    """A value's hue is a PURE function of the value: `palette[hash % len]`, the
+    same in every view and across runs, independent of what else is on screen.
+    Two different values may collide onto one colour (the cell text + state
+    marker still disambiguate) — we deliberately trade guaranteed-distinct hues
+    for a STABLE association, so a project doesn't change colour when you filter,
+    sort, or a new session appears. (#stable-hue)"""
     if not value:
         return ""
     import hashlib
@@ -3097,27 +3102,20 @@ def _stable_color(value: str, palette) -> str:
 
 
 def _build_color_map(values, palette) -> dict[str, str]:
-    """Assign each unique value a distinct palette colour (linear-probe over
-    the hash slot). When unique_count ≤ palette size we get an injective
-    mapping — same input → same colour across runs, and no two visible
-    values share a colour. Values overflow by hashing to the same slot only
-    once the palette is full."""
-    import hashlib
-    used: dict[str, str] = {}
-    occupied: set[str] = set()
-    # Sort so the assignment is deterministic regardless of iteration order
-    # of the input collection (sets etc.).
-    for v in sorted({v for v in values if v}):
-        h = int(hashlib.md5(v.encode("utf-8")).hexdigest(), 16) % len(palette)
-        for i in range(len(palette)):
-            c = palette[(h + i) % len(palette)]
-            if c not in occupied:
-                used[v] = c
-                occupied.add(c)
-                break
-        else:
-            used[v] = palette[h]   # palette exhausted — wrap
-    return used
+    """value → stable hue for a column/title (project | worktree | topic).
+
+    Each unique value maps to `_stable_color(v)` — a pure function of the value,
+    so the same project/topic renders in the same colour in every view and never
+    shifts when the visible set changes (filter / search / sort / a new session
+    appearing). This favours recognition STABILITY over distinctness: with only
+    len(palette) hues, two values can collide onto one colour once enough are
+    visible (birthday-bound), but the cell text and the state marker still tell
+    them apart.
+
+    (Earlier this linear-probed the *visible* set to guarantee distinct hues, but
+    that made a value's colour depend on its co-visible neighbours — so a project
+    changed colour mid-session on a filter/search/sort. #stable-hue)"""
+    return {v: _stable_color(v, palette) for v in {v for v in values if v}}
 
 
 # System memory snapshot for the live-pane gate. Any field may be None on a

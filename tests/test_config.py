@@ -189,13 +189,17 @@ def test_resolved_settings_covers_and_applies_runtime_knobs():
 
 
 def test_color_legend_explains_context_without_false_last_color_claim():
-    project = saikai._color_legend("project")
-    assert "same project" in project.lower()
-    assert "symbols show state" in project.lower()
-    assert "last column" not in project.lower()
+    project = saikai._color_legend("project").lower()
+    # #stable-hue: legend asserts the guaranteed direction (each project keeps a
+    # stable colour), NOT the reverse injective claim ("same colour = same
+    # project") which a fixed palette can't honour once two projects collide.
+    assert "project" in project and "stable color" in project
+    assert "same color = same project" not in project
+    assert "symbols show state" in project
+    assert "last column" not in project
 
-    assert "same worktree" in saikai._color_legend("worktree").lower()
-    assert "same topic" in saikai._color_legend("topic").lower()
+    assert "stable color" in saikai._color_legend("worktree").lower()
+    assert "stable color" in saikai._color_legend("topic").lower()
     assert "title colors are disabled" in saikai._color_legend("none").lower()
 
 
@@ -314,6 +318,27 @@ def test_activity_marker_shell_distinct_from_open():
     assert "&" in saikai._activity_marker({"is_bg": True, "is_open": True, "session_status": "shell"})
     # '$' is colour-mapped for the TUI list marker too
     assert saikai._MARKER_COLOR.get("$") == "yellow"
+
+
+def test_color_map_is_stable_across_visible_sets():
+    """Option A (#stable-hue): a value's hue is a pure function of the value, so
+    a project keeps its colour when the visible set changes (filter / search /
+    sort / a new session appearing). Guards against the old linear-probe map,
+    where a project's colour depended on its co-visible neighbours and shifted
+    between views."""
+    pal = saikai._PROJECT_PALETTE
+    alone = saikai._build_color_map(["proj-b"], pal)
+    crowded = saikai._build_color_map(["proj-a", "proj-b", "proj-c"], pal)
+    # proj-a and proj-b collide on the 11-colour palette; under the OLD probe map
+    # proj-b shifted when proj-a appeared. Now it must not.
+    assert alone["proj-b"] == crowded["proj-b"]
+    # the map agrees with the single-value helper, and is order-independent
+    assert crowded["proj-b"] == saikai._stable_color("proj-b", pal)
+    assert (saikai._build_color_map(["x", "y"], pal)
+            == saikai._build_color_map(["y", "x"], pal))
+    # empty / falsy values are dropped, never coloured
+    assert "" not in saikai._build_color_map(["", "keep"], pal)
+    assert saikai._stable_color("", pal) == ""
 
 
 def test_complete_dir_lists_and_filters_child_dirs():
@@ -994,6 +1019,8 @@ if __name__ == "__main__":
     print("PASS test_activity_marker_bg_agent_distinct_from_open")
     test_activity_marker_shell_distinct_from_open()
     print("PASS test_activity_marker_shell_distinct_from_open")
+    test_color_map_is_stable_across_visible_sets()
+    print("PASS test_color_map_is_stable_across_visible_sets")
     test_complete_dir_lists_and_filters_child_dirs()
     print("PASS test_complete_dir_lists_and_filters_child_dirs")
     test_complete_dir_caches_scandir_per_parent()
