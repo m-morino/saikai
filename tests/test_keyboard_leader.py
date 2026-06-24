@@ -37,7 +37,7 @@ ID2ACT = {
     "group": "cycle_group", "new": "new_session",
     "freeze": "freeze_pane", "restore": "restore_panes", "close": "close_live",
     "prev_tab": "prev_tab", "next_tab": "next_tab", "attention": "next_attention",
-    "toggle_list": "toggle_list", "rename": "rename",
+    "toggle_list": "toggle_list", "rename": "rename", "notifs": "notifications",
 }
 
 

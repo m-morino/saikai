@@ -384,6 +384,10 @@ DEFAULT_LEADER_LETTERS = {           # action id -> letter (config orientation)
     "restore": "p", "freeze": "z", "attention": "a", "toggle_list": "l",
     "close": "x", "prev_tab": "[", "next_tab": "]", "mark": " ",
     "settings": ",", "search_bar": "/",
+    # 'notifs' (recall dismissed toasts) also has an F11 Binding, but Windows
+    # Terminal binds F11 to full-screen and eats it — so give it a leader letter
+    # (Space m) that no host terminal intercepts. (#wt-f11)
+    "notifs": "m",
     # b2 (Task 11): the human-gated checkpoint→/clear→rehydrate flow. A LEADER
     # action (not an F-key) because the F-key / Shift+F-key space is full AND a
     # deliberate, discoverable two-keystroke gesture (which-key hinted) suits a
@@ -409,7 +413,7 @@ LEADER_FAMILY_OF = {
     "copy_prompt": "Session", "copy_summary": "Session",
     "preview_changes": "Session", "refresh": "Session",
     "sort": "View", "order": "View", "cycle_group": "View",
-    "toggle_tree": "View", "toggle_list": "View",
+    "toggle_tree": "View", "toggle_list": "View", "notifications": "View",
     "settings": "View", "toggle_search_bar": "View",
     "new_session": "Panes", "restore_panes": "Panes", "freeze_pane": "Panes",
     "next_attention": "Panes", "close_live": "Panes", "prev_tab": "Panes",
