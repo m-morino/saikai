@@ -258,6 +258,23 @@ def test_classify_pty_status_basics():
     assert rt.classify_pty_status("Would you like to continue?", "⠹ working") == "busy"
 
 
+def test_alt_screen_suppresses_false_needs_input():
+    """claude's alt-screen full-screen UIs (agent switcher, /help) render menu-like
+    text that _WAITING_RE / _MENU_RE misfire on — flipping the pane to a false
+    'needs input', and back as the TUI redraws on scroll. _classify suppresses a
+    body-only 'waiting' while in alt-screen (real task prompts use the normal
+    buffer); the title-spinner 'busy' still wins. (#alt-waiting)"""
+    term = rt.AgentTerminal(["agent"], status_classifier=rt.classify_pty_status)
+    menu = "1. one\n2. two\n3. three\n"
+    term._alt.in_alt = False
+    assert term._classify(menu, "") == "waiting"        # normal buffer → menu reads as waiting
+    term._alt.in_alt = True
+    assert term._classify(menu, "") == "idle"           # alt-screen TUI menu → NOT needs-input
+    assert term._classify(menu, "⠋ working") == "busy"  # spinner wins even in alt-screen
+    # a non-menu idle screen stays idle regardless of alt-screen
+    assert term._classify("just output", "✳ ready") == "idle"
+
+
 def test_classify_trust_folder_dialog_is_waiting():
     """The startup 'trust this folder?' gate blocks the session on the human, but
     it renders at the TOP of the screen (rest blank) so it sits OUTSIDE the tail
@@ -1002,6 +1019,8 @@ if __name__ == "__main__":
     print("PASS test_refresh_status_polls_pending_flip_on_static_screen")
     test_classify_pty_status_basics()
     print("PASS test_classify_pty_status_basics")
+    test_alt_screen_suppresses_false_needs_input()
+    print("PASS test_alt_screen_suppresses_false_needs_input")
     test_classify_trust_folder_dialog_is_waiting()
     print("PASS test_classify_trust_folder_dialog_is_waiting")
     test_status_classifier_profiles_and_injection()

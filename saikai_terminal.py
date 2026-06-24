@@ -1386,8 +1386,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # glyph), not a rolling byte tail: a tail keeps stale "esc to interrupt"
         # / answered prompts that scrolled up and would misclassify an idle pane.
         _txt, _title = self._current_screen()
-        classifier = getattr(self, "_status_classifier", classify_pty_status)
-        self._update_status(classifier(_txt, _title))
+        self._update_status(self._classify(_txt, _title))
 
     def _current_screen(self) -> tuple:
         """(visible text, title) under the lock. `title` is claude's OSC-0 title
@@ -1409,6 +1408,23 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._cached_screen = (txt, title)
             return txt, title
 
+    def _classify(self, txt: str, title: str) -> str:
+        """Run the status classifier, then suppress a body-text 'waiting' while on
+        the ALT screen. claude's full-screen TUIs (the agent switcher, /help, …)
+        render numbered-menu / choose-one text that _WAITING_RE / _MENU_RE misfire
+        on, flipping the pane to a false 'needs input' — and back, as the TUI
+        redraws on scroll/selection (the reported bug). claude's REAL task prompts
+        (permission / forced choice) render in the NORMAL buffer, so a 'waiting'
+        reached only through the alt-screen body isn't real → treat it as idle. The
+        title-spinner 'busy' path is unaffected (it returns before the waiting
+        check), so a genuinely working alt-screen UI still reads busy. (#alt-waiting)"""
+        classifier = getattr(self, "_status_classifier", classify_pty_status)
+        st = classifier(txt, title)
+        alt = getattr(self, "_alt", None)
+        if st == "waiting" and alt is not None and alt.in_alt:
+            return "idle"
+        return st
+
     def refresh_status(self) -> None:
         """Re-classify from the current screen + title. The host calls this
         periodically so a pane that went idle WITHOUT new output (no reader tick
@@ -1428,8 +1444,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         self._last_poll_ver = self._scr_ver
         txt, title = self._current_screen()
-        classifier = getattr(self, "_status_classifier", classify_pty_status)
-        self._update_status(classifier(txt, title))
+        self._update_status(self._classify(txt, title))
 
     def _update_status(self, new: str) -> None:
         """Debounce: a new status must persist >=2 ticks (reader OR host poll)
