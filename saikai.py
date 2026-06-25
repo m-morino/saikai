@@ -5065,6 +5065,29 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.push_screen(NotificationsScreen(getattr(self, "_notif_log", [])))
 
         def on_mount(self) -> None:
+            # Gated OUTPUT capture: tee everything saikai writes to the REAL
+            # terminal to a file, so the cursor/IME escape stream around focus can
+            # be inspected byte-for-byte (does our ?25h survive, or does a later
+            # write re-hide it?). Off unless SAIKAI_OUT_CAPTURE=<path>. (#wt-ime)
+            _ocap = os.environ.get("SAIKAI_OUT_CAPTURE")
+            if _ocap:
+                try:
+                    _drv = getattr(self, "_driver", None)
+                    if _drv is not None and not getattr(_drv, "_saikai_teed", False):
+                        _orig_w = _drv.write
+                        _cf = open(_ocap, "a", encoding="utf-8", errors="replace")
+
+                        def _tee(data, _o=_orig_w, _f=_cf):
+                            try:
+                                _f.write(repr(data) + "\n")
+                                _f.flush()
+                            except Exception:
+                                pass
+                            return _o(data)
+                        _drv.write = _tee
+                        _drv._saikai_teed = True
+                except Exception:
+                    pass
             # sid -> session map so the preview pane can warm its own cache on
             # demand: rendered and cached on a cache miss.
             self._sid_index = {s.get("id"): s for s in all_sessions}
@@ -6491,12 +6514,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if sync is None:
                 return
             try:
-                # Re-show the hardware cursor (WT disables IME on a hidden cursor)
-                # and re-anchor it — the window regaining focus doesn't fire the
-                # pane's own on_focus. (#wt-ime-cursor)
-                show = getattr(w, "_show_hw_cursor", None)
-                if show is not None:
-                    show(True)
+                # The OS window regaining focus doesn't fire the pane's own
+                # on_focus, so resume its cursor-blink keepalive and re-anchor —
+                # otherwise WT leaves the IME disabled until the next redraw.
+                # (#wt-ime-blink)
+                tmr = getattr(w, "_blink_timer", None)
+                if tmr is not None:
+                    try:
+                        w._blink_on = True
+                        tmr.resume()
+                    except Exception:
+                        pass
                 sync(reason="focus")
                 self.call_after_refresh(lambda: sync(reason="focus"))
             except Exception:

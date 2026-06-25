@@ -318,32 +318,46 @@ def test_status_classifier_profiles_and_injection():
     assert rt.ClaudeTerminal is rt.AgentTerminal  # compatibility alias
 
 
-def test_show_hw_cursor_emits_dec_and_is_guarded():
-    """_show_hw_cursor toggles the REAL cursor so WT keeps the IME enabled
-    (#wt-ime-cursor): \\x1b[?25h on focus, ?25l on blur. It must (a) never raise
-    with no mounted app/driver, and (b) write the DEC sequence through the driver
-    when one is reachable. We override the `app` property on a throwaway subclass
-    so the test needs no real Textual mount."""
-    # (a) headless: self.app raises → helper must swallow it, no exception.
-    bare = rt.AgentTerminal.__new__(rt.AgentTerminal)
-    bare.sid = "x"
-    bare._show_hw_cursor(True)
-    bare._show_hw_cursor(False)
+def test_blink_tick_toggles_blink_for_ime_keepalive():
+    """The WT IME fix (#wt-ime-blink): _blink_tick toggles _blink_on and re-anchors
+    the cursor every 0.5s while focused, so WT keeps re-receiving the cursor move
+    and leaves the IME enabled (a stock Textual Input keeps IME alive the same way
+    via its 0.5s cursor blink; saikai lacked the keepalive → idle panes went ×).
+    It must be a no-op when the pane isn't focused."""
+    calls = []
 
-    # (b) with a fake driver: assert the exact DEC bytes (Windows-gated).
-    writes = []
-    class _Drv:
-        def write(self, s): writes.append(s)
-    class _Shim(rt.AgentTerminal):
-        app = property(lambda self: type("A", (), {"_driver": _Drv()})())
-    t = _Shim.__new__(_Shim)
-    t.sid = "y"
-    t._show_hw_cursor(True)
-    t._show_hw_cursor(False)
-    if rt._IS_WIN:
-        assert writes == ["\x1b[?25h", "\x1b[?25l"]
-    else:
-        assert writes == []   # off-Windows is a no-op by design
+    class _Focused(rt.AgentTerminal):
+        has_focus = True
+        is_dead = False
+        def _sync_terminal_cursor(self, reason="repaint"):
+            calls.append(reason)     # stand in for re-anchor + refresh
+
+    t = _Focused.__new__(_Focused)
+    t._scroll = 0
+    t._blink_on = True
+    t._blink_tick()
+    assert t._blink_on is False and calls == ["focus"]   # toggled + re-anchored
+    t._blink_tick()
+    assert t._blink_on is True and calls == ["focus", "focus"]
+
+    class _Unfocused(rt.AgentTerminal):
+        has_focus = False
+        is_dead = False
+        def _sync_terminal_cursor(self, reason="repaint"):
+            calls.append("UNFOCUSED")
+
+    u = _Unfocused.__new__(_Unfocused)
+    u._scroll = 0
+    u._blink_on = True
+    u._blink_tick()
+    assert u._blink_on is True and "UNFOCUSED" not in calls   # no-op unfocused
+
+    # scrolled-back focused pane is also a no-op (cursor isn't at the live bottom)
+    s = _Focused.__new__(_Focused)
+    s._scroll = 5
+    s._blink_on = True
+    s._blink_tick()
+    assert s._blink_on is True
 
 
 def test_encode_key_meta_and_release():
@@ -1047,8 +1061,8 @@ if __name__ == "__main__":
     print("PASS test_refresh_status_polls_pending_flip_on_static_screen")
     test_classify_pty_status_basics()
     print("PASS test_classify_pty_status_basics")
-    test_show_hw_cursor_emits_dec_and_is_guarded()
-    print("PASS test_show_hw_cursor_emits_dec_and_is_guarded")
+    test_blink_tick_toggles_blink_for_ime_keepalive()
+    print("PASS test_blink_tick_toggles_blink_for_ime_keepalive")
     test_alt_screen_suppresses_false_needs_input()
     print("PASS test_alt_screen_suppresses_false_needs_input")
     test_classify_trust_folder_dialog_is_waiting()
