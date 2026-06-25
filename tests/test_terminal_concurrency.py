@@ -318,6 +318,34 @@ def test_status_classifier_profiles_and_injection():
     assert rt.ClaudeTerminal is rt.AgentTerminal  # compatibility alias
 
 
+def test_show_hw_cursor_emits_dec_and_is_guarded():
+    """_show_hw_cursor toggles the REAL cursor so WT keeps the IME enabled
+    (#wt-ime-cursor): \\x1b[?25h on focus, ?25l on blur. It must (a) never raise
+    with no mounted app/driver, and (b) write the DEC sequence through the driver
+    when one is reachable. We override the `app` property on a throwaway subclass
+    so the test needs no real Textual mount."""
+    # (a) headless: self.app raises → helper must swallow it, no exception.
+    bare = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    bare.sid = "x"
+    bare._show_hw_cursor(True)
+    bare._show_hw_cursor(False)
+
+    # (b) with a fake driver: assert the exact DEC bytes (Windows-gated).
+    writes = []
+    class _Drv:
+        def write(self, s): writes.append(s)
+    class _Shim(rt.AgentTerminal):
+        app = property(lambda self: type("A", (), {"_driver": _Drv()})())
+    t = _Shim.__new__(_Shim)
+    t.sid = "y"
+    t._show_hw_cursor(True)
+    t._show_hw_cursor(False)
+    if rt._IS_WIN:
+        assert writes == ["\x1b[?25h", "\x1b[?25l"]
+    else:
+        assert writes == []   # off-Windows is a no-op by design
+
+
 def test_encode_key_meta_and_release():
     """readline keys reach claude: Ctrl+letters AND Meta/Alt word-ops (ESC prefix).
     The release key must resolve to Textual's real name, not the dead 'ctrl+]'."""
@@ -1019,6 +1047,8 @@ if __name__ == "__main__":
     print("PASS test_refresh_status_polls_pending_flip_on_static_screen")
     test_classify_pty_status_basics()
     print("PASS test_classify_pty_status_basics")
+    test_show_hw_cursor_emits_dec_and_is_guarded()
+    print("PASS test_show_hw_cursor_emits_dec_and_is_guarded")
     test_alt_screen_suppresses_false_needs_input()
     print("PASS test_alt_screen_suppresses_false_needs_input")
     test_classify_trust_folder_dialog_is_waiting()

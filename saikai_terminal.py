@@ -1538,12 +1538,41 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self.refresh()
         self._sync_terminal_cursor()
 
+    def _show_hw_cursor(self, show: bool) -> None:
+        """Show/hide the REAL terminal cursor (\\x1b[?25h / ?25l).
+
+        ROOT CAUSE of the WT "IME goes ×" flicker: Textual's Windows driver hides
+        the hardware cursor at startup (windows_driver.py `\\x1b[?25l`) and never
+        re-shows it for the rest of the session — it only *moves* the (invisible)
+        cursor to `app.cursor_position` for IME anchoring. WezTerm anchors the IME
+        to that hidden cursor fine, but Windows Terminal keeps the IME DISABLED
+        unless the cursor is actually visible (it briefly re-enables on each move,
+        hence the ×/OK flicker as the pane redraws). So while a live pane is
+        focused we explicitly SHOW the hardware cursor — it lands on the claude
+        prompt, exactly where Textual parks cursor_position — and hide it again on
+        blur so the list/other panes don't carry a stray cursor. Windows-only;
+        other platforms' drivers manage cursor visibility themselves. (#wt-ime-cursor)"""
+        if not _IS_WIN:
+            return
+        try:
+            drv = getattr(self.app, "_driver", None)
+            if drv is not None:
+                drv.write("\x1b[?25h" if show else "\x1b[?25l")
+                if _IME_DEBUG:
+                    _log(f"hw-cursor {'SHOW' if show else 'HIDE'} "
+                         f"sid={getattr(self, 'sid', None)}")
+        except Exception:
+            pass
+
     def on_focus(self, event=None) -> None:
         # Anchor the IME the moment the pane is focused (don't wait for a repaint).
         if _IME_DEBUG:
             _log(f"on_focus sid={getattr(self, 'sid', None)} "
                  f"WT={bool(os.environ.get('WT_SESSION'))} "
                  f"has_focus={self.has_focus} scroll={self._scroll}")
+        # Make the real cursor visible so WT keeps the IME enabled (see
+        # _show_hw_cursor) — the actual fix for the ×/OK flicker. (#wt-ime-cursor)
+        self._show_hw_cursor(True)
         self._sync_terminal_cursor(reason="focus")
         # The immediate sync above can fire before layout settles — inside the
         # focus event `content_region`/`has_focus` may not be valid yet, so the
@@ -1626,10 +1655,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             pass
 
     def on_blur(self, event=None) -> None:
-        # Logging only (gated): record when the pane loses focus, so the IME log
-        # shows focus transitions. No behaviour change — Textual handles the rest.
         if _IME_DEBUG:
             _log(f"on_blur sid={getattr(self, 'sid', None)}")
+        # Hide the hardware cursor we showed on focus so the list view / other
+        # (unfocused) panes don't carry a stray blinking cursor. (#wt-ime-cursor)
+        self._show_hw_cursor(False)
 
     # ── thread → UI marshaling (defensive) ─────────────────────────────────────
     def _marshal(self, fn: Callable) -> None:
