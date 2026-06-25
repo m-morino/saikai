@@ -318,6 +318,30 @@ def test_status_classifier_profiles_and_injection():
     assert rt.ClaudeTerminal is rt.AgentTerminal  # compatibility alias
 
 
+def test_show_hw_cursor_native_cursor_dec_bytes():
+    """#native-cursor: on Windows the pane shows the terminal's NATIVE cursor via
+    \\x1b[?25h on focus / ?25l on blur (instead of saikai's wide reverse block);
+    elsewhere it's a no-op. Must never raise headless (no mounted app)."""
+    bare = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    bare.sid = "x"
+    bare._show_hw_cursor(True)     # no app context → swallowed, no raise
+    bare._show_hw_cursor(False)
+
+    writes = []
+    class _Drv:
+        def write(self, s): writes.append(s)
+    class _Shim(rt.AgentTerminal):
+        app = property(lambda self: type("A", (), {"_driver": _Drv()})())
+    t = _Shim.__new__(_Shim)
+    t.sid = "y"
+    t._show_hw_cursor(True)
+    t._show_hw_cursor(False)
+    if rt._IS_WIN:
+        assert writes == ["\x1b[?25h", "\x1b[?25l"]
+    else:
+        assert writes == []
+
+
 def test_blink_tick_toggles_blink_for_ime_keepalive():
     """The WT IME fix (#wt-ime-blink): _blink_tick toggles _blink_on and re-anchors
     the cursor every 0.5s while focused, so WT keeps re-receiving the cursor move
@@ -1061,6 +1085,8 @@ if __name__ == "__main__":
     print("PASS test_refresh_status_polls_pending_flip_on_static_screen")
     test_classify_pty_status_basics()
     print("PASS test_classify_pty_status_basics")
+    test_show_hw_cursor_native_cursor_dec_bytes()
+    print("PASS test_show_hw_cursor_native_cursor_dec_bytes")
     test_blink_tick_toggles_blink_for_ime_keepalive()
     print("PASS test_blink_tick_toggles_blink_for_ime_keepalive")
     test_alt_screen_suppresses_false_needs_input()

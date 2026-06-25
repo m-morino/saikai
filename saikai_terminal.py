@@ -888,10 +888,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # the glyph already carries width 2 (real blank cells hold " ").
             if ch.data == "":
                 continue
-            if show_cursor and x == cursor_x:
-                # break the run, emit the cursor cell reversed, restart. Keep the
-                # cell's real fg/bg/bold and just invert it, so the cursor on a
-                # themed prompt isn't flattened to a default-colour block.
+            if show_cursor and x == cursor_x and not _IS_WIN:
+                # Non-Windows: draw saikai's own cursor (cell reversed, keeping the
+                # cell's real fg/bg/bold so a themed prompt isn't flattened). On
+                # Windows we instead show the terminal's NATIVE cursor via
+                # _show_hw_cursor — its configured thin bar — and skip this block so
+                # there's no wide reverse-block on top of it. (#native-cursor)
                 flush(x)
                 run_chars = []
                 segments.append(Segment(ch.data or " ",
@@ -1572,12 +1574,32 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._blink_on = not self._blink_on
         self._sync_terminal_cursor(reason="focus")   # re-assert + refresh → re-emit move
 
+    def _show_hw_cursor(self, show: bool) -> None:
+        """Show/hide the REAL terminal cursor (Windows). This makes the user see the
+        terminal's NATIVE cursor — its own configured thin bar/underline — at the
+        prompt, instead of saikai's full-cell reverse block (which reads as too
+        wide). Textual's Windows driver hides the hardware cursor at startup and
+        only *moves* it; we re-show it while a pane is focused — the blink keepalive
+        keeps moving it so WT renders it and keeps the IME enabled — and hide it on
+        blur so the list / unfocused panes don't carry a stray cursor. Windows-only;
+        other platforms keep saikai's drawn cursor cell. (#native-cursor)"""
+        if not _IS_WIN:
+            return
+        try:
+            drv = getattr(self.app, "_driver", None)
+            if drv is not None:
+                drv.write("\x1b[?25h" if show else "\x1b[?25l")
+        except Exception:
+            pass
+
     def on_focus(self, event=None) -> None:
         # Anchor the IME the moment the pane is focused (don't wait for a repaint).
         if _IME_DEBUG:
             _log(f"on_focus sid={getattr(self, 'sid', None)} "
                  f"WT={bool(os.environ.get('WT_SESSION'))} "
                  f"has_focus={self.has_focus} scroll={self._scroll}")
+        # Show the terminal's native cursor (Windows) — see _show_hw_cursor.
+        self._show_hw_cursor(True)
         # Start the cursor-blink keepalive so WT keeps the IME enabled while this
         # pane is focused (the real fix for the ×/OK flicker). (#wt-ime-blink)
         self._blink_on = True
@@ -1670,8 +1692,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     def on_blur(self, event=None) -> None:
         if _IME_DEBUG:
             _log(f"on_blur sid={getattr(self, 'sid', None)}")
-        # Stop the blink keepalive (no need to re-emit cursor moves when this pane
-        # isn't focused) and leave the cursor drawn so a re-focus shows it at once.
+        # Hide the native cursor (Windows) so an unfocused pane / the list doesn't
+        # carry a stray cursor, and stop the keepalive (no moves needed unfocused).
+        self._show_hw_cursor(False)
         self._blink_on = True
         if self._blink_timer is not None:
             try:

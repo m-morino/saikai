@@ -6518,6 +6518,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # on_focus, so resume its cursor-blink keepalive and re-anchor —
                 # otherwise WT leaves the IME disabled until the next redraw.
                 # (#wt-ime-blink)
+                show = getattr(w, "_show_hw_cursor", None)
+                if show is not None:
+                    show(True)            # re-show the native cursor on window return
                 tmr = getattr(w, "_blink_timer", None)
                 if tmr is not None:
                     try:
