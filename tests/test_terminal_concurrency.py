@@ -342,6 +342,48 @@ def test_show_hw_cursor_native_cursor_dec_bytes():
         assert writes == []
 
 
+def test_autoscroll_tick_pins_anchor_to_content():
+    """#drag-autoscroll: while edge-dragging, _autoscroll_tick scrolls one line and
+    shifts the anchor by the SAME delta so it stays pinned to its text (the visible
+    row for a fixed line is hist-scroll+y, so scroll+Δ ⇒ row+Δ). The head rides the
+    edge, and it's a no-op once the scrollback limit / live bottom is hit."""
+    import threading as _th
+
+    class _Hist:
+        def __init__(self, n): self.top = list(range(n))
+
+    class _Scr:
+        def __init__(self, lines, histn): self.lines = lines; self.history = _Hist(histn)
+
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t._lock = _th.Lock()
+    t._screen = _Scr(lines=30, histn=100)
+    t.refresh = lambda *a, **k: None
+    t._scroll = 5
+    t._sel_anchor, t._sel_head = (10, 2), (20, 8)
+
+    # scroll UP (reveal older lines): scroll 5→6, anchor row +1, head → top row 0
+    t._autoscroll_dir = 1
+    t._autoscroll_tick()
+    assert t._scroll == 6 and t._sel_anchor == (11, 2) and t._sel_head == (0, 8)
+
+    # scroll DOWN (toward live): scroll 6→5, anchor row -1, head → bottom row lines-1
+    t._autoscroll_dir = -1
+    t._autoscroll_tick()
+    assert t._scroll == 5 and t._sel_anchor == (10, 2) and t._sel_head == (29, 8)
+
+    # at the live bottom (scroll 0) scrolling down is a no-op (anchor unchanged)
+    t._scroll, t._sel_anchor = 0, (10, 2)
+    t._autoscroll_dir = -1
+    t._autoscroll_tick()
+    assert t._scroll == 0 and t._sel_anchor == (10, 2)
+
+    # dir 0 (pointer not at an edge) does nothing
+    t._scroll, t._sel_anchor, t._autoscroll_dir = 4, (10, 2), 0
+    t._autoscroll_tick()
+    assert t._scroll == 4 and t._sel_anchor == (10, 2)
+
+
 def test_blink_tick_toggles_blink_for_ime_keepalive():
     """The WT IME fix (#wt-ime-blink): _blink_tick toggles _blink_on and re-anchors
     the cursor every 0.5s while focused, so WT keeps re-receiving the cursor move
@@ -1087,6 +1129,8 @@ if __name__ == "__main__":
     print("PASS test_classify_pty_status_basics")
     test_show_hw_cursor_native_cursor_dec_bytes()
     print("PASS test_show_hw_cursor_native_cursor_dec_bytes")
+    test_autoscroll_tick_pins_anchor_to_content()
+    print("PASS test_autoscroll_tick_pins_anchor_to_content")
     test_blink_tick_toggles_blink_for_ime_keepalive()
     print("PASS test_blink_tick_toggles_blink_for_ime_keepalive")
     test_alt_screen_suppresses_false_needs_input()

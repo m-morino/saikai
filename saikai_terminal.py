@@ -730,6 +730,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                                      # streaming pane can be drag-selected
         self._sel_anchor = None      # (row,col) drag start — saikai-OWNED selection
         self._sel_head = None        # (row,col) drag head; None ⇒ no selection
+        self._autoscroll_dir = 0     # drag at top/bottom edge: +1 up / -1 down / 0
+        self._autoscroll_timer = None  # ticks while edge-dragging (#drag-autoscroll)
         self._sel_prev_frozen = False
         self._frozen_buf = None      # snapshot of the displayed rows while frozen
                                      # (the reader keeps mutating screen.buffer, so
@@ -1198,6 +1200,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._snapshot_frozen()      # (already Shift+F9-frozen → keep its frame)
         self._sel_anchor = (event.y, event.x)
         self._sel_head = (event.y, event.x)
+        self._autoscroll_dir = 0
+        if self._autoscroll_timer is None:      # ticks while a drag sits at an edge
+            try:
+                self._autoscroll_timer = self.set_interval(0.06, self._autoscroll_tick)
+            except Exception:
+                self._autoscroll_timer = None
         try:
             self.capture_mouse()
         except Exception:
@@ -1207,16 +1215,66 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     def on_mouse_move(self, event) -> None:   # events.MouseMove
         if self._sel_anchor is None:
             return
-        self._sel_head = (event.y, event.x)
+        scr = self._screen
+        rows = scr.lines if scr is not None else 0
+        cols = scr.columns if scr is not None else 0
+        # A captured drag reports coords outside the pane; clamp the head into the
+        # visible grid so the highlight/extract stay in-bounds.
+        y = max(0, min(event.y, rows - 1)) if rows else event.y
+        x = max(0, min(event.x, cols - 1)) if cols else event.x
+        self._sel_head = (y, x)
+        # Edge auto-scroll: while the pointer sits at (or past) the top/bottom edge,
+        # keep scrolling so the selection can extend beyond the visible region. The
+        # tick does the actual scroll + anchor pinning. (#drag-autoscroll)
+        if rows:
+            self._autoscroll_dir = (1 if event.y <= 0
+                                    else -1 if event.y >= rows - 1 else 0)
         self.refresh()
         try:
             event.stop()
         except Exception:
             pass
 
+    def _autoscroll_tick(self) -> None:
+        """While drag-selecting with the pointer held at the top/bottom edge,
+        scroll one line in that direction and keep the anchor pinned to its content
+        so the selection extends past the visible region. Since the visible row for
+        a fixed line is `hist - scroll + y` (_scroll_row_index), bumping scroll by Δ
+        means the anchor's row must shift by Δ to stay on the same text. UI-thread
+        only; _scroll mutates under the lock, refresh runs outside it. (#drag-autoscroll)"""
+        if self._sel_anchor is None or self._autoscroll_dir == 0:
+            return
+        scr = self._screen
+        if scr is None:
+            return
+        d = self._autoscroll_dir
+        with self._lock:
+            hist = len(scr.history.top)
+            old = self._scroll
+            self._scroll = (min(old + 1, hist) if d > 0 else max(old - 1, 0))
+            new = self._scroll
+        delta = new - old
+        if delta == 0:
+            return                              # hit the scrollback top / live bottom
+        ay, ax = self._sel_anchor
+        self._sel_anchor = (ay + delta, ax)     # pin anchor to its line
+        hx = self._sel_head[1] if self._sel_head else ax
+        self._sel_head = (0 if d > 0 else scr.lines - 1, hx)   # head rides the edge
+        self.refresh()
+
+    def _stop_autoscroll(self) -> None:
+        self._autoscroll_dir = 0
+        if self._autoscroll_timer is not None:
+            try:
+                self._autoscroll_timer.stop()
+            except Exception:
+                pass
+            self._autoscroll_timer = None
+
     def on_mouse_up(self, event) -> None:     # events.MouseUp
         if self._sel_anchor is None:
             return
+        self._stop_autoscroll()
         try:
             self.release_mouse()
         except Exception:
