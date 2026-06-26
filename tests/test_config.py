@@ -640,6 +640,32 @@ def test_last_assistant_falls_back_to_whole_file_for_huge_final_turn():
     assert out == big, "huge final assistant turn was dropped by the tail seek"
 
 
+def test_session_turns_lists_user_and_assistant_in_order():
+    """#copy-response: _session_turns backs the transcript copy picker — it returns
+    (role, text) for user+assistant turns oldest→newest, skips non-text/other
+    records, and is best-effort (no crash on a bad path)."""
+    d = Path(tempfile.mkdtemp())
+    p = d / "t.jsonl"
+    lines = [
+        json.dumps({"type": "user",
+                    "message": {"role": "user",
+                                "content": [{"type": "text", "text": "hello"}]}}),
+        json.dumps({"type": "summary", "summary": "noise — not a turn"}),
+        json.dumps({"type": "assistant",
+                    "message": {"role": "assistant",
+                                "content": [{"type": "text", "text": "world reply"}]}}),
+        json.dumps({"type": "user",
+                    "message": {"role": "user", "content": "second prompt"}}),
+    ]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    turns = saikai._session_turns(p)
+    assert [r for r, _ in turns] == ["user", "assistant", "user"]   # order + summary skipped
+    assert turns[0][1] == "hello" and turns[1][1] == "world reply"
+    assert turns[2][1] == "second prompt"
+    # last-N cap and bad path are safe
+    assert saikai._session_turns(d / "nope.jsonl") == []
+
+
 def test_find_project_dir_requires_segment_boundary():
     """A candidate key matching only MID-segment must not win; an exact / boundary
     match must. (#audit-projdir-substr)"""
@@ -1037,6 +1063,8 @@ if __name__ == "__main__":
     print("PASS test_ctx_usage_splits_on_newline_only")
     test_last_assistant_falls_back_to_whole_file_for_huge_final_turn()
     print("PASS test_last_assistant_falls_back_to_whole_file_for_huge_final_turn")
+    test_session_turns_lists_user_and_assistant_in_order()
+    print("PASS test_session_turns_lists_user_and_assistant_in_order")
     test_find_project_dir_requires_segment_boundary()
     print("PASS test_find_project_dir_requires_segment_boundary")
     test_cell_width_zero_for_combining_and_zwj()

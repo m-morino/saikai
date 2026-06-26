@@ -3650,6 +3650,44 @@ def _last_assistant_text_from_jsonl(path) -> "str | None":
     return last
 
 
+def _session_turns(path, byte_window: int = 1_500_000, limit: int = 200) -> list:
+    """User/assistant turns from a transcript as (role, text), oldest→newest — the
+    backing list for the copy picker (so off-screen messages can be copied from the
+    log, which the alt-screen pane can't select). Tail-reads the last `byte_window`
+    bytes (transcripts get large) and returns at most the last `limit` non-empty
+    turns. Reuses the parser's _extract_text. Best-effort: [] on any error. A
+    window that slices mid-line just drops that one oldest partial turn. (#copy-response)"""
+    try:
+        import os
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - byte_window))
+            chunk = f.read().decode("utf-8", "replace")
+    except (OSError, ValueError, TypeError):
+        return []
+    out = []
+    for ln in chunk.split("\n"):       # '\n' only (see _ctx_usage_from_jsonl)
+        ln = ln.strip()
+        if not ln.startswith("{") or ('"user"' not in ln and '"assistant"' not in ln):
+            continue
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        role = obj.get("type")
+        if role not in ("user", "assistant"):
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        txt = _extract_text(msg.get("content", ""))
+        if txt and txt.strip():
+            out.append((role, txt.strip()))
+    return out[-limit:]
+
+
 def _first_cwd_from_jsonl(path) -> "str | None":
     """The first `cwd` in a transcript, scanning the first several records.
 
@@ -4712,6 +4750,55 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     head += f" [b]{title}[/b]"
                 log.write(head)
                 log.write(f"  {msg}")
+
+    class TranscriptCopyScreen(ModalScreen):
+        """Pick a message/turn from the session transcript and copy its FULL text —
+        the robust way to grab content that scrolled off the alt-screen pane (which
+        can't be selected past the visible edge). ↑↓ choose, Enter copies, Esc
+        cancels. Pre-selects the most recent turn so F1→Enter still grabs claude's
+        last reply in two keystrokes. Returns the chosen text (or None) via
+        dismiss(). (#copy-response)"""
+        CSS = """
+        TranscriptCopyScreen { align: center middle; }
+        #tc-box { background: $panel; border: solid $accent; padding: 1 2;
+                  width: 100; max-width: 96%; height: auto; max-height: 80%; }
+        #tc-list { height: auto; max-height: 30; }
+        """
+        BINDINGS = [Binding("escape", "cancel", show=False)]
+
+        def __init__(self, turns):
+            super().__init__()
+            self._turns = list(turns)            # [(role, text)] oldest→newest
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="tc-box"):
+                yield Static("[bold cyan]Copy from transcript[/bold cyan]   "
+                             "[dim]↑↓ choose · Enter copies · Esc cancels[/dim]")
+                opts = []
+                for role, text in self._turns:
+                    preview = " ".join(text.split())[:80]
+                    tag = "claude" if role == "assistant" else "you"
+                    col = "green" if role == "assistant" else "yellow"
+                    opts.append(Option(f"[{col}]{tag:>6}[/{col}]  {preview}"))
+                yield OptionList(*opts, id="tc-list")
+
+        def on_mount(self) -> None:
+            try:
+                ol = self.query_one("#tc-list", OptionList)
+                ol.focus()
+                if ol.option_count:                 # default to the most recent turn
+                    ol.highlighted = ol.option_count - 1
+            except Exception:
+                pass
+
+        def action_cancel(self) -> None:
+            self.dismiss(None)
+
+        def on_option_list_option_selected(self, event) -> None:
+            try:
+                self.dismiss(self._turns[event.option_index][1])
+            except Exception:
+                self.dismiss(None)
 
     def _render_qr(matrix):
         """Render a QR bool-matrix as Rich Text using upper-half-block cells
@@ -7762,27 +7849,30 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.notify(f"copied opening prompt ({len(text)} chars)", timeout=3)
 
         def action_copy_response(self) -> None:
-            """F1: copy claude's LAST response (full text) from the session
-            transcript. Works even when the reply scrolled off the visible pane —
-            an alt-screen app's off-screen lines can't be selected, but the JSONL
-            holds the complete text. Targets the focused live pane, else the list
-            cursor. (#copy-response)"""
+            """F1: open the transcript copy picker for the focused live pane (else
+            the list cursor) — pick any message/turn and copy its FULL text, even
+            content that scrolled off the alt-screen pane (which can't be selected).
+            Pre-selects the most recent turn, so F1→Enter copies claude's last reply
+            in two keystrokes. (#copy-response)"""
             w = getattr(self, "focused", None)
             sid = getattr(w, "sid", None) or self._cursor_sid()
             if not sid:
                 return
             s = self._sid_index.get(sid)
             path = (s or {}).get("jsonl_path") or _find_session_jsonl(sid)
-            text = _last_assistant_text_from_jsonl(path) if path else None
-            if not (text or "").strip():
-                self.notify("no response in the transcript yet", timeout=3)
+            turns = _session_turns(path) if path else []
+            if not turns:
+                self.notify("no transcript messages to copy yet", timeout=3)
                 return
-            if _copy_to_host_clipboard(text):
-                self.notify(f"copied claude's last response ({len(text)} chars)",
-                            timeout=4)
-            else:
-                self.notify("could not copy the response",
-                            severity="warning", timeout=3)
+
+            def _done(text) -> None:
+                if not text:
+                    return
+                if _copy_to_host_clipboard(text):
+                    self.notify(f"copied ({len(text)} chars) to clipboard", timeout=4)
+                else:
+                    self.notify("could not copy", severity="warning", timeout=3)
+            self.push_screen(TranscriptCopyScreen(turns), _done)
 
         def _apply_fresh_sessions(self, fresh, force: bool = False) -> None:
             nonlocal all_sessions
