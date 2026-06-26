@@ -664,6 +664,12 @@ def test_session_turns_lists_user_and_assistant_in_order():
     assert turns[2][1] == "second prompt"
     # last-N cap and bad path are safe
     assert saikai._session_turns(d / "nope.jsonl") == []
+    # _flatten_turns renders role-headed text for the copy-mode buffer
+    flat = saikai._flatten_turns(turns)
+    assert "claude" in flat and "you" in flat
+    assert "hello" in flat and "world reply" in flat
+    assert flat.index("hello") < flat.index("world reply")   # order preserved
+    assert saikai._flatten_turns([]) == ""
 
 
 def test_find_project_dir_requires_segment_boundary():

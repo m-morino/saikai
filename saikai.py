@@ -3688,6 +3688,19 @@ def _session_turns(path, byte_window: int = 1_500_000, limit: int = 200) -> list
     return out[-limit:]
 
 
+def _flatten_turns(turns) -> str:
+    """Render (role, text) turns into ONE plain-text document for the vi copy-mode
+    view, each turn prefixed with a role header so message boundaries are visible.
+    (#copy-mode)"""
+    parts = []
+    for role, text in turns:
+        tag = "claude" if role == "assistant" else "you"
+        parts.append(f"───── {tag} ─────")
+        parts.append(text)
+        parts.append("")
+    return "\n".join(parts).rstrip("\n")
+
+
 def _first_cwd_from_jsonl(path) -> "str | None":
     """The first `cwd` in a transcript, scanning the first several records.
 
@@ -4751,54 +4764,117 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 log.write(head)
                 log.write(f"  {msg}")
 
-    class TranscriptCopyScreen(ModalScreen):
-        """Pick a message/turn from the session transcript and copy its FULL text —
-        the robust way to grab content that scrolled off the alt-screen pane (which
-        can't be selected past the visible edge). ↑↓ choose, Enter copies, Esc
-        cancels. Pre-selects the most recent turn so F1→Enter still grabs claude's
-        last reply in two keystrokes. Returns the chosen text (or None) via
-        dismiss(). (#copy-response)"""
-        CSS = """
-        TranscriptCopyScreen { align: center middle; }
-        #tc-box { background: $panel; border: solid $accent; padding: 1 2;
-                  width: 100; max-width: 96%; height: auto; max-height: 80%; }
-        #tc-list { height: auto; max-height: 30; }
-        """
-        BINDINGS = [Binding("escape", "cancel", show=False)]
+    class _CopyModeArea(TextArea):
+        """A read-only TextArea with a tmux-copy-mode-vi key table, used to select
+        & yank transcript text with the keyboard. read_only TextArea passes
+        printable keys straight through (its _on_key early-returns under read_only
+        WITHOUT consuming), so these BINDINGS fire. h/j/k/l/w/b/0/$ + g/G +
+        ctrl+d/u navigate; v starts a selection (subsequent motions extend it);
+        y/Enter yanks to the clipboard; Esc/q closes. (#copy-mode)"""
+        BINDINGS = [
+            Binding("h", "cursor_left", show=False),
+            Binding("l", "cursor_right", show=False),
+            Binding("k", "cursor_up", show=False),
+            Binding("j", "cursor_down", show=False),
+            Binding("w", "cursor_word_right", show=False),
+            Binding("b", "cursor_word_left", show=False),
+            Binding("0", "cursor_line_start", show=False),
+            Binding("dollar_sign", "cursor_line_end", show=False),
+            Binding("ctrl+d", "half_down", show=False),
+            Binding("ctrl+u", "half_up", show=False),
+            Binding("g", "goto_top", show=False),
+            Binding("G", "goto_bottom", show=False),
+            Binding("v", "toggle_select", "Select"),
+            Binding("y", "yank", "Yank"),
+            Binding("enter", "yank", show=False),
+            Binding("escape", "quit_copy", "Close"),
+            Binding("q", "quit_copy", show=False),
+        ]
+        selecting = False
 
-        def __init__(self, turns):
-            super().__init__()
-            self._turns = list(turns)            # [(role, text)] oldest→newest
+        # Motions honour the selecting flag (vi visual mode); arrows route here too.
+        def action_cursor_left(self, select: bool = False) -> None:
+            super().action_cursor_left(self.selecting)
+        def action_cursor_right(self, select: bool = False) -> None:
+            super().action_cursor_right(self.selecting)
+        def action_cursor_up(self, select: bool = False) -> None:
+            super().action_cursor_up(self.selecting)
+        def action_cursor_down(self, select: bool = False) -> None:
+            super().action_cursor_down(self.selecting)
+        def action_cursor_word_left(self, select: bool = False) -> None:
+            super().action_cursor_word_left(self.selecting)
+        def action_cursor_word_right(self, select: bool = False) -> None:
+            super().action_cursor_word_right(self.selecting)
+        def action_cursor_line_start(self, select: bool = False) -> None:
+            super().action_cursor_line_start(self.selecting)
+        def action_cursor_line_end(self, select: bool = False) -> None:
+            super().action_cursor_line_end(self.selecting)
+        def action_half_down(self) -> None:
+            self.move_cursor_relative(rows=12, select=self.selecting)
+        def action_half_up(self) -> None:
+            self.move_cursor_relative(rows=-12, select=self.selecting)
+        def action_goto_top(self) -> None:
+            self.move_cursor((0, 0), select=self.selecting)
+        def action_goto_bottom(self) -> None:
+            self.move_cursor(self.document.end, select=self.selecting)
 
-        def compose(self) -> ComposeResult:
-            with Vertical(id="tc-box"):
-                yield Static("[bold cyan]Copy from transcript[/bold cyan]   "
-                             "[dim]↑↓ choose · Enter copies · Esc cancels[/dim]")
-                opts = []
-                for role, text in self._turns:
-                    preview = " ".join(text.split())[:80]
-                    tag = "claude" if role == "assistant" else "you"
-                    col = "green" if role == "assistant" else "yellow"
-                    opts.append(Option(f"[{col}]{tag:>6}[/{col}]  {preview}"))
-                yield OptionList(*opts, id="tc-list")
+        def action_toggle_select(self) -> None:
+            self.selecting = not self.selecting
+            if self.selecting:                       # anchor a fresh selection here
+                self.move_cursor(self.cursor_location, select=False)
 
-        def on_mount(self) -> None:
+        def action_yank(self) -> None:
+            text = self.selected_text or ""
+            if not text.strip():
+                self.app.notify("nothing selected — press v, move, then y",
+                                timeout=3)
+                return
+            if _copy_to_host_clipboard(text):
+                self.app.notify(f"copied ({len(text)} chars) to clipboard", timeout=4)
+            else:
+                self.app.notify("could not copy", severity="warning", timeout=3)
+            self.action_quit_copy()
+
+        def action_quit_copy(self) -> None:
             try:
-                ol = self.query_one("#tc-list", OptionList)
-                ol.focus()
-                if ol.option_count:                 # default to the most recent turn
-                    ol.highlighted = ol.option_count - 1
+                self.app.pop_screen()
             except Exception:
                 pass
 
-        def action_cancel(self) -> None:
-            self.dismiss(None)
+    class CopyModeScreen(ModalScreen):
+        """vi-style copy mode over the session transcript. saikai owns the full
+        text (read from the JSONL), so arbitrary keyboard selection works where the
+        live alt-screen pane can't be selected past its visible edge. j/k/↑↓ move,
+        v selects, y yanks, g/G top/bottom, Esc/q closes. Opens at the most recent
+        turn. (#copy-mode)"""
+        CSS = """
+        CopyModeScreen { align: center middle; }
+        #cm-box { background: $panel; border: solid $accent; padding: 0 1;
+                  width: 104; max-width: 96%; height: 84%; max-height: 44; }
+        #cm-hint { height: 1; }
+        #cm-area { height: 1fr; border: none; }
+        """
+        BINDINGS = [Binding("escape", "dismiss", show=False)]
 
-        def on_option_list_option_selected(self, event) -> None:
+        def __init__(self, text):
+            super().__init__()
+            self._text = text
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="cm-box"):
+                yield Static("[bold cyan]Copy mode[/bold cyan]   [dim]j/k ↑↓ move · "
+                             "v select · y yank · g/G top·bottom · Esc close[/dim]",
+                             id="cm-hint")
+                yield _CopyModeArea(self._text, read_only=True, soft_wrap=True,
+                                    language=None, id="cm-area")
+
+        def on_mount(self) -> None:
             try:
-                self.dismiss(self._turns[event.option_index][1])
+                area = self.query_one("#cm-area", _CopyModeArea)
+                area.focus()
+                area.move_cursor(area.document.end)   # start at the most recent turn
             except Exception:
-                self.dismiss(None)
+                pass
 
     def _render_qr(matrix):
         """Render a QR bool-matrix as Rich Text using upper-half-block cells
@@ -4910,11 +4986,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("f7", "toggle_hide", "Hide", id="hide", show=False, priority=True),
             Binding("f8", "preview_changes", "Changes", id="diff", show=False, priority=True),
             Binding("f9", "copy_prompt", "Copy", id="copy", show=False, priority=True),
-            # F1: copy claude's last RESPONSE from the transcript (works even when
-            # the reply scrolled off the alt-screen pane — can't be selected, but
-            # the JSONL has the full text). priority so it fires inside a focused
-            # claude pane (Space-leader is eaten by claude there). (#copy-response)
-            Binding("f1", "copy_response", "Copy reply", id="copy_response", show=False, priority=True),
+            # F1: vi-style copy mode over the transcript — select & yank any of
+            # claude's output with the keyboard, including replies that scrolled
+            # off the alt-screen pane (can't be selected there, but the JSONL has
+            # the full text). priority so it fires inside a focused claude pane
+            # (Space-leader is eaten by claude there). (#copy-mode)
+            Binding("f1", "copy_response", "Copy mode", id="copy_response", show=False, priority=True),
             Binding("shift+f5", "toggle_tree", "Tree", id="tree", show=False, priority=True),
             Binding("shift+f7", "cycle_group", "Group", id="group", show=False, priority=True),
             Binding("shift+f8", "new_session", "New", id="new", show=False, priority=True),
@@ -7849,11 +7926,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.notify(f"copied opening prompt ({len(text)} chars)", timeout=3)
 
         def action_copy_response(self) -> None:
-            """F1: open the transcript copy picker for the focused live pane (else
-            the list cursor) — pick any message/turn and copy its FULL text, even
-            content that scrolled off the alt-screen pane (which can't be selected).
-            Pre-selects the most recent turn, so F1→Enter copies claude's last reply
-            in two keystrokes. (#copy-response)"""
+            """F1: open vi-style copy mode over the session transcript for the
+            focused live pane (else the list cursor). Navigate with j/k/g/G, select
+            with v, yank with y — so you can copy ANY of claude's output, including
+            replies that scrolled off the alt-screen pane (which can't be selected).
+            (#copy-mode)"""
             w = getattr(self, "focused", None)
             sid = getattr(w, "sid", None) or self._cursor_sid()
             if not sid:
@@ -7864,15 +7941,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if not turns:
                 self.notify("no transcript messages to copy yet", timeout=3)
                 return
-
-            def _done(text) -> None:
-                if not text:
-                    return
-                if _copy_to_host_clipboard(text):
-                    self.notify(f"copied ({len(text)} chars) to clipboard", timeout=4)
-                else:
-                    self.notify("could not copy", severity="warning", timeout=3)
-            self.push_screen(TranscriptCopyScreen(turns), _done)
+            self.push_screen(CopyModeScreen(_flatten_turns(turns)))
 
         def _apply_fresh_sessions(self, fresh, force: bool = False) -> None:
             nonlocal all_sessions
