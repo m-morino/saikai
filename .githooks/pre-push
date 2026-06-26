@@ -1,0 +1,65 @@
+#!/bin/sh
+# saikai pre-push: two gates, mirroring what CI + history-hygiene require.
+#
+# Enable (once, per clone):   git config core.hooksPath .githooks
+#
+# 1) Identity guard — block pushing any commit whose author OR committer email is
+#    a corporate address, to keep real identity out of public history (the recap
+#    incident leaked masayuki.morino@agc.com).
+#      Override (discouraged): SKIP_IDENTITY_GUARD=1 git push ...
+# 2) Full test suite — run EXACTLY what CI runs (py_compile + every
+#    tests/test_*.py), so a failing test is caught HERE, not after the push. The
+#    old workflow ran a hand-picked SUBSET locally, so tests in unlisted files
+#    (e.g. test_sort_recency.py) slipped through and only CI caught them.
+#      Override (discouraged): SKIP_TESTS=1 git push ...
+
+# ── gate 1: identity ─────────────────────────────────────────────────────────
+if [ -z "$SKIP_IDENTITY_GUARD" ]; then
+    z=0000000000000000000000000000000000000000
+    bad=0
+    while read -r lref lsha rref rsha; do
+        [ "$lsha" = "$z" ] && continue                 # ref deletion
+        if [ "$rsha" = "$z" ]; then
+            commits=$(git rev-list "$lsha" --not --remotes=origin)
+        else
+            commits=$(git rev-list "$rsha..$lsha")
+        fi
+        for c in $commits; do
+            ids=$(git log -1 --format='%ae %ce' "$c")
+            case "$ids" in
+                *@agc.com*)
+                    echo "pre-push BLOCKED: $c carries a corporate email: $ids" >&2
+                    echo "  Fix the repo identity (git config user.email <github-noreply>) and rewrite before pushing." >&2
+                    bad=1 ;;
+            esac
+        done
+    done
+    [ "$bad" = 0 ] || exit 1
+fi
+
+# ── gate 2: full test suite (CI-identical) ───────────────────────────────────
+if [ -z "$SKIP_TESTS" ]; then
+    root=$(git rev-parse --show-toplevel) || exit 1
+    cd "$root" || exit 1
+    if   [ -x .venv/Scripts/python.exe ]; then PY=.venv/Scripts/python.exe   # Windows venv
+    elif [ -x .venv/bin/python ];        then PY=.venv/bin/python            # POSIX venv
+    elif command -v python3 >/dev/null 2>&1; then PY=python3
+    else PY=python; fi
+
+    echo "pre-push: py_compile + full test suite via $PY (SKIP_TESTS=1 to skip)…" >&2
+    if ! "$PY" -m py_compile saikai.py saikai_terminal.py saikai_provider.py saikai_mirror.py; then
+        echo "pre-push BLOCKED: py_compile failed." >&2
+        exit 1
+    fi
+    log=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/saikai-prepush.log")
+    for t in tests/test_*.py; do
+        if ! "$PY" "$t" >"$log" 2>&1; then
+            echo "pre-push BLOCKED: $t FAILED — fix it or SKIP_TESTS=1 to override." >&2
+            tail -12 "$log" >&2
+            exit 1
+        fi
+    done
+    echo "pre-push: all suites green." >&2
+fi
+
+exit 0

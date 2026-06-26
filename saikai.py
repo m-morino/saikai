@@ -4780,8 +4780,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("b", "cursor_word_left", show=False),
             Binding("0", "cursor_line_start", show=False),
             Binding("dollar_sign", "cursor_line_end", show=False),
-            Binding("ctrl+d", "half_down", show=False),
-            Binding("ctrl+u", "half_up", show=False),
+            Binding("ctrl+d", "half_down", show=False),   # readline-exempt: copy-mode modal only (no live pane focused)
+            Binding("ctrl+u", "half_up", show=False),      # readline-exempt: copy-mode modal only (no live pane focused)
             Binding("g", "goto_top", show=False),
             Binding("G", "goto_bottom", show=False),
             Binding("v", "toggle_select", "Select"),

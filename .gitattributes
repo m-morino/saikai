@@ -6,3 +6,4 @@
 # CRLF shebang (`#!/usr/bin/env sh\r`) breaks them on Linux/macOS.
 *.sh             text eol=lf
 scripts/hooks/*  text eol=lf
+.githooks/*      text eol=lf

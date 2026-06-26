@@ -22,22 +22,25 @@ uv run saikai.py            # run in place (deps auto-installed from the PEP-723
 Dependencies: `textual`, `pyte`, `platformdirs`, and a PTY backend
 (`pywinpty` on Windows, `ptyprocess` elsewhere).
 
-## Tests — run them before every commit
+## Tests — run them before every push
+
+Run **exactly what CI runs** — the whole `tests/test_*.py` glob, not a hand-picked
+subset (a subset misses tests in files you forgot, which is how green-locally /
+red-in-CI happens):
 
 ```bash
-python -m py_compile saikai.py saikai_terminal.py saikai_provider.py
-uv run python tests/test_config.py
-uv run python tests/test_demo_audit.py
-uv run python tests/test_demo_fixture.py
-uv run python tests/test_keyboard_leader.py
-uv run python tests/test_providers.py
-uv run python tests/test_pty_backend.py
-uv run python tests/test_resource_bounds.py
-uv run python tests/test_sort_recency.py
-uv run python tests/test_split_divider.py
-uv run python tests/test_terminal_concurrency.py
-uv run python tests/test_terminal_watchdog.py
+python -m py_compile saikai.py saikai_terminal.py saikai_provider.py saikai_mirror.py
+for t in tests/test_*.py; do echo "== $t =="; uv run python "$t" || break; done
 ```
+
+Better, let git do it for you — enable the bundled pre-push hook once per clone so
+the full suite (and the identity guard) runs automatically on `git push`:
+
+```bash
+git config core.hooksPath .githooks      # runs .githooks/pre-push on every push
+```
+
+It blocks the push if any suite fails (override, discouraged: `SKIP_TESTS=1 git push`).
 
 Most suites also run without textual / pyte / a PTY backend through soft
 imports. With textual installed, `test_split_divider.py` and
