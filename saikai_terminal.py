@@ -1211,6 +1211,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             pass
         self.refresh()
+        if _IME_DEBUG:
+            _log(f"drag-down rows={self._screen.lines} "
+                 f"hist={len(self._screen.history.top)} "
+                 f"mouse_report={getattr(self, '_mouse_reporting', False)} "
+                 f"alt={self._alt.in_alt}")
 
     def on_mouse_move(self, event) -> None:   # events.MouseMove
         if self._sel_anchor is None:
@@ -1254,6 +1259,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._scroll = (min(old + 1, hist) if d > 0 else max(old - 1, 0))
             new = self._scroll
         delta = new - old
+        if _IME_DEBUG:
+            _log(f"autoscroll d={d} scroll {old}->{new} hist={hist} delta={delta}")
         if delta == 0:
             return                              # hit the scrollback top / live bottom
         ay, ax = self._sel_anchor
