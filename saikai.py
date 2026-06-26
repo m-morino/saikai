@@ -4823,6 +4823,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("f7", "toggle_hide", "Hide", id="hide", show=False, priority=True),
             Binding("f8", "preview_changes", "Changes", id="diff", show=False, priority=True),
             Binding("f9", "copy_prompt", "Copy", id="copy", show=False, priority=True),
+            # F1: copy claude's last RESPONSE from the transcript (works even when
+            # the reply scrolled off the alt-screen pane — can't be selected, but
+            # the JSONL has the full text). priority so it fires inside a focused
+            # claude pane (Space-leader is eaten by claude there). (#copy-response)
+            Binding("f1", "copy_response", "Copy reply", id="copy_response", show=False, priority=True),
             Binding("shift+f5", "toggle_tree", "Tree", id="tree", show=False, priority=True),
             Binding("shift+f7", "cycle_group", "Group", id="group", show=False, priority=True),
             Binding("shift+f8", "new_session", "New", id="new", show=False, priority=True),
@@ -5014,7 +5019,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             "close_live", "close_all_live", "prev_tab", "next_tab",
             "next_attention", "toggle_list", "rename", "shrink_list",
             "grow_list", "notifications", "open_parent", "context_refresh",
-            "checkpoint",
+            "checkpoint", "copy_response",
         })
 
         def check_action(self, action: str, parameters):
@@ -7755,6 +7760,29 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self.notify(f"copy failed: {e!r}", severity="error", timeout=4)
                     return
             self.notify(f"copied opening prompt ({len(text)} chars)", timeout=3)
+
+        def action_copy_response(self) -> None:
+            """F1: copy claude's LAST response (full text) from the session
+            transcript. Works even when the reply scrolled off the visible pane —
+            an alt-screen app's off-screen lines can't be selected, but the JSONL
+            holds the complete text. Targets the focused live pane, else the list
+            cursor. (#copy-response)"""
+            w = getattr(self, "focused", None)
+            sid = getattr(w, "sid", None) or self._cursor_sid()
+            if not sid:
+                return
+            s = self._sid_index.get(sid)
+            path = (s or {}).get("jsonl_path") or _find_session_jsonl(sid)
+            text = _last_assistant_text_from_jsonl(path) if path else None
+            if not (text or "").strip():
+                self.notify("no response in the transcript yet", timeout=3)
+                return
+            if _copy_to_host_clipboard(text):
+                self.notify(f"copied claude's last response ({len(text)} chars)",
+                            timeout=4)
+            else:
+                self.notify("could not copy the response",
+                            severity="warning", timeout=3)
 
         def _apply_fresh_sessions(self, fresh, force: bool = False) -> None:
             nonlocal all_sessions
