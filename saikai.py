@@ -4787,6 +4787,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("v", "toggle_select", "Select"),
             Binding("y", "yank", "Yank"),
             Binding("enter", "yank", show=False),
+            Binding("Y", "yank_all", "Yank all"),
             Binding("escape", "quit_copy", "Close"),
             Binding("q", "quit_copy", show=False),
         ]
@@ -4824,16 +4825,30 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.move_cursor(self.cursor_location, select=False)
 
         def action_yank(self) -> None:
+            # Yank the visual selection (v + motion); with no selection, yank the
+            # CURRENT line so a bare `y` always copies something (vim 'yy' feel).
             text = self.selected_text or ""
             if not text.strip():
-                self.app.notify("nothing selected — press v, move, then y",
-                                timeout=3)
+                try:
+                    text = self.document[self.cursor_location[0]]
+                except Exception:
+                    text = ""
+            self._yank(text, "line")
+
+        def action_yank_all(self) -> None:
+            self._yank(self.text, "all")        # Y = copy the whole transcript
+
+        def _yank(self, text: str, what: str) -> None:
+            if not (text or "").strip():
+                self.app.notify("nothing to copy here", timeout=3)
                 return
             if _copy_to_host_clipboard(text):
-                self.app.notify(f"copied ({len(text)} chars) to clipboard", timeout=4)
+                self.app.notify(f"copied {what} ({len(text)} chars) to clipboard",
+                                timeout=4)
+                self.action_quit_copy()
             else:
-                self.app.notify("could not copy", severity="warning", timeout=3)
-            self.action_quit_copy()
+                self.app.notify("could not copy to clipboard",
+                                severity="warning", timeout=4)
 
         def action_quit_copy(self) -> None:
             try:
@@ -4862,8 +4877,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def compose(self) -> ComposeResult:
             with Vertical(id="cm-box"):
-                yield Static("[bold cyan]Copy mode[/bold cyan]   [dim]j/k ↑↓ move · "
-                             "v select · y yank · g/G top·bottom · Esc close[/dim]",
+                yield Static("[bold cyan]Copy mode[/bold cyan]   [dim]j/k move · "
+                             "v select→move · y copy (line/selection) · "
+                             "[b]Y copy all[/b] · g/G top·bottom · Esc close[/dim]",
                              id="cm-hint")
                 yield _CopyModeArea(self._text, read_only=True, soft_wrap=True,
                                     language=None, id="cm-area")
@@ -8248,9 +8264,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 import saikai_mirror as _m
                 self.push_screen(MirrorScreen(_url, _m.qr_matrix(_url), _copied,
                                               _hub.client_count()), on_close)
-            except Exception:
-                self.notify(f"Web mirror: {_url}", title="saikai mirror",
-                            timeout=12)
+            except Exception as _qr_err:
+                # Surface WHY the QR couldn't render (was silently swallowed): a
+                # missing `segno` in the running install is the usual cause — the
+                # mirror itself runs without it, only the QR needs it. (#mirror-qr)
+                self.notify(f"Web mirror: {_url}\n(QR unavailable: {_qr_err!r})",
+                            title="saikai mirror", severity="warning", timeout=15)
 
         def action_toggle_mirror_control(self) -> None:
             """Shift+F12 — flip web-mirror interactive control (default OFF). The
@@ -8814,7 +8833,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if _mir_on:
                     _hub = _mirror.MirrorHub(
                         token=_secrets.token_urlsafe(32), host=_mir_host,
-                        port=_mirror.mirror_port(os.environ))
+                        port=_mirror.mirror_port(os.environ),
+                        idle_secs=_mirror.mirror_idle_secs(os.environ))
                     # LAN input is its own opt-in: a LAN-exposed mirror stays
                     # read-only unless SAIKAI_MIRROR_ALLOW_LAN_INPUT=1. Loopback
                     # always permits input.
@@ -8834,6 +8854,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _mode = "LAN-exposed" if _mir_host != "127.0.0.1" else "loopback only"
                     _in_mode = ("input ON" if (_mir_host == "127.0.0.1" or _allow_lan_in)
                                 else "input OFF (set SAIKAI_MIRROR_ALLOW_LAN_INPUT=1)")
+                    _idle = _mirror.mirror_idle_secs(os.environ)
+                    _in_mode += ("; control idle-off DISABLED" if _idle <= 0
+                                 else f"; control idle-off {_idle:g}s")
                     # Persist the URL so it's reachable even though the Textual alt
                     # screen hides this banner during the session; cleaned up at exit.
                     _url_file = CACHE_DIR / "mirror-url.txt"

@@ -441,6 +441,9 @@ class MirrorHub:
         with self._idle_lock:
             if self._idle_timer is not None:
                 self._idle_timer.cancel()
+                self._idle_timer = None
+            if self._idle_secs <= 0:        # 0/negative = no idle auto-disable
+                return
             self._idle_timer = threading.Timer(self._idle_secs,
                                                self._on_idle_timeout)
             self._idle_timer.daemon = True
@@ -557,6 +560,19 @@ def mirror_port(env: dict) -> int:
     except ValueError:
         return 0
     return p if 0 < p < 65536 else 0
+
+
+def mirror_idle_secs(env: dict) -> float:
+    """Browser-control auto-disable window in seconds, from SAIKAI_MIRROR_IDLE_SECS.
+    Default 600 (10 min). **<= 0 disables the idle auto-disable entirely** — control
+    then stays on until you toggle it off locally with Shift+F12."""
+    raw = str(env.get("SAIKAI_MIRROR_IDLE_SECS", "")).strip()
+    if not raw:
+        return 600.0
+    try:
+        return float(raw)
+    except ValueError:
+        return 600.0
 
 
 def _lan_ip() -> str:

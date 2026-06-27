@@ -672,6 +672,27 @@ def test_session_turns_lists_user_and_assistant_in_order():
     assert saikai._flatten_turns([]) == ""
 
 
+def test_mirror_idle_secs_env_and_arm_guard():
+    """#mirror-idle: SAIKAI_MIRROR_IDLE_SECS overrides the browser-control
+    auto-disable window; <=0 disables it (control stays on). The idle timer must
+    not arm when disabled, so control never auto-turns-off mid-session."""
+    import saikai_mirror as m
+    assert m.mirror_idle_secs({}) == 600.0
+    assert m.mirror_idle_secs({"SAIKAI_MIRROR_IDLE_SECS": "1800"}) == 1800.0
+    assert m.mirror_idle_secs({"SAIKAI_MIRROR_IDLE_SECS": "0"}) == 0.0
+    assert m.mirror_idle_secs({"SAIKAI_MIRROR_IDLE_SECS": "-5"}) == -5.0
+    assert m.mirror_idle_secs({"SAIKAI_MIRROR_IDLE_SECS": "bad"}) == 600.0
+    hub0 = m.MirrorHub(token="t", idle_secs=0)
+    hub0._arm_idle_timer()
+    assert hub0._idle_timer is None          # disabled → never arms → no auto-off
+    hub = m.MirrorHub(token="t", idle_secs=600)
+    hub._arm_idle_timer()
+    try:
+        assert hub._idle_timer is not None   # enabled → arms a timer
+    finally:
+        hub._cancel_idle_timer()             # don't leak the threading.Timer
+
+
 def test_find_project_dir_requires_segment_boundary():
     """A candidate key matching only MID-segment must not win; an exact / boundary
     match must. (#audit-projdir-substr)"""
@@ -1071,6 +1092,8 @@ if __name__ == "__main__":
     print("PASS test_last_assistant_falls_back_to_whole_file_for_huge_final_turn")
     test_session_turns_lists_user_and_assistant_in_order()
     print("PASS test_session_turns_lists_user_and_assistant_in_order")
+    test_mirror_idle_secs_env_and_arm_guard()
+    print("PASS test_mirror_idle_secs_env_and_arm_guard")
     test_find_project_dir_requires_segment_boundary()
     print("PASS test_find_project_dir_requires_segment_boundary")
     test_cell_width_zero_for_combining_and_zwj()
