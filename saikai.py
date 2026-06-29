@@ -2920,6 +2920,38 @@ def _state_marker(s: dict, hidden: set, favorites: set) -> str:
     return _MARKER_BLANK
 
 
+def _marker_legend(s: dict, favorites: set, hidden: set) -> list:
+    """Plain-language meaning of the activity + state markers THIS session
+    currently shows — mirrors _activity_marker / _state_marker precedence so the
+    preview can explain its own +/./*/@/&/… glyphs in context. At most one
+    activity entry + one state entry (the two columns each show one glyph)."""
+    out = []
+    if s.get("is_bg"):
+        out.append("& background agent/job")
+    elif s.get("is_remote_control"):
+        out.append("R Remote Control on in another session")
+    elif s.get("is_open"):
+        ss = s.get("session_status")
+        if ss == "shell":
+            out.append("$ open, running a shell command elsewhere")
+        elif ss == "busy":
+            out.append("@ open, responding in another window")
+        else:
+            out.append("@ open in another window")
+    elif s.get("is_active"):
+        out.append("+ recently active")
+    elif _needs_attention(s, _TABLE_NA_CACHE):
+        out.append("! reply due — your last turn is unanswered")
+    elif s.get("is_recent"):
+        out.append(". recent (dormant)")
+    sid = s.get("id")
+    if sid in favorites:
+        out.append("* favorite")
+    elif sid in hidden:
+        out.append("x hidden")
+    return out
+
+
 def fmt_last_active(s: dict) -> str:
     """Human-friendly 'last activity' column: '5m', '2h', '3d', '04/22'.
     Keyed on _last_active_dt so the column matches the Recency sort exactly."""
@@ -5138,7 +5170,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
            #right is 1fr → it fills 100% automatically once the list is gone. */
         #main.nolist #table { display: none; }
         #main.nolist #grip { display: none; }
-        #preview { padding: 0 1; height: 1fr; }
+        #preview-scroll { height: 1fr; width: 1fr; }   /* scroll viewport (fills the pane) */
+        #preview { padding: 0 1; height: auto; width: 1fr; }   /* Static grows with content → #preview-scroll scrolls */
         /* No border on the live pane: a box around it makes the embedded claude
            look unlike a real terminal session, and the pane already signals focus
            by SHOWING its cursor only when focused (see AgentTerminal.render_line).
@@ -5207,15 +5240,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # panes are appended as TabPanes on Enter.
                     with TabbedContent(id="right", initial="tab-preview"):
                         with TabPane("Preview", id="tab-preview"):
-                            yield RichLog(id="preview", wrap=True,
-                                          highlight=False, markup=False)
+                            # Static (not RichLog) so the preview is TEXT-SELECTABLE
+                            # while keeping Rich/ANSI formatting — RichLog's selection
+                            # yields no text in Textual 8.2.7 (verified). VerticalScroll
+                            # supplies the scrolling RichLog used to. (#preview-select)
+                            with VerticalScroll(id="preview-scroll"):
+                                yield Static(id="preview", markup=False)
                 else:
                     # Legacy / graceful-fallback layout: bare preview pane.
-                    # The RichLog keeps id="preview" (so _update_preview's
-                    # query is identical in both layouts) and ALSO carries the
+                    # The Static keeps id="preview" (so _update_preview's query is
+                    # identical in both layouts); the scroll container carries the
                     # .right class so it sizes as the 1fr pane beside the grip.
-                    yield RichLog(id="preview", classes="right", wrap=True,
-                                  highlight=False, markup=False)
+                    with VerticalScroll(id="preview-scroll", classes="right"):
+                        yield Static(id="preview", markup=False)
             yield Footer()
             yield Static("", id="leaderhint")   # which-key panel (dock: bottom)
 
@@ -5936,9 +5973,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
                 try:
-                    pv = self.query_one("#preview", RichLog)
-                    pv.clear()
-                    pv.write(msg)
+                    self._set_preview(Text(msg, style="dim italic"))
                 except Exception:
                     pass
             # Restore the user's scroll position so a BACKGROUND rebuild (the live
@@ -6162,39 +6197,75 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             self._last_preview_sid = sid
             self._last_preview_mode = self.preview_mode
-            preview = self.query_one("#preview", RichLog)
-            preview.clear()
             if not sid:
+                self._set_preview()
                 return
             cache_dir = (PREVIEW_FULL_DIR if self.preview_mode == "full"
                          else PREVIEW_DIR)
             cache_file = cache_dir / f"{sid}.txt"
             # Rendering runs on the UI thread; guard it like the other handlers
             # in this class so one malformed session shows a per-row message
-            # instead of tearing down the whole picker.
+            # instead of tearing down the whole picker. Body renderables are
+            # collected into `parts` and pushed in ONE _set_preview (Static shows a
+            # single renderable; multiple are stacked in a Group).
             try:
                 s = self._sid_index.get(sid)
+                parts: list = []
+                # Context legend: explain THIS session's activity/state glyphs
+                # (the +/./*/@/&/… the user sees in the list) at the top of the
+                # preview. Only the markers it actually has, so it's a 1-line crib,
+                # not the full key. (#marker-legend)
+                if s is not None:
+                    _leg = _marker_legend(s, _load_favorites(), _load_hidden())
+                    if _leg:
+                        parts.append(Text("markers   " + "    ".join(_leg),
+                                          style="dim italic"))
                 if self.preview_mode == "changes" and s is not None:
                     # Transcript-reconstructed diff; render on demand (no cache).
-                    preview.write(Text.from_ansi(_render_preview_changes(s)))
+                    parts.append(Text.from_ansi(_render_preview_changes(s)))
+                    self._set_preview(*parts)
                     return
                 # Open sessions grow every turn, so a cached preview goes stale.
                 # Render them fresh each time (skip the cache entirely).
                 if s is not None and s.get("is_open"):
                     render = (_render_preview_full if self.preview_mode == "full"
                               else _render_preview)
-                    preview.write(Text.from_ansi(render(s)))
+                    parts.append(Text.from_ansi(render(s)))
+                    self._set_preview(*parts)
                     return
                 if not cache_file.exists() and s is not None:
                     # Warm on demand (fallback for rows the background pre-warm
                     # has not reached yet) so the cache stays self-sufficient.
                     _write_preview_cache(s)
                 if cache_file.exists():
-                    preview.write(Text.from_ansi(cache_file.read_text(encoding="utf-8")))
+                    parts.append(Text.from_ansi(cache_file.read_text(encoding="utf-8")))
                 else:
-                    preview.write(f"(no preview for {sid[:8]})")
+                    parts.append(Text(f"(no preview for {sid[:8]})"))
+                self._set_preview(*parts)
             except Exception as e:
-                preview.write(f"(preview failed for {sid[:8]}: {e})")
+                self._set_preview(Text(f"(preview failed for {sid[:8]}: {e})"))
+
+        def _set_preview(self, *renderables) -> None:
+            """Replace the preview Static's content with one or more Rich
+            renderables (Static shows a single renderable, so stack them in a
+            Group), then scroll the viewport to the top. Selectable + format-
+            preserving, unlike the old RichLog. (#preview-select)"""
+            try:
+                pv = self.query_one("#preview", Static)
+            except Exception:
+                return
+            if not renderables:
+                pv.update("")
+            elif len(renderables) == 1:
+                pv.update(renderables[0])
+            else:
+                from rich.console import Group
+                pv.update(Group(*renderables))
+            try:
+                self.query_one("#preview-scroll", VerticalScroll).scroll_home(
+                    animate=False)
+            except Exception:
+                pass
 
         # ── events ──────────────────────────────────────────────────────────
 
@@ -6522,10 +6593,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         pass
                 try:
                     label = getattr(self, "_header_labels", {}).get(sid, "")
-                    pv = self.query_one("#preview", RichLog)
-                    pv.clear()
-                    pv.write(Text(f"\n  ── {label} ──", style="bold #7aa2f7"))
-                    pv.write(Text("  group header — no session selected", style="dim"))
+                    self._set_preview(
+                        Text(f"\n  ── {label} ──", style="bold #7aa2f7"),
+                        Text("  group header — no session selected", style="dim"))
                 except Exception:
                     pass
                 return
