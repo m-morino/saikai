@@ -827,6 +827,40 @@ def _toggle_in_set(path: Path, sid: str) -> bool:
     return now_present
 
 
+def _bulk_toggle_in_set(path: Path, sids, force: "bool | None" = None) -> bool:
+    """Toggle many `sids` in the set at `path` with ONE read + ONE write; return
+    the resulting membership (True = the sids are now present).
+
+    Direction: force=True adds all, force=False removes all, force=None auto-
+    decides by the *converging* rule "any-off → all-on, else all-off". A mixed
+    selection becomes uniformly on (a second press turns it uniformly off) — it
+    never flips each row independently, which on a mixed set would un-favorite the
+    rows you can see while favoriting the ones scrolled off.
+
+    Shares _toggle_in_set's anti-erase guard (refuses to write when the file
+    EXISTS but won't parse) AND, by reading/writing once for the whole batch,
+    closes the lost-update window a per-sid loop would open between calls."""
+    ids = [s for s in sids if s]
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise RuntimeError(f"{path.name} exists but could not be read "
+                               f"({e!r}); not toggling (won't risk erasing it)") from e
+        s = set(raw) if isinstance(raw, list) else set()
+    else:
+        s = set()
+    if not ids:
+        return False
+    target = (any(i not in s for i in ids) if force is None else bool(force))
+    if target:
+        s.update(ids)
+    else:
+        s.difference_update(ids)
+    _save_set(path, s)
+    return target
+
+
 def _load_hidden() -> set[str]:
     return _load_set(HIDDEN_FILE)
 
@@ -4302,6 +4336,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "[bold cyan]Session ops[/bold cyan]  [dim](␣x = Space then x; F-keys are the aliases)[/dim]\n"
                 "  [yellow]␣f[/yellow] [dim]F6[/dim]     Toggle ★ favorite   ([dim]:fav[/dim] in search to filter)\n"
                 "  [yellow]␣h[/yellow] [dim]F7[/dim]     Toggle hide/unhide  ([dim]:hidden[/dim] in search to find them)\n"
+                "  [yellow]␣␣[/yellow]        Mark rows (▣) — then ␣f / ␣h / Enter act on ALL marked\n"
                 "  [yellow]␣e[/yellow] [dim]⇧F2[/dim]    Rename — type your own name (empty clears → auto-title)\n"
                 "  [yellow]␣y[/yellow] [dim]F9[/dim]     Copy this session's opening prompt\n"
                 "  [yellow]␣d[/yellow] [dim]F8[/dim]     Show what this session changed (transcript diff)\n"
@@ -5276,12 +5311,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # sid -> session map so the preview pane can warm its own cache on
             # demand: rendered and cached on a cache miss.
             self._sid_index = {s.get("id"): s for s in all_sessions}
-            self._marked: set = set()        # sids selected for batch launch (Space)
+            self._marked: set = set()        # sids selected (Space-Space); bulk-capable verbs (resume/favorite/hide) act on all marked — see _selected_or_cursor
             self._opening_live_sid = None     # sid whose pane should grab focus on open
             self._unread: set = set()         # live panes finished (idle) but not yet responded to → ! marker
             self._busy_seen: set = set()      # sids observed busy since their last "done" toast (catches tasks shorter than the poll)
             self._last_status: dict = {}      # sid -> last poll status snapshot — per INSTANCE: the class-attr default is a shared mutable dict, so a 2nd PickerApp (headless tests, a future multi-window) would otherwise read the first app's statuses on its first poll (#8)
             self._opened_sids: set = set()    # sids opened + kept this session (snapshot source)
+            self._quitting = False            # set in action_quit_all so kill-triggered _on_live_exit doesn't erode the saved restore snapshot (#restore-erosion)
             self._opening_sids: set = set()   # opens in flight (register deferred to the mount worker) — counted by the capacity gate + has() dedup
             self._last_cursor_row = -1        # prior cursor row → header-skip direction
             self._mem_pressure_warned = False # memory-pressure toast: once per crossing
@@ -5829,7 +5865,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # str of consistent width.
                     raw_title = _ANSI_RE.sub("", tree_prefixes[s["id"]]) + raw_title
                 if s["id"] in getattr(self, "_marked", ()):
-                    raw_title = "▣ " + raw_title       # batch-launch selection (Space)
+                    raw_title = "▣ " + raw_title       # selection (Space-Space)
                 if _b2_sid and s["id"] == _b2_sid:
                     raw_title = "↻ " + raw_title       # b2 checkpoint in progress on this session
                 _tstyle = _title_color.get(_color_key_for(s, _color_by), "")  # [display] color_by
@@ -6076,6 +6112,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return None if val.startswith("__hdr__") else val
             except Exception:
                 return None
+
+        def _selected_or_cursor(self) -> list:
+            """Bulk-scope resolver: the marked sids (Space-Space selection) in
+            display order if any rows are marked, else the single cursored row
+            (or []). This is the ONE place the "marks-else-cursor" rule lives, so
+            every bulk-capable verb (resume / favorite / hide) scopes identically
+            — the gesture is uniform, not a per-action special case. Filtering the
+            marks through `all_sessions` also drops a stale mark (a session that
+            left the list) here rather than acting on it."""
+            if self._marked:
+                return [s["id"] for s in all_sessions if s["id"] in self._marked]
+            sid = self._cursor_sid()
+            return [sid] if sid else []
 
         def _apply_split_ratio(self, ratio: float) -> None:
             """Set the list width to `ratio` of #main (the pane is 1fr → it
@@ -6581,8 +6630,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.exit(sid)
 
         def action_toggle_mark(self) -> None:
-            """Toggle the cursor row's batch-launch selection (Space). Split-live
-            only: batch launch opens one live pane per marked session."""
+            """Toggle the cursor row's selection (Space-Space). The marked set is
+            consumed by the bulk-capable verbs via _selected_or_cursor: Enter
+            (resume) opens one live pane per marked session; ␣f / ␣h favorite /
+            hide all marked. Single-target verbs (rename / copy-prompt / diff /
+            resume-detached / close) deliberately ignore marks. Split-live only."""
             if _LIVE_TERM is None:
                 return
             sid = self._cursor_sid()
@@ -6751,6 +6803,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # owner. Refuse with a clear reason; it becomes resumable once the bg job
             # finishes and its registry entry drops (is_bg → False on the next scan).
             if s and s.get("is_bg"):
+                _log(f"open SKIP {sid[:8]}: is_bg (background agent, not attachable)")
                 self.notify("running background agent — can't resume a live session "
                             "(resume it after the bg job finishes)",
                             severity="warning", title="saikai", timeout=8)
@@ -6758,6 +6811,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Already open in another Claude window/instance (the @ marker): a second
             # `claude --resume` on the same JSONL can interleave/corrupt it. Confirm.
             if s and s.get("is_open"):
+                _log(f"open GATE {sid[:8]}: is_open (open elsewhere) → confirm prompt")
                 self.push_screen(OpenElsewhereScreen(title),
                                  lambda ok: _spawn() if ok else None)
                 return
@@ -6964,10 +7018,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             stub injected with its saved cwd so resume targets the right dir."""
             if _LIVE_TERM is None or self._live is None:
                 return
+            cands = list(getattr(self, "_restore_candidates", []) or [])
             opened = 0
-            for row in list(getattr(self, "_restore_candidates", []) or []):
+            skipped = {"no_id": 0, "already_live": 0, "no_cwd": 0}
+            for row in cands:
                 sid = (row.get("id") if isinstance(row, dict) else row) or ""
-                if not sid or self._live.has(sid):
+                if not sid:
+                    skipped["no_id"] += 1
+                    continue
+                if self._live.has(sid):
+                    skipped["already_live"] += 1
                     continue
                 cwd = row.get("cwd", "") if isinstance(row, dict) else ""
                 if sid not in self._sid_index:
@@ -6976,12 +7036,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         all_sessions.append(stub)
                         self._sid_index[sid] = stub
                     else:
-                        continue   # not scanned and no usable cwd → can't resume
+                        # not scanned and no usable cwd → can't resume. Log it so a
+                        # lossy restore is diagnosable instead of silent. (#restore-diag)
+                        skipped["no_cwd"] += 1
+                        _log(f"restore SKIP {sid[:8]}: not in index, cwd={cwd!r} "
+                             f"is_dir={bool(cwd) and Path(cwd).is_dir()}")
+                        continue
                 self._open_or_attach_live(sid, refresh=False)
                 opened += 1
+            _log(f"restore: candidates={len(cands)} opened={opened} skipped={skipped}")
             if opened:
                 self._refresh_table()
                 self.notify(f"reopened {opened} pane(s) from last session", timeout=4)
+            elif skipped["no_cwd"]:
+                self.notify(f"couldn't restore {skipped['no_cwd']} pane(s) — their "
+                            f"folder couldn't be resolved (see saikai.log)",
+                            severity="warning", timeout=6)
             else:
                 self.notify("nothing to restore", timeout=3)
 
@@ -7186,8 +7256,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # next Shift+F4 restore (matches explicit-close in _close_live_sid).
             # The dead ✓ tab stays visible THIS session; re-launching it with Enter
             # re-adds it via _open_or_attach_live. Persist the trimmed snapshot now.
-            self._opened_sids.discard(sid)
-            self._save_open_panes()
+            # EXCEPTION: during quit teardown (_quitting), kill_all fires this for
+            # every pane — eroding + re-saving here empties the restore snapshot we
+            # just wrote in action_quit_all (the file ended up []). Skip it so quit
+            # preserves the open set for Shift+F4. (#restore-erosion)
+            if not getattr(self, "_quitting", False):
+                self._opened_sids.discard(sid)
+                self._save_open_panes()
             self._prune_dead_panes()   # bound retained ✓ dead-pane memory (#H6)
             self._refresh_table()
             if _was_focused:
@@ -7637,25 +7712,36 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         # ── actions ─────────────────────────────────────────────────────────
 
+        def _bulk_or_single_toggle(self, path, on_verb, off_verb, what) -> None:
+            """Favorite/hide scoped by _selected_or_cursor (marks → all marked,
+            else the cursor row). Converging bulk-toggle, ONE read+write, ONE
+            repaint; a count toast only when >1 row is affected so an off-screen
+            marked row is never silently mutated. Single-row (no marks) keeps the
+            original quiet flip. Marks clear only AFTER a successful write, so a
+            mid-batch failure (the anti-erase guard raising) leaves the selection
+            intact for a retry instead of dropping it with nothing done."""
+            sids = self._selected_or_cursor()
+            if not sids:
+                return
+            try:
+                now_on = _bulk_toggle_in_set(path, sids)
+            except Exception as e:
+                self.notify(f"{what} skipped: {e}", severity="error", timeout=6)
+                return
+            bulk = len(sids) > 1
+            if self._marked:
+                self._marked.clear()
+            if bulk:
+                self.notify(f"{on_verb if now_on else off_verb} {len(sids)} sessions",
+                            timeout=3)
+            self._refresh_table()
+
         def action_toggle_hide(self) -> None:
-            sid = self._cursor_sid()
-            if sid:
-                try:
-                    _toggle_in_set(HIDDEN_FILE, sid)
-                except Exception as e:
-                    self.notify(f"hide skipped: {e}", severity="error", timeout=6)
-                    return
-                self._refresh_table()
+            self._bulk_or_single_toggle(HIDDEN_FILE, "hid", "unhid", "hide")
 
         def action_toggle_fav(self) -> None:
-            sid = self._cursor_sid()
-            if sid:
-                try:
-                    _toggle_in_set(FAVORITE_FILE, sid)
-                except Exception as e:
-                    self.notify(f"favorite skipped: {e}", severity="error", timeout=6)
-                    return
-                self._refresh_table()
+            self._bulk_or_single_toggle(FAVORITE_FILE, "favorited", "unfavorited",
+                                        "favorite")
 
         def action_rename(self) -> None:
             # A focused live pane owns Shift+F2 (it goes to claude); only rename
@@ -7988,6 +8074,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                             fresh.append(old)
             all_sessions = fresh
             self._sid_index = {s.get("id"): s for s in fresh}
+            # Drop marks for sessions that fell out of the fresh scan (expiry /
+            # delete / window change). A dangling sid left in _marked would
+            # otherwise be acted on by the next bulk verb against a row the user
+            # can no longer see. Live-pane sids were re-appended above, so this
+            # keeps them. (#bulk-marks-prune)
+            if getattr(self, "_marked", None):
+                self._marked &= set(self._sid_index)
 
         def _auto_tick(self) -> None:
             # Quiet periodic re-scan (SAIKAI_AUTO_REFRESH). Skips while a live pane
@@ -8207,6 +8300,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self._save_open_panes()
             except Exception:
                 pass
+            # kill_all below fires _on_live_exit for EVERY pane as it dies; that
+            # handler discards the sid from _opened_sids and re-saves — which would
+            # erode the snapshot we just wrote down to [] (the "saved nothing on
+            # quit" bug). Flag the teardown so those exit callbacks skip the
+            # snapshot mutation and the just-saved restore set survives. (#restore-erosion)
+            self._quitting = True
             _log(f"quit: all, live={self._live.count if self._live else 0}")
             if self._live is not None:
                 self._live.kill_all(wait=True)
@@ -8831,8 +8930,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 import saikai_mirror as _mirror
                 _mir_on, _mir_host = _mirror.mirror_config(os.environ)
                 if _mir_on:
+                    # token_urlsafe(12) → 16 url-safe chars (96 bits). Short on
+                    # purpose: the URL it lands in is the QR's payload, and a
+                    # 43-char token (token_urlsafe(32)) pushed the QR to a dense
+                    # version that another PC's camera couldn't resolve. 96 bits
+                    # is still infeasible to brute-force over HTTP for an
+                    # ephemeral, control-gated, idle-off LAN mirror.
                     _hub = _mirror.MirrorHub(
-                        token=_secrets.token_urlsafe(32), host=_mir_host,
+                        token=_secrets.token_urlsafe(12), host=_mir_host,
                         port=_mirror.mirror_port(os.environ),
                         idle_secs=_mirror.mirror_idle_secs(os.environ))
                     # LAN input is its own opt-in: a LAN-exposed mirror stays
