@@ -610,6 +610,29 @@ def _scroll_row_index(hist_len: int, scroll: int, y: int) -> int:
     return hist_len - scroll + y
 
 
+def _pyte_grid_lines(screen) -> list:
+    """Visible grid as list[str], one string per row — a robust stand-in for
+    pyte's ``Screen.display``.
+
+    ``Screen.display`` carries ``assert sum(map(wcwidth, char[1:])) == 0``, which
+    raises ``AssertionError`` on any cell whose combining TAIL has a non-zero
+    width — reachable from real terminal output (malformed/edge sequences claude's
+    TUI can emit). Our snapshot_text / _current_screen callers wrapped display in
+    ``except Exception`` and so silently produced an EMPTY grid (the reported blank
+    pane dump, and a blanked status classifier) with no clue why. Walk the buffer
+    the way render_line does instead — skip the empty-string wide-char STUB pyte
+    stores at x+1, never call wcwidth — so this can't assert. Call under the pane
+    lock (buffer access). (#pane-dump)"""
+    rows = getattr(screen, "lines", 0) or 0
+    cols = getattr(screen, "columns", 0) or 0
+    buf = screen.buffer
+    out = []
+    for y in range(rows):
+        row = buf[y]
+        out.append("".join(row[x].data for x in range(cols) if row[x].data != ""))
+    return out
+
+
 def set_clipboard_windows(text: str) -> bool:
     """Put `text` on the Windows clipboard as CF_UNICODETEXT via Win32 directly.
 
@@ -1532,7 +1555,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             if self._scr_ver == self._cached_ver:
                 return self._cached_screen
             try:
-                txt = "\n".join(self._screen.display)
+                # _pyte_grid_lines, not screen.display: display's wcwidth assert
+                # can raise on real output and would blank the classifier. (#pane-dump)
+                txt = "\n".join(_pyte_grid_lines(self._screen))
             except Exception:
                 txt = ""
             title = getattr(self._screen, "title", "") or ""
@@ -1673,18 +1698,21 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     def snapshot_text(self) -> str:
         """Plain-text dump of the pane's CURRENT visible pyte screen + geometry,
         for the pane-dump debug key (so a garbled bottom can be inspected off the
-        live UI). pyte's ``screen.display`` is the rendered visible grid; read it
-        under the lock (the reader feeds the stream under the same lock), format
-        outside. (#pane-dump)"""
+        live UI). Render the visible grid with ``_pyte_grid_lines`` (NOT pyte's
+        ``screen.display``, whose wcwidth assert can raise on real output and once
+        left this body empty) under the lock — the reader feeds the stream under
+        the same lock — and format outside. (#pane-dump)"""
         lines: list = []
         meta = {}
         with self._lock:
             scr = self._screen
             if scr is not None:
                 try:
-                    lines = list(scr.display)      # visible grid as list[str]
-                except Exception:
-                    lines = []
+                    lines = _pyte_grid_lines(scr)  # visible grid as list[str]
+                except Exception as exc:
+                    # Never swallow into an empty body again — surface the reason
+                    # right in the dump so a future failure is self-diagnosing.
+                    lines = [f"<snapshot render failed: {exc!r}>"]
                 try:
                     meta = {"cols": scr.columns, "rows": scr.lines,
                             "cx": scr.cursor.x, "cy": scr.cursor.y,

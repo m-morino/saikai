@@ -181,6 +181,28 @@ def test_pane_refresh_coalesces():
     assert len(queued) == 2, "should re-queue a repaint after the UI painted"
 
 
+class _Cell:
+    """Minimal pyte-Char stand-in: _pyte_grid_lines only reads ``.data``."""
+    __slots__ = ("data",)
+
+    def __init__(self, data):
+        self.data = data
+
+
+class _FakeScreen:
+    """pyte-shaped screen (lines/columns/buffer[y][x].data) for the buffer walk in
+    _pyte_grid_lines — keeps this suite pyte-free like the module docstring."""
+
+    def __init__(self, text, title="T"):
+        self.title = title
+        self.set_text(text)
+
+    def set_text(self, text):
+        self.lines = 1
+        self.columns = len(text)
+        self.buffer = {0: {x: _Cell(ch) for x, ch in enumerate(text)}}
+
+
 def test_current_screen_caches_by_version():
     """_current_screen reuses the last join until _scr_ver bumps (a feed bumps it),
     so the host poll / render path don't re-join an unchanged screen."""
@@ -190,13 +212,11 @@ def test_current_screen_caches_by_version():
     ct._cached_ver = -1
     ct._cached_screen = ("", "")
 
-    class _Scr:
-        display = ["line a", "line b"]
-        title = "T"
-    ct._screen = _Scr()
-    assert ct._current_screen() == ("line a\nline b", "T")
-    ct._screen.display = ["CHANGED"]                       # mutate WITHOUT a version bump
-    assert ct._current_screen() == ("line a\nline b", "T"), "should serve the cached join"
+    scr = _FakeScreen("line a")
+    ct._screen = scr
+    assert ct._current_screen() == ("line a", "T")
+    scr.set_text("CHANGED")                               # mutate WITHOUT a version bump
+    assert ct._current_screen() == ("line a", "T"), "should serve the cached join"
     ct._scr_ver = 6                                        # a feed bumps the version
     assert ct._current_screen() == ("CHANGED", "T"), "bump → rejoin"
 
