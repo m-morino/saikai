@@ -513,10 +513,10 @@ def test_bad_write_key_increments_failure_counter():
     hub._control_enabled = True
     port = hub.serve()
     try:
-        before = hub._bad_key_count
+        before = hub._bad_key.get("127.0.0.1", (0, 0.0, 0.0))[0]
         _post(port, "/input", {"data": "x"},
               headers={"X-Mirror-Write-Key": "wrong"})
-        assert hub._bad_key_count == before + 1, hub._bad_key_count
+        assert hub._bad_key.get("127.0.0.1", (0, 0.0, 0.0))[0] == before + 1, hub._bad_key
     finally:
         hub.stop()
 

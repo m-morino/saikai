@@ -703,6 +703,9 @@ def test_pilot_mirror_control_toggle():
             self.calls = []
         def set_control_state(self, enabled, target=None):
             self.calls.append((enabled, target))
+            # Mirror the real hub's contract: return the effective state so the
+            # app keeps its own copy in sync. (Loopback stub → no clamp.)
+            return enabled
         # on_mount also wires these; provide no-op stand-ins.
         def set_size(self, *a):
             pass
@@ -715,6 +718,8 @@ def test_pilot_mirror_control_toggle():
         def set_key_handler(self, *a):
             pass
         def set_client_change_handler(self, *a):
+            pass
+        def set_control_change_handler(self, *a):
             pass
         def url(self):
             return "http://127.0.0.1:0/?token=x"

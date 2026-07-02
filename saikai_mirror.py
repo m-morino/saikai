@@ -29,6 +29,7 @@ _Control = collections.namedtuple("_Control", ["json"])
 # refuse input for a cooldown so a lost/guessed key can't be hammered. (#audit-mirror-ratecap)
 _BAD_KEY_LOCKOUT_THRESHOLD = 20
 _BAD_KEY_LOCKOUT_SECS = 30.0
+_BAD_KEY_TTL_SECS = 600.0   # idle sweep age for sub-threshold per-source entries
 
 
 # pyte stores a colour as: a basic name, a "bright"+name, a 6-hex string
@@ -155,6 +156,7 @@ class MirrorHub:
         self._mouse_handler = None             # _marshal-shaped, set at app mount
         self._key_handler = None               # _marshal-shaped, set at app mount
         self._client_change_handler = None     # notified (count) on connect/disconnect
+        self._control_change_handler = None    # notified (bool) on HUB-initiated control changes
         self._control_target = None            # focused-pane title (advisory)
         # Write-key: NEVER placed in any URL/file/QR/log; delivered only over the
         # authenticated SSE stream and required as the X-Mirror-Write-Key header.
@@ -165,8 +167,16 @@ class MirrorHub:
         self._idle_secs = idle_secs
         self._idle_timer = None
         self._idle_lock = threading.Lock()
-        self._bad_key_count = 0
-        self._bad_key_lockout_until = 0.0   # monotonic; input refused until then
+        # Per-source (peer IP) bad-key bookkeeping. Global counters let one
+        # abusive peer's guesses trip a hub-wide lockout that also refuses the
+        # legitimate operator's correct key — a same-LAN DoS knob. Keying by the
+        # TCP peer IP (which can't be spoofed on an established connection) bounds
+        # a lockout to the offending source. One dict so count/deadline can't
+        # drift apart; swept on every note so sub-threshold strays that never
+        # return can't grow it for the life of the process. (#audit-mirror-ratecap)
+        self._bad_key_lock = threading.Lock()
+        # src IP -> (consecutive bad keys, lockout deadline, last seen) — monotonic.
+        self._bad_key: dict[str, tuple[int, float, float]] = {}
         self._last_accept_t = 0.0
         # Accepted-input rate cap (seconds between accepted injects). Now actually
         # REACHABLE at runtime via env (was hardcoded 0.0 → the documented flood
@@ -205,23 +215,38 @@ class MirrorHub:
         except queue.Full:
             pass
 
-    def _note_bad_key(self) -> None:
-        """Count a bad write-key attempt; arm a cooldown lockout at the threshold."""
-        self._bad_key_count += 1
-        if self._bad_key_count >= _BAD_KEY_LOCKOUT_THRESHOLD:
-            import time as _t
-            self._bad_key_lockout_until = _t.monotonic() + _BAD_KEY_LOCKOUT_SECS
-
-    def _input_locked_out(self) -> bool:
-        """True while the bad-key cooldown is active; auto-resets afterwards."""
-        if self._bad_key_lockout_until <= 0.0:
-            return False
+    def _note_bad_key(self, src: str = "?") -> None:
+        """Count a bad write-key attempt from `src`; arm a per-source cooldown at
+        the threshold so one peer's guesses can't lock out anyone else. Sweeps
+        entries idle past _BAD_KEY_TTL_SECS (and not locked) — many one-off
+        strangers must not leak an entry each forever."""
         import time as _t
-        if _t.monotonic() < self._bad_key_lockout_until:
-            return True
-        self._bad_key_lockout_until = 0.0
-        self._bad_key_count = 0
-        return False
+        now = _t.monotonic()
+        with self._bad_key_lock:
+            for k in [k for k, (_, until, seen) in self._bad_key.items()
+                      if now >= until and now - seen > _BAD_KEY_TTL_SECS]:
+                del self._bad_key[k]
+            n = self._bad_key.get(src, (0, 0.0, 0.0))[0] + 1
+            until = (now + _BAD_KEY_LOCKOUT_SECS
+                     if n >= _BAD_KEY_LOCKOUT_THRESHOLD else 0.0)
+            self._bad_key[src] = (n, until, now)
+
+    def _clear_bad_key(self, src: str = "?") -> None:
+        """A legit key from `src` clears its streak and any pending lockout."""
+        with self._bad_key_lock:
+            self._bad_key.pop(src, None)
+
+    def _input_locked_out(self, src: str = "?") -> bool:
+        """True while `src`'s bad-key cooldown is active; auto-resets afterwards."""
+        import time as _t
+        with self._bad_key_lock:
+            until = self._bad_key.get(src, (0, 0.0, 0.0))[1]
+            if until <= 0.0:
+                return False
+            if _t.monotonic() < until:
+                return True
+            self._bad_key.pop(src, None)
+            return False
 
     def broadcast(self, data: str) -> None:
         """Called from Textual's UI thread (MirrorDriver.write). MUST NOT block.
@@ -280,6 +305,14 @@ class MirrorHub:
         # Written from the UI thread (on_mount), read from the HTTP server thread.
         # Single attribute assign/read is GIL-atomic (same as set_input_handler).
         self._client_change_handler = fn
+
+    def set_control_change_handler(self, fn) -> None:
+        # Same GIL-atomic single-attribute pattern. Called with the new bool state
+        # when the HUB (not the app) changes control — today only the idle auto-off
+        # timer. App-initiated toggles sync via set_control_state's return value
+        # instead, so this never fires on the UI thread (call_from_thread inside
+        # the handler would raise there).
+        self._control_change_handler = fn
 
     def _notify_client_change(self) -> None:
         # Called from the HTTP server thread on connect/disconnect. The handler is
@@ -385,10 +418,13 @@ class MirrorHub:
         # Same GIL-atomic single-attribute pattern as set_input_handler.
         self._key_handler = fn
 
-    def set_control_state(self, enabled: bool, target=None) -> None:
+    def set_control_state(self, enabled: bool, target=None) -> bool:
         """Store the advisory control state + focused-pane title and broadcast a
         control frame to every connected browser. The app's UI-thread gate is the
-        authority; this copy is what do_POST fast-rejects against."""
+        authority; this copy is what do_POST fast-rejects against. Returns the
+        EFFECTIVE state after the LAN opt-in clamp below, so the caller can keep
+        its own copy in sync instead of falsely believing control is ON when this
+        gate silently forced it OFF."""
         # LAN input is opt-in: a non-loopback bind cannot ENABLE control unless
         # allow_lan_input was set at launch. Disabling is always honored.
         if enabled and not self._host_is_loopback() and not self.allow_lan_input:
@@ -415,6 +451,7 @@ class MirrorHub:
             self._arm_idle_timer()
         else:
             self._cancel_idle_timer()
+        return self._control_enabled
 
     def update_control_target(self, target=None) -> None:
         """Refresh ONLY the control banner's 'typing into' target (focus moved
@@ -459,6 +496,17 @@ class MirrorHub:
         # No accepted input within the window: disable control + tell the browser.
         if self._control_enabled:
             self.set_control_state(False, None)
+            # Hub-initiated change: nothing called set_control_state on the app's
+            # behalf, so its return value can't sync the app's authoritative copy —
+            # without this push the TUI keeps showing control ON while every POST
+            # 409s, and the next Shift+F12 toggles from the stale True (one dead
+            # press). Timer thread; the handler marshals to the UI thread.
+            fn = self._control_change_handler
+            if fn is not None:
+                try:
+                    fn(False)
+                except Exception:
+                    pass
 
     def inject(self, data: str) -> bool:
         """Accept browser keyboard input IFF control is on AND a handler is wired.
@@ -1063,16 +1111,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _write_key_ok(self) -> bool:
         hub = self.server.hub
-        # Enforce the bad-key cooldown (was a write-only counter): a lost/guessed
-        # write-key can't be hammered once the threshold trips. (#audit-mirror-ratecap)
-        if hub._input_locked_out():
+        src = self.client_address[0] if self.client_address else "?"
+        # Enforce the per-source bad-key cooldown (was a hub-wide write-only
+        # counter): a lost/guessed write-key can't be hammered once the threshold
+        # trips, and one abusive peer can't lock out the real operator's own
+        # correct key. (#audit-mirror-ratecap)
+        if hub._input_locked_out(src):
             return False
         got = self.headers.get("X-Mirror-Write-Key", "")
         ok = hmac.compare_digest(got, hub._write_key)
         if ok:
-            hub._bad_key_count = 0                    # legit key → clear the streak
+            hub._clear_bad_key(src)                   # legit key → clear the streak
         else:
-            hub._note_bad_key()
+            hub._note_bad_key(src)
         return ok
 
     def _allowed_hosts(self) -> set:

@@ -166,14 +166,24 @@ def test_bad_key_lockout_enforced_and_resets():
     """The bad-key counter must actually LOCK OUT input at the threshold (was a
     write-only counter) and auto-reset after the cooldown. (#audit-mirror-ratecap)"""
     hub = m.MirrorHub(token="t")
-    assert hub._input_locked_out() is False
+    src = "10.0.0.9"
+    assert hub._input_locked_out(src) is False
     for _ in range(m._BAD_KEY_LOCKOUT_THRESHOLD):
-        hub._note_bad_key()
-    assert hub._input_locked_out() is True, "threshold of bad keys must lock out input"
+        hub._note_bad_key(src)
+    assert hub._input_locked_out(src) is True, "threshold of bad keys must lock out input"
+    # A DIFFERENT source is unaffected — the lockout is per-peer, not hub-wide.
+    assert hub._input_locked_out("10.0.0.42") is False
     # Simulate the cooldown elapsing → auto-reset, input allowed again.
-    hub._bad_key_lockout_until = 1.0          # far in the past (monotonic)
-    assert hub._input_locked_out() is False
-    assert hub._bad_key_count == 0
+    n, _until, seen = hub._bad_key[src]
+    hub._bad_key[src] = (n, 1.0, seen)        # deadline far in the past (monotonic)
+    assert hub._input_locked_out(src) is False
+    assert src not in hub._bad_key
+    # Sub-threshold strays are swept once idle past the TTL — no per-IP leak.
+    hub._note_bad_key("10.0.0.7")
+    n, until, _seen = hub._bad_key["10.0.0.7"]
+    hub._bad_key["10.0.0.7"] = (n, until, -2 * m._BAD_KEY_TTL_SECS)
+    hub._note_bad_key("10.0.0.8")             # any note sweeps expired entries
+    assert "10.0.0.7" not in hub._bad_key, "idle sub-threshold entry must be swept"
 
 
 def test_min_accept_gap_reads_env():

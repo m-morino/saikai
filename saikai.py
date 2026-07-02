@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import unicodedata
@@ -585,14 +586,28 @@ def _at_live_capacity(live_count: int, pending: int, max_live: int) -> bool:
     return (int(live_count) + int(pending)) >= int(max_live)
 
 
-def _write_json(path: Path, obj) -> None:
-    """Atomically write JSON to path. Uses tempfile + os.replace so concurrent
-    readers/writers (worker pool, concurrent reads) cannot observe a torn write."""
+def _write_text_atomic(path: Path, text: str, mode: "int | None" = None) -> None:
+    """Atomically write `text` to path via a unique tempfile + os.replace, so a
+    concurrent reader (another saikai tab polling the pref) can never observe the
+    truncate-then-write window that a plain path.write_text opens — during which
+    the read returns an empty string and the caller silently reverts to a wrong
+    default mode/filter until the next distinct-mtime read.
+
+    `mode` (e.g. 0o600 for token-bearing files) is applied at tmp CREATION, not
+    chmod-after-write — a chmod would leave a default-umask window; os.replace
+    then carries the tmp's permissions onto the destination."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(obj, indent=2, ensure_ascii=False)
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    # PID + thread id keep the tmp name unique across concurrent writers of the
+    # same path (the docstring's worker-pool safety claim needs the thread id;
+    # PID alone collides between two threads in one process).
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}")
     try:
-        tmp.write_text(payload, encoding="utf-8")
+        if mode is not None:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+        else:
+            tmp.write_text(text, encoding="utf-8")
         os.replace(tmp, path)
     finally:
         if tmp.exists():
@@ -600,6 +615,12 @@ def _write_json(path: Path, obj) -> None:
                 tmp.unlink()
             except Exception:
                 pass
+
+
+def _write_json(path: Path, obj) -> None:
+    """Atomically write JSON to path. Uses tempfile + os.replace so concurrent
+    readers/writers (worker pool, concurrent reads) cannot observe a torn write."""
+    _write_text_atomic(path, json.dumps(obj, indent=2, ensure_ascii=False))
 
 
 # ── Cache ───────────────────────────────────────────────────────────────────
@@ -631,6 +652,14 @@ SORT_DEFAULT = [
 PARSED_DIR = CACHE_DIR / "parsed"
 PREVIEW_DIR = CACHE_DIR / "preview"
 PREVIEW_FULL_DIR = CACHE_DIR / "preview-full"
+
+# Single source for the LAN-input opt-in env var name: it appears in the env
+# read, the startup banner, and the Shift+F12 refusal toast — a rename or typo
+# in any one copy would tell users to set a variable that does nothing.
+_MIRROR_LAN_INPUT_ENV = "SAIKAI_MIRROR_ALLOW_LAN_INPUT"
+# Where the (token-bearing) mirror URL is persisted while the picker runs;
+# written at mirror startup, removed at exit AND before a resume handoff.
+_MIRROR_URL_FILE = CACHE_DIR / "mirror-url.txt"
 
 
 def _log(msg: str) -> None:
@@ -877,8 +906,7 @@ def _get_view_mode() -> str:
 
 def _toggle_view_mode() -> str:
     new_mode = "show-hidden" if _get_view_mode() == "default" else "default"
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    VIEW_MODE_FILE.write_text(new_mode, encoding="utf-8")
+    _write_text_atomic(VIEW_MODE_FILE, new_mode)
     _invalidate_pref(VIEW_MODE_FILE)
     return new_mode
 
@@ -892,8 +920,7 @@ def _get_tree_mode() -> bool:
 
 def _toggle_tree_mode() -> bool:
     new = not _get_tree_mode()
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    TREE_MODE_FILE.write_text("on" if new else "off", encoding="utf-8")
+    _write_text_atomic(TREE_MODE_FILE, "on" if new else "off")
     _invalidate_pref(TREE_MODE_FILE)
     return new
 
@@ -912,8 +939,7 @@ def _get_group_by() -> str:
 def _set_group_by(value: str) -> None:
     if value not in ("none", "date", "project", "state"):
         value = "none"
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    GROUP_BY_FILE.write_text(value, encoding="utf-8")
+    _write_text_atomic(GROUP_BY_FILE, value)
     _invalidate_pref(GROUP_BY_FILE)
 
 
@@ -949,8 +975,7 @@ def _get_status_filter() -> str:
 def _set_status_filter(value: str) -> None:
     if value not in ("active", "archived", "all"):
         value = "active"
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    STATUS_FILTER_FILE.write_text(value, encoding="utf-8")
+    _write_text_atomic(STATUS_FILTER_FILE, value)
     _invalidate_pref(STATUS_FILTER_FILE)
 
 
@@ -965,8 +990,7 @@ def _get_lastact_days() -> int:
 
 
 def _set_lastact_days(days: int) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    LASTACT_FILTER_FILE.write_text(str(int(days)), encoding="utf-8")
+    _write_text_atomic(LASTACT_FILTER_FILE, str(int(days)))
     _invalidate_pref(LASTACT_FILTER_FILE)
 
 
@@ -1460,7 +1484,14 @@ def _is_session_pid_live(pid: int, pid_index: "dict | None") -> bool:
     if info is None:
         return False
     name = info[0]
-    return name in _CLAUDE_PROC_NAMES or "claude" in name or "node" in name
+    # Exact image-name match (szExeFile is always "<name>.exe" here), plus a
+    # "claude*" prefix for wrapper variants (claude.exe, claude-code.exe). The old
+    # bare `"node" in name` / `"claude" in name` substring test matched ANY image
+    # containing those tokens (e.g. an unrelated "node-red.exe", "vscode-node.exe"),
+    # widening the PID-reuse false-positive window this guard exists to close.
+    # (A recycled PID landing on a real node.exe still can't be told apart by name
+    # alone — that residue needs ppid ancestry, out of scope here.) (#audit-pidreuse)
+    return name in _CLAUDE_PROC_NAMES or name.startswith("claude")
 
 
 # ── Terminal-death watchdog (Windows SIGHUP emulation) ───────────────────────
@@ -1837,7 +1868,15 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
 
 def parse_session(jsonl_path: Path) -> dict | None:
     sid = jsonl_path.stem
-    _st = jsonl_path.stat()
+    # A session's JSONL can vanish between a caller's glob() snapshot and this
+    # stat (another saikai tab deleting/hiding it, or Claude Code pruning an
+    # ephemeral transcript). The since=None callers (e.g. the Claude-Desktop
+    # import) do NOT wrap parse_session, so an unhandled FileNotFoundError here
+    # would abort the whole enumeration — skip the one vanished session instead.
+    try:
+        _st = jsonl_path.stat()
+    except OSError:
+        return None
     mtime, size = _st.st_mtime, _st.st_size
     cache_file = PARSED_DIR / f"{sid}.json"
 
@@ -1972,7 +2011,13 @@ def load_sessions_in_dir(project_dir: Path, since: datetime | None) -> list[dict
                     continue
         except Exception:
             continue
-        s = parse_session(jsonl)
+        # Contain per-file failures at the loop level too: whatever parse_session
+        # may raise (beyond the stat race it guards itself), one bad/vanished
+        # JSONL must not abort the enumeration of every other session in the dir.
+        try:
+            s = parse_session(jsonl)
+        except Exception:
+            continue
         if s:
             s["project_name"] = project_dir.name
             sessions.append(s)
@@ -4192,6 +4237,23 @@ class _MirrorControl:
             except Exception:
                 pass
 
+    def _mirror_control_changed(self, on: bool) -> None:
+        """HUB-initiated control-state change (idle auto-off). Runs on the UI
+        thread (the hub's change handler marshals here). Sync the app's
+        authoritative _control_enabled so the next Shift+F12 toggles from the
+        REAL state instead of a stale True (which made the first press a dead
+        'OFF an already-off control'), and tell the user the mirror went
+        read-only."""
+        if self._control_enabled == bool(on):
+            return
+        self._control_enabled = bool(on)
+        try:
+            if not on:
+                self.notify("Mirror control auto-OFF (idle) — read-only",
+                            title="saikai mirror", timeout=5)
+        except Exception:
+            pass
+
 
 def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                  flat: bool = False, reload_fn=None) -> None:
@@ -5519,6 +5581,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     except Exception:
                         pass
                 _hub.set_client_change_handler(_client_change)
+
+                def _control_change(on, _app=_app_ref):
+                    if not getattr(_app, "is_running", False):
+                        return
+                    try:
+                        _app.call_from_thread(_app._mirror_control_changed, bool(on))
+                    except Exception:
+                        pass
+                _hub.set_control_change_handler(_control_change)
                 # Show the QR so a phone can join without typing the tokened URL
                 # (the stderr banner is alt-screen hidden). action_mirror_info also
                 # copies the URL to the host clipboard, every time — F12 re-opens it.
@@ -6720,9 +6791,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             sid = self._cursor_sid()
             if sid:
                 # Tear down any live panes first so their PTYs don't outlive the
-                # picker as orphans once we exit into the foreground claude.
+                # picker as orphans once we exit into the foreground claude. WAIT
+                # for the reaps: exit() → _resume_claude() immediately execs a new
+                # foreground `claude --resume <sid>` in the SAME cwd, so a still-
+                # dying old process could race the new one on the transcript/lock
+                # (corrupted turns, "session in use") — and atexit won't fire until
+                # that foreground child returns. action_quit_all uses wait=True for
+                # the same reason; keep this path symmetric.
                 if self._live is not None:
-                    self._live.kill_all()
+                    self._live.kill_all(wait=True)
                 self.exit(sid)
 
         def action_toggle_mark(self) -> None:
@@ -7050,6 +7127,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             in self._opening_sids (added by _spawn_live_pane) until this returns —
             the `finally` always clears it — so the capacity gate + has() dedup
             count this in-flight open while register() is pending."""
+            registered = False
             try:
                 try:
                     exists = False
@@ -7066,10 +7144,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                             pass
                     await tabs.add_pane(pane)
                 except Exception as e:
-                    try:
-                        self._live.note_reap(term.kill())
-                    except Exception:
-                        pass
                     self.notify(f"could not open tab: {e!r}", severity="error", timeout=8)
                     return
                 # claude died DURING mount (pyte/ConPTY spawn failed, or an instant
@@ -7078,10 +7152,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # Shift+F4 restore set. Drop the zombie tab and tell the user.
                 if getattr(term, "is_dead", False):
                     try:
-                        self._live.note_reap(term.kill())
-                    except Exception:
-                        pass
-                    try:
                         await tabs.remove_pane(pane_id)
                     except Exception:
                         pass
@@ -7089,6 +7159,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                 severity="warning", timeout=6)
                     return
                 self._live.register(sid, term)
+                registered = True
                 _log(f"live open: {sid[:8]}  ({self._live.count}/{self._live.max_live})")
                 self._opened_sids.add(sid)
                 self._save_open_panes()
@@ -7111,6 +7182,18 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if refresh:
                     self._refresh_table()
             finally:
+                # Safety net for the un-registered term. The explicit error paths
+                # above already `return` without registering; this ALSO catches
+                # asyncio.CancelledError (a BaseException, so it bypasses the
+                # `except Exception` above) raised when App exit calls
+                # workers.cancel_all() at a pending `await` — otherwise a PTY that
+                # AgentTerminal.on_mount already spawned would leak, untracked by
+                # LiveSessionManager/join_all_reaps, surviving saikai's exit. (#audit-mount-cancel)
+                if not registered:
+                    try:
+                        self._live.note_reap(term.kill())
+                    except Exception:
+                        pass
                 self._opening_sids.discard(sid)
 
         def _save_open_panes(self) -> None:
@@ -8546,24 +8629,33 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             _hub = getattr(self, "_mirror_hub", None)
             if _hub is None:
                 return
-            self._control_enabled = not self._control_enabled
+            desired = not self._control_enabled
             # Reset the input parser on every toggle so a partial escape buffered in a
             # PRIOR control session can't survive an OFF→ON and complete against the
             # first key of the new session as a phantom. (#H9)
             self._mirror_parser = None
             # Designate a control target only while enabling; disabling clears it
             # (matches the hub's own `target if enabled else None` normalisation).
-            t = self._focused_terminal() if self._control_enabled else None
+            t = self._focused_terminal() if desired else None
             target = (getattr(t, "title", None) if t is not None else None)
+            # The hub may CLAMP enable→off on a LAN bind without SAIKAI_MIRROR_ALLOW_LAN_INPUT.
+            # Trust its returned effective state as authority so the TUI never claims
+            # control is ON while every /input POST is actually being 409'd.
             try:
-                _hub.set_control_state(self._control_enabled, target)
+                effective = _hub.set_control_state(desired, target)
             except Exception:
-                pass
+                effective = desired
+            self._control_enabled = bool(effective)
             if self._control_enabled:
                 msg = (f"Mirror control ON — typing into: {target}" if target
                        else "Mirror control ON — no pane focused")
                 self.notify(msg, title="saikai mirror", severity="warning",
                             timeout=6)
+            elif desired and not self._control_enabled:
+                # Requested ON but the hub refused it (LAN bind, input not opted in).
+                self.notify("Mirror control stays OFF — LAN input needs "
+                            f"{_MIRROR_LAN_INPUT_ENV}=1",
+                            title="saikai mirror", severity="warning", timeout=7)
             else:
                 self.notify("Mirror control OFF (read-only)",
                             title="saikai mirror", timeout=4)
@@ -9111,7 +9203,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # read-only unless SAIKAI_MIRROR_ALLOW_LAN_INPUT=1. Loopback
                     # always permits input.
                     _allow_lan_in = str(os.environ.get(
-                        "SAIKAI_MIRROR_ALLOW_LAN_INPUT", "")).strip().lower() in (
+                        _MIRROR_LAN_INPUT_ENV, "")).strip().lower() in (
                         "1", "true", "yes", "on")
                     _hub.allow_lan_input = _allow_lan_in
                     # LAN input is the flood-risk path: enforce a default accepted-
@@ -9125,21 +9217,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _app_kwargs["driver_class"] = _Drv
                     _mode = "LAN-exposed" if _mir_host != "127.0.0.1" else "loopback only"
                     _in_mode = ("input ON" if (_mir_host == "127.0.0.1" or _allow_lan_in)
-                                else "input OFF (set SAIKAI_MIRROR_ALLOW_LAN_INPUT=1)")
+                                else f"input OFF (set {_MIRROR_LAN_INPUT_ENV}=1)")
                     _idle = _mirror.mirror_idle_secs(os.environ)
                     _in_mode += ("; control idle-off DISABLED" if _idle <= 0
                                  else f"; control idle-off {_idle:g}s")
                     # Persist the URL so it's reachable even though the Textual alt
                     # screen hides this banner during the session; cleaned up at exit.
-                    _url_file = CACHE_DIR / "mirror-url.txt"
+                    _url_file = _MIRROR_URL_FILE
                     try:
                         # The URL carries the access token, so create the file
                         # owner-only (0600) rather than at the default umask.
-                        _url_file.parent.mkdir(parents=True, exist_ok=True)
-                        _fd = os.open(str(_url_file),
-                                      os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                        with os.fdopen(_fd, "w", encoding="utf-8") as _uf:
-                            _uf.write(_hub.url() + "\n")
+                        # Atomic: a concurrent reader (a script polling for the
+                        # URL) must never observe the truncate window as empty.
+                        _write_text_atomic(_url_file, _hub.url() + "\n", mode=0o600)
                         atexit.register(lambda f=_url_file: f.unlink(missing_ok=True))
                     except OSError:
                         _url_file = None
@@ -9202,6 +9292,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         print(_c(f"  textual debug log: {log_path}", YELLOW), file=sys.stderr)
         return
     if chosen:
+        # Stop the web mirror BEFORE handing off to the foreground claude. Resume
+        # runs `claude --resume` via subprocess.run and blocks until it returns, so
+        # the Python process (and its atexit-registered _hub.stop) stays alive the
+        # whole time. Left running, the mirror keeps serving — with a still-valid
+        # token and, if opted in, a live /input endpoint wired to the now-gone UI —
+        # a stale attack surface for the entire resumed session. (#audit-mirror-resume)
+        if _hub is not None:
+            try:
+                _hub.stop()
+                # Drop the persisted URL with the server: atexit won't fire until
+                # the resumed foreground claude RETURNS (hours later), and until
+                # then the file would keep pointing readers at a dead endpoint.
+                # (The atexit unlink is missing_ok — double-removal is fine.)
+                _MIRROR_URL_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
         _resume_claude(chosen, all_sessions)
 
 
@@ -9235,12 +9341,11 @@ def _add_saikai_suppress_session(session_id: str) -> None:
     なる過去の事故 (2026-05-24 検出) を構造的に防ぐ。 session_id ごとに 1 件
     だけ「最初の idle_prompt 抑止」 を予約する設計。
 
-    pid 付き tmp + os.replace で並行 saikai launch race にも安全。 古い entry
-    (>1h) は ついでに prune (= claude が即 crash した stale を回収)。
+    _write_json (atomic tmp + os.replace) で並行 saikai launch race にも安全。
+    古い entry (>1h) は ついでに prune (= claude が即 crash した stale を回収)。
     """
     import json as _json
     import time as _time
-    _SAIKAI_SUPPRESS_PATH.parent.mkdir(parents=True, exist_ok=True)
     state: dict[str, float] = {}
     if _SAIKAI_SUPPRESS_PATH.is_file():
         try:
@@ -9253,15 +9358,10 @@ def _add_saikai_suppress_session(session_id: str) -> None:
     now = _time.time()
     state = {k: v for k, v in state.items() if now - v < _SAIKAI_SUPPRESS_TTL}
     state[session_id] = now
-    tmp = _SAIKAI_SUPPRESS_PATH.with_suffix(f".{os.getpid()}.tmp")
     try:
-        tmp.write_text(_json.dumps(state, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, _SAIKAI_SUPPRESS_PATH)
+        _write_json(_SAIKAI_SUPPRESS_PATH, state)
     except Exception:
-        try:                       # don't leave a .<pid>.tmp behind on failure
-            tmp.unlink()
-        except OSError:
-            pass
+        pass                       # best-effort: a lost suppress = one extra ping
 
 
 def _resolve_resume_cwd(full_id: str, sessions: list[dict]) -> str | None:
