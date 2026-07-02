@@ -321,25 +321,32 @@ def test_status_classifier_profiles_and_injection():
 def test_show_hw_cursor_native_cursor_dec_bytes():
     """#native-cursor: on Windows the pane shows the terminal's NATIVE cursor via
     \\x1b[?25h on focus / ?25l on blur (instead of saikai's wide reverse block);
-    elsewhere it's a no-op. Must never raise headless (no mounted app)."""
-    bare = rt.AgentTerminal.__new__(rt.AgentTerminal)
-    bare.sid = "x"
-    bare._show_hw_cursor(True)     # no app context → swallowed, no raise
-    bare._show_hw_cursor(False)
+    elsewhere it's a no-op. Must never raise headless (no mounted app).
+    The native-cursor / anchor machinery is opt-in (SAIKAI_IME_ANCHOR); enable it
+    for this test since it verifies that machinery's byte output. (#ime-anchor-optout)"""
+    _saved = rt._IME_ANCHOR
+    rt._IME_ANCHOR = True
+    try:
+        bare = rt.AgentTerminal.__new__(rt.AgentTerminal)
+        bare.sid = "x"
+        bare._show_hw_cursor(True)     # no app context → swallowed, no raise
+        bare._show_hw_cursor(False)
 
-    writes = []
-    class _Drv:
-        def write(self, s): writes.append(s)
-    class _Shim(rt.AgentTerminal):
-        app = property(lambda self: type("A", (), {"_driver": _Drv()})())
-    t = _Shim.__new__(_Shim)
-    t.sid = "y"
-    t._show_hw_cursor(True)
-    t._show_hw_cursor(False)
-    if rt._IS_WIN:
-        assert writes == ["\x1b[?25h", "\x1b[?25l"]
-    else:
-        assert writes == []
+        writes = []
+        class _Drv:
+            def write(self, s): writes.append(s)
+        class _Shim(rt.AgentTerminal):
+            app = property(lambda self: type("A", (), {"_driver": _Drv()})())
+        t = _Shim.__new__(_Shim)
+        t.sid = "y"
+        t._show_hw_cursor(True)
+        t._show_hw_cursor(False)
+        if rt._IS_WIN:
+            assert writes == ["\x1b[?25h", "\x1b[?25l"]
+        else:
+            assert writes == []
+    finally:
+        rt._IME_ANCHOR = _saved
 
 
 def test_autoscroll_tick_pins_anchor_to_content():
@@ -389,41 +396,48 @@ def test_blink_tick_toggles_blink_for_ime_keepalive():
     the cursor every 0.5s while focused, so WT keeps re-receiving the cursor move
     and leaves the IME enabled (a stock Textual Input keeps IME alive the same way
     via its 0.5s cursor blink; saikai lacked the keepalive → idle panes went ×).
-    It must be a no-op when the pane isn't focused."""
+    It must be a no-op when the pane isn't focused. The keepalive is opt-in
+    (SAIKAI_IME_ANCHOR); enable it for this test. (#ime-anchor-optout)"""
     calls = []
+    _saved = rt._IME_ANCHOR
+    rt._IME_ANCHOR = True
+    try:
+        class _Focused(rt.AgentTerminal):
+            has_focus = True
+            is_dead = False
+            def _is_focused_pane(self): return True
+            def _sync_terminal_cursor(self, reason="repaint"):
+                calls.append(reason)     # stand in for re-anchor + refresh
 
-    class _Focused(rt.AgentTerminal):
-        has_focus = True
-        is_dead = False
-        def _sync_terminal_cursor(self, reason="repaint"):
-            calls.append(reason)     # stand in for re-anchor + refresh
+        t = _Focused.__new__(_Focused)
+        t._scroll = 0
+        t._blink_on = True
+        t._blink_tick()
+        assert t._blink_on is False and calls == ["focus"]   # toggled + re-anchored
+        t._blink_tick()
+        assert t._blink_on is True and calls == ["focus", "focus"]
 
-    t = _Focused.__new__(_Focused)
-    t._scroll = 0
-    t._blink_on = True
-    t._blink_tick()
-    assert t._blink_on is False and calls == ["focus"]   # toggled + re-anchored
-    t._blink_tick()
-    assert t._blink_on is True and calls == ["focus", "focus"]
+        class _Unfocused(rt.AgentTerminal):
+            has_focus = False
+            is_dead = False
+            def _is_focused_pane(self): return False
+            def _sync_terminal_cursor(self, reason="repaint"):
+                calls.append("UNFOCUSED")
 
-    class _Unfocused(rt.AgentTerminal):
-        has_focus = False
-        is_dead = False
-        def _sync_terminal_cursor(self, reason="repaint"):
-            calls.append("UNFOCUSED")
+        u = _Unfocused.__new__(_Unfocused)
+        u._scroll = 0
+        u._blink_on = True
+        u._blink_tick()
+        assert u._blink_on is True and "UNFOCUSED" not in calls   # no-op unfocused
 
-    u = _Unfocused.__new__(_Unfocused)
-    u._scroll = 0
-    u._blink_on = True
-    u._blink_tick()
-    assert u._blink_on is True and "UNFOCUSED" not in calls   # no-op unfocused
-
-    # scrolled-back focused pane is also a no-op (cursor isn't at the live bottom)
-    s = _Focused.__new__(_Focused)
-    s._scroll = 5
-    s._blink_on = True
-    s._blink_tick()
-    assert s._blink_on is True
+        # scrolled-back focused pane is also a no-op (cursor isn't at the live bottom)
+        s = _Focused.__new__(_Focused)
+        s._scroll = 5
+        s._blink_on = True
+        s._blink_tick()
+        assert s._blink_on is True
+    finally:
+        rt._IME_ANCHOR = _saved
 
 
 def test_encode_key_meta_and_release():

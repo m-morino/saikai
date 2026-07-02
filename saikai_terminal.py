@@ -94,6 +94,16 @@ def _log(msg: str) -> None:
 _IME_DEBUG = str(os.environ.get("SAIKAI_IME_DEBUG", "")).strip().lower() in (
     "1", "true", "yes", "on")
 
+# Custom IME-anchor machinery (keepalive blink + cursor re-anchor to claude's
+# prompt cell + native hardware cursor + the App._display re-assert). It puts the
+# WT IME/composition window AT the claude prompt. DEFAULT ON: without it the IME
+# window sits at Textual's default cursor (wrong place — unusable for CJK input),
+# which is worse than the known alt-tab ×/ON flicker. Set SAIKAI_IME_ANCHOR=0 to
+# turn it off (cursor handling then matches a stock Textual app — flicker-free but
+# the IME window is mispositioned). (#ime-anchor-optout)
+_IME_ANCHOR = str(os.environ.get("SAIKAI_IME_ANCHOR", "1")).strip().lower() not in (
+    "0", "false", "no", "off")
+
 # Opt-in raw-PTY capture: when SAIKAI_PTY_CAPTURE names a file, every decoded chunk
 # the reader feeds is appended as repr() (escape sequences visible) — for diagnosing
 # how a child renders, e.g. whether an agent TUI drives ?1049 alt-screen, ?2026
@@ -179,6 +189,25 @@ def _post_signal(pid, sig_name: str) -> None:
 # and lets py_compile / unit tests run without textual/pyte/pywinpty.
 try:
     import pyte  # type: ignore
+    # pyte (via the wcwidth module) counts each Regional-Indicator symbol
+    # (U+1F1E6–U+1F1FF) as width 2, so a flag emoji like 🇯🇵 occupies FOUR cells in
+    # pyte's grid. But Rich/Textual AND Windows Terminal render a flag pair as
+    # width 2 (verified: rich.cell_len('🇯🇵')==2). That 4-vs-2 disagreement shifts
+    # every line carrying a flag (e.g. claude's "🇯🇵 JA" status line) two columns
+    # and cascades into stale-cell garble in the rows below. Reconcile pyte to the
+    # render target: treat each RI as width 1, so a pair renders as 2 like Rich/WT.
+    # (#flag-width — confirmed via the Ctrl+F12 pane dump: pyte stored 🇯🇵 as 4 cells)
+    try:
+        _pyte_wcwidth_orig = pyte.screens.wcwidth
+
+        def _wcwidth_flag_aware(char, _orig=_pyte_wcwidth_orig):
+            if char and 0x1F1E6 <= ord(char[0]) <= 0x1F1FF:
+                return 1
+            return _orig(char)
+
+        pyte.screens.wcwidth = _wcwidth_flag_aware
+    except Exception:
+        pass
 except Exception:  # pragma: no cover - exercised only when dep absent
     pyte = None  # type: ignore
 
@@ -730,6 +759,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                                      # streaming pane can be drag-selected
         self._sel_anchor = None      # (row,col) drag start — saikai-OWNED selection
         self._sel_head = None        # (row,col) drag head; None ⇒ no selection
+        self._pending_anchor = None  # (row,col) of a press awaiting a drag; a click that never drags stays pending → no freeze/capture (#click-no-freeze)
         self._autoscroll_dir = 0     # drag at top/bottom edge: +1 up / -1 down / 0
         self._autoscroll_timer = None  # ticks while edge-dragging (#drag-autoscroll)
         self._sel_prev_frozen = False
@@ -1189,17 +1219,31 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             pass
 
     def on_mouse_down(self, event) -> None:   # events.MouseDown
-        # Left-drag selects. Start a selection + FREEZE so a streaming claude can't
-        # repaint over it; capture the mouse so a drag outside the pane still
-        # tracks. Do NOT stop the event — the click should still focus the pane.
+        # Record a PENDING anchor only — do NOT freeze / capture_mouse / refresh on
+        # the bare press. A click (down+up with no drag) must simply focus the pane
+        # and keep WT's IME alive: freezing + capturing on EVERY press churned focus
+        # (blur→focus) and dropped the IME on each click (the ×/OK flicker traced to
+        # real button-1 events landing on the pane). The selection engages on the
+        # first real drag move (on_mouse_move). Don't stop the event — the click
+        # still focuses the pane. (#click-no-freeze)
         if self._screen is None or self.is_dead or getattr(event, "button", 1) != 1:
             return
+        self._pending_anchor = (event.y, event.x)
+        self._sel_anchor = None
+        if _IME_DEBUG:
+            _log(f"mouse-down at=({getattr(event,'x','?')},{getattr(event,'y','?')}) "
+                 f"button={getattr(event,'button','?')} "
+                 f"screen=({getattr(event,'screen_x','?')},{getattr(event,'screen_y','?')}) "
+                 f"(pending, no freeze) mouse_report={getattr(self, '_mouse_reporting', False)}")
+
+    def _begin_drag_selection(self) -> None:
+        """Engage the selection state (freeze + snapshot + capture + autoscroll)
+        once a real drag is detected — deferred from on_mouse_down so a bare click
+        never freezes the pane or churns focus (WT IME). (#click-no-freeze)"""
         self._sel_prev_frozen = self._frozen
         self._frozen = True
         if self._frozen_buf is None:     # entering freeze for this drag → pin frame
             self._snapshot_frozen()      # (already Shift+F9-frozen → keep its frame)
-        self._sel_anchor = (event.y, event.x)
-        self._sel_head = (event.y, event.x)
         self._autoscroll_dir = 0
         if self._autoscroll_timer is None:      # ticks while a drag sits at an edge
             try:
@@ -1210,16 +1254,17 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self.capture_mouse()
         except Exception:
             pass
-        self.refresh()
-        if _IME_DEBUG:
-            _log(f"drag-down rows={self._screen.lines} "
-                 f"hist={len(self._screen.history.top)} "
-                 f"mouse_report={getattr(self, '_mouse_reporting', False)} "
-                 f"alt={self._alt.in_alt}")
 
     def on_mouse_move(self, event) -> None:   # events.MouseMove
+        # Engage the drag-selection on the FIRST real movement after a press. Until
+        # then the press is only a focus click (no freeze/capture), so the IME lives.
         if self._sel_anchor is None:
-            return
+            pend = getattr(self, "_pending_anchor", None)
+            if pend is None or (event.y, event.x) == pend:
+                return                        # no press, or no movement yet
+            self._sel_anchor = pend           # real drag → start selecting now
+            self._sel_head = pend
+            self._begin_drag_selection()
         scr = self._screen
         rows = scr.lines if scr is not None else 0
         cols = scr.columns if scr is not None else 0
@@ -1279,8 +1324,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._autoscroll_timer = None
 
     def on_mouse_up(self, event) -> None:     # events.MouseUp
+        if _IME_DEBUG:
+            _log(f"mouse-up at=({getattr(event,'x','?')},{getattr(event,'y','?')}) "
+                 f"button={getattr(event,'button','?')} anchor={self._sel_anchor} "
+                 f"pending={getattr(self, '_pending_anchor', None)}")
+        self._pending_anchor = None            # click/drag ended; drop the pending press
         if self._sel_anchor is None:
-            return
+            return                             # bare click (no drag) → nothing to finalize
         self._stop_autoscroll()
         try:
             self.release_mouse()
@@ -1620,6 +1670,58 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self.refresh()
         self._sync_terminal_cursor()
 
+    def snapshot_text(self) -> str:
+        """Plain-text dump of the pane's CURRENT visible pyte screen + geometry,
+        for the pane-dump debug key (so a garbled bottom can be inspected off the
+        live UI). pyte's ``screen.display`` is the rendered visible grid; read it
+        under the lock (the reader feeds the stream under the same lock), format
+        outside. (#pane-dump)"""
+        lines: list = []
+        meta = {}
+        with self._lock:
+            scr = self._screen
+            if scr is not None:
+                try:
+                    lines = list(scr.display)      # visible grid as list[str]
+                except Exception:
+                    lines = []
+                try:
+                    meta = {"cols": scr.columns, "rows": scr.lines,
+                            "cx": scr.cursor.x, "cy": scr.cursor.y,
+                            "chid": bool(getattr(scr.cursor, "hidden", False)),
+                            "hist": len(getattr(scr, "history").top)
+                                    if hasattr(scr, "history") else "-"}
+                except Exception:
+                    meta = {}
+        try:
+            wsz = f"{self.size.width}x{self.size.height}"
+        except Exception:
+            wsz = "?"
+        alt = getattr(self, "_alt", None)
+        hdr = (f"sid={getattr(self, 'sid', None)} "
+               f"pyte={meta.get('rows','?')}x{meta.get('cols','?')} widget={wsz} "
+               f"cursor=({meta.get('cx','?')},{meta.get('cy','?')}) "
+               f"cursor_hidden={meta.get('chid','?')} "
+               f"alt_screen={getattr(alt, 'in_alt', '?') if alt else '?'} "
+               f"hist={meta.get('hist','?')} scroll={self._scroll} "
+               f"mouse_report={getattr(self, '_mouse_reporting', False)}")
+        ruler = "    " + "".join(str(i % 10) for i in range(meta.get("cols", 0) or 0))
+        body = "\n".join(f"{i:3}|{ln}" for i, ln in enumerate(lines))
+        return hdr + "\n" + ruler + "\n" + body + "\n"
+
+    def _is_focused_pane(self) -> bool:
+        """True if THIS pane is the screen's LOGICAL focus — the correct gate for
+        IME anchoring. Uses ``screen.focused is self`` rather than ``self.has_focus``:
+        has_focus is app_focus-gated and LAGS a WT window-refocus (on_focus fires
+        while has_focus is still False → the anchor bailed → the ×/ON IME flicker on
+        alt-tab). screen.focused is set synchronously by set_focus, so it's already
+        this pane when on_focus / app-refocus runs. Falls back to has_focus if the
+        screen isn't reachable. (#ime-appfocus)"""
+        try:
+            return self.screen.focused is self
+        except Exception:
+            return bool(self.has_focus)
+
     def _blink_tick(self) -> None:
         """Cursor-blink keepalive — THE Windows-Terminal IME fix.
 
@@ -1634,7 +1736,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         WT does NOT flicker, which proved this is not a Textual/WT limitation but a
         missing keepalive.) Toggling the cursor every 0.5s and re-anchoring forces
         the move to keep flowing, like Input. Windows-only. (#wt-ime-blink)"""
-        if self.is_dead or not self.has_focus or self._scroll != 0:
+        if not _IME_ANCHOR:
+            return
+        if self.is_dead or not self._is_focused_pane() or self._scroll != 0:
             return
         self._blink_on = not self._blink_on
         self._sync_terminal_cursor(reason="focus")   # re-assert + refresh → re-emit move
@@ -1648,7 +1752,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         keeps moving it so WT renders it and keeps the IME enabled — and hide it on
         blur so the list / unfocused panes don't carry a stray cursor. Windows-only;
         other platforms keep saikai's drawn cursor cell. (#native-cursor)"""
-        if not _IS_WIN:
+        if not _IS_WIN or not _IME_ANCHOR:
             return
         try:
             drv = getattr(self.app, "_driver", None)
@@ -1660,9 +1764,24 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     def on_focus(self, event=None) -> None:
         # Anchor the IME the moment the pane is focused (don't wait for a repaint).
         if _IME_DEBUG:
+            # Full state dump so the × return and the ON return can be DIFFed: the
+            # value that flips between them IS the deterministic ×/ON toggle. (#ime-toggle-diag)
+            try:
+                _sf = self.screen.focused
+                _sfn = f"{type(_sf).__name__}#{getattr(_sf,'id',None)}" if _sf else "None"
+            except Exception:
+                _sfn = "?"
+            try:
+                _cp = getattr(self.app, "cursor_position", "?")
+            except Exception:
+                _cp = "?"
+            _tim = getattr(self, "_blink_timer", None)
             _log(f"on_focus sid={getattr(self, 'sid', None)} "
                  f"WT={bool(os.environ.get('WT_SESSION'))} "
-                 f"has_focus={self.has_focus} scroll={self._scroll}")
+                 f"has_focus={self.has_focus} focused_pane={self._is_focused_pane()} "
+                 f"screen.focused={_sfn} blink_on={getattr(self,'_blink_on','?')} "
+                 f"frozen={getattr(self,'_frozen','?')} scroll={self._scroll} "
+                 f"cursor_pos={_cp} timer_paused={getattr(_tim,'_active', '?') if _tim else None}")
         # Show the terminal's native cursor (Windows) — see _show_hw_cursor.
         self._show_hw_cursor(True)
         # Start the cursor-blink keepalive so WT keeps the IME enabled while this
@@ -1698,14 +1817,17 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         pane is focused and live (scroll at the bottom). Reads the pyte cursor under
         the lock, then sets app.cursor_position OUTSIDE the lock (per the concurrency
         invariant — never marshal/block while holding self._lock)."""
-        if Offset is None or self.is_dead or not self.has_focus or self._scroll != 0:
+        if not _IME_ANCHOR:
+            return
+        if Offset is None or self.is_dead or not self._is_focused_pane() or self._scroll != 0:
             # Diagnostic: a focus-triggered sync that bails here is the suspected
             # race — the pane regained focus but the cursor never got anchored,
             # so WT may show the IME as disabled (×). (#ime-race)
             if _IME_DEBUG and reason == "focus":
                 _log(f"ime SKIP sid={getattr(self, 'sid', None)} reason=focus "
                      f"OffsetNone={Offset is None} dead={self.is_dead} "
-                     f"has_focus={self.has_focus} scroll={self._scroll}")
+                     f"has_focus={self.has_focus} focused_pane={self._is_focused_pane()} "
+                     f"scroll={self._scroll}")
             return
         try:
             app = self.app
@@ -1756,7 +1878,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
 
     def on_blur(self, event=None) -> None:
         if _IME_DEBUG:
-            _log(f"on_blur sid={getattr(self, 'sid', None)}")
+            _who = "?"
+            try:
+                _f = self.app.focused
+                _who = f"{type(_f).__name__}#{getattr(_f, 'id', None)}" if _f is not None else "None"
+            except Exception:
+                pass
+            _log(f"on_blur sid={getattr(self, 'sid', None)} focus_now={_who}")
         # Hide the native cursor (Windows) so an unfocused pane / the list doesn't
         # carry a stray cursor, and stop the keepalive (no moves needed unfocused).
         self._show_hw_cursor(False)
