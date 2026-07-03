@@ -249,6 +249,36 @@ def _raw_request(port, method, path, headers):
         s.close()
 
 
+def test_post_refused_input_returns_429():
+    """A refused injection (rate cap / bounded queue full / no handler) must NOT
+    read as success: the handler used to discard hub.inject*()'s False and 204
+    anyway, so throttled keystrokes vanished with the browser believing they
+    landed. Refusal maps to 429. (#audit-codex-inject-429)"""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0)
+    delivered = []
+    hub.set_input_handler(lambda d: delivered.append(d))
+    hub._control_enabled = True
+    port = hub.serve()
+    key = hub._write_key
+    try:
+        WK = {"X-Mirror-Write-Key": key}
+        # accepted baseline
+        st, _ = _post(port, "/input", {"data": "a"}, headers=WK)
+        assert st == 204, st
+        # force the accepted-input rate cap: everything now inside the gap
+        hub._min_accept_gap = 100.0
+        st, _ = _post(port, "/input", {"data": "b"}, headers=WK)
+        assert st == 429, f"refused input must be 429, got {st}"
+        st, _ = _post(port, "/key", {"key": "enter"}, headers=WK)
+        assert st == 429, st
+        st, _ = _post(port, "/mouse",
+                      {"col": 1, "row": 1, "button": 0, "kind": "down"},
+                      headers=WK)
+        assert st == 429, st
+    finally:
+        hub.stop()
+
+
 def test_host_allow_list_and_origin_matrix():
     hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0)
     hub.set_input_handler(lambda d: None)
@@ -985,6 +1015,7 @@ if __name__ == "__main__":
     test_mouse_and_key_inject_gate_on_control_and_handler()
     test_update_control_target_syncs_without_rearming_idle()
     test_post_input_write_key_and_body_matrix()
+    test_post_refused_input_returns_429()
     test_host_allow_list_and_origin_matrix()
     test_post_mouse_gate_and_body_matrix()
     test_post_mouse_host_and_origin_matrix()

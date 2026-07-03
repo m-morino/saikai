@@ -1210,7 +1210,12 @@ def _read_last_jsonl_record(path):
         for line in reversed(tail.splitlines()):
             line = line.strip()
             if line:
-                return json.loads(line)
+                rec = json.loads(line)
+                # Contract: a RECORD (dict) or None. A trailing `[]` / `"x"` is
+                # valid JSON but not a record — returning it made _needs_attention
+                # AttributeError on .get(), which killed --table outright and
+                # broke every TUI refresh. (#audit-codex-lastrec)
+                return rec if isinstance(rec, dict) else None
     except Exception:
         return None
     return None
@@ -11507,6 +11512,11 @@ def main():
                                 s["worktree_label"] = wt_label
                             if extra:
                                 fresh.extend(extra)
+            # Same sid from >1 project dir (case-variant encoded dirs on a
+            # case-insensitive FS) must collapse HERE too, not just at initial
+            # load — DataTable.add_row(key=sid) raises on a duplicate key, so a
+            # reappearing sid broke the list only AFTER an F5/auto-refresh. (#audit-codex-reload-dedup)
+            fresh = _dedup_sessions_by_id(fresh)
             fresh.sort(key=lambda s: s["first_ts"], reverse=True)
             for s in fresh:
                 cached = (_load_cache(s["id"], s["mtime"], s.get("last_ts", ""))

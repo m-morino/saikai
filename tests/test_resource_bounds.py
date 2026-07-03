@@ -471,6 +471,18 @@ def test_hostile_inputs_degrade_instead_of_raising():
                                   "cache_read_input_tokens": None}}}) + "\n",
             encoding="utf-8")
         assert saikai._ctx_usage_from_jsonl(j) == (None, None)   # all-zero → skipped
+    # last-record reader: a trailing valid-but-non-dict JSON line ([] / "x") is
+    # NOT a record — returning it made _needs_attention AttributeError on .get()
+    # (killed --table, broke every TUI refresh). (#audit-codex-lastrec)
+    with _tf.TemporaryDirectory() as td:
+        j = _P(td) / "t.jsonl"
+        j.write_text('{"type":"user","message":{"role":"user","content":"hi"}}\n'
+                     '[]\n', encoding="utf-8")
+        assert saikai._read_last_jsonl_record(j) is None
+        assert saikai._needs_attention(
+            {"id": "s1", "mtime": 0.0, "jsonl_path": str(j)}, {}) is False
+        j.write_text('"just a string"\n', encoding="utf-8")
+        assert saikai._read_last_jsonl_record(j) is None
     # tab_label: newline/ANSI in a user-derived title must not corrupt the tab bar
     lbl = st.tab_label("evil\ntitle \x1b[2Jx", "busy")
     assert "\n" not in lbl and "\x1b" not in lbl and "evil title" in lbl

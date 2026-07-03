@@ -1441,6 +1441,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     # HTTP/1.1 so keep-alive + SSE behave; ALWAYS emit Content-Length or use 204.
     protocol_version = "HTTP/1.1"
+
+    def handle_one_request(self) -> None:
+        """Treat a client that vanished mid-request/response as a NORMAL
+        disconnect, not an error. The SSE stream already catches these
+        internally, but the one-shot GET/POST/send_error paths let
+        BrokenPipeError / ConnectionResetError escape to socketserver, which
+        printed a full traceback per dropped phone connection. (#audit-codex-disconnect)"""
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
     # StreamRequestHandler.setup() applies this via socket.settimeout(), so a peer
     # that stalls on a header/body read (Slowloris) is dropped instead of parking a
     # blocked thread forever. Long enough for a real slow phone; short enough that a
@@ -1756,7 +1767,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if not hub._control_enabled:                    # advisory fast-reject
             self.send_error(409, "control off")
             return
-        hub.inject(data)
+        if not hub.inject(data):
+            # rate cap / bounded queue full — the input was NOT accepted. A
+            # silent 204 here made throttled keystrokes vanish with the browser
+            # believing they landed. (#audit-codex-inject-429)
+            self.send_error(429, "input throttled")
+            return
         self._send_status(204)
 
     _MOUSE_KINDS = {"down", "up", "scrollup", "scrolldown"}
@@ -1783,7 +1799,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if not hub._control_enabled:
             self.send_error(409, "control off")
             return
-        hub.inject_mouse(col, row, button, kind)
+        if not hub.inject_mouse(col, row, button, kind):
+            self.send_error(429, "input throttled")   # (#audit-codex-inject-429)
+            return
         self._send_status(204)
 
     _KEY_CAP = 64   # longest sensible key string ("ctrl+shift+pageup" << 64)
@@ -1800,7 +1818,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if not hub._control_enabled:
             self.send_error(409, "control off")
             return
-        hub.inject_key(key)
+        if not hub.inject_key(key):
+            self.send_error(429, "input throttled")   # (#audit-codex-inject-429)
+            return
         self._send_status(204)
 
     def _send_status(self, code):
