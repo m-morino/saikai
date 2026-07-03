@@ -647,8 +647,11 @@ _BRACKETED_RE = re.compile(r"\x1b\[\?2004([hl])")
 # it uses to scroll its OWN view. saikai tracks the mode so on_mouse_scroll can
 # FORWARD the wheel to the child instead of consuming it for saikai's own scrollback
 # (which is empty in the alt-screen such a TUI runs in → the wheel "did nothing").
-_MOUSE_REPORT_RE = re.compile(r"\x1b\[\?(?:1000|1002|1003)([hl])")
-_MOUSE_SGR_RE = re.compile(r"\x1b\[\?1006([hl])")
+# DEC private-mode set/reset. ONE regex over the whole param list so a child that
+# COMBINES params (e.g. \x1b[?1002;1006h) is parsed — a per-mode regex misses that
+# form. We act on the mouse-tracking + SGR-encoding params; others are ignored here
+# (bracketed paste / sync-update keep their own trackers below). (#faithful-mouse)
+_DEC_PRIVATE_RE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
 # Synchronized output (DEC mode 2026, BSU/ESU): a TUI brackets a full frame's writes
 # in ?2026h … ?2026l so the terminal presents the COMPLETE frame, not the half-drawn
 # intermediate. saikai feeds pyte continuously but DEFERS the pane repaint until the
@@ -804,6 +807,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     """
 
     can_focus = True
+    # Opt OUT of Textual's app-level (drag) text selection: this pane forwards mouse
+    # events to the child (which runs its OWN selection/scroll when it enables mouse
+    # tracking), so Textual must not also try to select over it. saikai's own
+    # Shift+drag copy still works — it's a custom handler, not Textual's selection.
+    ALLOW_SELECT = False
     DEFAULT_CSS = "AgentTerminal { width: 1fr; height: 1fr; }"
 
     def __init__(
@@ -853,6 +861,19 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._sel_anchor = None      # (row,col) drag start — saikai-OWNED selection
         self._sel_head = None        # (row,col) drag head; None ⇒ no selection
         self._pending_anchor = None  # (row,col) of a press awaiting a drag; a click that never drags stays pending → no freeze/capture (#click-no-freeze)
+        # Child mouse-tracking state (parsed from the child's DEC private-mode sets).
+        # A faithful terminal forwards mouse events to the child per these; see
+        # _forward_mouse. _mouse_reporting = any tracking on; the three flags below
+        # distinguish click-only (?1000) vs button-drag motion (?1002) vs any motion
+        # (?1003) so we forward motion only when the child asked for it.
+        self._mouse_reporting = False
+        self._mouse_sgr = False        # ?1006 SGR extended encoding negotiated
+        self._mouse_click = False      # ?1000 press/release
+        self._mouse_btn_motion = False # ?1002 motion while a button is held (drag)
+        self._mouse_any_motion = False # ?1003 motion always (hover)
+        self._fwd_buttons = set()      # forwarded buttons currently held (a drag in progress)
+        self._fwd_captured = False     # captured the mouse for the current forwarded gesture?
+        self._fwd_last = (1, 1)        # last forwarded (col,row) — for a synthetic release
         self._autoscroll_dir = 0     # drag at top/bottom edge: +1 up / -1 down / 0
         self._autoscroll_timer = None  # ticks while edge-dragging (#drag-autoscroll)
         self._sel_prev_frozen = False
@@ -1155,23 +1176,46 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             pass
 
-    # ── mouse wheel -> scroll back through history.top ─────────────────────────
+    # ── mouse -> child PTY (faithful terminal) ─────────────────────────────────
+    def _mouse_seq(self, cb: int, col: int, row: int, final: str) -> str:
+        """One mouse report in the negotiated encoding. SGR (?1006) has no coord
+        limit. Legacy X10 caps col/row at 95: a cell byte is chr(32+n), and n >= 96
+        yields >= U+0080, which pty.write expands to multi-byte UTF-8 and corrupts the
+        fixed 6-byte X10 packet (the child then misreads the cell). X10 beyond 95 cells
+        is unrepresentable through a str writer; modern children negotiate SGR. For X10
+        the caller pre-encodes the button byte in ``cb`` (SGR uses ``final`` to tell
+        press 'M' from release 'm'; X10 encodes a release as button 3)."""
+        if getattr(self, "_mouse_sgr", False):
+            return f"\x1b[<{cb};{col};{row}{final}"
+        return ("\x1b[M" + chr(32 + cb)
+                + chr(32 + min(col, 95)) + chr(32 + min(row, 95)))
+
+    def _event_cell(self, event) -> tuple:
+        """Widget-relative event coords → 1-based terminal (col, row), clamped to the
+        grid so a drag past the edge still reports the edge cell (lets the child run
+        its own autoscroll). Shared by _forward_wheel and _forward_mouse."""
+        col = max(1, int(getattr(event, "x", 0)) + 1)
+        row = max(1, int(getattr(event, "y", 0)) + 1)
+        scr = getattr(self, "_screen", None)
+        if scr is not None:
+            try:
+                col = min(col, int(scr.columns))
+                row = min(row, int(scr.lines))
+            except Exception:
+                pass
+        return col, row
+
     def _forward_wheel(self, event, up: bool) -> bool:
         """When the child enabled mouse reporting, send it a WHEEL event so a
         full-screen TUI scrolls its OWN view — instead of saikai's scrollback, which
         is empty in the alt-screen such a TUI runs in (so the wheel did nothing).
-        SGR (?1006) encoding when negotiated, else legacy X10. Returns True if sent."""
+        Returns True if sent."""
         if not getattr(self, "_mouse_reporting", False) or self._pty is None or self.is_dead:
             return False
         try:
-            col = max(1, int(getattr(event, "x", 0)) + 1)   # event coords → 1-based cell
-            row = max(1, int(getattr(event, "y", 0)) + 1)
-            btn = 64 if up else 65                           # SGR wheel: 64 = up, 65 = down
-            if getattr(self, "_mouse_sgr", False):
-                seq = f"\x1b[<{btn};{col};{row}M"
-            else:                                            # legacy X10 (cells capped at 223)
-                seq = "\x1b[M" + chr(32 + btn) + chr(32 + min(col, 223)) + chr(32 + min(row, 223))
-            self._pty.write(seq)
+            col, row = self._event_cell(event)
+            btn = 64 if up else 65                           # wheel: 64 = up, 65 = down
+            self._pty.write(self._mouse_seq(btn, col, row, "M"))
             return True
         except Exception:
             return False
@@ -1326,15 +1370,71 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             pass
 
+    def _forward_mouse(self, kind: str, event) -> None:
+        """Encode a mouse event and write it to the child PTY, so a child that
+        enabled mouse tracking (e.g. claude's fullscreen renderer) runs its OWN
+        selection / drag-autoscroll — exactly what it gets under a native terminal.
+        Inverts Textual's SGR decode (button = (cb+1)&3): cb = (button-1)&3, motion
+        adds 32, shift/meta/ctrl add 4/8/16. SGR (?1006) when negotiated, else legacy
+        X10. kind ∈ {down,up,move}. UI-thread only (like _forward_wheel; pty.write is
+        non-blocking). (#faithful-mouse)"""
+        if self._pty is None or self.is_dead:
+            return
+        try:
+            # This event's OWN button — Textual sets it on down / up / drag-motion
+            # (its parser decodes button=(cb+1)&3). Using the event (not a stored
+            # drag button) keeps multi-button presses/releases correctly attributed.
+            button = getattr(event, "button", 0) or 0
+            base = ((button - 1) & 3) if button else 3   # 0/1/2 = L/M/R; no-button = 3
+            motion = 32 if kind == "move" else 0
+            mods = ((4 if getattr(event, "shift", False) else 0)
+                    + (8 if getattr(event, "meta", False) else 0)
+                    + (16 if getattr(event, "ctrl", False) else 0))
+            col, row = self._event_cell(event)
+            self._fwd_last = (col, row)                     # for a synthetic release on cancel
+            if self._mouse_sgr:                             # SGR: real button + 'm' on release
+                cb = base + motion + mods
+                self._pty.write(self._mouse_seq(cb, col, row, "m" if kind == "up" else "M"))
+            else:                                           # X10: a release is button code 3
+                lb = (3 if kind == "up" else base) + motion + mods
+                self._pty.write(self._mouse_seq(lb, col, row, "M"))
+        except Exception:
+            pass
+
+    def _child_owns_mouse(self) -> bool:
+        """True when the child enabled mouse tracking and can take events now."""
+        return bool(self._mouse_reporting) and self._pty is not None and not self.is_dead
+
     def on_mouse_down(self, event) -> None:   # events.MouseDown
-        # Record a PENDING anchor only — do NOT freeze / capture_mouse / refresh on
-        # the bare press. A click (down+up with no drag) must simply focus the pane
-        # and keep WT's IME alive: freezing + capturing on EVERY press churned focus
-        # (blur→focus) and dropped the IME on each click (the ×/OK flicker traced to
-        # real button-1 events landing on the pane). The selection engages on the
-        # first real drag move (on_mouse_move). Don't stop the event — the click
-        # still focuses the pane. (#click-no-freeze)
-        if self._screen is None or self.is_dead or getattr(event, "button", 1) != 1:
+        if self._screen is None or self.is_dead:
+            return
+        # FAITHFUL TERMINAL: when the child tracks the mouse (its fullscreen renderer),
+        # forward EVERY press + drag — incl. Shift — so the child runs its OWN
+        # selection / drag-autoscroll (smarter: indent/word/line aware, OSC-52 copy).
+        # saikai does NOT keep an in-pane selection here; the terminal-native escape
+        # hatch is WT's own Shift+drag, which WT intercepts before Textual anyway.
+        # saikai's freeze-select below only runs for a child that does NOT track the
+        # mouse (the classic renderer / a plain shell). (#faithful-mouse)
+        if self._child_owns_mouse():
+            try:
+                if not self.has_focus:        # own the mouse → own the keys too, but
+                    self.focus()              # guard so a click on an already-focused
+            except Exception:                 # pane can't churn focus (WT IME)
+                pass
+            self._fwd_buttons.add(getattr(event, "button", 1) or 1)
+            self._forward_mouse("down", event)
+            # Capture is DEFERRED to the first drag-move (on_mouse_move) so a bare
+            # click never captures — avoids the per-click capture churn the
+            # #click-no-freeze fix removed. (#faithful-mouse)
+            try:
+                event.stop()
+            except Exception:
+                pass
+            return
+        # saikai's own selection path (Shift+drag, or a child with no mouse tracking):
+        # record a PENDING anchor only — a bare click just focuses the pane (no freeze
+        # / capture), the drag engages on the first real move. (#click-no-freeze)
+        if getattr(event, "button", 1) != 1:
             return
         self._pending_anchor = (event.y, event.x)
         self._sel_anchor = None
@@ -1359,6 +1459,32 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             pass
 
     def on_mouse_move(self, event) -> None:   # events.MouseMove
+        # Forwarding a drag to the child? Relay motion so its selection/autoscroll
+        # tracks — but only if the child asked for motion (?1002 button-drag or ?1003
+        # any-motion). A ?1000-only child gets press/release only. (#faithful-mouse)
+        if self._fwd_buttons:                  # a forwarded drag is active
+            if self._mouse_any_motion or self._mouse_btn_motion:
+                if not self._fwd_captured:     # capture on the FIRST real drag-move only
+                    try:
+                        self.capture_mouse()   # → moves keep coming after we leave the pane
+                        self._fwd_captured = True
+                    except Exception:
+                        pass
+                self._forward_mouse("move", event)
+            try:
+                event.stop()
+            except Exception:
+                pass
+            return
+        # Hover motion (no button held): forward if the child asked for ANY-motion
+        # tracking (?1003) — e.g. hover menus / mouseover highlight. (#faithful-mouse)
+        if self._mouse_any_motion and self._child_owns_mouse():
+            self._forward_mouse("move", event)
+            try:
+                event.stop()
+            except Exception:
+                pass
+            return
         # Engage the drag-selection on the FIRST real movement after a press. Until
         # then the press is only a focus click (no freeze/capture), so the IME lives.
         if self._sel_anchor is None:
@@ -1425,6 +1551,29 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._autoscroll_timer = None
 
     def on_mouse_up(self, event) -> None:     # events.MouseUp
+        # End a forwarded drag: relay the release + free the mouse capture. Skip the
+        # release write if the child turned tracking OFF mid-drag (else it gets a
+        # stray escape it no longer expects), but ALWAYS drop the capture/state.
+        # (#faithful-mouse)
+        if self._fwd_buttons:
+            if self._child_owns_mouse():
+                self._forward_mouse("up", event)   # event.button = the released button
+            btn = getattr(event, "button", 0) or 0
+            if btn:
+                self._fwd_buttons.discard(btn)
+            else:
+                self._fwd_buttons.clear()          # unknown button → end the whole gesture
+            if not self._fwd_buttons:              # all buttons up → drop the capture
+                self._fwd_captured = False
+                try:
+                    self.release_mouse()
+                except Exception:
+                    pass
+            try:
+                event.stop()
+            except Exception:
+                pass
+            return
         self._pending_anchor = None            # click/drag ended; drop the pending press
         if self._sel_anchor is None:
             return                             # bare click (no drag) → nothing to finalize
@@ -1544,12 +1693,23 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         _bp = _BRACKETED_RE.findall(chunk)       # track claude's bracketed-paste mode for on_paste (last h/l wins)
         if _bp:
             self._bracketed_paste = (_bp[-1] == "h")
-        _mr = _MOUSE_REPORT_RE.findall(chunk)    # child wants mouse events (incl. wheel)?
-        if _mr:
-            self._mouse_reporting = (_mr[-1] == "h")
-        _msgr = _MOUSE_SGR_RE.findall(chunk)     # …in SGR extended encoding?
-        if _msgr:
-            self._mouse_sgr = (_msgr[-1] == "h")
+        _dec = _DEC_PRIVATE_RE.findall(chunk)    # DEC private-mode sets (mouse / SGR / …)
+        if _dec:
+            for _params, _hl in _dec:
+                _on = (_hl == "h")
+                for _p in _params.split(";"):    # handle COMBINED params (?1002;1006h)
+                    if _p == "1000":
+                        self._mouse_click = _on
+                    elif _p == "1002":
+                        self._mouse_btn_motion = _on   # motion while a button is held
+                    elif _p == "1003":
+                        self._mouse_any_motion = _on   # any motion (hover)
+                    elif _p == "1006":
+                        self._mouse_sgr = _on          # SGR extended encoding
+            # any tracking on ⇒ the child owns the mouse (incl. wheel + drag-select)
+            self._mouse_reporting = (getattr(self, "_mouse_click", False)
+                                     or getattr(self, "_mouse_btn_motion", False)
+                                     or getattr(self, "_mouse_any_motion", False))
         _su = _SYNC_RE.findall(chunk)            # synchronized-update block open/close
         if _su:
             self._in_sync_update = (_su[-1] == "h")
@@ -1912,10 +2072,37 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             pass
 
+    def _cancel_forwarded_drag(self) -> None:
+        """Drop a stuck forwarded-drag capture (e.g. the MouseUp was lost because the
+        pane blurred / the OS window switched mid-drag). Send the child a release for
+        each still-held button FIRST — else a fullscreen child thinks the button is
+        still down and leaves its drag-selection armed — then drop the capture.
+        (#faithful-mouse)"""
+        if not self._fwd_buttons:
+            return
+        if self._child_owns_mouse() and self._pty is not None:
+            col, row = getattr(self, "_fwd_last", (1, 1))
+            for btn in sorted(self._fwd_buttons):
+                base = ((btn - 1) & 3) if btn else 3
+                try:
+                    if self._mouse_sgr:
+                        self._pty.write(self._mouse_seq(base, col, row, "m"))
+                    else:                                 # X10 release = button 3
+                        self._pty.write(self._mouse_seq(3, col, row, "M"))
+                except Exception:
+                    pass
+        self._fwd_buttons.clear()
+        self._fwd_captured = False
+        try:
+            self.release_mouse()
+        except Exception:
+            pass
+
     def on_blur(self, event=None) -> None:
         # Hide the native cursor (Windows) so an unfocused pane / the list doesn't
         # carry a stray cursor.
         self._show_hw_cursor(False)
+        self._cancel_forwarded_drag()          # a lost MouseUp must not stick capture
 
     # ── thread → UI marshaling (defensive) ─────────────────────────────────────
     def _marshal(self, fn: Callable) -> None:

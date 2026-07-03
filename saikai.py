@@ -6992,6 +6992,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if sync is None:
                 return
             try:
+                # If the window blurred mid-drag (button held during alt-tab), the
+                # pane never got its MouseUp — drop any stuck forwarded-drag capture
+                # on return so it doesn't funnel phantom motion. (#faithful-mouse)
+                cancel = getattr(w, "_cancel_forwarded_drag", None)
+                if cancel is not None:
+                    cancel()
                 # The OS window regaining focus doesn't fire the pane's own
                 # on_focus, so re-anchor its cursor — otherwise WT leaves the IME
                 # disabled until the next redraw. (#ime-race)

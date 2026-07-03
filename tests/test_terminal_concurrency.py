@@ -1092,6 +1092,182 @@ def test_finalize_preserves_active_drag_snapshot():
     assert t._frozen is False and t._frozen_buf is None
 
 
+class _FakePtyWrites:
+    """Records what saikai writes to the child PTY."""
+    def __init__(self):
+        self.writes = []
+    def write(self, s):
+        self.writes.append(s)
+
+
+class _MouseEv:
+    def __init__(self, x, y, button=1, shift=False, meta=False, ctrl=False):
+        self.x = x
+        self.y = y
+        self.button = button
+        self.shift = shift
+        self.meta = meta
+        self.ctrl = ctrl
+        self.stopped = False
+    def stop(self):
+        self.stopped = True
+
+
+def _mk_mouse_term(sgr=True):
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t._pty = _FakePtyWrites()
+    t.is_dead = False
+    t._screen = object()
+    t._mouse_sgr = sgr
+    t._mouse_reporting = True
+    t._mouse_click = True
+    t._mouse_btn_motion = True
+    t._mouse_any_motion = False
+    t._fwd_buttons = set()
+    t._fwd_captured = False
+    t._fwd_last = (1, 1)
+    t._pending_anchor = None
+    t._sel_anchor = None
+    t.focus = lambda: None
+    t.capture_mouse = lambda: None
+    t.release_mouse = lambda: None
+    return t
+
+
+def test_forward_mouse_sgr_encoding():
+    """_forward_mouse inverts Textual's SGR decode (button=(cb+1)&3): L/M/R press,
+    release ('m'), drag motion (+32), and shift/ctrl modifiers (+4/+16). 1-based cells."""
+    t = _mk_mouse_term(sgr=True)
+    w = t._pty.writes
+    t._forward_mouse("down", _MouseEv(4, 2, button=1))     # left @ x4,y2 -> col5,row3
+    assert w[-1] == "\x1b[<0;5;3M", w[-1]
+    t._forward_mouse("down", _MouseEv(0, 0, button=3))     # right -> base (3-1)&3 = 2
+    assert w[-1] == "\x1b[<2;1;1M", w[-1]
+    t._forward_mouse("up", _MouseEv(4, 2, button=1))       # release terminates 'm'
+    assert w[-1] == "\x1b[<0;5;3m", w[-1]
+    # motion during a left drag: Textual carries button=1 on the MouseMove
+    t._forward_mouse("move", _MouseEv(9, 9, button=1))     # base 0 + motion 32
+    assert w[-1] == "\x1b[<32;10;10M", w[-1]
+    t._forward_mouse("down", _MouseEv(0, 0, button=1, shift=True, ctrl=True))  # +4+16
+    assert w[-1] == "\x1b[<20;1;1M", w[-1]
+
+
+def test_forward_mouse_legacy_x10():
+    """Without SGR (?1006), fall back to X10: \\x1b[M + chr(32+cb/col/row); release
+    button code is 3."""
+    t = _mk_mouse_term(sgr=False)
+    w = t._pty.writes
+    t._forward_mouse("down", _MouseEv(4, 2, button=1))     # cb 0, col5, row3
+    assert w[-1] == "\x1b[M" + chr(32) + chr(37) + chr(35), repr(w[-1])
+    t._forward_mouse("up", _MouseEv(4, 2, button=1))       # release -> cb 3
+    assert w[-1] == "\x1b[M" + chr(35) + chr(37) + chr(35), repr(w[-1])
+    # col/row past 95 CAP at 95 (chr(127)) — never emit chr(>=128), which pty.write
+    # would expand to multi-byte UTF-8 and corrupt the fixed 6-byte X10 packet.
+    t._forward_mouse("down", _MouseEv(120, 200, button=1))
+    assert w[-1] == "\x1b[M" + chr(32) + chr(127) + chr(127), repr(w[-1])
+
+
+def test_dec_private_re_parses_combined_params():
+    """The DEC-private regex captures the WHOLE param list + h/l, so COMBINED
+    params (\\x1b[?1002;1006h) are seen — a per-mode regex would miss that form."""
+    assert rt._DEC_PRIVATE_RE.findall("\x1b[?1002;1006h") == [("1002;1006", "h")]
+    assert rt._DEC_PRIVATE_RE.findall(
+        "\x1b[?1000h\x1b[?1006h\x1b[?1002l") == [("1000", "h"), ("1006", "h"), ("1002", "l")]
+
+
+def test_on_mouse_down_forwards_all_when_child_tracks_else_selects():
+    """When the child tracks the mouse (fullscreen), EVERY press forwards to it —
+    incl. Shift (saikai keeps no in-pane selection there; the child's is smarter and
+    OSC-52-copies). When the child does NOT track (classic renderer / plain shell), a
+    bare press starts saikai's own grid selection instead."""
+    t = _mk_mouse_term(sgr=True)    # (reading self.has_focus raises on a __new__ inst;
+                                    #  on_mouse_down's guard try/except swallows it)
+    t.on_mouse_down(_MouseEv(3, 1, button=1, shift=False))
+    assert t._pty.writes and t._pty.writes[-1].startswith("\x1b[<0;4;2"), t._pty.writes
+    assert 1 in t._fwd_buttons
+    # Shift+press ALSO forwards now (shift modifier bit +4 → cb 4)
+    t._fwd_buttons = set()
+    t._pty.writes.clear()
+    t.on_mouse_down(_MouseEv(3, 1, button=1, shift=True))
+    assert t._pty.writes and t._pty.writes[-1] == "\x1b[<4;4;2M", t._pty.writes
+    assert 1 in t._fwd_buttons
+    # classic child (no mouse tracking): bare press → saikai's OWN selection anchor
+    t._fwd_buttons = set()
+    t._pty.writes.clear()
+    t._mouse_reporting = False
+    t._mouse_click = t._mouse_btn_motion = t._mouse_any_motion = False
+    t.on_mouse_down(_MouseEv(3, 1, button=1, shift=False))
+    assert t._pty.writes == [] and t._pending_anchor == (1, 3)
+
+
+def test_on_mouse_move_forwards_motion_only_when_tracked():
+    """A forwarded drag relays motion only if the child asked for it (?1002/?1003)."""
+    t = _mk_mouse_term(sgr=True)
+    t._fwd_buttons = {1}
+    t._fwd_captured = True                       # already capturing (skip capture_mouse)
+    t._mouse_btn_motion = True
+    t.on_mouse_move(_MouseEv(9, 9, button=1))
+    assert t._pty.writes and t._pty.writes[-1] == "\x1b[<32;10;10M"
+    # click-only child (no motion modes): a forwarded drag must NOT relay motion
+    t._pty.writes.clear()
+    t._mouse_btn_motion = False
+    t._mouse_any_motion = False
+    t.on_mouse_move(_MouseEv(5, 5, button=1))
+    assert t._pty.writes == []
+
+
+def test_on_mouse_move_forwards_hover_when_any_motion():
+    """A child with ?1003 (any-motion) gets hover reports even with NO button held."""
+    t = _mk_mouse_term(sgr=True)
+    t._mouse_any_motion = True                 # ?1003 hover tracking on (no button held)
+    t.on_mouse_move(_MouseEv(2, 2, button=0))  # no button
+    assert t._pty.writes and t._pty.writes[-1] == "\x1b[<35;3;3M"   # no-button motion: base 3 + 32
+    # without any-motion, a hover (no held button) is NOT forwarded
+    t._pty.writes.clear()
+    t._mouse_any_motion = False
+    t.on_mouse_move(_MouseEv(2, 2, button=0))
+    assert t._pty.writes == []
+
+
+def test_on_mouse_up_skips_release_when_child_stopped_tracking():
+    """If the child turned mouse tracking OFF mid-drag, on_mouse_up must NOT write a
+    stray release — but must still drop the capture / _fwd_buttons state."""
+    t = _mk_mouse_term(sgr=True)
+    t._fwd_buttons = {1}
+    t._mouse_reporting = False                 # child disabled tracking mid-drag
+    t._mouse_click = t._mouse_btn_motion = t._mouse_any_motion = False
+    t.on_mouse_up(_MouseEv(4, 2, button=1))
+    assert t._pty.writes == [] and not t._fwd_buttons
+
+
+def test_on_mouse_up_multi_button_releases_correct_button():
+    """A second button pressed during a held drag must release with ITS OWN button;
+    the first button's release must not be mis-attributed, and the capture is held
+    until ALL buttons are up. (regression: a single _fwd_drag overwrote the button)"""
+    t = _mk_mouse_term(sgr=True)
+    t.on_mouse_down(_MouseEv(0, 0, button=1))   # left down
+    t.on_mouse_down(_MouseEv(0, 0, button=3))   # right down (left still held)
+    assert t._fwd_buttons == {1, 3}
+    t._pty.writes.clear()
+    t.on_mouse_up(_MouseEv(0, 0, button=1))     # left up → left release, right still held
+    assert t._pty.writes[-1] == "\x1b[<0;1;1m", t._pty.writes
+    assert t._fwd_buttons == {3}
+    t.on_mouse_up(_MouseEv(0, 0, button=3))     # right up → right release, gesture ends
+    assert t._pty.writes[-1] == "\x1b[<2;1;1m", t._pty.writes
+    assert t._fwd_buttons == set()
+
+
+def test_cancel_forwarded_drag_sends_release():
+    """A stuck forwarded drag (lost MouseUp on blur/alt-tab) must send the child a
+    release so it doesn't believe the button is still held, then clear state."""
+    t = _mk_mouse_term(sgr=True)
+    t._fwd_buttons = {1}
+    t._fwd_last = (3, 2)
+    t._cancel_forwarded_drag()
+    assert t._pty.writes and t._pty.writes[-1] == "\x1b[<0;3;2m", t._pty.writes
+    assert not t._fwd_buttons and t._fwd_captured is False
+
+
 if __name__ == "__main__":
     test_consume_collapses_alt_screen_reset_amplification()
     print("PASS test_consume_collapses_alt_screen_reset_amplification")
@@ -1111,6 +1287,24 @@ if __name__ == "__main__":
     print("PASS test_posix_reap_escalates_to_sigkill")
     test_post_signal_never_raises()
     print("PASS test_post_signal_never_raises")
+    test_forward_mouse_sgr_encoding()
+    print("PASS test_forward_mouse_sgr_encoding")
+    test_forward_mouse_legacy_x10()
+    print("PASS test_forward_mouse_legacy_x10")
+    test_dec_private_re_parses_combined_params()
+    print("PASS test_dec_private_re_parses_combined_params")
+    test_on_mouse_down_forwards_all_when_child_tracks_else_selects()
+    print("PASS test_on_mouse_down_forwards_all_when_child_tracks_else_selects")
+    test_on_mouse_move_forwards_motion_only_when_tracked()
+    print("PASS test_on_mouse_move_forwards_motion_only_when_tracked")
+    test_on_mouse_move_forwards_hover_when_any_motion()
+    print("PASS test_on_mouse_move_forwards_hover_when_any_motion")
+    test_on_mouse_up_skips_release_when_child_stopped_tracking()
+    print("PASS test_on_mouse_up_skips_release_when_child_stopped_tracking")
+    test_on_mouse_up_multi_button_releases_correct_button()
+    print("PASS test_on_mouse_up_multi_button_releases_correct_button")
+    test_cancel_forwarded_drag_sends_release()
+    print("PASS test_cancel_forwarded_drag_sends_release")
     test_pane_refresh_coalesces()
     print("PASS test_pane_refresh_coalesces")
     test_current_screen_caches_by_version()
