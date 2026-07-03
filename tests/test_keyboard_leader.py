@@ -1972,6 +1972,57 @@ def test_pilot_toast_user_content_renders_verbatim():
         f"F11 recall must survive stray close tags: {facts}"
 
 
+def test_tabpane_title_uses_markup_safe_content_not_rich_text():
+    """A live pane's TabPane title is USER content (session AI title / first
+    message) that can contain '[' — e.g. '[wip] ASCoM 予算'. Textual's TabPane
+    title/label type is ContentType = str | textual.content.Content; a rich Text
+    is NOT accepted — render_str→_strip_control_codes calls str.translate, which
+    rich Text lacks, raising AttributeError and crashing _spawn_live_pane on
+    EVERY session open/restore. f0c2c57 wrapped these in rich Text for markup-
+    safety (the right goal, wrong type); a plain str is unsafe too (the '[' is
+    parsed as markup and swallowed). The fix is textual Content: markup-safe AND
+    accepted. The sibling toast test covered notify() but not this TabPane path,
+    so the crash shipped. (#audit-toast-markup)"""
+    # (1) Source guard — the exact shapes f0c2c57 introduced must stay gone. This
+    # is the cheap, deps-free check that WOULD have caught the regression (the
+    # behavioral half below needs a real PTY to reach _spawn_live_pane).
+    src = Path(saikai.__file__).read_text(encoding="utf-8")
+    assert "TabPane(Text(" not in src, \
+        "TabPane title must be str|Content, never rich Text (crashes render_str)"
+    assert "pane.label = Text(" not in src, \
+        "TabPane label must be str|Content, never rich Text"
+
+    # (2) Behavioral — the real production expression, Content(tab_label(...)),
+    # must construct without raising and keep brackets literal (not markup).
+    try:
+        from textual.widgets import TabPane
+        from textual.content import Content
+        from rich.text import Text
+    except Exception:
+        print("SKIP test_tabpane_title_uses_markup_safe_content_not_rich_text "
+              "(textual unavailable)")
+        return
+    import saikai_terminal
+    hostile = "[wip] plan [x]"          # short: stays under tab_label's 18-char cut
+    label = saikai_terminal.tab_label(hostile, "idle")
+    assert "[wip]" in label and "[x]" in label, \
+        f"tab_label must keep brackets literal (no markup escaping): {label!r}"
+    pane = TabPane(Content(label))       # regressed line raised AttributeError here
+    plain = pane._title.plain
+    assert "[wip]" in plain and "[x]" in plain, \
+        f"Content title must render brackets verbatim, not as markup: {plain!r}"
+    # Anti-regression witness: confirm the wrapped-in-Text shape really does crash
+    # in this textual, so the source guard is guarding a live hazard — but don't
+    # hard-fail if a future textual starts accepting Text (Content stays correct).
+    try:
+        TabPane(Text(label))
+    except AttributeError:
+        pass
+    else:
+        print("NOTE: TabPane(Text(...)) no longer crashes in this textual; "
+              "source guard still valid — Content is the supported type.")
+
+
 def test_pilot_filter_engaged_window_survives_focus_move():
     """Filtering must not switch the foreground live pane out from under the user.
     The post-filter RowHighlighted is queued (the rebuild is call_after_refresh'd),
@@ -2279,6 +2330,8 @@ if __name__ == "__main__":
     test_pilot_filter_engaged_window_survives_focus_move()
     test_pilot_checkpoint_marker_on_row()
     test_pilot_toast_user_content_renders_verbatim()
+    test_tabpane_title_uses_markup_safe_content_not_rich_text()
+    print("PASS test_tabpane_title_uses_markup_safe_content_not_rich_text")
     test_pilot_cycle_tab_skips_dead_pane()
     test_pilot_double_space_does_not_leave_leader_armed()
     print("PASS test_pilot_double_space_does_not_leave_leader_armed")

@@ -4583,6 +4583,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                      TabPane, Tabs, TextArea)
         from textual.widgets.option_list import Option
         from rich.text import Text
+        from textual.content import Content  # markup-safe title/label type (TabPane
+        #   rejects rich Text: render_str→_strip_control_codes calls str.translate)
     except ImportError as e:
         print(_c(f"  textual is required but not installed ({e}). "
                  f"Install it with: uv tool install textual "
@@ -7427,7 +7429,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 status_classifier=_LIVE_TERM.classifier_for_profile(
                     _ACTIVE_PROVIDER.status_profile),
             )
-            pane = TabPane(Text(_LIVE_TERM.tab_label(title, "idle")), term, id=pane_id)  # Text: titles are user content (#audit-toast-markup)
+            pane = TabPane(Content(_LIVE_TERM.tab_label(title, "idle")), term, id=pane_id)  # Content: markup-safe title (rich Text crashes render_str) (#audit-toast-markup)
             # Mount on the UI event loop in a worker so we can AWAIT the removal of
             # any lingering same-id dead pane BEFORE adding the new one. remove_pane()
             # is deferred (returns AwaitComplete), so the old synchronous
@@ -7709,7 +7711,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 title = _pane_title(s, sid, self._live.get(sid))
                 pane = tabs.get_pane(self._live.pane_id(sid))
                 if pane is not None:
-                    pane.label = Text(_LIVE_TERM.tab_label(title, status))  # (#audit-toast-markup)
+                    pane.label = Content(_LIVE_TERM.tab_label(title, status))  # (#audit-toast-markup)
             except Exception:
                 pass
 
@@ -7817,7 +7819,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 title = _pane_title(s, sid, self._live.get(sid))
                 pane = tabs.get_pane(self._live.pane_id(sid))
                 if pane is not None:
-                    pane.label = Text(_LIVE_TERM.tab_label(title, "dead"))  # (#audit-toast-markup)
+                    pane.label = Content(_LIVE_TERM.tab_label(title, "dead"))  # (#audit-toast-markup)
             except Exception:
                 pass
             self._live.forget(sid)
@@ -8352,7 +8354,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         pane = tabs.get_pane(self._live.pane_id(sid))
                         if pane is not None:
                             title = _pane_title(_live_s, sid, self._live.get(sid))
-                            pane.label = Text(_LIVE_TERM.tab_label(title, self._live.status(sid)))  # (#audit-toast-markup)
+                            pane.label = Content(_LIVE_TERM.tab_label(title, self._live.status(sid)))  # (#audit-toast-markup)
                 except Exception:
                     pass
                 self.notify("name cleared — back to auto-title" if not clean
