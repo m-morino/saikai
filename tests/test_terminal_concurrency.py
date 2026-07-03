@@ -12,6 +12,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Headless harness: no terminal to watch, and the watchdog's os._exit on a
 # false-positive orphan detection would kill the test process. (production-only)
 os.environ["SAIKAI_NO_TERMINAL_WATCHDOG"] = "1"
+# Isolate app-launch tests from a developer's ambient SAIKAI_MIRROR (the mirror
+# perturbs focus-on-launch in the Pilot harness). (#test-isolation)
+os.environ.pop("SAIKAI_MIRROR", None)
 import saikai_terminal as rt
 import saikai
 

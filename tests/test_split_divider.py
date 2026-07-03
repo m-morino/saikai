@@ -19,6 +19,9 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Isolate the app-launch smoke test from a developer's ambient SAIKAI_MIRROR (the
+# mirror perturbs focus-on-launch in the Pilot harness). (#test-isolation)
+os.environ.pop("SAIKAI_MIRROR", None)
 import saikai
 
 try:

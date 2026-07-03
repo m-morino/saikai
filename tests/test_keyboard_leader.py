@@ -10,6 +10,11 @@ import os
 import sys
 import tempfile
 import uuid
+
+# Isolate the Pilot app-launch tests from a developer's ambient SAIKAI_MIRROR: with
+# it set, the launched app starts the web mirror, which perturbs focus-on-launch and
+# makes the "table owns focus" assertion flake. Tests must not depend on that env.
+os.environ.pop("SAIKAI_MIRROR", None)
 from pathlib import Path
 
 # Point saikai at a throwaway home BEFORE importing it (it derives CACHE_DIR /
