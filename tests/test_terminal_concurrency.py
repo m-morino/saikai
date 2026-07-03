@@ -411,55 +411,6 @@ def test_autoscroll_tick_pins_anchor_to_content():
     assert t._scroll == 4 and t._sel_anchor == (10, 2)
 
 
-def test_blink_tick_toggles_blink_for_ime_keepalive():
-    """The WT IME fix (#wt-ime-blink): _blink_tick toggles _blink_on and re-anchors
-    the cursor every 0.5s while focused, so WT keeps re-receiving the cursor move
-    and leaves the IME enabled (a stock Textual Input keeps IME alive the same way
-    via its 0.5s cursor blink; saikai lacked the keepalive → idle panes went ×).
-    It must be a no-op when the pane isn't focused. The keepalive is opt-in
-    (SAIKAI_IME_ANCHOR); enable it for this test. (#ime-anchor-optout)"""
-    calls = []
-    _saved = rt._IME_ANCHOR
-    rt._IME_ANCHOR = True
-    try:
-        class _Focused(rt.AgentTerminal):
-            has_focus = True
-            is_dead = False
-            def _is_focused_pane(self): return True
-            def _sync_terminal_cursor(self, reason="repaint"):
-                calls.append(reason)     # stand in for re-anchor + refresh
-
-        t = _Focused.__new__(_Focused)
-        t._scroll = 0
-        t._blink_on = True
-        t._blink_tick()
-        assert t._blink_on is False and calls == ["focus"]   # toggled + re-anchored
-        t._blink_tick()
-        assert t._blink_on is True and calls == ["focus", "focus"]
-
-        class _Unfocused(rt.AgentTerminal):
-            has_focus = False
-            is_dead = False
-            def _is_focused_pane(self): return False
-            def _sync_terminal_cursor(self, reason="repaint"):
-                calls.append("UNFOCUSED")
-
-        u = _Unfocused.__new__(_Unfocused)
-        u._scroll = 0
-        u._blink_on = True
-        u._blink_tick()
-        assert u._blink_on is True and "UNFOCUSED" not in calls   # no-op unfocused
-
-        # scrolled-back focused pane is also a no-op (cursor isn't at the live bottom)
-        s = _Focused.__new__(_Focused)
-        s._scroll = 5
-        s._blink_on = True
-        s._blink_tick()
-        assert s._blink_on is True
-    finally:
-        rt._IME_ANCHOR = _saved
-
-
 def test_encode_key_meta_and_release():
     """readline keys reach claude: Ctrl+letters AND Meta/Alt word-ops (ESC prefix).
     The release key must resolve to Textual's real name, not the dead 'ctrl+]'."""
@@ -1174,8 +1125,6 @@ if __name__ == "__main__":
     print("PASS test_show_hw_cursor_native_cursor_dec_bytes")
     test_autoscroll_tick_pins_anchor_to_content()
     print("PASS test_autoscroll_tick_pins_anchor_to_content")
-    test_blink_tick_toggles_blink_for_ime_keepalive()
-    print("PASS test_blink_tick_toggles_blink_for_ime_keepalive")
     test_alt_screen_suppresses_false_needs_input()
     print("PASS test_alt_screen_suppresses_false_needs_input")
     test_classify_trust_folder_dialog_is_waiting()

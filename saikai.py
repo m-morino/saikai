@@ -6979,28 +6979,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
 
-        def _display(self, screen, renderable) -> None:
-            # Before Textual emits this frame's cursor-move (CUP → ESC[r;cH) to the
-            # terminal, clamp app.cursor_position to the FOCUSED live pane's anchor
-            # cell. Textual emits Control.move_to(app.cursor_position) once per
-            # CompositorUpdate with NO position-dedup, and more than one widget
-            # writes app.cursor_position (the pane's IME anchor vs Textual's own
-            # search Input). Whichever wrote LAST before the (PTY-driven) dirty frame
-            # is what WT receives, which alternated across window-focus cycles — the
-            # deterministic IME ×/ON flicker on alt-tab. Re-asserting the pane anchor
-            # here makes the emitted CUP the claude prompt cell EVERY frame, so WT
-            # keeps the IME armed on every window return. Only acts when a live pane
-            # is the focused widget; the list/search keep Textual's own cursor.
-            # (#ime-cursor-race — deduced by the multi-agent review)
-            try:
-                if _LIVE_TERM is not None and getattr(_LIVE_TERM, "_IME_ANCHOR", False):
-                    w = self.screen.focused
-                    if isinstance(w, _LIVE_TERM.AgentTerminal):
-                        w._sync_terminal_cursor(reason="display")
-            except Exception:
-                pass
-            super()._display(screen, renderable)
-
         def on_app_focus(self, event=None) -> None:
             """The OS window regained focus (terminal FocusIn, ?1004). Textual
             WIDGET focus did NOT change — the live pane still has it — so the
@@ -7009,33 +6987,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             redraw happens to re-anchor it (hence the intermittency: idle panes
             stay ×, busy ones self-heal). Re-anchor the focused pane's cursor on
             window focus-in, and again after the refresh Textual runs. (#ime-race)"""
-            if os.environ.get("SAIKAI_IME_DEBUG"):
-                try:
-                    _f = self.screen.focused
-                    _log(f"APP_FOCUS restored={type(_f).__name__ if _f else None}"
-                         f"#{getattr(_f, 'id', None) if _f else ''} "
-                         f"app_focus={getattr(self, 'app_focus', '?')}")
-                except Exception:
-                    pass
             w = getattr(self, "focused", None)
             sync = getattr(w, "_sync_terminal_cursor", None)   # only AgentTerminal has it
             if sync is None:
                 return
             try:
                 # The OS window regaining focus doesn't fire the pane's own
-                # on_focus, so resume its cursor-blink keepalive and re-anchor —
-                # otherwise WT leaves the IME disabled until the next redraw.
-                # (#wt-ime-blink)
+                # on_focus, so re-anchor its cursor — otherwise WT leaves the IME
+                # disabled until the next redraw. (#ime-race)
                 show = getattr(w, "_show_hw_cursor", None)
                 if show is not None:
                     show(True)            # re-show the native cursor on window return
-                tmr = getattr(w, "_blink_timer", None)
-                if tmr is not None:
-                    try:
-                        w._blink_on = True
-                        tmr.resume()
-                    except Exception:
-                        pass
                 sync(reason="focus")
                 self.call_after_refresh(lambda: sync(reason="focus"))
             except Exception:
@@ -7449,19 +7411,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     pane.label = _LIVE_TERM.tab_label(title, status)
             except Exception:
                 pass
-
-        def on_app_blur(self, event=None) -> None:
-            # WT window LOST OS focus. Log the logical focus so the next app-focus
-            # can show whether Textual restores it. (#ime-appfocus-diag)
-            if os.environ.get("SAIKAI_IME_DEBUG"):
-                try:
-                    f = self.screen.focused
-                    _log(f"APP_BLUR focused={type(f).__name__ if f else None}"
-                         f"#{getattr(f, 'id', None) if f else ''} "
-                         f"active_tab={getattr(self.query_one('#right', TabbedContent), 'active', '?')}")
-                except Exception:
-                    pass
-
 
         def action_dump_pane(self) -> None:
             """Ctrl+F12: write the focused (else active-tab) live pane's visible
@@ -9314,34 +9263,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _app_kwargs = {}
                 print(_c(f"  saikai mirror disabled (setup failed: {_mir_err})",
                          YELLOW), file=sys.stderr)
-        # IME boundary capture: when SAIKAI_IME_DEBUG is set (and the mirror
-        # hasn't already supplied a driver), wrap the console driver to log every
-        # DEC private-mode sequence (ESC[?…h/l) saikai writes to the REAL terminal.
-        # A stock Textual app keeps WT's IME alive idle; saikai doesn't — so the
-        # modes saikai sets that the stock app doesn't ARE the suspect. Dedup so
-        # only mode-set CHANGES are logged, not every frame. (#ime-boundary)
-        if os.environ.get("SAIKAI_IME_DEBUG") and "driver_class" not in _app_kwargs:
-            try:
-                import saikai_mirror as _mir2
-                import re as _re_ime
-                _ime_base = _mir2._base_driver_class()
-
-                class _ImeDebugDriver(_ime_base):
-                    _last = None
-
-                    def write(self, data):
-                        try:
-                            ms = _re_ime.findall(r"\x1b\[\?[0-9;]+[hl]", data)
-                            if ms and ms != _ImeDebugDriver._last:
-                                _ImeDebugDriver._last = ms
-                                _log("driver DEC: " + " ".join(ms))
-                        except Exception:
-                            pass
-                        return super().write(data)
-
-                _app_kwargs["driver_class"] = _ImeDebugDriver
-            except Exception:
-                pass
         _app = PickerApp(**_app_kwargs)
         _app._mirror_hub = _hub
         chosen = _app.run()

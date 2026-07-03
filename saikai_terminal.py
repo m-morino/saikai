@@ -85,22 +85,15 @@ def _log(msg: str) -> None:
         pass
 
 
-# SAIKAI_IME_DEBUG=1 logs IME-anchor moves + pane focus/blur to ~/.cache/saikai/
-# saikai.log, so the cursor/IME behaviour on a given terminal can be inspected
-# after the fact. The IME candidate window anchors to wherever app.cursor_position
-# parks the hardware cursor (Windows Terminal reads the cursor CELL, not its
-# visibility) — these lines show that cell as it changes, plus when the pane gains
-# or loses focus, so a post-mortem can tell whether the anchor was correct/current.
-_IME_DEBUG = str(os.environ.get("SAIKAI_IME_DEBUG", "")).strip().lower() in (
-    "1", "true", "yes", "on")
-
-# Custom IME-anchor machinery (keepalive blink + cursor re-anchor to claude's
-# prompt cell + native hardware cursor + the App._display re-assert). It puts the
-# WT IME/composition window AT the claude prompt. DEFAULT ON: without it the IME
-# window sits at Textual's default cursor (wrong place — unusable for CJK input),
-# which is worse than the known alt-tab ×/ON flicker. Set SAIKAI_IME_ANCHOR=0 to
-# turn it off (cursor handling then matches a stock Textual app — flicker-free but
-# the IME window is mispositioned). (#ime-anchor-optout)
+# IME-anchor: re-anchor the (hidden) hardware cursor to claude's prompt cell +
+# show the native hardware cursor there (Windows). This puts the WT IME/composition
+# window AT the claude prompt. DEFAULT ON: without it the IME window sits at
+# Textual's default cursor (wrong place — unusable for CJK input in the classic
+# renderer). Set SAIKAI_IME_ANCHOR=0 to turn it off (cursor handling then matches a
+# stock Textual app). NOTE: this positions the IME in the CLASSIC renderer; under
+# claude's fullscreen renderer claude hides the terminal cursor (draws its own), so
+# the anchor is a no-op there — set CLAUDE_CODE_NATIVE_CURSOR=1 for the child if you
+# want the fullscreen prompt to keep the real cursor. (#ime-anchor-optout)
 _IME_ANCHOR = str(os.environ.get("SAIKAI_IME_ANCHOR", "1")).strip().lower() not in (
     "0", "false", "no", "off")
 
@@ -854,9 +847,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._screen = None          # pyte.Screen
         self._stream = None          # pyte.Stream (feeds str)
         self._alt = AltScreenTracker()
-        self._blink_on = True        # cursor-blink flag (see _blink_tick); stays
-                                     # True when the timer never runs (non-Windows)
-        self._blink_timer = None     # 0.5s blink keepalive — keeps WT's IME alive
         self._scroll = 0             # lines scrolled back (0 = live bottom)
         self._frozen = False         # paused repaint: hold the view still so a
                                      # streaming pane can be drag-selected
@@ -919,15 +909,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             daemon=True,
         )
         self._reader.start()
-        # Cursor-blink keepalive (Windows only — the WT IME fix, see _blink_tick).
-        # Created paused; on_focus resumes it, on_blur pauses it. Mirrors how
-        # Textual's own Input keeps its cursor (and the IME) alive. (#wt-ime-blink)
-        if _IS_WIN:
-            try:
-                self._blink_timer = self.set_interval(
-                    0.5, self._blink_tick, pause=True)
-            except Exception:
-                self._blink_timer = None
 
     def _spawn(self, rows: int, cols: int) -> None:
         kwargs: dict = {"dimensions": (rows, cols)}
@@ -1026,11 +1007,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if cells is None:
             return Strip.blank(width)
         # Cursor only in the live view (it lives at the bottom, not in history).
-        # _blink_on toggles every 0.5s while focused (Windows) so the cursor blinks
-        # and the keepalive re-emits its move; it stays True elsewhere. (#wt-ime-blink)
         show_cursor = (s == 0 and self.has_focus and y == cursor_y
-                       and not self.is_dead and not cursor_hidden
-                       and getattr(self, "_blink_on", True))
+                       and not self.is_dead and not cursor_hidden)
         _has_sel = self._sel_anchor is not None and self._sel_head is not None
         segments = []
         run_chars: list[str] = []
@@ -1360,11 +1338,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         self._pending_anchor = (event.y, event.x)
         self._sel_anchor = None
-        if _IME_DEBUG:
-            _log(f"mouse-down at=({getattr(event,'x','?')},{getattr(event,'y','?')}) "
-                 f"button={getattr(event,'button','?')} "
-                 f"screen=({getattr(event,'screen_x','?')},{getattr(event,'screen_y','?')}) "
-                 f"(pending, no freeze) mouse_report={getattr(self, '_mouse_reporting', False)}")
 
     def _begin_drag_selection(self) -> None:
         """Engage the selection state (freeze + snapshot + capture + autoscroll)
@@ -1434,8 +1407,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._scroll = (min(old + 1, hist) if d > 0 else max(old - 1, 0))
             new = self._scroll
         delta = new - old
-        if _IME_DEBUG:
-            _log(f"autoscroll d={d} scroll {old}->{new} hist={hist} delta={delta}")
         if delta == 0:
             return                              # hit the scrollback top / live bottom
         ay, ax = self._sel_anchor
@@ -1454,10 +1425,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._autoscroll_timer = None
 
     def on_mouse_up(self, event) -> None:     # events.MouseUp
-        if _IME_DEBUG:
-            _log(f"mouse-up at=({getattr(event,'x','?')},{getattr(event,'y','?')}) "
-                 f"button={getattr(event,'button','?')} anchor={self._sel_anchor} "
-                 f"pending={getattr(self, '_pending_anchor', None)}")
         self._pending_anchor = None            # click/drag ended; drop the pending press
         if self._sel_anchor is None:
             return                             # bare click (no drag) → nothing to finalize
@@ -1857,27 +1824,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             return bool(self.has_focus)
 
-    def _blink_tick(self) -> None:
-        """Cursor-blink keepalive — THE Windows-Terminal IME fix.
-
-        ROOT CAUSE: Textual anchors the IME by *moving* the (hidden) hardware
-        cursor to `app.cursor_position` on each render — saikai's pane does this
-        exactly like Textual's own Input. The difference is that Input BLINKS its
-        cursor every 0.5s, which re-renders and so keeps re-emitting the cursor
-        move to the terminal; WT keeps the IME enabled only while the cursor keeps
-        moving. saikai's pane emitted a move only when claude produced output, so
-        an IDLE focused pane stopped moving the cursor and WT disabled the IME (×)
-        — exactly the observed busy-OK / idle-× flicker. (A stock Textual Input in
-        WT does NOT flicker, which proved this is not a Textual/WT limitation but a
-        missing keepalive.) Toggling the cursor every 0.5s and re-anchoring forces
-        the move to keep flowing, like Input. Windows-only. (#wt-ime-blink)"""
-        if not _IME_ANCHOR:
-            return
-        if self.is_dead or not self._is_focused_pane() or self._scroll != 0:
-            return
-        self._blink_on = not self._blink_on
-        self._sync_terminal_cursor(reason="focus")   # re-assert + refresh → re-emit move
-
     def _show_hw_cursor(self, show: bool) -> None:
         """Show/hide the REAL terminal cursor (Windows). This makes the user see the
         terminal's NATIVE cursor — its own configured thin bar/underline — at the
@@ -1898,35 +1844,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
 
     def on_focus(self, event=None) -> None:
         # Anchor the IME the moment the pane is focused (don't wait for a repaint).
-        if _IME_DEBUG:
-            # Full state dump so the × return and the ON return can be DIFFed: the
-            # value that flips between them IS the deterministic ×/ON toggle. (#ime-toggle-diag)
-            try:
-                _sf = self.screen.focused
-                _sfn = f"{type(_sf).__name__}#{getattr(_sf,'id',None)}" if _sf else "None"
-            except Exception:
-                _sfn = "?"
-            try:
-                _cp = getattr(self.app, "cursor_position", "?")
-            except Exception:
-                _cp = "?"
-            _tim = getattr(self, "_blink_timer", None)
-            _log(f"on_focus sid={getattr(self, 'sid', None)} "
-                 f"WT={bool(os.environ.get('WT_SESSION'))} "
-                 f"has_focus={self.has_focus} focused_pane={self._is_focused_pane()} "
-                 f"screen.focused={_sfn} blink_on={getattr(self,'_blink_on','?')} "
-                 f"frozen={getattr(self,'_frozen','?')} scroll={self._scroll} "
-                 f"cursor_pos={_cp} timer_paused={getattr(_tim,'_active', '?') if _tim else None}")
         # Show the terminal's native cursor (Windows) — see _show_hw_cursor.
         self._show_hw_cursor(True)
-        # Start the cursor-blink keepalive so WT keeps the IME enabled while this
-        # pane is focused (the real fix for the ×/OK flicker). (#wt-ime-blink)
-        self._blink_on = True
-        if self._blink_timer is not None:
-            try:
-                self._blink_timer.resume()
-            except Exception:
-                pass
         self._sync_terminal_cursor(reason="focus")
         # The immediate sync above can fire before layout settles — inside the
         # focus event `content_region`/`has_focus` may not be valid yet, so the
@@ -1955,14 +1874,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if not _IME_ANCHOR:
             return
         if Offset is None or self.is_dead or not self._is_focused_pane() or self._scroll != 0:
-            # Diagnostic: a focus-triggered sync that bails here is the suspected
-            # race — the pane regained focus but the cursor never got anchored,
-            # so WT may show the IME as disabled (×). (#ime-race)
-            if _IME_DEBUG and reason == "focus":
-                _log(f"ime SKIP sid={getattr(self, 'sid', None)} reason=focus "
-                     f"OffsetNone={Offset is None} dead={self.is_dead} "
-                     f"has_focus={self.has_focus} focused_pane={self._is_focused_pane()} "
-                     f"scroll={self._scroll}")
             return
         try:
             app = self.app
@@ -1977,7 +1888,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             try:
                 cx = int(screen.cursor.x)
                 cy = int(screen.cursor.y)
-                chid = bool(getattr(screen.cursor, "hidden", False))
             except Exception:
                 return
         try:
@@ -1999,36 +1909,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                         self.refresh(repaint=True)
                     except Exception:
                         pass
-            # Log every focus-triggered sync (and any repaint that moves the anchor)
-            # with the cursor-hidden state: if the × correlates with cursor_hidden
-            # or xy=None, that pins the cause (blink-off vs region-not-ready). (#ime-race)
-            if _IME_DEBUG and (reason == "focus" or xy != getattr(self, "_ime_log_xy", None)):
-                self._ime_log_xy = xy
-                _log(f"ime {'FOCUS' if reason == 'focus' else 'move'} "
-                     f"sid={getattr(self, 'sid', None)} cell={xy} "
-                     f"claude=({cx},{cy}) cursor_hidden={chid} "
-                     f"region=({region.x},{region.y},{region.width}x{region.height})")
         except Exception:
             pass
 
     def on_blur(self, event=None) -> None:
-        if _IME_DEBUG:
-            _who = "?"
-            try:
-                _f = self.app.focused
-                _who = f"{type(_f).__name__}#{getattr(_f, 'id', None)}" if _f is not None else "None"
-            except Exception:
-                pass
-            _log(f"on_blur sid={getattr(self, 'sid', None)} focus_now={_who}")
         # Hide the native cursor (Windows) so an unfocused pane / the list doesn't
-        # carry a stray cursor, and stop the keepalive (no moves needed unfocused).
+        # carry a stray cursor.
         self._show_hw_cursor(False)
-        self._blink_on = True
-        if self._blink_timer is not None:
-            try:
-                self._blink_timer.pause()
-            except Exception:
-                pass
 
     # ── thread → UI marshaling (defensive) ─────────────────────────────────────
     def _marshal(self, fn: Callable) -> None:
