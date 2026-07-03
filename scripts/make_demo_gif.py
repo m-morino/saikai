@@ -15,7 +15,9 @@ with Pillow (per-frame durations). The same leak guard as the screenshots
 aborts if anything private would ship.
 
 Usage:  uv run scripts/make_demo_gif.py
-Output: docs/assets/saikai-demo-headless.gif
+        (no Chrome/Edge? add --with cairosvg for a pure-headless render)
+Output: docs/assets/saikai-demo-headless.gif  (+ a saikai-demo.gif copy, the
+        canonical name the READMEs embed); likewise the -ja pair.
 """
 import asyncio
 import os
@@ -265,10 +267,22 @@ for name, _ in FRAMES:
         raise SystemExit(f"LEAK in {name}: {hits} — demo NOT safe to publish")
 print(f"captured {len(FRAMES)} frames (leak-checked): {FRAMES_DIR}")
 
+# Rasterization-only glyph fix: Claude Code prints tool results under U+23BF (⎿),
+# which GitHub renders fine from the live SVG (the viewer's browser has it) but
+# which is ABSENT from the headless font stacks that rasterize these frames
+# (Fira-Code-from-CDN and DejaVu both draw it as a .notdef box). Swap it for the
+# rounded elbow ╰ (U+2570) — present in every monospace font, visually the same
+# corner — so the rasterized GIF has no tofu. The source screenshots keep ⎿.
+for name, _ in FRAMES:
+    p = FRAMES_DIR / name
+    s = p.read_text(encoding="utf-8")
+    if "⎿" in s:
+        p.write_text(s.replace("⎿", "╰"), encoding="utf-8")
+
 # ---- 5. SVG -> PNG via Edge/Chrome headless ---------------------------------
 
 
-def _find_browser() -> str:
+def _find_browser():
     cands = [
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
@@ -279,10 +293,21 @@ def _find_browser() -> str:
         p = shutil.which(c) or (c if Path(c).is_file() else None)
         if p:
             return p
-    raise SystemExit("no Edge/Chrome found for SVG->PNG rendering")
+    return None                              # fall back to cairosvg (below)
 
 
+# Prefer a browser (best fidelity, and it's what Windows has); otherwise use
+# cairosvg so the GIF can be regenerated HEADLESS on a box with no Chrome/Edge
+# (a Pi / CI). Install it just for this run: `uv run --with cairosvg make_demo_gif.py`.
 browser = _find_browser()
+_cairosvg = None
+if browser is None:
+    try:
+        import cairosvg as _cairosvg
+    except ModuleNotFoundError:
+        raise SystemExit("no Edge/Chrome found, and cairosvg isn't available — "
+                         "re-run with:  uv run --with cairosvg scripts/make_demo_gif.py")
+    print("no browser found — rendering SVG->PNG with cairosvg (headless)")
 first_svg = (FRAMES_DIR / FRAMES[0][0]).read_text(encoding="utf-8")
 m = re.search(r'<svg[^>]*\bwidth="([\d.]+)"[^>]*\bheight="([\d.]+)"', first_svg)
 if not m:
@@ -296,28 +321,32 @@ print(f"frame size: {W}x{H}; rendering with {browser}")
 
 for name, _ in FRAMES:
     svg = FRAMES_DIR / name
-    html = svg.with_suffix(".html")
-    # Inline the SVG into a zero-margin page so the screenshot is exactly the
-    # frame — file:// + <img src=svg> would add body margins and rescaling.
-    html.write_text("<!doctype html><html><head><meta charset='utf-8'>"
-                    "<style>html,body{margin:0;padding:0}</style></head><body>"
-                    + svg.read_text(encoding="utf-8") + "</body></html>",
-                    encoding="utf-8")
     png = svg.with_suffix(".png")
-    cmd = [browser, "--headless=new", "--disable-gpu",
-           "--force-device-scale-factor=1", "--hide-scrollbars",
-           f"--window-size={W},{H}", f"--screenshot={png}",
-           html.as_uri()]
-    # `--headless=new` occasionally stalls on a cold spawn (AV / proxy / first
-    # paint). It uses an ephemeral profile, so a retry never lock-conflicts.
-    for attempt in range(2):
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=90)
-            break
-        except subprocess.TimeoutExpired:
-            if attempt:
-                raise
-            print(f"  {name}: render stalled, retrying once")
+    if _cairosvg is not None:
+        _cairosvg.svg2png(url=str(svg), write_to=str(png),
+                          output_width=W, output_height=H)
+    else:
+        html = svg.with_suffix(".html")
+        # Inline the SVG into a zero-margin page so the screenshot is exactly the
+        # frame — file:// + <img src=svg> would add body margins and rescaling.
+        html.write_text("<!doctype html><html><head><meta charset='utf-8'>"
+                        "<style>html,body{margin:0;padding:0}</style></head><body>"
+                        + svg.read_text(encoding="utf-8") + "</body></html>",
+                        encoding="utf-8")
+        cmd = [browser, "--headless=new", "--disable-gpu",
+               "--force-device-scale-factor=1", "--hide-scrollbars",
+               f"--window-size={W},{H}", f"--screenshot={png}",
+               html.as_uri()]
+        # `--headless=new` occasionally stalls on a cold spawn (AV / proxy / first
+        # paint). It uses an ephemeral profile, so a retry never lock-conflicts.
+        for attempt in range(2):
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, timeout=90)
+                break
+            except subprocess.TimeoutExpired:
+                if attempt:
+                    raise
+                print(f"  {name}: render stalled, retrying once")
     if not png.is_file():
         raise SystemExit(f"render failed for {name}")
 print("rendered all frames to PNG")
@@ -330,11 +359,20 @@ GIF_OUT_JA = ASSETS / "saikai-demo-ja-headless.gif"
 
 
 def _font(sz, jp=False):
+    # Windows paths first (that's where the maintainer records), then Linux/macOS
+    # fallbacks so callouts render with real glyphs (— → and CJK) when generating
+    # headless on a Pi/CI instead of tofu-ing on ImageFont.load_default().
     en = (r"C:\Windows\Fonts\segoeuib.ttf", r"C:\Windows\Fonts\arialbd.ttf",
-          r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\arial.ttf")
+          r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\arial.ttf",
+          "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+          "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+          "/System/Library/Fonts/Helvetica.ttc")
     jp_ = (r"C:\Windows\Fonts\YuGothB.ttc", r"C:\Windows\Fonts\meiryob.ttc",
            r"C:\Windows\Fonts\YuGothM.ttc", r"C:\Windows\Fonts\meiryo.ttc",
-           r"C:\Windows\Fonts\msgothic.ttc")
+           r"C:\Windows\Fonts\msgothic.ttc",
+           "/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf",
+           "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+           "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc")
     for p in (jp_ if jp else en):
         try:
             return ImageFont.truetype(p, sz)
@@ -464,6 +502,12 @@ def build_gif(texts, font, big_font, tagline, sub, out_gif):
     imgs[0].save(out_gif, save_all=True, append_images=imgs[1:],
                  duration=durations, loop=0, optimize=True)
     print(f"saved: {out_gif}  ({len(imgs)} frames, {out_gif.stat().st_size/1024:.0f} KB)")
+    # Promote to the canonical name the READMEs embed (drop the "-headless" tag),
+    # so a regen updates the published hero in one step — no manual copy, and the
+    # README can never point at a stale demo.
+    canonical = out_gif.with_name(out_gif.name.replace("-headless", ""))
+    shutil.copyfile(out_gif, canonical)
+    print(f"  -> {canonical.name}")
 
 
 build_gif(_EN, _font(27), _font(48),

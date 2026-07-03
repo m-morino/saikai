@@ -13,9 +13,7 @@
 > straight into it.** One searchable list on the left; the session you pick
 > running live, right beside it.
 
-<!-- Interim hero: the current split-live cockpit (SVG, matches the shipped UI).
-     Restore the animated saikai-demo.gif here once it's re-recorded to match. -->
-![saikai — the session list on the left, a live claude session running on the right](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-split-live.svg)
+![saikai in motion — the session list on the left flags who needs you; pick one and it runs live on the right, jump between the fleet, checkpoint a bloated session](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-demo.gif)
 
 **vs. `claude --resume`:** `-r` opens *one* session in the folder you're in.
 saikai watches **all** of them at once — every repo and worktree — runs several
@@ -51,6 +49,8 @@ default.
 
 > **Back and forth:** `Enter` opens the selected session on the right · `Ctrl+]`
 > returns to the list · `F2`/`F3` switch panes.
+
+![The split-live layout: the session list on the left, a live claude session on the right, with the Enter / Ctrl+] / F2 / F3 keys that move between them](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-split-live.svg)
 
 - **Who needs you, at a glance.** The list opens grouped by state — **Needs
   input** first — with one cyan accent reserved for "this needs you right now"
