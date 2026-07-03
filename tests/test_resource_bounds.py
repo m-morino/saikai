@@ -715,6 +715,19 @@ def test_self_audit_round4_regressions():
     assert saikai._is_active_now({"mtime": now + 2}, now) is True
 
 
+def test_option_labels_are_markup_safe():
+    """OptionList prompts built from USER content (directory names in the
+    Shift+F8 picker) must be Text objects: a bare-str prompt renders as markup,
+    so a folder named "bad [/x] dir" raised MarkupError at LAYOUT time and
+    crashed the whole app (reproduced). Static net: every Option( call in
+    saikai.py wraps its label in Text(. (#audit-self-option-markup)"""
+    import re as _re
+    src = (Path(__file__).parent.parent / "saikai.py").read_text(encoding="utf-8")
+    bare = [m.start() for m in _re.finditer(r"Option\((?!Text\()[a-z_]", src)]
+    lines = [src[:pos].count("\n") + 1 for pos in bare]
+    assert not lines, f"bare-str Option prompts (markup-unsafe): lines {lines}"
+
+
 def test_no_unguarded_jsonl_record_loops():
     """Permanent net for the round-3 bug class: every per-line json.loads loop
     must isinstance-guard (or bind through a dict-checking helper) before
@@ -786,6 +799,8 @@ if __name__ == "__main__":
     print("PASS test_codex_round3_regressions")
     test_self_audit_round4_regressions()
     print("PASS test_self_audit_round4_regressions")
+    test_option_labels_are_markup_safe()
+    print("PASS test_option_labels_are_markup_safe")
     test_no_unguarded_jsonl_record_loops()
     print("PASS test_no_unguarded_jsonl_record_loops")
     test_memory_safety_presets_and_override()

@@ -4971,7 +4971,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 ol = self.query_one("#new-dirs", OptionList)
                 ol.clear_options()
                 if self._opts:
-                    ol.add_options([Option(lbl) for _k, _p, lbl in self._opts])
+                    # Text(): labels are DIRECTORY NAMES (user content) — a
+                    # str prompt renders as markup, so "[red]x" loses text and a
+                    # stray "[/x]" raises MarkupError at LAYOUT time and crashes
+                    # the whole app. (#audit-self-option-markup)
+                    ol.add_options([Option(Text(lbl)) for _k, _p, lbl in self._opts])
             except Exception:
                 pass
 
