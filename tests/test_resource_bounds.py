@@ -138,7 +138,7 @@ def test_b2_step_sequence_orders_clear_after_confirm_and_idle():
     # the spec'd states, all present
     for st in ("inject_handoff", "await_handoff_idle", "extract_prompt",
                "confirm", "inject_clear", "detect_child", "inject_reseed",
-               "record_lineage"):
+               "verify_reseed", "record_lineage"):
         assert st in seq, f"missing state {st!r}: {seq}"
     i = {st: seq.index(st) for st in seq}
     # the load-bearing safety invariant: /clear is gated behind the confirm
@@ -148,8 +148,10 @@ def test_b2_step_sequence_orders_clear_after_confirm_and_idle():
     # handoff is injected, then we wait for it, then read the prompt out, then
     # the human confirms — only then do we clear.
     assert i["inject_handoff"] < i["await_handoff_idle"] < i["extract_prompt"] < i["confirm"], seq
-    # detect the fresh child before reseeding it, and record lineage last.
-    assert i["inject_clear"] < i["detect_child"] < i["inject_reseed"] < i["record_lineage"], seq
+    # detect the fresh child before reseeding it, VERIFY the reseed actually
+    # submitted (the post-/clear re-init absorbs a too-early CR), lineage last.
+    assert (i["inject_clear"] < i["detect_child"] < i["inject_reseed"]
+            < i["verify_reseed"] < i["record_lineage"]), seq
 
 
 def test_extract_handoff_prompt_slices_new_session_block():
@@ -182,6 +184,24 @@ def test_extract_handoff_prompt_slices_new_session_block():
     )
     got2 = ex(body2)
     assert got2 is not None and "Resume the build from the failing test." in got2
+    # header/bold marker FOLLOWED BY a fenced block that does not repeat the
+    # marker inside — the shape models produce most often when they add a
+    # heading. The audit found this returned None (silent checkpoint abort):
+    # the bare-mode scan stopped AT the fence and extracted "". (#audit-b2-extract)
+    body_hdr_fence = (
+        "summary...\n\n## NEW SESSION PROMPT\n```\n"
+        "Resume X from the failing test.\nDo Y next.\n```\n"
+    )
+    got_hf = ex(body_hdr_fence)
+    assert got_hf is not None and "Resume X from the failing test." in got_hf, got_hf
+    assert "```" not in (got_hf or ""), got_hf
+    body_bold_fence = (
+        "summary...\n\n**NEW SESSION PROMPT**\n```text\n"
+        "Resume Z with the flag set.\n```\ntrailing prose"
+    )
+    got_bf = ex(body_bold_fence)
+    assert got_bf is not None and "Resume Z with the flag set." in got_bf, got_bf
+    assert "trailing prose" not in (got_bf or ""), got_bf
     # an assistant that ECHOES the marker in PROSE before the real fenced block
     # (e.g. the improved prompt tells it to "end with ... NEW SESSION PROMPT", so
     # the reply narrates that) must NOT make the extractor lock onto the prose —

@@ -1219,6 +1219,19 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             pass
 
+    def kill_input_line(self) -> None:
+        """Send Ctrl+U to clear the child's input line before an injection.
+        A leftover draft the user typed while idle would otherwise CONCATENATE
+        with an injected prompt — and a "draft/clear" no longer starts with '/'
+        so it submits as a garbage MESSAGE instead of running the command.
+        UI-thread only. (#audit-b2-draft)"""
+        if self._pty is None or self.is_dead:
+            return
+        try:
+            self._pty.write("\x15")
+        except Exception:
+            pass
+
     # ── mouse -> child PTY (faithful terminal) ─────────────────────────────────
     def _mouse_seq(self, cb: int, col: int, row: int, final: str) -> str:
         """One mouse report in the negotiated encoding. SGR (?1006) has no coord

@@ -1378,18 +1378,35 @@ def test_pilot_context_refresh_idle_and_busy():
                         self._status_val = status_val
                     def statuses(self):
                         return {"fake-sid-refresh": self._status_val}
+                    def set_status(self, sid, status):
+                        pass          # _b1_tick refreshes the target's status
                     def all_terms(self):
                         return []     # _poll_live_status iterates this each tick
 
                 fake_term = _FakeTerm()
 
-                # --- Test 1: idle pane -> should inject /compact + submit ---
+                # --- Test 1: idle pane -> inject /compact, settle, CR, verify ---
+                # (#audit-b1-verify: the CR now comes from the tick machine after
+                # a palette settle, and success requires the pane to go busy)
                 self._live = _FakeLive("idle")
                 self._focused_terminal = lambda: fake_term
                 await pilot.app.run_action("context_refresh")
-                await pilot.pause(0.1)
+                await pilot.pause(0.05)
                 facts["idle_paste"] = list(fake_term.paste_calls)
+                facts["idle_submit_immediate"] = list(fake_term.submit_calls)
+                # drive the machine: 2 settle ticks -> CR; then flip busy -> done
+                for _ in range(3):
+                    if getattr(self, "_b1", None) is None:
+                        break
+                    self._b1_tick()
                 facts["idle_submit"] = list(fake_term.submit_calls)
+                self._live = _FakeLive("busy")   # the compact turn started
+                for _ in range(3):
+                    if getattr(self, "_b1", None) is None:
+                        break
+                    self._b1_tick()
+                facts["idle_b1_done"] = getattr(self, "_b1", None) is None
+                self._live = _FakeLive("idle")   # restore for the next cases
 
                 # --- Test 2: busy pane -> should NOT inject ---
                 fake_term.paste_calls.clear()
@@ -1429,8 +1446,14 @@ def test_pilot_context_refresh_idle_and_busy():
 
     assert facts.get("idle_paste") == ["/compact"], \
         f"idle pane should inject /compact: {facts}"
+    # the CR must NOT ride in the same tick as the paste (palette absorb) —
+    # it comes from the tick machine after the settle. (#audit-b1-verify)
+    assert facts.get("idle_submit_immediate") == [], \
+        f"CR must not be sent in the same tick as the paste: {facts}"
     assert facts.get("idle_submit") == [True], \
-        f"idle pane should call submit: {facts}"
+        f"the settle ticks must send exactly one CR: {facts}"
+    assert facts.get("idle_b1_done") is True, \
+        f"b1 must finish once the pane goes busy: {facts}"
     assert facts.get("busy_paste") == [], \
         f"busy pane must not inject: {facts}"
     assert facts.get("busy_submit") == [], \
@@ -1466,11 +1489,17 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
     pdir.mkdir(parents=True, exist_ok=True)
     parent_sid = str(uuid.uuid4())
     parent_jsonl = pdir / f"{parent_sid}.jsonl"
-    # Parent transcript: a /handoff exchange whose last assistant turn carries a
-    # fenced NEW SESSION PROMPT block (what b2 extracts + reseeds with).
+    # Parent transcript starts WITHOUT the handoff exchange: b2's freshness gate
+    # (#audit-b2-freshness) requires the transcript to GROW after the inject, so
+    # the test appends the /handoff exchange AFTER the machine starts — exactly
+    # like the real handoff turn writing its records.
     parent_recs = [
         {"type": "ai-title", "aiTitle": "Parent", "timestamp": "2026-06-17T09:00:00.000Z",
          "cwd": pane_cwd},
+    ]
+    parent_jsonl.write_text("\n".join(json.dumps(r) for r in parent_recs) + "\n",
+                            encoding="utf-8")
+    handoff_recs = [
         {"type": "user", "timestamp": "2026-06-17T09:05:00.000Z", "cwd": pane_cwd,
          "message": {"role": "user", "content": "/handoff"}},
         {"type": "assistant", "timestamp": "2026-06-17T09:05:30.000Z", "cwd": pane_cwd,
@@ -1479,8 +1508,6 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
             "Resume saikai Task 11: the parent built the state machine; "
             "continue from the failing detect test.\n```\n"}]}},
     ]
-    parent_jsonl.write_text("\n".join(json.dumps(r) for r in parent_recs) + "\n",
-                            encoding="utf-8")
     child_sid = str(uuid.uuid4())          # the sid /clear will "mint"
     facts: dict = {}
 
@@ -1569,6 +1596,12 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
                 await pilot.app.run_action("checkpoint")
                 await pilot.pause(0.05)
                 facts["started"] = getattr(self, "_b2", None) is not None
+                # Simulate the handoff turn writing its records: the transcript
+                # must GROW past the pre-inject size or the freshness gate
+                # (#audit-b2-freshness) rightly refuses to extract.
+                with parent_jsonl.open("a", encoding="utf-8") as _f:
+                    for _r in handoff_recs:
+                        _f.write(json.dumps(_r) + "\n")
                 # The user immediately navigates AWAY from the checkpointed session
                 # (focus leaves it). The machine must NOT stall/timeout — it tracks
                 # the captured b2["sid"]/term, not the focused pane. Simulate that by
@@ -1601,6 +1634,9 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
 
                 # Confirm with Ctrl+S -> the machine resumes past the gate (Enter now
                 # inserts a newline in the editable prompt; Ctrl+S commits the edit).
+                # The modal swallows a proceed within 0.4s of mount (the async-push
+                # mid-typing guard, #audit-b2-modal-arm) — wait it out first.
+                await pilot.pause(0.5)
                 await pilot.press("ctrl+s")
                 await pilot.pause(0.1)
                 facts["modal_after_enter"] = type(self.screen).__name__
@@ -1626,10 +1662,16 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
                      "timestamp": _child_ts},
                 ]) + "\n", encoding="utf-8")
 
-                # Finish the machine (detect -> reseed -> record_lineage -> done).
-                for _ in range(40):
+                # Finish the machine (detect -> reseed -> verify -> record ->
+                # done). verify_reseed only advances once the pane visibly starts
+                # the reseed turn — flip the status to busy as soon as the reseed
+                # paste is observed, exactly like the real turn spinning up.
+                for _ in range(60):
                     if getattr(self, "_b2", None) is None:
                         break
+                    if any(e[0] == "paste" and "Resume saikai Task 11" in e[1]
+                           for e in fake_term.events if len(e) >= 2):
+                        self._live.set_status(parent_sid, "busy")
                     self._b2_tick()
                     await pilot.pause(0.02)
 
@@ -1657,6 +1699,16 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
                 # targets the child sid + its transcript — give that transcript its
                 # own /handoff exchange (a reseeded child you checkpoint again has
                 # worked + handed off) so extract_prompt can reach the confirm modal.
+                # The reseed-verify flip above left the (re-keyed) pane 'busy' —
+                # settle it back to idle or the 2nd checkpoint's midturn gate
+                # rightly refuses to start.
+                self._live.set_status(child_sid, "idle")
+                self._focused_terminal = lambda: fake_term
+                fake_term.events.clear()
+                await pilot.app.run_action("checkpoint")
+                await pilot.pause(0.05)
+                # append the child's own /handoff exchange AFTER the start, past
+                # the freshness gate (same as the first run).
                 with child_jsonl.open("a", encoding="utf-8") as _f:
                     for _r in [
                         {"type": "user", "timestamp": "2026-06-17T10:00:00.000Z",
@@ -1668,10 +1720,6 @@ def test_pilot_checkpoint_gated_clear_and_lineage():
                              "Continue the child's work from here.\n```\n"}]}},
                     ]:
                         _f.write(json.dumps(_r) + "\n")
-                self._focused_terminal = lambda: fake_term
-                fake_term.events.clear()
-                await pilot.app.run_action("checkpoint")
-                await pilot.pause(0.05)
                 drive_until("confirm")
                 for _ in range(3):
                     if type(self.screen).__name__ == "ConfirmRefreshScreen":
@@ -1851,6 +1899,77 @@ def test_pilot_checkpoint_marker_on_row():
     assert "↻" not in facts.get("before", ""), f"no marker before a checkpoint: {facts}"
     assert "↻" in facts.get("during", ""), f"↻ marker must show during a checkpoint: {facts}"
     assert "↻" not in facts.get("after", ""), f"marker must clear after: {facts}"
+
+
+def test_pilot_toast_user_content_renders_verbatim():
+    """Toast messages carry USER content — session titles ('needs input:
+    {title}'), exception reprs, paths. Textual renders notifications as content
+    markup by default, so '[wip] fix' displayed as ' fix' (tag swallowed) and a
+    stray '[/x]' raised MarkupError inside Toast.render — the toast never showed
+    at all. saikai's notify wrapper must force markup=False, and the F11 recall
+    screen must render the logged message verbatim. (#audit-toast-markup)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_toast_user_content_renders_verbatim (textual unavailable)")
+        return
+    import asyncio
+    from textual.app import App
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(120, 24)) as pilot:
+                await pilot.pause(0.4)
+                import textual.app as _ta
+                captured = []
+                _orig = _ta.App.notify
+
+                def _spy(app, message, **kwargs):
+                    captured.append((message, dict(kwargs)))
+                    return _orig(app, message, **kwargs)
+
+                _ta.App.notify = _spy
+                try:
+                    # the shapes that actually broke: bracketed title + stray
+                    # close tag (MarkupError in Toast.render before the fix)
+                    self.notify("needs input: [wip] fix [b]auth[/b]", timeout=1)
+                    self.notify("rename failed: bad [/x] tag", severity="error",
+                                timeout=1)
+                finally:
+                    _ta.App.notify = _orig
+                facts["markup_flags"] = [k.get("markup") for _, k in captured]
+                facts["messages"] = [m for m, _ in captured]
+                # F11 recall: the logged text must render VERBATIM (no swallowed
+                # tags, no MarkupError from the markup=True RichLog)
+                self.action_notifications()
+                await pilot.pause(0.2)
+                try:
+                    from textual.widgets import RichLog
+                    log = self.screen.query_one("#notif-log", RichLog)
+                    facts["recall"] = "\n".join(
+                        strip.text for strip in log.lines)
+                except Exception as e:  # noqa: BLE001
+                    facts["recall_err"] = repr(e)
+                await pilot.press("escape")
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+    assert facts.get("markup_flags") == [False, False], \
+        f"notify must force markup=False for user content: {facts}"
+    rec = facts.get("recall", "")
+    assert "[wip] fix [b]auth[/b]" in rec, \
+        f"F11 recall must render bracketed content verbatim: {facts}"
+    assert "bad [/x] tag" in rec, \
+        f"F11 recall must survive stray close tags: {facts}"
 
 
 def test_pilot_filter_engaged_window_survives_focus_move():
@@ -2159,6 +2278,7 @@ if __name__ == "__main__":
     test_pilot_refresh_preserves_scroll_position()
     test_pilot_filter_engaged_window_survives_focus_move()
     test_pilot_checkpoint_marker_on_row()
+    test_pilot_toast_user_content_renders_verbatim()
     test_pilot_cycle_tab_skips_dead_pane()
     test_pilot_double_space_does_not_leave_leader_armed()
     print("PASS test_pilot_double_space_does_not_leave_leader_armed")
@@ -2172,5 +2292,6 @@ if __name__ == "__main__":
     print("PASS test_pilot_refresh_preserves_scroll_position")
     print("PASS test_pilot_filter_engaged_window_survives_focus_move")
     print("PASS test_pilot_checkpoint_marker_on_row")
+    print("PASS test_pilot_toast_user_content_renders_verbatim")
     print("PASS test_pilot_cycle_tab_skips_dead_pane")
     print("ALL PASS")

@@ -3730,6 +3730,11 @@ _B2_STEPS = (
     "inject_clear",         # ONLY after confirm: snapshot sids, paste /clear
     "detect_child",         # bind the fresh child sid (falsifiable, see below)
     "inject_reseed",        # paste the parent's NEW SESSION PROMPT into the child
+    "verify_reseed",        # confirm the reseed SUBMITTED (busy) — resend CR if not:
+    #                         claude's post-/clear re-init absorbs a too-early CR
+    #                         (measured on v2.1.198; the paste survives, the CR dies),
+    #                         and without this gate b2 toasted "done" on an empty,
+    #                         never-reseeded child. (#audit-b2-reseed-cr)
     "record_lineage",       # _set_lineage(child, parent, parent_jsonl)
 )
 
@@ -3860,6 +3865,18 @@ def _extract_handoff_prompt(text: "str | None") -> "str | None":
     def _body_after(idx, ch):
         body = []
         j = idx + 1
+        if not ch:
+            # Header/bold marker ("## NEW SESSION PROMPT" / "**…**") followed by a
+            # fenced block that does NOT repeat the marker inside — a shape models
+            # produce often. The old bare-mode "stop at any fence" returned "" here
+            # (the very next line IS the fence), silently aborting the checkpoint.
+            # Instead, step INTO that fence and collect its body. (#audit-b2-extract)
+            k = j
+            while k < n and not lines[k].strip():
+                k += 1
+            fch = _fence_char(lines[k]) if k < n else ""
+            if fch:
+                j, ch = k + 1, fch
         while j < n:
             if ch:
                 if _is_close_fence(lines[j], ch):
@@ -4985,6 +5002,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def __init__(self, prompt: str):
             super().__init__()
             self._prompt = prompt or ""
+            # The modal is pushed ASYNCHRONOUSLY (up to minutes after ␣c, whenever
+            # the handoff settles) and steals focus mid-whatever — so a Ctrl+S the
+            # user was about to type elsewhere must not fire the DESTRUCTIVE
+            # proceed in its first instants. Esc (cancel) stays instant. (#audit-b2-modal-arm)
+            self._armed_at = time.monotonic()
 
         def prompt_text(self) -> str:
             """The NEW SESSION PROMPT this modal is gating on — the live (possibly
@@ -5003,6 +5025,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 yield TextArea(self._prompt, id="confref-prompt")
 
         def action_proceed(self) -> None:
+            if time.monotonic() - self._armed_at < 0.4:
+                return                         # swallow a mid-typing Ctrl+S (see __init__)
             self.dismiss(self.prompt_text())   # the (possibly edited) reseed prompt
 
         def action_cancel(self) -> None:
@@ -5070,14 +5094,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if not self._entries:
                 log.write("[dim](no notifications yet)[/dim]")
                 return
+            from rich.markup import escape as _rich_escape
+            from rich.text import Text
             _col = {"information": "cyan", "warning": "yellow", "error": "red"}
             for ts, sev, title, msg in reversed(self._entries):   # newest first
                 c = _col.get(sev, "white")
                 head = f"[dim]{ts}[/dim] [{c}]{sev[:4].upper()}[/{c}]"
                 if title:
-                    head += f" [b]{title}[/b]"
+                    head += f" [b]{_rich_escape(title)}[/b]"
                 log.write(head)
-                log.write(f"  {msg}")
+                # The message is USER content (titles, exception text, paths) —
+                # write it as a Text object so this markup=True log renders it
+                # VERBATIM: "[WIP] fix" must not lose its tag, and a stray
+                # "[/x]" must not raise MarkupError. (#audit-toast-markup)
+                log.write(Text(f"  {msg}"))
 
     class _CopyModeArea(TextArea):
         """A read-only TextArea with a tmux-copy-mode-vi key table, used to select
@@ -5440,6 +5470,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         # __init__ (the shared class-attr default would leak one PickerApp's
         # statuses into a second instance — see the #8 fix at its init site).
         _b2: "dict | None" = None  # b2 (Task 11) checkpoint state machine; None = idle
+        _b1: "dict | None" = None  # b1 /compact inject verifier; None = idle (#audit-b1-verify)
         _b2_timer = None           # the self-cancelling tick interval handle
 
         def compose(self) -> ComposeResult:
@@ -5555,6 +5586,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # missed "needs input" / "done" / error / memory-pressure warning is
             # otherwise gone. F11 (action_notifications) surfaces it. Lazy-init so
             # toasts raised during mount/startup are captured too.
+            #
+            # markup=False: toast messages carry USER content — session titles
+            # ("needs input: {title}"), exception reprs, paths — and Textual
+            # renders notifications as content markup by default. "[WIP] fix x"
+            # displays as " fix x" (tag swallowed) and a stray "[/x]" raises
+            # MarkupError inside Toast.render, so the toast never shows at all.
+            # No saikai toast uses intentional markup — turn it off wholesale.
+            # (#audit-toast-markup)
+            kwargs.setdefault("markup", False)
             buf = getattr(self, "_notif_log", None)
             if buf is None:
                 from collections import deque
@@ -6202,7 +6242,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if has_worktrees:
                     wt = s.get("worktree_label") or ""
                     row.append(Text(wt[:11], style=wt_color.get(wt, "") if wt else ""))
-                row.append(Text(raw_title, style=_tstyle) if _tstyle else raw_title)
+                # ALWAYS a Text object: a bare str cell goes through DataTable's
+                # default_cell_formatter, which treats str as POSSIBLE MARKUP —
+                # a title containing "[wip]"/"[b]" would silently lose text.
+                # (#audit-toast-markup)
+                row.append(Text(raw_title, style=_tstyle))
                 table.add_row(*row, key=s["id"])
                 if first_session_row is None:
                     first_session_row = n
@@ -7288,7 +7332,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 status_classifier=_LIVE_TERM.classifier_for_profile(
                     _ACTIVE_PROVIDER.status_profile),
             )
-            pane = TabPane(_LIVE_TERM.tab_label(title, "idle"), term, id=pane_id)
+            pane = TabPane(Text(_LIVE_TERM.tab_label(title, "idle")), term, id=pane_id)  # Text: titles are user content (#audit-toast-markup)
             # Mount on the UI event loop in a worker so we can AWAIT the removal of
             # any lingering same-id dead pane BEFORE adding the new one. remove_pane()
             # is deferred (returns AwaitComplete), so the old synchronous
@@ -7568,7 +7612,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 title = _pane_title(s, sid, self._live.get(sid))
                 pane = tabs.get_pane(self._live.pane_id(sid))
                 if pane is not None:
-                    pane.label = _LIVE_TERM.tab_label(title, status)
+                    pane.label = Text(_LIVE_TERM.tab_label(title, status))  # (#audit-toast-markup)
             except Exception:
                 pass
 
@@ -7676,7 +7720,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 title = _pane_title(s, sid, self._live.get(sid))
                 pane = tabs.get_pane(self._live.pane_id(sid))
                 if pane is not None:
-                    pane.label = _LIVE_TERM.tab_label(title, "dead")
+                    pane.label = Text(_LIVE_TERM.tab_label(title, "dead"))  # (#audit-toast-markup)
             except Exception:
                 pass
             self._live.forget(sid)
@@ -8208,7 +8252,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         pane = tabs.get_pane(self._live.pane_id(sid))
                         if pane is not None:
                             title = _pane_title(_live_s, sid, self._live.get(sid))
-                            pane.label = _LIVE_TERM.tab_label(title, self._live.status(sid))
+                            pane.label = Text(_LIVE_TERM.tab_label(title, self._live.status(sid)))  # (#audit-toast-markup)
                 except Exception:
                     pass
                 self.notify("name cleared — back to auto-title" if not clean
@@ -8909,18 +8953,110 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             """Shift+F11 — inject /compact into the focused live pane to summarise
             the context in place (non-destructive). No-op + toast when no pane is
             focused or the pane is mid-turn (busy/waiting — don't interrupt a
-            running turn or a pending permission prompt)."""
+            running turn or a pending permission prompt).
+
+            Injection is HARDENED like b2's (#audit-b2-reseed-cr): paste, settle
+            ~0.6s (the leading '/' opens the slash palette; a too-early CR can be
+            absorbed), CR, then VERIFY the pane actually went busy — resending
+            the CR while it hasn't. The old paste+CR-in-one-tick fired a success
+            toast with no evidence the command ran. (#audit-b1-verify)"""
             t = self._focused_terminal()
             if t is None:
                 self.notify("focus a live pane to refresh its context", timeout=3)
                 return
-            if self._pane_is_midturn(getattr(t, "sid", None)):
+            sid = getattr(t, "sid", None)
+            if self._pane_is_midturn(sid):
                 self.notify("pane is busy — refresh when it's idle",
                             severity="warning", timeout=3)
                 return
-            t.paste_text("/compact")
-            t.submit()
-            self.notify("sent /compact to compact this session in place", timeout=4)
+            if getattr(self, "_b1", None) is not None:
+                self.notify("a /compact is already in flight", timeout=3)
+                return
+            b2 = getattr(self, "_b2", None)
+            if b2 is not None and b2.get("sid") == sid:
+                self.notify("a checkpoint is running on this pane",
+                            severity="warning", timeout=3)
+                return
+            try:
+                _kill = getattr(t, "kill_input_line", None)
+                if _kill is not None:
+                    _kill()                # leftover draft would concatenate (#audit-b2-draft)
+                t.paste_text("/compact")
+            except Exception:
+                self.notify("could not inject /compact", severity="error", timeout=4)
+                return
+            self._b1 = {"term": t, "sid": sid, "ticks": 0,
+                        "submitted_at": None, "crs": 0}
+            self._b1_timer = self.set_interval(0.3, self._b1_tick)
+            self.notify("sending /compact…", timeout=3)
+
+        def _b1_finish(self, msg=None, severity="information") -> None:
+            """Tear down the b1 /compact verifier: stop the interval, drop state,
+            optional toast. Idempotent (same contract as _b2_finish)."""
+            tm = getattr(self, "_b1_timer", None)
+            if tm is not None:
+                try:
+                    tm.stop()
+                except Exception:
+                    pass
+                self._b1_timer = None
+            self._b1 = None
+            if msg:
+                try:
+                    _log(f"[b1] finish [{severity}]: {msg}")
+                except Exception:
+                    pass
+                self.notify(msg, severity=severity, timeout=5)
+
+        def _b1_tick(self) -> None:
+            """Advance the b1 /compact injection: settle → CR → verify busy,
+            resending the CR while the pane stays idle (absorbed-CR hardening,
+            same measurements as b2's verify_reseed)."""
+            b1 = getattr(self, "_b1", None)
+            if not b1:
+                return
+            term = b1["term"]
+            if term is None or getattr(term, "is_dead", False):
+                self._b1_finish("/compact aborted — pane closed", "warning")
+                return
+            b1["ticks"] += 1
+            if b1["submitted_at"] is None:
+                if b1["ticks"] >= self._B2_CLEAR_SETTLE_TICKS:
+                    try:
+                        term.submit()
+                    except Exception:
+                        self._b1_finish("could not submit /compact", "error")
+                        return
+                    b1["submitted_at"] = b1["ticks"]
+                return
+            since = b1["ticks"] - b1["submitted_at"]
+            try:
+                term.refresh_status()
+                _ts = getattr(term, "_status", "")
+                self._live.set_status(b1["sid"], _ts)
+                self._apply_live_status(b1["sid"], _ts)
+            except Exception:
+                pass
+            status = (self._live.statuses().get(b1["sid"])
+                      if self._live else None)
+            if status in ("busy", "waiting"):
+                self._b1_finish("sent /compact — compacting this session in place")
+                return
+            if since >= self._B2_RESEED_VERIFY_TICKS:
+                self._b1_finish("/compact may not have submitted — check the pane "
+                                "(press Enter there if it still shows /compact)",
+                                "warning")
+                return
+            if since % 7 == 0:
+                try:
+                    term.submit()
+                except Exception:
+                    pass
+                b1["crs"] = b1.get("crs", 0) + 1
+                try:
+                    _log(f"[b1] compact CR resent (n={b1['crs']})")
+                except Exception:
+                    pass
 
         # ── b2 (Task 11): human-gated checkpoint → /handoff → confirm → /clear →
         # reseed → lineage. Implemented as a TICK STATE MACHINE (off a
@@ -8937,6 +9073,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                        # makes it ≥2 → ambiguous → reset). (#audit-b2-toctou)
         _B2_SETTLE_TICKS = 2           # let a just-injected turn register as busy
         _B2_CLEAR_SETTLE_TICKS = 2     # ~0.6s between /clear paste and its CR (spike #5)
+        _B2_RESEED_VERIFY_TICKS = 34   # ~10s for the reseed turn to visibly START
+                                       # (busy); while idle the CR is resent every
+                                       # ~2s — claude's post-/clear re-init absorbs
+                                       # a too-early CR (measured on v2.1.198, worse
+                                       # the bigger the cleared session). (#audit-b2-reseed-cr)
         _B2_HANDOFF_IDLE_TICKS = 1000  # ~5min ceiling for the handoff turn to finish
                                        # (b2's use case is a GROWN session, where
                                        # summarising into a NEW SESSION PROMPT — with
@@ -8974,12 +9115,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             from pathlib import Path as _P
             jp = _P(jp)
+            try:
+                _pre_size = jp.stat().st_size
+            except OSError:
+                _pre_size = 0
             self._b2 = {
                 "state": "inject_handoff",
                 "sid": sid,                  # parent sid (pre-/clear)
                 "term": t,
                 "parent_jsonl": str(jp),
                 "project_dir": str(jp.parent),
+                # Transcript size BEFORE the handoff inject: extract_prompt requires
+                # GROWTH past this, so a silently-failed inject (absorbed CR) can
+                # never extract a STALE block from a PREVIOUS handoff still sitting
+                # at the tail — a wrong-but-plausible prompt in the confirm modal
+                # was the worst failure shape of all. (#audit-b2-freshness)
+                "pre_size": _pre_size,
                 # cwd-LAST (current), not origin_cwd (first): the /clear child is
                 # minted in the pane's CURRENT dir, so after a mid-session worktree/
                 # branch cd, origin_cwd != current and the child's first cwd would
@@ -8995,8 +9146,32 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Drive the machine off a self-cancelling interval (cancelled in
             # _b2_finish). 0.3s matches the spike's settle granularity.
             self._b2_timer = self.set_interval(0.3, self._b2_tick)
+            self._b2_log(f"start sid={sid} jsonl={jp.name} pre_size={_pre_size}")
             self.notify("checkpoint: drafting the handoff…", timeout=4)
             self._b2_mark_dirty()      # show the ↻ checkpoint marker (focus-safe)
+
+        def _b2_log(self, msg: str) -> None:
+            """Trace the b2 machine to saikai.log. The audit of 'checkpoint feels
+            broken' had ZERO on-disk evidence to work from — every failure was a
+            vanished toast — so every transition/abort/resend logs. (#audit-b2-log)"""
+            try:
+                _log(f"[b2] {msg}")
+            except Exception:
+                pass
+
+        def _b2_save_prompt(self, prompt) -> "str | None":
+            """Persist a confirmed-but-unusable reseed prompt so an aborted
+            checkpoint never DISCARDS what the user already vetted (it exists in
+            the parent transcript, but digging it out mid-failure is hostile).
+            Returns the path (str) for the toast, or None."""
+            if not prompt:
+                return None
+            try:
+                p = CACHE_DIR / "checkpoint-reseed-prompt.md"
+                _write_text_atomic(p, str(prompt))
+                return str(p)
+            except Exception:
+                return None
 
         def _b2_mark_dirty(self) -> None:
             """Repaint the list for the ↻ checkpoint marker WITHOUT disrupting a
@@ -9053,6 +9228,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     except Exception:
                         self._status_refresh_pending = True
             if msg:
+                if had_state:
+                    self._b2_log(f"finish [{severity}]: {msg}")
                 self.notify(msg, severity=severity, timeout=5)
 
         def _b2_tick(self) -> None:
@@ -9084,12 +9261,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if _hp_warn:
                     self.notify(_hp_warn, severity="warning", timeout=6)
                 try:
+                    # Clear any leftover draft first: pasted text CONCATENATES with
+                    # whatever sits in claude's input box (idle ≠ empty), and a
+                    # "draft<handoff>" submits as one garbled message. (#audit-b2-draft)
+                    _kill = getattr(term, "kill_input_line", None)
+                    if _kill is not None:
+                        _kill()
                     term.paste_text(_hp)
                     term.submit()
                 except Exception:
                     self._b2_finish("checkpoint aborted — could not inject the handoff prompt",
                                     "error")
                     return
+                self._b2_log("handoff injected")
                 b2["ticks"] = self._B2_SETTLE_TICKS
                 b2["state"] = "await_handoff_idle"
                 return
@@ -9140,13 +9324,34 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
 
             if st == "extract_prompt":
-                txt = _last_assistant_text_from_jsonl(b2["parent_jsonl"])
-                prompt = _extract_handoff_prompt(txt)
+                # Freshness gate: the handoff turn must have APPENDED to the parent
+                # transcript. Without it, an inject whose CR was silently absorbed
+                # (pane idle throughout) extracts a STALE block from a PREVIOUS
+                # handoff at the tail — and the confirm modal shows a plausible but
+                # wrong prompt. Growth may lag the idle flip (writer flush), so
+                # retry a few ticks before concluding. (#audit-b2-freshness)
+                try:
+                    cur_size = Path(b2["parent_jsonl"]).stat().st_size
+                except OSError:
+                    cur_size = -1
+                fresh = cur_size > b2.get("pre_size", 0)
+                txt = _last_assistant_text_from_jsonl(b2["parent_jsonl"]) if fresh else None
+                prompt = _extract_handoff_prompt(txt) if fresh else None
                 if not prompt:
+                    # Retry window: covers both flush lag (file about to grow /
+                    # final record mid-write) and the extractor briefly seeing a
+                    # truncated tail. ~3s at the 0.3s tick. (#audit-b2-extract-retry)
+                    b2["extract_wait"] = b2.get("extract_wait", 0) + 1
+                    if b2["extract_wait"] <= 10:
+                        return
                     self._b2_finish(
-                        "checkpoint aborted — no NEW SESSION PROMPT in the handoff",
+                        "checkpoint aborted — no NEW SESSION PROMPT in the handoff"
+                        if fresh else
+                        "checkpoint aborted — the handoff never reached the "
+                        "transcript (nothing new was written)",
                         "warning")
                     return
+                self._b2_log(f"prompt extracted ({len(prompt)} chars)")
                 b2["prompt"] = prompt
                 b2["state"] = "confirm"
                 return
@@ -9185,15 +9390,44 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # timestamps (a naive-local value mis-ordered the child on
                 # +UTC-offset hosts — see _parse_iso_aware / _bind_cleared_child).
                 if not b2.get("_clear_pasted"):
+                    # Re-check the pane is still idle: the confirm modal can sit
+                    # open for MINUTES, and the pane's state may have moved on
+                    # meanwhile (auto-compact kicking in near the ceiling — b2's
+                    # exact use case — or a hook/turn). Pasting /clear into a busy
+                    # pane queues it as a literal MESSAGE. Wait for idle again,
+                    # with a ceiling. (#audit-b2-postconfirm)
+                    try:
+                        term.refresh_status()
+                        self._apply_live_status(b2["sid"], getattr(term, "_status", ""))
+                    except Exception:
+                        pass
+                    if self._pane_is_midturn(b2["sid"]):
+                        b2["clear_wait"] = b2.get("clear_wait", 0) + 1
+                        if b2["clear_wait"] > 200:      # ~60s of unexpected activity
+                            _p = self._b2_save_prompt(b2.get("prompt"))
+                            self._b2_finish(
+                                "checkpoint aborted — the pane went busy after the "
+                                "confirm; /clear was NOT sent"
+                                + (f" (reseed prompt saved to {_p})" if _p else ""),
+                                "warning")
+                            return
+                        return
                     b2["pre_sids"] = _project_sids(b2["project_dir"])
                     b2["clear_ts"] = datetime.now(timezone.utc).strftime(
                         "%Y-%m-%dT%H:%M:%S.000Z")
                     try:
+                        # Ctrl+U first: a leftover draft would turn the paste into
+                        # "draft/clear" — no leading '/', so it would SUBMIT as a
+                        # garbage message instead of running /clear. (#audit-b2-draft)
+                        _kill = getattr(term, "kill_input_line", None)
+                        if _kill is not None:
+                            _kill()
                         term.paste_text("/clear")
                     except Exception:
                         self._b2_finish("checkpoint aborted — could not inject /clear",
                                         "error")
                         return
+                    self._b2_log("clear pasted")
                     b2["_clear_pasted"] = True
                     b2["ticks"] = self._B2_CLEAR_SETTLE_TICKS
                     return
@@ -9229,6 +9463,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     b2["_cand"], b2["_cand_n"] = None, 0
                 if len(cands) == 1 and b2.get("_cand_n", 0) >= self._B2_CHILD_CONFIRM_TICKS:
                     b2["child"] = cands[0]
+                    self._b2_log(f"child bound sid={cands[0]}")
                     b2["state"] = "inject_reseed"
                     return
                 # Defensive re-send: one extra CR partway through the window in
@@ -9243,23 +9478,119 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     b2["resent_cr"] = True
                 b2["ticks"] -= 1
                 if b2["ticks"] <= 0:
+                    minted = bool(_project_sids(b2["project_dir"])
+                                  - set(b2["pre_sids"] or ()))
+                    if minted:
+                        # /clear DID mint new transcript(s) — we just can't
+                        # falsifiably pick ONE (contamination / ≥2 candidates).
+                        # The pane itself IS a fresh session either way, so reseed
+                        # it rather than throwing away the prompt the user just
+                        # vetted; only the lineage record is skipped. Reseed needs
+                        # no child sid — only _set_lineage does. (#audit-b2-reseed-anyway)
+                        self._b2_log("detect_child timeout WITH mint — "
+                                     "reseeding without lineage")
+                        b2["child"] = None
+                        b2["state"] = "inject_reseed"
+                        return
+                    # No new transcript at all: /clear very likely never executed
+                    # (both CRs absorbed). Do NOT paste the prompt into the
+                    # un-cleared parent — save it for the user instead.
+                    _p = self._b2_save_prompt(b2.get("prompt"))
                     self._b2_finish(
-                        "checkpoint: /clear sent, but the new session could not be "
-                        "identified — no lineage recorded", "warning")
+                        "checkpoint: /clear was sent but no new session appeared — "
+                        "the pane may not have cleared; nothing was reseeded"
+                        + (f" (reseed prompt saved to {_p})" if _p else ""),
+                        "warning")
                 return
 
             if st == "inject_reseed":
+                # Two-phase like inject_clear (paste → settle → CR), then VERIFY.
+                # b2's old paste+CR-in-one-tick worked in the spike era because the
+                # child jsonl took 2.5-4s to appear; on v2.1.198 it is minted
+                # INSTANTLY (the /clear command record), so binding — and this
+                # inject — now lands while claude is still re-initialising after
+                # /clear. Measured: the paste survives, the CR is absorbed, and the
+                # old code then toasted "done" over a never-reseeded child. (#audit-b2-reseed-cr)
+                if not b2.get("_reseed_pasted"):
+                    try:
+                        term.paste_text(b2["prompt"])
+                    except Exception:
+                        _p = self._b2_save_prompt(b2.get("prompt"))
+                        self._b2_finish(
+                            "checkpoint: reseed prompt could not be injected"
+                            + (f" (saved to {_p})" if _p else ""), "error")
+                        return
+                    self._b2_log("reseed pasted")
+                    b2["_reseed_pasted"] = True
+                    b2["ticks"] = self._B2_CLEAR_SETTLE_TICKS
+                    return
+                if b2["ticks"] > 0:
+                    b2["ticks"] -= 1
+                    return
                 try:
-                    term.paste_text(b2["prompt"])
                     term.submit()
                 except Exception:
+                    _p = self._b2_save_prompt(b2.get("prompt"))
                     self._b2_finish(
-                        "checkpoint: reseed prompt could not be injected", "error")
+                        "checkpoint: reseed prompt could not be submitted"
+                        + (f" (saved to {_p})" if _p else ""), "error")
                     return
-                b2["state"] = "record_lineage"
+                b2["ticks"] = self._B2_RESEED_VERIFY_TICKS
+                b2["state"] = "verify_reseed"
+                return
+
+            if st == "verify_reseed":
+                # The reseed only COUNTS once the pane actually starts the turn
+                # (busy — or waiting, e.g. a permission prompt the reseed's first
+                # step raised). While it stays idle, the CR was absorbed by the
+                # post-/clear re-init: resend it every ~2s (harmless once the turn
+                # has started — it lands on an empty input). Track the TARGET's
+                # own screen every tick, same as await_handoff_idle, so this is
+                # focus-independent. (#audit-b2-reseed-cr)
+                try:
+                    term.refresh_status()
+                    _ts = getattr(term, "_status", "")
+                    self._live.set_status(b2["sid"], _ts)
+                    self._apply_live_status(b2["sid"], _ts)
+                except Exception:
+                    pass
+                status = (self._live.statuses().get(b2["sid"])
+                          if self._live else None)
+                if status in ("busy", "waiting"):
+                    self._b2_log("reseed submit verified (pane went busy)")
+                    b2["state"] = "record_lineage"
+                    return
+                b2["ticks"] -= 1
+                if b2["ticks"] <= 0:
+                    # Give up verifying but DON'T abort: lineage/re-key are still
+                    # correct, and the pasted prompt sits in the child's input —
+                    # the final toast tells the user to press Enter there.
+                    b2["reseed_unverified"] = True
+                    self._b2_log("reseed NOT verified — pane never went busy")
+                    b2["state"] = "record_lineage"
+                    return
+                if b2["ticks"] % 7 == 0:
+                    try:
+                        term.submit()
+                    except Exception:
+                        pass
+                    b2["reseed_crs"] = b2.get("reseed_crs", 0) + 1
+                    self._b2_log(f"reseed CR resent (n={b2['reseed_crs']})")
                 return
 
             if st == "record_lineage":
+                _unv = bool(b2.get("reseed_unverified"))
+                _unv_suffix = (" — the reseed did NOT visibly submit: open the pane "
+                               "and press Enter (the prompt is in its input box)"
+                               if _unv else "")
+                if not b2.get("child"):
+                    # detect_child timed out WITH a mint: the pane was reseeded
+                    # above, but no falsifiable child sid → skip lineage/re-key
+                    # (guessing would wire Shift+F6 to the wrong session).
+                    self._b2_finish(
+                        "checkpoint: reseeded, but the new session could not be "
+                        "identified — no lineage recorded" + _unv_suffix, "warning")
+                    return
                 try:
                     _set_lineage(b2["child"], b2["sid"], b2["parent_jsonl"])
                 except Exception as e:               # noqa: BLE001
@@ -9310,7 +9641,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     title = (s_par.get("ai_title") or s_par.get("summary")
                              or _P(b2["pane_cwd"]).name or child_sid[:8])
                     stub = _new_session_stub(child_sid, b2["pane_cwd"], title)
-                    stub["jsonl_path"] = child_jsonl
+                    stub["jsonl_path"] = str(child_jsonl)   # str like every other entry
                     self._sid_index[child_sid] = stub
                 except Exception:
                     pass
@@ -9322,8 +9653,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
                 self._b2_mark_dirty()      # focus-safe list repaint for the re-key
-                self._b2_finish("checkpoint done — fresh session reseeded "
-                                "(Shift+F6 jumps back to the parent)")
+                if _unv:
+                    self._b2_finish("checkpoint: lineage recorded, but the reseed "
+                                    "did NOT visibly submit — open the pane and "
+                                    "press Enter (the prompt is in its input box)",
+                                    "warning")
+                else:
+                    self._b2_finish("checkpoint done — fresh session reseeded "
+                                    "(Shift+F6 jumps back to the parent)")
                 return
 
             # Unknown state — fail safe.
