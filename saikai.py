@@ -191,7 +191,10 @@ def _pref_cached(path: Path, parse, default):
     writers also _invalidate_pref() so a write + an immediate re-read can't be
     masked by a coarse filesystem mtime resolution. (#14)"""
     try:
-        m = path.stat().st_mtime
+        _st = path.stat()
+        m = (_st.st_mtime_ns, _st.st_size)   # ns+size: same class as custom-titles/
+        #                                      lineage — mtime alone misses a
+        #                                      same-mtime rewrite (#audit-self-prefcache)
     except OSError:
         _PREF_CACHE.pop(str(path), None)
         return default
@@ -1123,13 +1126,13 @@ def _is_recent_now(s: dict, now_ts: float) -> bool:
     time — not the load-time is_recent snapshot, which goes stale as the picker
     stays open (a ':recent' search 40 min in would otherwise return the set that
     was recent AT LAUNCH). Uses the stored mtime; a reload re-stats it."""
-    return 0 <= (now_ts - (s.get("mtime") or 0.0)) < 1800   # future mtime ≠ recent (#audit-codex-futuremtime)
+    return -30.0 <= (now_ts - (s.get("mtime") or 0.0)) < 1800   # future ≠ recent; ±30s clock-jitter slack (#audit-codex-futuremtime)
 
 
 def _is_active_now(s: dict, now_ts: float) -> bool:
     """True if running (live-registry snapshot) or touched < 5 min ago, evaluated
     against the current time (see _is_recent_now re: staleness)."""
-    return bool(s.get("is_open")) or 0 <= (now_ts - (s.get("mtime") or 0.0)) < 300  # (#audit-codex-futuremtime)
+    return bool(s.get("is_open")) or -30.0 <= (now_ts - (s.get("mtime") or 0.0)) < 300  # (#audit-codex-futuremtime)
 
 
 def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
@@ -1887,7 +1890,7 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
     # the OPPOSITE: age 0 reads as "touched just now". A future mtime now maps
     # to +inf age, so is_active/is_recent read False for it. (#audit-codex-futuremtime)
     _raw_age = time.time() - mtime
-    age_sec = _raw_age if _raw_age >= 0 else float("inf")
+    age_sec = max(0.0, _raw_age) if _raw_age >= -30.0 else float("inf")
     active = _load_active_sessions()
     cwd = parsed.get("cwd", "")
     # origin_cwd = where Claude originally indexed the session (first cwd in JSONL).
@@ -2996,27 +2999,36 @@ def _preview_impl(session_id: str, cache_dir: Path, render) -> None:
         # silently avoids the caller spinning a "loading" indicator while it
         # waits for the preview command to do nothing useful.
         return
-    # Exact cache hit (full UUID — fast path)
-    cache_file = cache_dir / f"{sid}.txt"
-    if cache_file.exists():
+    # Resolve the transcript FIRST so a cache hit can be freshness-checked:
+    # the cache's mtime is pinned to the transcript's by _write_if_stale, and
+    # serving a hit blind meant a session that grew since the last TUI warm
+    # printed a silently STALE preview forever. (#audit-self-preview-fresh)
+    found = _find_session_jsonl(sid)
+
+    def _cache_fresh(cf: Path) -> bool:
+        if not cf.exists():
+            return False
+        if found is None:
+            return True          # transcript gone (session deleted) — serve what we have
+        try:
+            return abs(cf.stat().st_mtime - found.stat().st_mtime) < 1e-6
+        except OSError:
+            return True
+    cache_file = cache_dir / f"{(found.stem if found else sid)}.txt"
+    if _cache_fresh(cache_file):
         sys.stdout.write(cache_file.read_text(encoding="utf-8"))
         return
-    # Cache miss: probably a partial SID typed by the user on the CLI. Resolve
-    # to the full SID via the JSONL filename and retry cache before falling
-    # back to a fresh parse (which is missing forest-derived parent info, so
-    # the user would otherwise see a degraded preview).
-    found = _find_session_jsonl(sid)
     if not found:
         print(f"(session {sid[:8]} not found)")
-        return
-    full_cache = cache_dir / f"{found.stem}.txt"
-    if full_cache.exists():
-        sys.stdout.write(full_cache.read_text(encoding="utf-8"))
         return
     s = parse_session(found)
     if not s:
         print("(unable to parse session)")
         return
+    try:
+        _write_preview_cache(s)      # re-warm so the next call is fast AND fresh
+    except Exception:
+        pass
     print(render(s))
 
 
@@ -4224,8 +4236,12 @@ def _ctx_window_for(tokens, override=None, model=None) -> int:
     turn's model is 1M-capable, default to the 1M window -- the base model id can't
     tell a 1M session from a 200K one, and 1M is the common mode. Else infer the
     smallest tier that fits the observed count (a 720K reading can't be 200K)."""
-    if override:
-        return int(override)
+    try:
+        _ov = int(override) if override else 0
+    except (TypeError, ValueError):
+        _ov = 0
+    if _ov > 0:                    # a 0/negative SAIKAI_CTX_WINDOW rendered
+        return _ov                 # "ctx 0K/0K (-2000%)" garbage (#audit-self-ctxwin)
     if _model_supports_1m(model):
         return 1_000_000
     for t in _CTX_TIERS:

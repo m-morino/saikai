@@ -652,6 +652,93 @@ def test_codex_round3_regressions():
     assert saikai._is_recent_now({"mtime": now - 60}, now) is True
 
 
+def test_self_audit_round4_regressions():
+    """Self-audit findings (#audit-self-*): the third same-mtime cache instance,
+    non-positive ctx-window override, CLI preview freshness, jitter slack."""
+    import json as _json
+    import tempfile as _tf
+    import time as _time
+    from pathlib import Path as _P
+
+    # B. _pref_cached keys on (mtime_ns, size): a same-mtime rewrite is seen
+    with _tf.TemporaryDirectory() as td:
+        p = _P(td) / "favorite.json"
+        p.write_text('["a"]', encoding="utf-8")
+        ns = p.stat().st_mtime_ns
+        assert saikai._load_set(p) == {"a"}
+        p.write_text('["a","bb"]', encoding="utf-8")
+        os.utime(p, ns=(ns, ns))                 # spoof: same mtime, new size
+        assert saikai._load_set(p) == {"a", "bb"}, \
+            "a same-mtime different-size rewrite must invalidate _pref_cached"
+
+    # D. a 0/negative window override falls back instead of poisoning the gauge
+    assert saikai._ctx_window_for(1000, override=-5) == 200_000
+    assert saikai._ctx_window_for(1000, override=0) == 200_000
+    assert saikai._ctx_window_for(1000, override="abc") == 200_000
+    assert saikai._ctx_window_for(1000, override=500_000) == 500_000
+
+    # K. CLI preview must not serve a cache older than the transcript
+    import contextlib as _cl
+    import io as _io
+    with _tf.TemporaryDirectory() as td:
+        pdir = _P(td) / ".claude" / "projects" / "-w"
+        pdir.mkdir(parents=True)
+        sid = "cccccccc-0000-4000-8000-000000000001"
+        j = pdir / f"{sid}.jsonl"
+        j.write_text(_json.dumps({
+            "type": "user", "cwd": "/w", "timestamp": "2026-07-01T00:00:00.000Z",
+            "message": {"role": "user", "content": "OLD content"}}) + "\n",
+            encoding="utf-8")
+        _saved_root = saikai.PROJECTS_ROOT
+        saikai.PROJECTS_ROOT = pdir.parent
+        try:
+            saikai.PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+            stale = saikai.PREVIEW_DIR / f"{sid}.txt"
+            stale.write_text("STALE PREVIEW", encoding="utf-8")
+            os.utime(stale, (j.stat().st_mtime - 100, j.stat().st_mtime - 100))
+            buf = _io.StringIO()
+            with _cl.redirect_stdout(buf):
+                saikai.preview_session(sid)
+            out = buf.getvalue()
+            assert "STALE PREVIEW" not in out, \
+                "a cache older than the transcript must be re-rendered"
+            assert "OLD content" in out, out[:200]
+            stale.unlink(missing_ok=True)
+        finally:
+            saikai.PROJECTS_ROOT = _saved_root
+
+    # J. clock-jitter slack: an mtime a FEW SECONDS ahead still reads recent,
+    # a genuinely future one (restored backup) does not
+    now = _time.time()
+    assert saikai._is_recent_now({"mtime": now + 2}, now) is True
+    assert saikai._is_recent_now({"mtime": now + 86400}, now) is False
+    assert saikai._is_active_now({"mtime": now + 2}, now) is True
+
+
+def test_no_unguarded_jsonl_record_loops():
+    """Permanent net for the round-3 bug class: every per-line json.loads loop
+    must isinstance-guard (or bind through a dict-checking helper) before
+    attribute access — 12 of 18 external-audit findings were this one hole in
+    different places. Heuristic: the guard must appear within the next 8 lines
+    of the loads. (#audit-codex-nondict)"""
+    import re as _re
+    root = Path(__file__).parent.parent
+    bad = []
+    for mod in ("saikai.py", "saikai_terminal.py", "saikai_mirror.py",
+                "saikai_provider.py"):
+        lines = (root / mod).read_text(encoding="utf-8").splitlines()
+        for i, ln in enumerate(lines):
+            m = _re.search(r"(\w+)\s*=\s*json\.loads\((line|ln)\b", ln)
+            if not m:
+                continue
+            var = m.group(1)
+            window = "\n".join(lines[i + 1:i + 9])
+            if f"isinstance({var}, dict)" not in window:
+                bad.append(f"{mod}:{i + 1} ({var})")
+    assert not bad, ("per-line json.loads without a dict guard — a valid-but-"
+                     f"non-dict line ([]/\"x\") will abort the scan: {bad}")
+
+
 def test_memory_safety_presets_and_override():
     """The one-knob memory_safety maps to gate-threshold presets: 'on' == the old
     per-OS defaults (no behaviour change), 'off' loosens the headroom, 'strict'
@@ -697,6 +784,10 @@ if __name__ == "__main__":
     print("PASS test_codex_round2_regressions")
     test_codex_round3_regressions()
     print("PASS test_codex_round3_regressions")
+    test_self_audit_round4_regressions()
+    print("PASS test_self_audit_round4_regressions")
+    test_no_unguarded_jsonl_record_loops()
+    print("PASS test_no_unguarded_jsonl_record_loops")
     test_memory_safety_presets_and_override()
     print("PASS test_memory_safety_presets_and_override")
     test_na_cache_is_bounded()
