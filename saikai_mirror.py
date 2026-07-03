@@ -35,13 +35,19 @@ _BAD_KEY_TTL_SECS = 600.0   # idle sweep age for sub-threshold per-source entrie
 # write-key, so guessing one can't consume the other's) — the read token gates the
 # SSE stream that hands out the write-key, so hammering it must also be bounded.
 _BAD_TOKEN_LOCKOUT_THRESHOLD = 50
+# A source that has presented a VALID credential (read token or write-key) within
+# this window is EXEMPT from both lockouts — so an attacker sharing the operator's
+# IPv6 /64 (or the operator's own stale-token browser tab) can't lock out the real
+# operator's device, while a peer that never authenticated stays fully throttled.
+_PROVEN_TTL_SECS = 3600.0
 # Availability caps (a single-user LAN mirror never needs many of any of these).
 # The connection + timeout caps bound an UNAUTHENTICATED Slowloris/socket flood
 # that would otherwise park a blocked thread per socket and freeze the host's own
-# UI thread; the client cap bounds a token-holder opening many SSE streams. (#audit-mirror-dos)
+# UI thread; the client cap bounds a token-holder opening many SSE streams. Sized
+# for a single user (a browser opens ~6 parallel + one SSE), not a server. (#audit-mirror-dos)
 _MAX_SSE_CLIENTS = 8        # concurrent /stream viewers
-_MAX_CONNECTIONS = 128      # concurrent accepted sockets, all sources
-_MAX_CONN_PER_IP = 16       # concurrent accepted sockets from one source IP
+_MAX_CONNECTIONS = 48       # concurrent accepted sockets, all sources
+_MAX_CONN_PER_IP = 12       # concurrent accepted sockets from one source IP
 _CONN_TIMEOUT = 20          # seconds; a socket idle on header/body reads is dropped
 
 
@@ -240,6 +246,7 @@ class MirrorHub:
         # Two independent budgets: write-key guesses and read-token guesses.
         self._bad_key: dict[str, tuple[int, float, float]] = {}
         self._bad_token: dict[str, tuple[int, float, float]] = {}
+        self._proven: dict[str, float] = {}   # normalised src -> monotonic exempt-until
         self._last_accept_t = 0.0
         # Accepted-input rate cap (seconds between accepted injects). Now actually
         # REACHABLE at runtime via env (was hardcoded 0.0 → the documented flood
@@ -311,6 +318,21 @@ class MirrorHub:
             store.pop(src, None)
             return False
 
+    def _mark_proven(self, src: str) -> None:
+        """Record that `src` presented a VALID credential — exempting it from both
+        lockouts for _PROVEN_TTL_SECS. Sweeps expired entries so it stays bounded."""
+        import time as _t
+        now = _t.monotonic()
+        with self._bad_key_lock:
+            for k in [k for k, exp in self._proven.items() if exp <= now]:
+                del self._proven[k]
+            self._proven[_norm_src(src)] = now + _PROVEN_TTL_SECS
+
+    def _is_proven(self, src: str) -> bool:
+        import time as _t
+        with self._bad_key_lock:
+            return self._proven.get(_norm_src(src), 0.0) > _t.monotonic()
+
     # Write-key wrappers (public names kept for the tests + call sites).
     def _note_bad_key(self, src: str = "?") -> None:
         self._note_bad(self._bad_key, src, _BAD_KEY_LOCKOUT_THRESHOLD)
@@ -319,7 +341,9 @@ class MirrorHub:
         self._clear_bad(self._bad_key, src)
 
     def _input_locked_out(self, src: str = "?") -> bool:
-        return self._locked_out(self._bad_key, src)
+        # A proven source (recently authenticated) is exempt, so a hostile peer
+        # sharing its /64 can't lock out the real operator's device.
+        return not self._is_proven(src) and self._locked_out(self._bad_key, src)
 
     # Read-token wrappers (separate budget so guessing one secret can't consume the
     # other's cooldown, and a token guess is bounded just like a write-key guess).
@@ -327,7 +351,7 @@ class MirrorHub:
         self._note_bad(self._bad_token, src, _BAD_TOKEN_LOCKOUT_THRESHOLD)
 
     def _token_locked_out(self, src: str = "?") -> bool:
-        return self._locked_out(self._bad_token, src)
+        return not self._is_proven(src) and self._locked_out(self._bad_token, src)
 
     def broadcast(self, data: str) -> None:
         """Called from Textual's UI thread (MirrorDriver.write). MUST NOT block.
@@ -1455,7 +1479,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         q = parse_qs(urlparse(self.path).query)
         got = (q.get("token") or [""])[0]
         ok = hmac.compare_digest(got, hub._token)
-        if not ok:
+        if ok:
+            hub._mark_proven(src)     # authenticated → exempt from lockouts (grace)
+        else:
             hub._note_bad_token(src)
         return ok
 
@@ -1472,6 +1498,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         ok = hmac.compare_digest(got, hub._write_key)
         if ok:
             hub._clear_bad_key(src)                   # legit key → clear the streak
+            hub._mark_proven(src)                     # + exempt from lockouts (grace)
         else:
             hub._note_bad_key(src)
         return ok

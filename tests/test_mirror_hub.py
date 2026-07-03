@@ -238,6 +238,31 @@ def test_read_token_has_its_own_lockout():
     assert src in hub._bad_token and src not in hub._bad_key
 
 
+def test_proven_source_is_exempt_from_lockouts():
+    """A source that presented a VALID credential is exempt from BOTH lockouts, so
+    a hostile peer sharing its IPv6 /64 (or the operator's own stale-token tab)
+    can't lock out the real operator's device. An un-proven peer stays throttled.
+    (#audit-mirror-lockout-grace)"""
+    hub = m.MirrorHub(token="t")
+    # Attacker floods bad write-keys from the SAME /64 as the operator → arms lockout.
+    for _ in range(m._BAD_KEY_LOCKOUT_THRESHOLD):
+        hub._note_bad_key("2001:db8:1:2::99")
+    assert hub._input_locked_out("2001:db8:1:2::abc") is True     # un-proven, same /64
+    hub._mark_proven("2001:db8:1:2::5")                           # operator authenticates
+    assert hub._input_locked_out("2001:db8:1:2::5") is False      # exempt despite shared bucket
+    # Read-token lockout honours the same grace (stale-tab self-lockout fix).
+    hub2 = m.MirrorHub(token="t")
+    for _ in range(m._BAD_TOKEN_LOCKOUT_THRESHOLD):
+        hub2._note_bad_token("10.0.0.5")
+    assert hub2._token_locked_out("10.0.0.5") is True
+    hub2._mark_proven("10.0.0.5")
+    assert hub2._token_locked_out("10.0.0.5") is False
+    # The grace expires (bounded): a far-past deadline is swept / ignored.
+    import time as _t
+    hub2._proven["10.0.0.5"] = _t.monotonic() - 1.0
+    assert hub2._token_locked_out("10.0.0.5") is True
+
+
 def test_paste_framing_rejects_embedded_esc():
     """A bracketed-paste region with an interior raw ESC is the injection-smuggling
     pattern; a well-behaved browser never sends it. (#audit-mirror-paste-smuggle)"""
@@ -300,6 +325,8 @@ if __name__ == "__main__":
     print("PASS test_norm_src_collapses_rotatable_identities")
     test_read_token_has_its_own_lockout()
     print("PASS test_read_token_has_its_own_lockout")
+    test_proven_source_is_exempt_from_lockouts()
+    print("PASS test_proven_source_is_exempt_from_lockouts")
     test_paste_framing_rejects_embedded_esc()
     print("PASS test_paste_framing_rejects_embedded_esc")
     test_tls_scheme_and_url()
