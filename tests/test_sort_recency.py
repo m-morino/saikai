@@ -290,6 +290,21 @@ def test_render_header_includes_worktree_and_model():
         assert "worktree:" in out and "wt-feature" in out, out
         assert "model:" in out and "claude-opus-4-8" in out, out
         assert "via vscode" in out, out
+
+        # Condensed preview leads with the RECOGNITION signal (the first user
+        # message) BEFORE the secondary metadata (cwd / id), which now sits under a
+        # dim "details" block — so a glance recognizes the session, no scrolling
+        # past a metadata header. (#preview-recognition-first)
+        import re as _re
+        prev = _re.sub(r"\x1b\[[0-9;]*m", "", saikai._render_preview(s))
+        i_msg = prev.index("hi there please help me build a thing")
+        i_first = prev.index("First user message")
+        i_details = prev.index("details")
+        i_cwd = prev.index("cwd:")
+        assert i_first < i_msg < i_details < i_cwd, \
+            f"recognition signal must precede the details block:\n{prev}"
+        # The compact context line carries turns + project, no 10-row header above.
+        assert prev.index("turns") < i_first, prev
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

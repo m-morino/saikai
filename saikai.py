@@ -2723,9 +2723,57 @@ def _render_header(s: dict) -> list[str]:
     return lines
 
 
+def _preview_detail_rows(s: dict) -> list[str]:
+    """The secondary metadata (parent lineage, cwd, worktree, model, edited files,
+    full id) — everything NOT in the one-line summary. Shown DIM below the messages
+    in the condensed preview (recognition signal first, details on demand), and
+    reused nowhere else. Only non-empty rows are emitted."""
+    found = s["jsonl_path"]
+    rows: list[str] = []
+    pid = s.get("parent_id")
+    if pid:
+        score = s.get("parent_score", 0.0)
+        reasons = s.get("parent_reasons", [])
+        marker = _confidence_marker(score)
+        rs = "  ·  ".join(reasons) if reasons else ""
+        rows.append(f"  parent:   {marker} {pid[:8]}  [score {score:.2f}]  {rs}".rstrip())
+    cwd = s.get("cwd", "")
+    if cwd:
+        rows.append(f"  cwd:      {cwd}")
+    wt = s.get("worktree_label") or ""
+    if wt:
+        rows.append(f"  worktree: {wt}")
+    try:
+        _ep, _model = _session_surface_model(found)
+    except Exception:
+        _ep = _model = None
+    if _model or _ep:
+        _meta = [m for m in (_model, (f"via {_ep}" if _ep else "")) if m]
+        rows.append(f"  model:    {'  ·  '.join(_meta)}")
+    edited = _extract_edited_files(found)
+    if edited:
+        rows.append(f"  edited:   {', '.join(edited)}")
+    rows.append(f"  id:       {s['id']}")
+    # The whole block is secondary — render it dim so the messages above own the eye.
+    return [_c(r, DIM) for r in rows]
+
+
 def _render_preview(s: dict) -> str:
-    """Condensed preview text: header + first/last user msgs."""
-    lines = _render_header(s)
+    """Condensed preview: lead with the RECOGNITION signal (title + first/last user
+    message) so a glance tells sessions apart, then a single compact context line,
+    then the secondary metadata dimmed below. The full labelled header lives one
+    Tab away (_render_preview_full)."""
+    hidden_tag = "  [HIDDEN]" if s["id"] in _load_hidden() else ""
+    title = f"\033[1m{s['ai_title'] or '(no AI title)'}\033[0m{hidden_tag}"
+    # One compact context line — start · last · turns · project · branch. No "ago"
+    # so it reads right whether fmt_last_active is a relative age (5m) or a date.
+    meta = [f"start {fmt_ts(s['first_ts'])}", f"last {fmt_last_active(s)}",
+            f"{s['n_turns']} turns", s["jsonl_path"].parent.name]
+    branch = s.get("git_branch") or ""
+    if branch:
+        meta.append(branch)
+    lines = [title, _c("  " + "  ·  ".join(meta), DIM), ""]
+    # Recognition signal FIRST (was buried under ~10 metadata rows).
     lines.append("\033[36m── First user message ──\033[0m")
     if s["real_msgs"]:
         lines.append(s["real_msgs"][0][:1500])
@@ -2735,6 +2783,11 @@ def _render_preview(s: dict) -> str:
         lines.append("")
         lines.append(f"\033[36m── Last user message  (#{len(s['real_msgs'])}) ──\033[0m")
         lines.append(s["real_msgs"][-1][:1500])
+    detail = _preview_detail_rows(s)
+    if detail:
+        lines.append("")
+        lines.append("\033[2m── details ──\033[0m")
+        lines.extend(detail)
     lines.append("")
     lines.append("\033[2mTab: full/summary  ·  F8: changes (transcript diff)\033[0m")
     return "\n".join(lines)
