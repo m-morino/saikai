@@ -1276,8 +1276,10 @@ term.onData((d) => {
     try { term.select(a % term.cols, Math.floor(a / term.cols), (b - a) + 1); } catch (e) {}
   }
   function drag(y, x) {                   // returns true once it consumes the move
-    if (lastY === null || !controlOn || fatal) return false;
+    if (lastY === null) return false;
+    // Selection is LOCAL (never touches the host) — usable in read-only too.
     if (selectMode) { selectTo(x, y); return true; }
+    if (!controlOn || fatal) return false;
     accum += y - lastY; lastY = y;
     let moved = false;
     // pointer up (y decreases) -> see items below -> scroll the list DOWN.
@@ -1411,6 +1413,7 @@ document.getElementById('sel-copy').addEventListener('click', (e) => {
   const hint = document.getElementById('sel-hint');
   if (!s) { hint.textContent = 'nothing selected — drag first'; return; }
   hint.textContent = copyText(s) ? ('copied ' + s.length + ' chars') : 'copy failed';
+  try { term.focus(); } catch (_) {}      // hidden-textarea copy stole the keyboard
 });
 document.getElementById('sel-done').addEventListener('click', (e) => {
   e.preventDefault(); setSelectMode(false);

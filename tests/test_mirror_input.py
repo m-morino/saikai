@@ -962,6 +962,17 @@ def test_page_wires_select_mode_and_copy():
         "no Copy/Done controls for select mode"
     # touch-action must switch to 'none' so a select drag isn't stolen for pan.
     assert "'none'" in page, "select mode must capture the drag (touch-action:none)"
+    # Selection is LOCAL (never touches the host) — it must work for READ-ONLY
+    # viewers too, so in drag() the selectMode branch must come BEFORE the
+    # controlOn gate. (Fable5 re-check finding: the first cut gated selection
+    # behind control, locking read-only viewers out of a local operation.)
+    _drag = page[page.index("function drag("):]
+    _drag = _drag[:_drag.index("function end(")]
+    assert _drag.index("selectMode") < _drag.index("controlOn"), \
+        "drag(): selection must not be gated behind controlOn (read-only viewers select too)"
+    # Copy must hand the keyboard back to the terminal (the hidden-textarea
+    # fallback steals focus).
+    assert "term.focus" in page.split('id="sel-copy"')[0] or "term.focus()" in page, page
 
 
 def test_page_key_bar_flow_and_labels():
