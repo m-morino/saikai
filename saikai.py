@@ -9403,10 +9403,23 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # version that another PC's camera couldn't resolve. 96 bits
                     # is still infeasible to brute-force over HTTP for an
                     # ephemeral, control-gated, idle-off LAN mirror.
+                    # TLS (opt-in): encrypt the LAN transport so a passive sniffer
+                    # can't harvest the token / write-key / keystrokes. Resolve a
+                    # cert (user-provided, else openssl self-signed cached in
+                    # CACHE_DIR); if TLS was asked for but no cert is obtainable
+                    # (no openssl), warn and stay HTTP rather than failing launch.
+                    _tls = None
+                    if _mirror.mirror_tls_enabled(os.environ):
+                        _tls = _mirror.resolve_tls_paths(os.environ, CACHE_DIR, _mir_host)
+                        if _tls is None:
+                            print(_c("  ⚠ SAIKAI_MIRROR_TLS set but no cert available "
+                                     "(install openssl, or set SAIKAI_MIRROR_TLS_CERT/"
+                                     "_KEY) — mirror staying on HTTP", YELLOW),
+                                  file=sys.stderr)
                     _hub = _mirror.MirrorHub(
                         token=_secrets.token_urlsafe(12), host=_mir_host,
                         port=_mirror.mirror_port(os.environ),
-                        idle_secs=_mirror.mirror_idle_secs(os.environ))
+                        idle_secs=_mirror.mirror_idle_secs(os.environ), tls=_tls)
                     # LAN input is its own opt-in: a LAN-exposed mirror stays
                     # read-only unless SAIKAI_MIRROR_ALLOW_LAN_INPUT=1. Loopback
                     # always permits input.
@@ -9424,6 +9437,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _Drv = _mirror.make_mirror_driver(_mirror._base_driver_class(), _hub)
                     _app_kwargs["driver_class"] = _Drv
                     _mode = "LAN-exposed" if _mir_host != "127.0.0.1" else "loopback only"
+                    _mode += ", TLS" if _tls else ", HTTP"
                     _in_mode = ("input ON" if (_mir_host == "127.0.0.1" or _allow_lan_in)
                                 else f"input OFF (set {_MIRROR_LAN_INPUT_ENV}=1)")
                     _idle = _mirror.mirror_idle_secs(os.environ)

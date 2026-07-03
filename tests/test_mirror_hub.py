@@ -242,6 +242,40 @@ def test_paste_framing_rejects_embedded_esc():
     assert m._paste_framing_ok("\x1b[200~no end marker but \x1b here") is False
 
 
+def test_tls_scheme_and_url():
+    """TLS is off by default (http); when the hub is given a cert/key pair its
+    scheme + url() flip to https so the QR/URL advertise the encrypted origin. (#audit-mirror-tls)"""
+    assert m.mirror_tls_enabled({}) is False
+    assert m.mirror_tls_enabled({"SAIKAI_MIRROR_TLS": "1"}) is True
+    plain = m.MirrorHub(token="tok", host="127.0.0.1", port=9999)
+    assert plain._scheme == "http" and plain.url().startswith("http://")
+    secure = m.MirrorHub(token="tok", host="127.0.0.1", port=9999,
+                         tls=("/x/cert.pem", "/x/key.pem"))
+    assert secure._scheme == "https" and secure.url().startswith("https://")
+
+
+def test_resolve_tls_paths_precedence():
+    """User-provided cert+key win when both exist; a named-but-missing pair returns
+    None (never silently self-signs); absent env → openssl self-sign (if available). """
+    import tempfile
+    from pathlib import Path
+    d = Path(tempfile.mkdtemp())
+    cert, key = d / "c.pem", d / "k.pem"
+    cert.write_text("x"); key.write_text("y")
+    got = m.resolve_tls_paths(
+        {"SAIKAI_MIRROR_TLS_CERT": str(cert), "SAIKAI_MIRROR_TLS_KEY": str(key)}, d)
+    assert got == (str(cert), str(key))
+    # named but missing → None (don't fall back to self-sign under the user's nose)
+    assert m.resolve_tls_paths(
+        {"SAIKAI_MIRROR_TLS_CERT": str(d / "nope.pem"),
+         "SAIKAI_MIRROR_TLS_KEY": str(key)}, d) is None
+    # no cert env → self-sign via openssl when present; skip the assert if absent.
+    import shutil
+    if shutil.which("openssl"):
+        auto = m.resolve_tls_paths({}, d / "auto")
+        assert auto is not None and Path(auto[0]).is_file() and Path(auto[1]).is_file()
+
+
 def test_add_client_caps_concurrent_viewers():
     """The SSE viewer cap bounds a token-holder opening streams in a loop (each
     forces a UI-thread repaint). Over cap → (None, None), no registration. (#audit-mirror-dos)"""
@@ -263,6 +297,10 @@ if __name__ == "__main__":
     print("PASS test_read_token_has_its_own_lockout")
     test_paste_framing_rejects_embedded_esc()
     print("PASS test_paste_framing_rejects_embedded_esc")
+    test_tls_scheme_and_url()
+    print("PASS test_tls_scheme_and_url")
+    test_resolve_tls_paths_precedence()
+    print("PASS test_resolve_tls_paths_precedence")
     test_add_client_caps_concurrent_viewers()
     print("PASS test_add_client_caps_concurrent_viewers")
     test_broadcast_is_nonblocking_and_drops_oldest()

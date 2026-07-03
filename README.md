@@ -225,6 +225,9 @@ mirror to watch *all* your local sessions from the couch.
 | `SAIKAI_MIRROR_HOST` | `127.0.0.1` | mirror bind address; set to a LAN IP to reach it from another device |
 | `SAIKAI_MIRROR_PORT` | `0` | fixed mirror port so a firewall rule can target it; `0` lets the OS pick a free port |
 | `SAIKAI_MIRROR_ALLOW_LAN_INPUT` | off | allow control **input** over a non-loopback bind; otherwise a LAN mirror stays read-only (loopback always permits input) |
+| `SAIKAI_MIRROR_TLS` | off | serve over **HTTPS** so a passive sniffer on the LAN can't harvest the token / write-key / keystrokes. Uses `SAIKAI_MIRROR_TLS_CERT`+`SAIKAI_MIRROR_TLS_KEY` if set, else auto-generates a self-signed cert (needs `openssl`; the browser shows a one-time trust warning). Falls back to HTTP with a warning if no cert is obtainable |
+| `SAIKAI_MIRROR_TLS_CERT` / `_KEY` | — | PEM cert + key to serve TLS with (both required); overrides the self-signed default |
+| `SAIKAI_MIRROR_ALLOW_ALL_INTERFACES` | off | permit a `0.0.0.0`/`::` wildcard bind (exposes every interface — VPN/Docker/Tailscale included); without it a wildcard falls back to the detected LAN IP |
 
 <details><summary><b>Advanced: fine-grained memory-gate thresholds</b> (you rarely need these — <code>SAIKAI_MEM_SAFETY</code> sets them for you; anything set here overrides the preset)</summary>
 

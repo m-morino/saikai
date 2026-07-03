@@ -179,10 +179,14 @@ def _synth_full_frame(screen: "pyte.Screen", cols: int, rows: int) -> str:
 class MirrorHub:
     def __init__(self, token: str, host: str = "127.0.0.1", port: int = 0,
                  cols: int = 80, rows: int = 24, ingest_cap: int = 256,
-                 idle_secs: float = 600.0) -> None:
+                 idle_secs: float = 600.0, tls: "tuple[str, str] | None" = None) -> None:
         self._token = token
         self._host = host
         self._port = port
+        # TLS: (certfile, keyfile) when the transport is encrypted, else None.
+        # When set, serve() wraps the listening socket and url() advertises https.
+        self._tls = tls
+        self._scheme = "https" if tls else "http"
         self._cols = cols
         self._rows = rows
         self._ingest: queue.Queue[str] = queue.Queue(ingest_cap)
@@ -438,6 +442,17 @@ class MirrorHub:
         self._httpd = _Server((self._host, self._port), _Handler)
         self._httpd.hub = self
         self._port = self._httpd.server_address[1]
+        # TLS termination: wrap the LISTENING socket so every accepted connection
+        # does a handshake before any HTTP is read — closes the cleartext-sniffing
+        # vector (token, write-key, keystrokes) on a hostile LAN. A plain-http
+        # client that connects to the https port simply fails the handshake and is
+        # dropped by the per-connection timeout. (#audit-mirror-tls)
+        if self._tls is not None:
+            import ssl
+            certfile, keyfile = self._tls
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile, keyfile)
+            self._httpd.socket = ctx.wrap_socket(self._httpd.socket, server_side=True)
         threading.Thread(target=self._httpd.serve_forever,
                          name="saikai-mirror-http", daemon=True).start()
         self._drain = threading.Thread(target=self._drain_loop,
@@ -669,7 +684,7 @@ class MirrorHub:
         host = _lan_ip() if self._host in ("0.0.0.0", "") else self._host
         if ":" in host and not host.startswith("["):
             host = f"[{host}]"   # bracket an IPv6 literal so the URL authority parses
-        return f"http://{host}:{self._port}/?token={self._token}"
+        return f"{self._scheme}://{host}:{self._port}/?token={self._token}"
 
 
 def mirror_config(env: dict) -> tuple[bool, str]:
@@ -701,6 +716,87 @@ def mirror_port(env: dict) -> int:
     except ValueError:
         return 0
     return p if 0 < p < 65536 else 0
+
+
+def mirror_tls_enabled(env: dict) -> bool:
+    """Whether the operator asked for TLS (SAIKAI_MIRROR_TLS truthy). Encrypting the
+    LAN transport is what stops a passive sniffer from harvesting the token, the
+    SSE-delivered write-key, and every keystroke — the one gap the app-layer
+    controls can't close."""
+    return str(env.get("SAIKAI_MIRROR_TLS", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _openssl_run(argv: list, timeout: float) -> int:
+    """Run openssl quietly (no console flash on Windows); return its exit code, or
+    a nonzero sentinel on any failure."""
+    extra = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+    try:
+        import subprocess
+        return subprocess.run(argv, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=timeout, **extra).returncode
+    except Exception:
+        return 1
+
+
+def _gen_self_signed(cache_dir, host: str = "") -> "tuple[str, str] | None":
+    """A cached self-signed cert/key under cache_dir, generated via openssl (the
+    stdlib can serve TLS but can't MINT a cert). Reused across runs while still
+    valid so the browser isn't asked to re-trust every launch. Returns (cert, key)
+    or None when openssl is absent / generation fails → caller warns and stays
+    HTTP. SANs cover loopback + the detected LAN IP so the cert matches the URL."""
+    import os as _os
+    import shutil
+    from pathlib import Path
+    try:
+        d = Path(cache_dir)
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    certf, keyf = d / "mirror-cert.pem", d / "mirror-key.pem"
+    if certf.is_file() and keyf.is_file():
+        # -checkend 3600: exit 0 iff the cert is valid for at least another hour.
+        if _openssl_run(["openssl", "x509", "-checkend", "3600", "-noout",
+                         "-in", str(certf)], 5) == 0:
+            return (str(certf), str(keyf))
+    if not shutil.which("openssl"):
+        return None
+    ips = {"127.0.0.1"}
+    lan = _lan_ip()
+    if lan and lan != "127.0.0.1":
+        ips.add(lan)
+    if host and host not in ("0.0.0.0", "", "::", "127.0.0.1", "localhost"):
+        ips.add(host)
+    san = "subjectAltName=" + ",".join(
+        ["DNS:localhost"] + [f"IP:{ip}" for ip in sorted(ips)])
+    rc = _openssl_run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "365",
+         "-nodes", "-keyout", str(keyf), "-out", str(certf),
+         "-subj", "/CN=saikai-mirror", "-addext", san], 30)
+    if rc != 0:
+        return None
+    try:
+        _os.chmod(keyf, 0o600)
+    except OSError:
+        pass
+    return (str(certf), str(keyf))
+
+
+def resolve_tls_paths(env: dict, cache_dir, host: str = "") -> "tuple[str, str] | None":
+    """(certfile, keyfile) for the mirror's TLS, or None to fall back to plain HTTP.
+
+    Precedence: an explicit SAIKAI_MIRROR_TLS_CERT + _KEY pair (both must exist —
+    a named-but-missing pair returns None rather than silently self-signing) → an
+    openssl-generated self-signed cert cached under cache_dir → None. Only meaningful
+    when mirror_tls_enabled(env)."""
+    import os as _os
+    cert = str(env.get("SAIKAI_MIRROR_TLS_CERT", "")).strip()
+    key = str(env.get("SAIKAI_MIRROR_TLS_KEY", "")).strip()
+    if cert or key:
+        if cert and key and _os.path.isfile(cert) and _os.path.isfile(key):
+            return (cert, key)
+        return None
+    return _gen_self_signed(cache_dir, host)
 
 
 def mirror_idle_secs(env: dict) -> float:
@@ -1344,8 +1440,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         return ip == "::1" or ip == "::ffff:127.0.0.1" or ip.startswith("127.")
 
     def _server_origins(self) -> set:
-        """The exact Origin/Referer-host values that count as same-origin."""
-        return {f"http://{h}" for h in self._allowed_hosts()}
+        """The exact Origin/Referer-host values that count as same-origin — under
+        the server's actual scheme (https when TLS is on, else http)."""
+        scheme = self.server.hub._scheme
+        return {f"{scheme}://{h}" for h in self._allowed_hosts()}
 
     def _origin_ok(self) -> bool:
         """Fail-closed CSRF defense-in-depth: require an Origin (or, absent that,
