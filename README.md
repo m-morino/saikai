@@ -8,31 +8,38 @@
 
 **English** | [日本語](https://github.com/m-morino/saikai/blob/master/README.ja.md)
 
-> **Find, resume, and supervise every Claude Code session from one terminal** —
-> one searchable list across all your repos and worktrees, with the session you
-> pick running live right beside it.
+> ## A live cockpit for every Claude Code session you have running.
+> **See which one needs you — across all your repos and worktrees — and jump
+> straight into it.** One searchable list on the left; the session you pick
+> running live, right beside it.
 
 ![saikai demo](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-demo.gif)
 
+**vs. `claude --resume`:** `-r` opens *one* session in the folder you're in.
+saikai watches **all** of them at once — every repo and worktree — runs several
+**live** side by side, and shows at a glance (one cyan accent) which is working,
+which is waiting, and which finished and needs your reply. It's the difference
+between reopening a file and a control room.
+
 ## Who it's for
 
-`claude --resume` (`-r`) is great for picking up the session in the folder
-you're in. But once your work is spread across repos and worktrees, it can't
-help you *recognize* the one you want: there's no searching the conversation, no
-glance at what you last said, no way to flag the sessions you keep coming back
-to. That gap is the whole reason saikai exists. You'll want it if you'd like to:
+You're running Claude Code across several repos and worktrees and you keep
+losing track: which session was I in, which one is stuck waiting on me, where
+did that half-finished change go? `claude --resume` can't answer that — it only
+knows the current folder, with no search, no preview, no cross-session view.
+That gap is the whole reason saikai exists. You'll want it if you'd like to:
 
-- find a session across any repo or worktree without remembering where it started;
-- recognize past work by its content — search the transcript, skim a preview,
-  diff the changes — not just by its title;
-- favorite the sessions you return to and reopen them instantly;
-- run several `claude` sessions at once and see at a glance which is working,
-  waiting, or done;
-- close the terminal and bring the whole working set back later.
+- **see who needs you** — every running session's state at a glance, and one key
+  to jump to the next one waiting on a human;
+- run several `claude` sessions **live** at once and switch between them
+  instantly, without a pile of terminal tabs;
+- find a session across any repo or worktree by its *content* — search the
+  transcript, skim a preview, diff the changes — not just its title;
+- favorite the ones you return to, and bring the whole working set back later.
 
-Why a terminal app? Claude Code is CLI-first — new features tend to land there
-first — and a terminal is far lighter than a desktop app. saikai puts a Claude
-Desktop-style, cross-session list right where you already work.
+Why a terminal app? Claude Code is CLI-first — new features land there first —
+and a terminal is far lighter than a desktop app. saikai puts a mission-control
+view right where you already work.
 
 ## Features
 
@@ -44,17 +51,20 @@ picked on the right** (saikai calls this *split-live*; on by default).
 > **Back and forth:** `Enter` opens the selected session on the right · `Ctrl+]`
 > returns to the list · `F2`/`F3` switch panes.
 
-- **Every session, one searchable screen.** Browse and search across all your
-  repos and worktrees by title, conversation text, or session ID, then resume
-  from where each one started.
-- **Run sessions live, switch instantly.** Open the one you pick as a real
-  `claude` process beside the list, and move between them with a keystroke.
-- **Grouped by status — jump to what needs you.** `~` working · `?` waiting ·
-  `!` finished and awaiting your reply; group/sort by it and hop to the next pane
-  that needs a human.
-- **Favorites and previews to tell sessions apart.** Star the ones you return to
-  (`f`); preview the conversation, diff the changes, reuse a prompt, follow
-  inferred parent/child chains.
+- **Who needs you, at a glance.** The list opens grouped by state — **Needs
+  input** first — with one cyan accent reserved for "this needs you right now"
+  (`?` waiting · `!` finished, awaiting your reply); everything else stays calm
+  and dim. The cursor even *opens* on the first session that needs you, and one
+  key hops to the next one.
+- **Run several sessions live, switch instantly.** Open the ones you pick as real
+  `claude` processes beside the list and move between them with a keystroke — a
+  fleet you can watch and steer, not a pile of terminal tabs.
+- **Find any session by its content.** Search across all your repos and worktrees
+  by title, conversation text, or session ID; skim a preview (it leads with your
+  first/last message), diff what changed, then resume from where it started.
+- **Favorites and lineage to tell sessions apart.** Star the ones you return to
+  (`f`); reuse a prompt, follow inferred parent/child chains across context
+  resets.
 - **Quit without losing your work.** Reopen the same working set later with
   `Shift+F4`. No daemon, no database — it just reads Claude's own history files
   (AI summaries are opt-in).
