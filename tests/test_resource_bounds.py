@@ -497,6 +497,95 @@ def test_hostile_inputs_degrade_instead_of_raising():
         "rekey onto an existing sid must be a no-op, not an overwrite"
 
 
+def test_codex_round2_regressions():
+    """Locks in the round-2 external-audit fixes (#audit-codex-*)."""
+    import ast as _ast
+    import json as _json
+    import subprocess as _sp
+    import tempfile as _tf
+    from datetime import datetime as _dt, timezone as _tz
+    from pathlib import Path as _P
+
+    # 1. duplicate method definitions silently shadow the earlier one (a dup
+    # on_descendant_focus turned the header-skip baseline into dead code).
+    # Generic net: NO class in any saikai module may define a method twice.
+    for mod in ("saikai.py", "saikai_terminal.py", "saikai_mirror.py"):
+        tree = _ast.parse((_P(__file__).parent.parent / mod).read_text(
+            encoding="utf-8"))
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef):
+                seen: dict = {}
+                for item in node.body:
+                    if isinstance(item, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                        assert item.name not in seen, (
+                            f"{mod}: class {node.name} defines {item.name!r} twice "
+                            f"(lines {seen[item.name]} and {item.lineno}) — the "
+                            f"second silently shadows the first")
+                        seen[item.name] = item.lineno
+
+    # 2. _session_surface_model: a valid-but-non-dict line must not abort the scan
+    with _tf.TemporaryDirectory() as td:
+        j = _P(td) / "s.jsonl"
+        j.write_text("[]\n"
+                     + _json.dumps({"entrypoint": "cli"}) + "\n"
+                     + _json.dumps({"type": "assistant",
+                                    "message": {"model": "claude-opus-4-8"}}) + "\n",
+                     encoding="utf-8")
+        assert saikai._session_surface_model(j) == ("cli", "claude-opus-4-8")
+
+    # 3. main() treats a broken stdout pipe as a normal pipeline end.
+    # The wrapper re-points FD 1 at devnull (so shutdown flush can't re-raise);
+    # save/restore the real stdout FD or every later test print vanishes.
+    _orig = saikai._main
+    saikai._main = lambda: (_ for _ in ()).throw(BrokenPipeError())
+    _saved_fd = os.dup(1)
+    try:
+        try:
+            saikai.main()
+            raised = None
+        except SystemExit as e:
+            raised = e.code
+        assert raised == 0, f"BrokenPipeError must exit(0), got {raised!r}"
+    finally:
+        os.dup2(_saved_fd, 1)
+        os.close(_saved_fd)
+        saikai._main = _orig
+
+    # 4. chronological sorts parse tz-aware: +09:00 vs Z must order by instant
+    early_jst = "2026-01-01T00:30:00+09:00"     # = 2025-12-31T15:30:00Z
+    late_z = "2025-12-31T16:00:00Z"
+    assert saikai._iso_sort_key(early_jst) < saikai._iso_sort_key(late_z)
+    rows = [{"id": "early-jst", "first_ts": early_jst},
+            {"id": "late-z", "first_ts": late_z}]
+    rows.sort(key=lambda s: saikai._iso_sort_key(s["first_ts"]), reverse=True)
+    assert [r["id"] for r in rows] == ["late-z", "early-jst"], rows
+    assert saikai._iso_sort_key(None) == saikai._TS_EPOCH
+
+    # 5. preview staleness: an append that moves mtime by <1s must re-render
+    with _tf.TemporaryDirectory() as td:
+        cache = _P(td) / "p.txt"
+        calls = []
+        saikai._write_if_stale(cache, 1000.0, lambda: calls.append(1) or "v1")
+        saikai._write_if_stale(cache, 1000.5, lambda: calls.append(1) or "v2")
+        assert len(calls) == 2, "a 0.5s-newer transcript must refresh the cache"
+        assert cache.read_text(encoding="utf-8") == "v2"
+        saikai._write_if_stale(cache, 1000.5, lambda: calls.append(1) or "v3")
+        assert len(calls) == 2, "an unchanged mtime must still hit the cache"
+
+    # 6. custom-titles cache key includes size: a same-mtime rewrite is seen
+    ct = saikai.CUSTOM_TITLES_FILE
+    ct.parent.mkdir(parents=True, exist_ok=True)
+    ct.write_text(_json.dumps({"sid": "old"}), encoding="utf-8")
+    ns = ct.stat().st_mtime_ns
+    assert saikai._load_custom_titles().get("sid") == "old"
+    ct.write_text(_json.dumps({"sid": "newer!"}), encoding="utf-8")
+    os.utime(ct, ns=(ns, ns))                    # spoof: same mtime, new size
+    assert saikai._load_custom_titles().get("sid") == "newer!", \
+        "a same-mtime different-size rewrite must invalidate the cache"
+    ct.unlink()
+    saikai._CUSTOM_TITLES_CACHE = None
+
+
 def test_memory_safety_presets_and_override():
     """The one-knob memory_safety maps to gate-threshold presets: 'on' == the old
     per-OS defaults (no behaviour change), 'off' loosens the headroom, 'strict'
@@ -538,6 +627,8 @@ def test_memory_safety_presets_and_override():
 if __name__ == "__main__":
     test_hostile_inputs_degrade_instead_of_raising()
     print("PASS test_hostile_inputs_degrade_instead_of_raising")
+    test_codex_round2_regressions()
+    print("PASS test_codex_round2_regressions")
     test_memory_safety_presets_and_override()
     print("PASS test_memory_safety_presets_and_override")
     test_na_cache_is_bounded()

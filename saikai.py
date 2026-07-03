@@ -756,7 +756,9 @@ def _load_custom_titles() -> dict:
     transcript. Re-read only when the file mtime changes (or after a write)."""
     global _CUSTOM_TITLES_CACHE, _CUSTOM_TITLES_MTIME
     try:
-        m = CUSTOM_TITLES_FILE.stat().st_mtime
+        _st = CUSTOM_TITLES_FILE.stat()
+        m = (_st.st_mtime_ns, _st.st_size)   # ns+size: an external same-mtime
+        #                                      rewrite must not serve the old map (#audit-codex-cachekey)
     except OSError:
         _CUSTOM_TITLES_CACHE, _CUSTOM_TITLES_MTIME = {}, None
         return {}
@@ -809,7 +811,8 @@ def _load_lineage() -> dict:
     mtime changes (or after a write)."""
     global _LINEAGE_CACHE, _LINEAGE_MTIME
     try:
-        m = LINEAGE_FILE.stat().st_mtime
+        _st = LINEAGE_FILE.stat()
+        m = (_st.st_mtime_ns, _st.st_size)   # ns+size (#audit-codex-cachekey)
     except OSError:
         _LINEAGE_CACHE, _LINEAGE_MTIME = {}, None
         return {}
@@ -1378,7 +1381,7 @@ def _apply_sort(sessions: list[dict], keys: list[dict]) -> None:
         # All branches return a non-None comparable value, so sort() never
         # raises TypeError on mixed None/str even when a session is missing
         # a timestamp or other field.
-        if col == "date":  return s.get("first_ts") or ""
+        if col == "date":  return _iso_sort_key(s.get("first_ts"))  # tz-aware (#audit-codex-tsort)
         if col == "last":  return _last_active_dt(s) or datetime.min
         if col == "proj":  return (s.get("project_name") or "").lower()
         if col == "title": return (s.get("ai_title") or _first_msg(s) or "").lower()
@@ -2924,10 +2927,17 @@ def _render_preview_changes(s: dict) -> str:
 
 
 def _write_if_stale(path: Path, mtime: float, render) -> None:
-    """Write `render()` to path only if path is missing or its mtime drifts from `mtime`."""
+    """Write `render()` to path only if path is missing or its mtime drifts from
+    `mtime` (the cache file's own mtime is pinned to the transcript's below).
+
+    The drift tolerance must be TINY: with the old <1.0s window, a transcript
+    appended within a second of the cached snapshot read as "fresh" and the
+    stale preview persisted until some LATER write moved the mtime by >=1s. A
+    float utime->stat round-trip is exact to well under a microsecond, so 1e-6
+    keeps FS-precision slack without swallowing real appends. (#audit-codex-cachekey)"""
     if path.exists():
         try:
-            if abs(path.stat().st_mtime - mtime) < 1.0:
+            if abs(path.stat().st_mtime - mtime) < 1e-6:
                 return
         except Exception:
             pass
@@ -4089,6 +4099,19 @@ def _parse_iso_aware(s):
     except ValueError:
         return None
     return dt.astimezone() if dt.tzinfo is None else dt
+
+
+_TS_EPOCH = datetime.fromtimestamp(0, timezone.utc)
+
+
+def _iso_sort_key(ts) -> datetime:
+    """CHRONOLOGICAL sort key for transcript ISO timestamps. Raw string
+    comparison mis-orders mixed offsets — "2026-01-01T00:30:00+09:00" sorts
+    lexically AFTER "2025-12-31T16:00:00Z" yet is 30 minutes EARLIER — so every
+    first_ts sort parses tz-aware; missing/unparseable sinks to the epoch
+    (oldest end). (#audit-codex-tsort)"""
+    dt = _parse_iso_aware(ts)
+    return dt if dt is not None else _TS_EPOCH
 
 
 def _cleared_child_candidates(project_dir, pre_existing_sids, pane_cwd, clear_ts) -> list:
@@ -7797,19 +7820,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
 
-        def on_descendant_focus(self) -> None:
-            # Refresh the header-skip baseline whenever focus lands on the list.
-            # Focus can return to the table WITHOUT a RowHighlighted event (Esc-back
-            # / Ctrl+] from a pane, a pane close), which would otherwise leave
-            # _last_cursor_row frozen at its pre-pane value and send the next
-            # header-skip the wrong way. One central point covers every path. (#audit-header-skip)
-            try:
-                w = self.focused
-                if getattr(w, "id", None) == "table":
-                    self._last_cursor_row = w.cursor_row
-            except Exception:
-                pass
-
         def on_agent_terminal_focus_released(self, event) -> None:
             """The terminal's Ctrl+] (SAIKAI_RELEASE_KEY) escape hatch: refocus the list."""
             self.query_one("#table", DataTable).focus()
@@ -7836,6 +7846,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 pass
 
         def on_descendant_focus(self, event) -> None:
+            # NOTE: this is the ONLY on_descendant_focus — a second definition in
+            # this class would silently shadow it (a duplicate did exactly that
+            # and turned the header-skip baseline below into dead code, so ↑ from
+            # the row under a group header pushed the cursor back). (#audit-codex-dupfocus)
+            #
+            # Refresh the header-skip baseline whenever focus lands on the list.
+            # Focus can return to the table WITHOUT a RowHighlighted event (Esc-back
+            # / Ctrl+] from a pane, a pane close), which would otherwise leave
+            # _last_cursor_row frozen at its pre-pane value and send the next
+            # header-skip the wrong way. One central point covers every path. (#audit-header-skip)
+            try:
+                w = getattr(event, "widget", None)
+                if getattr(w, "id", None) == "table":
+                    self._last_cursor_row = w.cursor_row
+            except Exception:
+                pass
             # Always-on focus trail: focus moves aren't otherwise logged, so an
             # unexpected "focus changed on its own" had no record. Log each move
             # to saikai.log next to the pane/refresh events that triggered it
@@ -10647,7 +10673,7 @@ def cmd_sidechain_tree(target_id_prefix: str) -> None:
 
     # Order branches by first timestamp so the tree reads chronologically.
     summaries = [(af, _read_subagent_summary(af)) for af in agent_files]
-    summaries.sort(key=lambda x: x[1]["first_ts"] or "")
+    summaries.sort(key=lambda x: _iso_sort_key(x[1]["first_ts"]))
 
     for i, (agent_file, summary) in enumerate(summaries):
         meta_file = agent_file.with_suffix(".meta.json")
@@ -10694,7 +10720,7 @@ def _build_forest(sessions: list[dict], floor: float = 0.20) -> None:
     be a 30+ minute Haiku call. _topic_similarity returns 0 for missing topics,
     so the forest still builds on cwd/branch/title. Run --related <sid> to get
     topic-aware scoring on demand."""
-    by_time = sorted(sessions, key=lambda s: s["first_ts"])
+    by_time = sorted(sessions, key=lambda s: _iso_sort_key(s["first_ts"]))
     max_struct = _W_CWD + _W_BRANCH + _W_TITLE + _W_TOPIC   # ceiling of `structural`
     for i, s in enumerate(by_time):
         best_score, best_parent = floor, None
@@ -10880,10 +10906,16 @@ def _session_surface_model(jsonl: Path) -> tuple:
                     o = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(o, dict):
+                    # a valid-but-non-dict line ([] / "x") raised AttributeError
+                    # into the OUTER except, aborting the scan and silently
+                    # skipping the session in --sync-desktop. (#audit-codex-surface)
+                    continue
                 if ep is None and "entrypoint" in o:
                     ep = o["entrypoint"]
                 if o.get("type") == "assistant":
-                    m = (o.get("message") or {}).get("model")
+                    msg = o.get("message")
+                    m = msg.get("model") if isinstance(msg, dict) else None
                     if m:
                         model = m
     except Exception:
@@ -11067,7 +11099,7 @@ def _sweep_cache_litter() -> None:
             pass
 
 
-def main():
+def _main():
     try:                       # housekeeping off the launch path (see docstring)
         threading.Thread(target=_sweep_cache_litter, daemon=True,
                          name="saikai-cache-sweep").start()
@@ -11415,7 +11447,7 @@ def main():
     # Initial chronological sort gives _build_forest a deterministic order; the
     # user-configurable sort spec is applied AFTER forest building so it controls
     # only the displayed order.
-    sessions.sort(key=lambda s: s["first_ts"], reverse=True)
+    sessions.sort(key=lambda s: _iso_sort_key(s["first_ts"]), reverse=True)
     _log(f"start: loaded {len(sessions)} sessions "
          f"(all_projects={args.all_projects}, project={args.project}, days={args.days})")
 
@@ -11517,7 +11549,7 @@ def main():
             # load — DataTable.add_row(key=sid) raises on a duplicate key, so a
             # reappearing sid broke the list only AFTER an F5/auto-refresh. (#audit-codex-reload-dedup)
             fresh = _dedup_sessions_by_id(fresh)
-            fresh.sort(key=lambda s: s["first_ts"], reverse=True)
+            fresh.sort(key=lambda s: _iso_sort_key(s["first_ts"]), reverse=True)
             for s in fresh:
                 cached = (_load_cache(s["id"], s["mtime"], s.get("last_ts", ""))
                           if not s.get("is_open") else None)
@@ -11534,6 +11566,23 @@ def main():
 
         textual_pick(sessions, repo, args.all_projects, flat=flat,
                      reload_fn=_reload)
+
+
+def main():
+    """Console entry (pyproject: saikai = "saikai:main"): run the CLI/TUI,
+    treating a broken stdout pipe as a normal pipeline end. `saikai --table |
+    head` closes our stdout after 10 lines; the write then raised
+    BrokenPipeError with a full traceback and a non-zero exit. (#audit-codex-pipe)"""
+    try:
+        _main()
+    except BrokenPipeError:
+        # The reader went away — nothing more to say. Point stdout at devnull
+        # so the interpreter-shutdown flush can't raise a second time.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            pass
+        sys.exit(0)
 
 
 if __name__ == "__main__":
