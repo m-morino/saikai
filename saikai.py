@@ -114,6 +114,21 @@ def _color_key_for(s: dict, mode: str) -> str:
     return project_short(s.get("project_name") or "")   # default: project
 
 
+def _esc_markup(s: object) -> str:
+    """Escape USER content (session titles, folder names, search queries) before
+    it goes into a Textual CONTENT-markup string — a Static/Label with markup=True,
+    a TabPane title, or a markup `.update()`. A raw '[' is parsed as a style tag:
+    '[wip]' is silently swallowed, and '[/x]' / '[/]' raise MarkupError inside
+    Content.from_markup, corrupting or crashing the render. Uses Textual's own
+    escaper (textual.markup.escape); rich.markup.escape happens to work because
+    both honor '\\[', but this is the API for Textual content markup. For a whole
+    widget prefer Content(literal) or Content.from_markup(tmpl, var=...) (its
+    $variables substitute as literals). NOTE: a RichLog(markup=True) renders RICH
+    markup, not Textual content — escape those with rich.markup.escape instead."""
+    from textual.markup import escape
+    return escape(str(s))
+
+
 def _color_legend(color_by: str) -> str:
     """Plain-language explanation shared by help and Settings."""
     # Phrased as the guaranteed direction (same project → one stable colour);
@@ -4769,7 +4784,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         f"{a}→[yellow]{k}[/yellow]" for a, k in list(_rm.items())[:12]) + "\n")
                 if getattr(app, "_leader_key", ""):
                     _lk = "Space" if app._leader_key == "space" else app._leader_key
-                    body += (f"[bold cyan]Menu key[/bold cyan]  [yellow]{_lk}[/yellow] "
+                    body += (f"[bold cyan]Menu key[/bold cyan]  [yellow]{_esc_markup(_lk)}[/yellow] "
                              "in the list, then one letter (pause to see this map in place):\n")
                     _groups = _leader_groups(getattr(app, "_leader_actions", {}))
                     for _fam, _pairs in _groups:
@@ -4855,7 +4870,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         f"({_state})[/dim]\n")
                 for sec, key, val, src in _resolved_settings():
                     _sc = {"env": "yellow", "config": "green"}.get(src, "dim")
-                    body += (f"  [dim]\\[{sec}][/dim] {key:<22} = {val!r:<14} "
+                    body += (f"  [dim]\\[{sec}][/dim] {key:<22} = {_esc_markup(repr(val)):<14} "  # val is env/config user content
                              f"[{_sc}]({src})[/{_sc}]\n")
                 with VerticalScroll(id="set-config"):
                     yield Static(body)
@@ -5146,10 +5161,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def compose(self) -> ComposeResult:
             with Vertical(id="oe-box"):
                 yield Static("[bold yellow]Already open elsewhere[/bold yellow]")
-                from rich.markup import escape as _esc
                 # the title is USER content — unescaped, "[/x]" in it raised
-                # MarkupError and crashed the whole UI when this modal opened. (#audit-codex-oe-markup)
-                yield Static(f"[dim]'{_esc(self._title)}' is open in another Claude "
+                # MarkupError and crashed the whole UI when this modal opened.
+                # _esc_markup = textual.markup.escape: a Static(markup=True) renders
+                # Textual content markup, so use its escaper. (#audit-codex-oe-markup)
+                yield Static(f"[dim]'{_esc_markup(self._title)}' is open in another Claude "
                              "window. Resuming starts a SECOND Claude on the same "
                              "conversation — they can clobber each other's writes.[/dim]")
                 yield Static("[dim]Enter resumes anyway · Esc cancels[/dim]")
@@ -6453,7 +6469,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
             # Scope: "All projects" when --all-projects, else repo name
             scope = "All projects" if show_project else (repo.name if repo else "All projects")
-            scope_str = f"{sep}{scope}"
+            scope_str = f"{sep}{_esc_markup(scope)}"   # repo.name is user content: a '[' folder crashes markup
 
             # Show Tree only when ON (a row of OFFs is noise).
             tree_str = f"{sep}Tree: [green]ON[/green]" if _get_tree_mode() else ""
@@ -6523,7 +6539,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _q = ""
                 if _q:
                     _qd = _q if len(_q) <= 30 else _q[:29] + "…"
-                    search_str = f"{sep}[yellow]search: {_qd!r}[/yellow]"
+                    search_str = f"{sep}[yellow]search: {_esc_markup(repr(_qd))}[/yellow]"
                 else:
                     search_str = f"{sep}[dim]/ search[/dim]"
             # Standing keyboard breadcrumb — the footer is trimmed to the core

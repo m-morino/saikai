@@ -2023,6 +2023,55 @@ def test_tabpane_title_uses_markup_safe_content_not_rich_text():
               "source guard still valid — Content is the supported type.")
 
 
+def test_statusbar_markup_escapes_user_search_and_folder():
+    """_update_subtitle echoes two pieces of USER content into a markup=True
+    statusbar Static: the search query ('search: {q!r}') and the scope (the repo
+    FOLDER NAME). Both were interpolated raw — a '[' folder, or a '[/x]' typed
+    into the search box, made Static.update -> Content.from_markup raise
+    MarkupError (crashing _update_subtitle) or silently swallowed the text
+    ('[bold]' -> gone). User content must be escaped with textual.markup.escape:
+    a Static renders Textual CONTENT markup, not rich markup, so the library's
+    own escaper is the right tool (rich.markup.escape happens to work only
+    because both honor '\\['). Commit 08ef9b7 already proved bracketed folder
+    names are a live hazard here. (#audit-toast-markup)"""
+    # (1) Source guard — the raw-interpolation shapes must stay gone and the
+    # escaper must be wired in. This is the cheap catch for a re-regression.
+    src = Path(saikai.__file__).read_text(encoding="utf-8")
+    assert "search: {_qd!r}" not in src, \
+        "statusbar search echo must escape the query (textual.markup.escape)"
+    assert 'scope_str = f"{sep}{scope}"' not in src, \
+        "statusbar scope (repo.name) must be markup-escaped"
+    assert "_esc_markup(repr(_qd))" in src and "_esc_markup(scope)" in src, \
+        "statusbar must route user content through _esc_markup"
+
+    # (2) Behavioral — the exact hazard shapes must survive the SAME sink the
+    # statusbar uses (a markup=True Static.update), and the unescaped form must
+    # still crash (so the guard protects a live hazard, not a style nit).
+    try:
+        from textual.widgets import Static
+        from textual.markup import MarkupError
+    except Exception:
+        print("SKIP test_statusbar_markup_escapes_user_search_and_folder "
+              "(textual unavailable)")
+        return
+    esc = saikai._esc_markup
+    for hostile in ["[bold]x", "a [/x] b", "'[/]'", "[archive]", "proj [v2] dir"]:
+        s = Static()
+        # mirrors _update_subtitle: developer markup + escaped user content.
+        s.update(f"[yellow]search: {esc(repr(hostile))}[/yellow]  {esc(hostile)}")
+        vis = getattr(s, "_Static__visual", None)
+        plain = getattr(vis, "plain", "") or ""
+        assert hostile in plain, \
+            f"escaped user content must render literally: {hostile!r} -> {plain!r}"
+    crashed = False
+    try:
+        Static().update("stray [/x] close")   # the pre-fix statusbar shape
+    except MarkupError:
+        crashed = True
+    assert crashed, \
+        "an unescaped stray close tag must MarkupError — the hazard is real"
+
+
 def test_pilot_filter_engaged_window_survives_focus_move():
     """Filtering must not switch the foreground live pane out from under the user.
     The post-filter RowHighlighted is queued (the rebuild is call_after_refresh'd),
@@ -2332,6 +2381,8 @@ if __name__ == "__main__":
     test_pilot_toast_user_content_renders_verbatim()
     test_tabpane_title_uses_markup_safe_content_not_rich_text()
     print("PASS test_tabpane_title_uses_markup_safe_content_not_rich_text")
+    test_statusbar_markup_escapes_user_search_and_folder()
+    print("PASS test_statusbar_markup_escapes_user_search_and_folder")
     test_pilot_cycle_tab_skips_dead_pane()
     test_pilot_double_space_does_not_leave_leader_armed()
     print("PASS test_pilot_double_space_does_not_leave_leader_armed")
