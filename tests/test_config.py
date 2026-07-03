@@ -237,10 +237,19 @@ def test_reset_terminal_modes_guarded_and_emits():
             return True
     tbuf = _Tty()
     _sys.stderr = tbuf
+    # Force non-win32 so the emit path runs deterministically on every OS. On real
+    # win32 the function probes the OS console for VT via ctypes GetStdHandle(-12)/
+    # GetConsoleMode and BAILS when that probe fails — which it does under a piped
+    # test stderr (pre-push hook / CI), independent of the mocked sys.stderr. The
+    # emitted disable+show-cursor sequence is platform-agnostic; the win32 VT gate
+    # is a real-console runtime concern, not part of what bytes get written.
+    _saved_platform = saikai.sys.platform
+    saikai.sys.platform = "linux"
     try:
         saikai._reset_terminal_modes()
     finally:
         _sys.stderr = saved
+        saikai.sys.platform = _saved_platform
     out = tbuf.getvalue()
     assert "\033[?1003l" in out and "\033[?1006l" in out and "\033[?1004l" in out
     assert out.endswith("\033[?25h")
