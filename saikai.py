@@ -10676,17 +10676,13 @@ def main():
                "                            \"frequent\" for auto-permission (default 5).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # --help groups the flags by purpose. Everyday scope/view flags sit at the
+    # top; the scripting, analysis, and config surfaces are demoted into labelled
+    # sections below so `saikai --help` reads as a short, calm list — the flags
+    # themselves and their behaviour are UNCHANGED (aliases/hooks keep working).
     p.add_argument("--version", action="version", version=f"saikai {__version__}")
-    p.add_argument("--init-config", action="store_true",
-                   help="Write a commented config.toml template to the config path, then exit.")
-    p.add_argument("--print-config", action="store_true",
-                   help="Print the resolved settings + their source (default/config/env), then exit.")
-    p.add_argument("--dump-handoff-prompt", action="store_true",
-                   help="Write the built-in b2 handoff prompt to the override file "
-                        "(SAIKAI_HANDOFF_PROMPT_FILE, else CACHE_DIR/handoff-prompt.md) "
-                        "so you can edit it, then exit.")
-    p.add_argument("--force", action="store_true",
-                   help="With --init-config: overwrite an existing config file.")
+
+    # ── common: what most invocations use ──
     # default=None on persisted flags so we can detect "not provided" and use
     # the last saved value instead.
     def _nonneg_int(v: str) -> int:
@@ -10703,7 +10699,81 @@ def main():
     p.add_argument("--all", "--all-projects", action="store_true",
                    default=None, dest="all_scope",
                    help="Show sessions across all projects")
-    p.add_argument("--reset-options", action="store_true",
+    p.add_argument("--project", metavar="PATH")
+    p.add_argument("--table", action="store_true",
+                   help="Show static table instead of the interactive picker")
+    p.add_argument("--pick", action="store_true",
+                   help="Open the interactive picker. This is the default when "
+                        "no other action flag is given; --pick is kept as an explicit "
+                        "no-op for clarity in shell aliases.")
+
+    # ── session actions ──
+    g_session = p.add_argument_group(
+        "session actions",
+        "one-shot operations on a session, for shell aliases and Claude hooks — "
+        "the picker has keys for all of these (f favorite, h hide, Tab preview)")
+    g_session.add_argument("--favorite", metavar="SESSION_ID",
+                   help="Toggle favorite (★) state for a session")
+    g_session.add_argument("--fav-current", action="store_true",
+                   help="Mark the current Claude Code session as favorite. "
+                        "Resolves the session ID from $CLAUDE_SESSION_ID, "
+                        "falling back to the most-recently-modified JSONL "
+                        "in this project's encoded directory.")
+    g_session.add_argument("--hide", metavar="SESSION_ID",
+                   help="Toggle hidden state for a session")
+    g_session.add_argument("--preview", metavar="SESSION_ID",
+                   help="Print a session's content preview")
+    g_session.add_argument("--preview-full", metavar="SESSION_ID",
+                   help="Print a session's full conversation preview")
+
+    # ── view & sort ──
+    g_view = p.add_argument_group(
+        "view & sort",
+        "persist a display preference from the shell; inside the picker set them "
+        "live (F6 favorite-view, Shift-F5 tree, a column-header click to sort)")
+    g_view.add_argument("--toggle-view", action="store_true",
+                   help="Toggle saved default/show-hidden view mode (persistent).")
+    g_view.add_argument("--toggle-tree", action="store_true",
+                   help="Toggle saved flat/nested tree-display mode (persistent). "
+                        "Same effect as Shift-F5 inside the picker.")
+    g_view.add_argument("--cycle-sort", type=int, metavar="N", choices=[1, 2, 3],
+                   help="Advance the Nth sort priority to the next column. Persistent. "
+                        "In the picker, click a column header instead.")
+    g_view.add_argument("--toggle-sort-dir", type=int, metavar="N", choices=[1, 2, 3],
+                   help="Toggle the Nth sort priority's direction (asc/desc). Persistent. "
+                        "In the picker, click a sorted column header again to reverse.")
+    g_view.add_argument("--reset-sort", action="store_true",
+                   help="Reset all sort priorities to defaults (recency desc, then none).")
+
+    # ── analysis & export ──
+    g_analysis = p.add_argument_group("analysis & export")
+    g_analysis.add_argument("--related", metavar="SESSION_ID",
+                   help="Show sessions related to SESSION_ID with confidence scores and reasons")
+    g_analysis.add_argument("--tree", action="store_true",
+                   help="Group sessions into an inferred parent/child forest (heuristic, "
+                        "scores cwd / branch / title / topic + time decay).")
+    g_analysis.add_argument("--sidechain", metavar="SESSION_ID",
+                   help="Show the in-session sidechain (subagent) tree for SESSION_ID "
+                        "using isSidechain+parentUuid metadata (confirmed, not heuristic).")
+    g_analysis.add_argument("--sync-desktop", action="store_true",
+                   help="Create Claude Desktop session-list entries for Terminal/VS Code "
+                        "sessions missing from it. NOTE: this WRITES into Claude Desktop's "
+                        "own session store, whose format is internal/undocumented; the write "
+                        "is additive + idempotent and never touches ~/.claude/projects. "
+                        "Restart Desktop afterwards to see them.")
+
+    # ── config & defaults ──
+    g_config = p.add_argument_group("config & defaults")
+    g_config.add_argument("--init-config", action="store_true",
+                   help="Write a commented config.toml template to the config path, then exit.")
+    g_config.add_argument("--print-config", action="store_true",
+                   help="Print the resolved settings + their source (default/config/env), then exit.")
+    g_config.add_argument("--force", action="store_true",
+                   help="With --init-config: overwrite an existing config file.")
+    g_config.add_argument("--save-defaults", action="store_true",
+                   help="Persist the current --days/--here/--all values as new defaults. "
+                        "Without this flag, CLI args are one-shot and saved options stay untouched.")
+    g_config.add_argument("--reset-options", action="store_true",
                    help="Forget saved --days/--here/--all defaults. Preserves "
                         "split ratio and filter-bar visibility. Does NOT clear "
                         "hidden/favorite/view-mode/tree-mode/sort — "
@@ -10711,61 +10781,15 @@ def main():
                         "picker, ':hidden' in search for hidden rows, a column-header "
                         "click to sort (or the matching "
                         "--toggle-* / --cycle-sort / --reset-sort flags).")
-    p.add_argument("--save-defaults", action="store_true",
-                   help="Persist the current --days/--here/--all values as new defaults. "
-                        "Without this flag, CLI args are one-shot and saved options stay untouched.")
-    p.add_argument("--pick", action="store_true",
-                   help="Open the interactive picker. This is the default when "
-                        "no other action flag is given; --pick is kept as an explicit "
-                        "no-op for clarity in shell aliases.")
-    p.add_argument("--table", action="store_true",
-                   help="Show static table instead of the interactive picker")
-    p.add_argument("--project", metavar="PATH")
-    p.add_argument("--no-summary", action="store_true",
+    g_config.add_argument("--dump-handoff-prompt", action="store_true",
+                   help="Write the built-in b2 handoff prompt to the override file "
+                        "(SAIKAI_HANDOFF_PROMPT_FILE, else CACHE_DIR/handoff-prompt.md) "
+                        "so you can edit it, then exit.")
+    g_config.add_argument("--no-summary", action="store_true",
                    help="Skip Haiku summarization (use AI title or first user msg)")
-    p.add_argument("--refresh-summary", action="store_true",
+    g_config.add_argument("--refresh-summary", action="store_true",
                    help="Discard cached Haiku summaries and regenerate. Does NOT touch "
                         "parsed/topic caches; delete ~/.cache/saikai/parsed/ for that.")
-    p.add_argument("--preview", metavar="SESSION_ID",
-                   help="Print a session's content preview")
-    p.add_argument("--preview-full", metavar="SESSION_ID",
-                   help="Print a session's full conversation preview")
-    p.add_argument("--hide", metavar="SESSION_ID",
-                   help="Toggle hidden state for a session")
-    p.add_argument("--favorite", metavar="SESSION_ID",
-                   help="Toggle favorite (★) state for a session")
-    p.add_argument("--fav-current", action="store_true",
-                   help="Mark the current Claude Code session as favorite. "
-                        "Resolves the session ID from $CLAUDE_SESSION_ID, "
-                        "falling back to the most-recently-modified JSONL "
-                        "in this project's encoded directory.")
-    p.add_argument("--toggle-view", action="store_true",
-                   help="Toggle saved default/show-hidden view mode (persistent).")
-    p.add_argument("--toggle-tree", action="store_true",
-                   help="Toggle saved flat/nested tree-display mode (persistent). "
-                        "Same effect as Shift-F5 inside the picker.")
-    p.add_argument("--cycle-sort", type=int, metavar="N", choices=[1, 2, 3],
-                   help="Advance the Nth sort priority to the next column. Persistent. "
-                        "In the picker, click a column header instead.")
-    p.add_argument("--toggle-sort-dir", type=int, metavar="N", choices=[1, 2, 3],
-                   help="Toggle the Nth sort priority's direction (asc/desc). Persistent. "
-                        "In the picker, click a sorted column header again to reverse.")
-    p.add_argument("--reset-sort", action="store_true",
-                   help="Reset all sort priorities to defaults (recency desc, then none).")
-    p.add_argument("--sync-desktop", action="store_true",
-                   help="Create Claude Desktop session-list entries for Terminal/VS Code "
-                        "sessions missing from it. NOTE: this WRITES into Claude Desktop's "
-                        "own session store, whose format is internal/undocumented; the write "
-                        "is additive + idempotent and never touches ~/.claude/projects. "
-                        "Restart Desktop afterwards to see them.")
-    p.add_argument("--related", metavar="SESSION_ID",
-                   help="Show sessions related to SESSION_ID with confidence scores and reasons")
-    p.add_argument("--tree", action="store_true",
-                   help="Group sessions into an inferred parent/child forest (heuristic, "
-                        "scores cwd / branch / title / topic + time decay).")
-    p.add_argument("--sidechain", metavar="SESSION_ID",
-                   help="Show the in-session sidechain (subagent) tree for SESSION_ID "
-                        "using isSidechain+parentUuid metadata (confirmed, not heuristic).")
     args = p.parse_args()
 
     if args.init_config:
