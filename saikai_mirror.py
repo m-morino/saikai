@@ -635,29 +635,58 @@ def _is_private_ipv4(ip: str) -> bool:
     return a == 10 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168)
 
 
+_LOCAL_IPV4S_CACHE: "set | None" = None
+
+
+def _hostname_ipv4s(timeout: float = 1.0) -> set:
+    """IPv4s the machine's hostname resolves to, TIME-BOUNDED. getaddrinfo takes no
+    timeout, and on macOS a runner's `.local` hostname can make it hang for a long
+    time (mDNS/DNS) — run it in a daemon thread and abandon it past `timeout` so it
+    can NEVER block the mirror's per-request host check (the macOS-CI hang:
+    _allowed_hosts → _local_ipv4s → getaddrinfo on every request → recv timeout)."""
+    import socket
+    import threading
+    out: set = set()
+
+    def _work():
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                out.add(info[4][0])
+        except Exception:
+            pass
+
+    th = threading.Thread(target=_work, daemon=True)
+    th.start()
+    th.join(timeout)      # a slow resolver just yields {} — the UDP-trick IP remains
+    return set(out)
+
+
 def _local_ipv4s() -> set:
     """Every local IPv4 we can discover without extra deps: the default-route
     egress IP (UDP-connect trick, no packet sent) plus all addresses the hostname
     resolves to. Used to build the Host allow-list so a phone reaching us by ANY
-    local IP isn't 403'd, and to pick the URL/QR host."""
+    local IP isn't 403'd, and to pick the URL/QR host. MEMOISED (process-lifetime):
+    _allowed_hosts calls this on every request and the hostname lookup can be slow;
+    the addresses don't change within a mirror session. Caching doesn't weaken
+    anti-rebinding — the allow-list is IP literals, an attacker's Host is a name."""
+    global _LOCAL_IPV4S_CACHE
+    if _LOCAL_IPV4S_CACHE is not None:
+        return set(_LOCAL_IPV4S_CACHE)
     import socket
     ips: set = set()
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            s.connect(("8.8.8.8", 80))
+            s.connect(("8.8.8.8", 80))       # no packet sent; picks the egress iface
             ips.add(s.getsockname()[0])
         finally:
             s.close()
     except OSError:
         pass
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ips.add(info[4][0])
-    except OSError:
-        pass
+    ips |= _hostname_ipv4s()                  # time-bounded (macOS .local can hang)
     ips.discard("0.0.0.0")
-    return ips
+    _LOCAL_IPV4S_CACHE = set(ips)
+    return set(ips)
 
 
 def _lan_ip() -> str:

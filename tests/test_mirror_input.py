@@ -617,6 +617,32 @@ def test_wildcard_bind_allows_lan_ip_host():
         hub.stop()
 
 
+def test_local_ipv4s_time_bounds_slow_hostname_and_memoises():
+    """Regression (macOS-CI hang): a slow/hanging hostname resolver must NOT block
+    the per-request host check. _allowed_hosts calls _local_ipv4s on every request;
+    getaddrinfo(gethostname()) can hang for a long time on a macOS '.local' runner,
+    which timed the mirror requests out. _local_ipv4s now time-bounds the lookup and
+    memoises, so it returns fast even when getaddrinfo sleeps forever."""
+    import socket, time
+    saved_cache, saved_gai = m._LOCAL_IPV4S_CACHE, socket.getaddrinfo
+    m._LOCAL_IPV4S_CACHE = None
+
+    def _slow(*a, **k):
+        time.sleep(5)                        # simulate a macOS .local mDNS hang
+        return saved_gai(*a, **k)
+    socket.getaddrinfo = _slow
+    try:
+        t0 = time.monotonic()
+        first = m._local_ipv4s()             # cold: bounded hostname cost, paid once
+        assert time.monotonic() - t0 < 3.0, "_local_ipv4s blocked on a hanging resolver"
+        t1 = time.monotonic()
+        second = m._local_ipv4s()            # memoised: doesn't touch the resolver
+        assert time.monotonic() - t1 < 0.5 and second == first
+    finally:
+        socket.getaddrinfo = saved_gai
+        m._LOCAL_IPV4S_CACHE = saved_cache
+
+
 def test_mirror_inject_mouse_double_gate_and_events():
     """_mirror_inject_mouse no-ops when control is OFF (UI-thread re-check), and
     when ON posts MouseDown+MouseUp for a click / MouseScroll* for a scroll, at
@@ -974,6 +1000,7 @@ if __name__ == "__main__":
     test_sgr_mouse_regex_is_escaping_safe_and_correct()
     test_client_count_and_change_handler()
     test_wildcard_bind_allows_lan_ip_host()
+    test_local_ipv4s_time_bounds_slow_hostname_and_memoises()
     test_mirror_inject_mouse_double_gate_and_events()
     test_mirror_inject_key_double_gate_and_event()
     test_page_routes_mouse_and_has_key_bar()
