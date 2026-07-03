@@ -1023,6 +1023,10 @@ _PAGE_HTML = """<!doctype html><html><head><meta charset="utf-8">
 font:bold 16px monospace;flex:1 1 auto;border:1px solid #555;border-radius:6px;
 background:#333;color:#eee;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 #kb button:active{background:#3a3}
+#selbar button{min-width:64px;padding:8px 18px;font:bold 16px monospace;
+border:1px solid #4a4;border-radius:6px;background:#2c4a2c;color:#eee;
+flex:0 0 auto;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+#selbar button:active{background:#3a3}
 #kb{align-items:center}
 #kb-arrows{display:grid;grid-template-areas:". up ." "left down right";gap:4px;flex:0 0 auto}
 #kb-arrows>[data-k="up"]{grid-area:up}#kb-arrows>[data-k="down"]{grid-area:down}
@@ -1066,6 +1070,7 @@ es.onmessage = (e) => {
 // ── Phase B: write-key + control state over named SSE events ────────────────
 let writeKey = null;
 let controlOn = false;
+let selectMode = false;         // drag = select text (not scroll) while ON
 let banner = document.createElement('div');
 banner.style.cssText =
   'position:fixed;top:0;left:0;right:0;font:bold 14px monospace;'+
@@ -1073,12 +1078,20 @@ banner.style.cssText =
 banner.textContent = 'CONTROL OFF (read-only)';
 document.body.appendChild(banner);
 
+function applyTouchAction() {
+  // SELECT mode: capture the drag entirely (touch-action:none) so it selects
+  // instead of panning. CONTROL on: claim the single-finger VERTICAL drag for
+  // scroll (pan-x keeps horizontal pan, pinch-zoom keeps zoom). READ-ONLY: let
+  // the browser pan freely so a viewer can move around the mirrored screen.
+  try {
+    document.getElementById('t').style.touchAction =
+      selectMode ? 'none' : (controlOn ? 'pan-x pinch-zoom' : 'auto');
+  } catch (e) {}
+}
+
 function setBanner(on, target) {
   controlOn = on;
-  // When controlling, claim a single-finger VERTICAL drag for list scroll
-  // (pan-x keeps horizontal pan, pinch-zoom keeps zoom); read-only lets the
-  // browser pan freely so a viewer can move around the mirrored screen.
-  try { document.getElementById('t').style.touchAction = on ? 'pan-x pinch-zoom' : 'auto'; } catch (e) {}
+  applyTouchAction();
   if (on) {
     banner.style.background = '#3a3';
     banner.textContent = 'CONTROL ON — typing into: ' + (target || '(no pane focused)');
@@ -1206,6 +1219,7 @@ term.onData((d) => {
   if (!controlOn || fatal) return;      // disabled until a control on-frame
   const mm = d.match(sgrMouseRe);
   if (mm) {
+    if (selectMode) return;             // taps drive selection, not the host, while selecting
     const b = parseInt(mm[1], 10);
     const col = parseInt(mm[2], 10) - 1;     // 1-based xterm -> 0-based cell
     const row = parseInt(mm[3], 10) - 1;
@@ -1244,13 +1258,26 @@ term.onData((d) => {
     return [Math.max(0, Math.min(term.cols - 1, c)),
             Math.max(0, Math.min(term.rows - 1, w))];
   }
-  let pressX = 0, pressY = 0;
+  let pressX = 0, pressY = 0, startIdx = 0;
   function begin(x, y) {
     lastY = y; accum = 0; pressX = x; pressY = y;
     const cc = cellAt(x, y); scol = cc[0]; srow = cc[1];
+    startIdx = srow * term.cols + scol;       // reading-order index of the anchor
+    if (selectMode) { try { term.clearSelection(); } catch (e) {} }
   }
-  function drag(y) {                     // returns true once it emits >=1 scroll
+  // SELECT mode: extend a character-precise, reading-order selection from the
+  // anchor cell to the cell under the pointer, driven by OUR drag so it works
+  // regardless of xterm's app mouse-mode (no mode-fight with saikai/claude). A
+  // linear length that wraps across rows == the text a mouse-drag would grab.
+  function selectTo(x, y) {
+    const cc = cellAt(x, y);
+    const curIdx = cc[1] * term.cols + cc[0];
+    const a = Math.min(startIdx, curIdx), b = Math.max(startIdx, curIdx);
+    try { term.select(a % term.cols, Math.floor(a / term.cols), (b - a) + 1); } catch (e) {}
+  }
+  function drag(y, x) {                   // returns true once it consumes the move
     if (lastY === null || !controlOn || fatal) return false;
+    if (selectMode) { selectTo(x, y); return true; }
     accum += y - lastY; lastY = y;
     let moved = false;
     // pointer up (y decreases) -> see items below -> scroll the list DOWN.
@@ -1310,13 +1337,13 @@ term.onData((d) => {
   el.addEventListener('touchstart', (e) => {
     if (e.touches.length !== 1) { lastY = null; cancelLongPress(); return; }  // pinch -> browser
     begin(e.touches[0].clientX, e.touches[0].clientY);
-    armLongPress();                       // hold without moving -> context menu
+    if (!selectMode) armLongPress();      // hold without moving -> context menu (not while selecting)
   }, {passive: true});
   el.addEventListener('touchmove', (e) => {
     if (e.touches.length !== 1) return;
-    const ty = e.touches[0].clientY;
-    if (Math.abs(ty - pressY) > 10 || Math.abs(e.touches[0].clientX - pressX) > 10) cancelLongPress();
-    if (drag(ty)) e.preventDefault();     // we consumed this drag
+    const tx = e.touches[0].clientX, ty = e.touches[0].clientY;
+    if (Math.abs(ty - pressY) > 10 || Math.abs(tx - pressX) > 10) cancelLongPress();
+    if (drag(ty, tx)) e.preventDefault();  // we consumed this drag (scroll or select)
   }, {passive: false});
   el.addEventListener('touchend', end, {passive: true});
   // Mouse: a held LEFT-button drag scrolls the surface under the cursor. Listens
@@ -1326,16 +1353,68 @@ term.onData((d) => {
   el.addEventListener('mousedown', (e) => { if (e.button === 0) begin(e.clientX, e.clientY); });
   el.addEventListener('mousemove', (e) => {
     if (lastY === null || !(e.buttons & 1)) return;        // only while left held
-    if (drag(e.clientY)) e.preventDefault();
+    if (drag(e.clientY, e.clientX)) e.preventDefault();
   });
   window.addEventListener('mouseup', end);
   el.addEventListener('contextmenu', (e) => {
-    if (!controlOn || fatal) return;
+    if (!controlOn || fatal || selectMode) return;         // no row-menu while selecting
     e.preventDefault();
     const cc = cellAt(e.clientX, e.clientY);
     openMenu(e.clientX, e.clientY, cc[0], cc[1]);
   });
 })();
+
+// ── Copy to clipboard, LAN-safe: navigator.clipboard needs a secure context
+//    (https / localhost) which a plain-http LAN mirror is NOT, so fall back to a
+//    hidden-textarea + execCommand('copy'). Returns a promise-ish boolean. ──────
+function copyText(s) {
+  if (!s) return false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(s); return true;
+    }
+  } catch (e) {}
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = s; ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    const ok = document.execCommand('copy'); ta.remove(); return ok;
+  } catch (e) { return false; }
+}
+
+// ── SELECT mode: a slim bar (Copy / Done) shown only while selecting, so the
+//    default chrome stays minimal. Toggling drag semantics lives in selectMode. ─
+const selBar = document.createElement('div');
+selBar.id = 'selbar';
+selBar.style.cssText =
+  'position:fixed;left:0;right:0;display:none;gap:6px;justify-content:center;'+
+  'padding:6px;background:#243;z-index:10;font:bold 15px monospace;'+
+  'border-top:1px solid #4a4';
+selBar.innerHTML =
+  '<span id="sel-hint" style="align-self:center;color:#9d9;flex:1 1 auto;'+
+    'text-align:left;padding-left:6px">Drag to select · then Copy</span>'+
+  '<button id="sel-copy" style="min-height:44px">Copy</button>'+
+  '<button id="sel-done" style="min-height:44px">Done</button>';
+document.body.appendChild(selBar);
+function setSelectMode(on) {
+  selectMode = on;
+  selBar.style.display = on ? 'flex' : 'none';
+  applyTouchAction();
+  if (!on) { try { term.clearSelection(); } catch (e) {} }
+  const sb = document.getElementById('kb-select');
+  if (sb) sb.style.background = on ? '#3a3' : '';
+  fitChrome();
+}
+document.getElementById('sel-copy').addEventListener('click', (e) => {
+  e.preventDefault();
+  let s = ''; try { s = term.getSelection(); } catch (_) {}
+  const hint = document.getElementById('sel-hint');
+  if (!s) { hint.textContent = 'nothing selected — drag first'; return; }
+  hint.textContent = copyText(s) ? ('copied ' + s.length + ' chars') : 'copy failed';
+});
+document.getElementById('sel-done').addEventListener('click', (e) => {
+  e.preventDefault(); setSelectMode(false);
+});
 
 // ── On-screen key bar: fixed-position buttons -> POST /key. This is the ONLY
 //    channel for app-level keys: typed text rides /input -> the focused live
@@ -1356,15 +1435,21 @@ kbBar.style.cssText =
   'padding:4px;background:#222;z-index:9;font:bold 14px monospace';
 // Action keys grouped on the left; the four arrows form a d-pad cross on the
 // right (↑ over ←↓→) so list/dropdown navigation reads like a real keypad.
+// Primary row ordered by how often a remote hand reaches for each, grouped by
+// intent: cancel/confirm first, then the saikai command gestures, then the
+// text-select toggle, then More, with the four arrows as a d-pad cross on the
+// right (up over left/down/right) so list/dropdown navigation reads like a
+// real keypad. F12 (connection QR) moved to the secondary row — it's setup,
+// not a during-session key.
 kbBar.innerHTML =
   '<button data-k="escape">Esc</button>'+
-  '<button data-k="tab">Tab</button>'+
   '<button data-k="enter">&#9166; Enter</button>'+
+  '<button data-k="tab">Tab</button>'+
   '<button data-k="space">Leader</button>'+
   '<button id="kb-ctrl" data-k="">Ctrl</button>'+
   '<button data-k="ctrl+right_square_bracket">&#9776; List</button>'+
+  '<button id="kb-select" data-k="">&#9986; Select</button>'+
   '<button id="kb-more" data-k="">More</button>'+
-  '<button data-k="f12">F12</button>'+
   '<div id="kb-arrows">'+
     '<button data-k="up">&#8593;</button>'+
     '<button data-k="left">&#8592;</button>'+
@@ -1379,12 +1464,13 @@ kbBar.innerHTML =
     '<button data-k="slash">Find</button>'+
     '<button data-k="f5">Refresh</button>'+
     '<button data-k="shift+f3">Next!</button>'+
-    '<button data-k="f10">Close</button>'+
-    '<button data-k="f9">Copy</button>'+
+    '<button data-k="f10">Close pane</button>'+
+    '<button data-k="f9">Copy prompt</button>'+
     '<button data-k="shift+f2">Rename</button>'+
     '<button data-k="shift+f4">Restore</button>'+
     '<button data-k="f11">Notifs</button>'+
-    '<button data-k="shift+f11">Refresh</button>'+
+    '<button data-k="shift+f11">Compact</button>'+
+    '<button data-k="f12">Mirror QR</button>'+
     '<button data-k="pageup">PgUp</button>'+
     '<button data-k="pagedown">PgDn</button>'+
     '<button data-k="home">Top</button>'+
@@ -1399,6 +1485,10 @@ kbBar.querySelectorAll('button').forEach((b) => {
     if (b.id === 'kb-ctrl') {                 // arm/disarm the sticky modifier
       ctrlSticky = !ctrlSticky;
       kbCtrl.style.background = ctrlSticky ? '#3a3' : '';
+      return;
+    }
+    if (b.id === 'kb-select') {               // toggle drag-to-select-text mode
+      setSelectMode(!selectMode);
       return;
     }
     if (b.id === 'kb-more') {                 // reveal/hide the secondary action row
@@ -1427,7 +1517,13 @@ kbBar.querySelectorAll('button').forEach((b) => {
 function fitChrome() {
   const tdiv = document.getElementById('t');
   if (!tdiv) return;
-  tdiv.style.paddingTop = banner.offsetHeight + 'px';
+  // The select bar (when active) docks just under the status banner at the top.
+  let top = banner.offsetHeight;
+  if (selBar.style.display !== 'none') {
+    selBar.style.top = top + 'px';
+    top += selBar.offsetHeight;
+  }
+  tdiv.style.paddingTop = top + 'px';
   tdiv.style.paddingBottom = kbBar.offsetHeight + 'px';
 }
 fitChrome();

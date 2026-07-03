@@ -923,6 +923,72 @@ def test_page_wires_mouse_drag_to_scroll():
     assert "postMouse" in page and "scrollup" in page and "scrolldown" in page, page
 
 
+def test_page_wires_select_mode_and_copy():
+    """A Select toggle turns drag-to-scroll into drag-to-SELECT-text: the user
+    asked for mouse-drag range selection (a drag used to only scroll). While
+    selectMode is on, the drag drives a character-precise xterm selection
+    (term.select over a reading-order length that wraps rows) instead of scroll,
+    SGR taps are suppressed (a tap must not click a row mid-select), and a Copy
+    control reads term.getSelection() to the clipboard — with an execCommand
+    fallback because a plain-http LAN mirror is not a secure context, so
+    navigator.clipboard is unavailable. (Manual verification covers real drag
+    fidelity + clipboard.)"""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=80, rows=24)
+    hub.set_mouse_handler(lambda *a: None)
+    hub.set_key_handler(lambda *a: None)
+    port = hub.serve()
+    try:
+        page = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/?token=secret", timeout=3.0
+        ).read().decode("utf-8")
+    finally:
+        hub.stop()
+    # a Select toggle button + the mode state it flips.
+    assert 'id="kb-select"' in page, "no Select toggle in the key bar"
+    assert "selectMode" in page, "no select-mode state"
+    assert "setSelectMode" in page, "no select-mode toggle handler"
+    # the drag drives a real xterm selection (char-precise, not whole-line).
+    assert "term.select(" in page, "select mode must drive term.select()"
+    assert "getSelection" in page, "no way to read the selection for copy"
+    assert "clearSelection" in page, "toggling select off must clear the selection"
+    # a tap while selecting must NOT click a row (SGR forwarding suppressed).
+    assert "taps drive selection" in page or "selectMode) return" in page, \
+        "SGR mouse must be suppressed while selecting"
+    # Copy is LAN-safe: navigator.clipboard needs a secure context (https/
+    # localhost) which a plain-http LAN mirror is not — an execCommand fallback
+    # must exist so copy works over http.
+    assert "execCommand('copy')" in page, "no http-safe clipboard fallback"
+    assert 'id="sel-copy"' in page and 'id="sel-done"' in page, \
+        "no Copy/Done controls for select mode"
+    # touch-action must switch to 'none' so a select drag isn't stolen for pan.
+    assert "'none'" in page, "select mode must capture the drag (touch-action:none)"
+
+
+def test_page_key_bar_flow_and_labels():
+    """Key-bar layout follows the remote workflow and drops the confusing labels:
+    F12 (connection QR) is setup, not a during-session key, so it lives in the
+    secondary row as 'Mirror QR'; shift+f11 is /compact — labelling it 'Refresh'
+    collided with f5 Refresh, so it reads 'Compact' now (one Refresh only)."""
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=80, rows=24)
+    hub.set_key_handler(lambda *a: None)
+    port = hub.serve()
+    try:
+        page = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/?token=secret", timeout=3.0
+        ).read().decode("utf-8")
+    finally:
+        hub.stop()
+    # F12 present but wired to the secondary row with a descriptive label.
+    assert 'data-k="f12"' in page and ">Mirror QR<" in page, page
+    # shift+f11 relabelled Compact; exactly one "Refresh" (f5) — the collision is gone.
+    assert 'data-k="shift+f11"' in page and ">Compact<" in page, page
+    assert page.count("Refresh") == 1, \
+        f"'Refresh' must be unambiguous (f5 only), found {page.count('Refresh')}"
+    # the primary bar leads with Esc then Enter (confirm/cancel are the most-used).
+    assert page.index('data-k="escape"') < page.index('data-k="enter"') \
+        < page.index('data-k="tab"'), "primary bar not ordered by flow"
+
+
 def test_page_wires_long_press_context_menu():
     """Feature 4: a long-press (touch) / right-click (mouse) on a row opens a
     context menu whose buttons post saikai's existing row actions (resume / copy /
@@ -1038,5 +1104,7 @@ if __name__ == "__main__":
     test_page_key_bar_has_saikai_action_keys()
     test_page_wires_touch_swipe_to_scroll()
     test_page_wires_mouse_drag_to_scroll()
+    test_page_wires_select_mode_and_copy()
+    test_page_key_bar_flow_and_labels()
     test_page_wires_long_press_context_menu()
     print("OK test_mirror_input")
