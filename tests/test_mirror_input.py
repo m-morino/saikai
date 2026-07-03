@@ -975,6 +975,41 @@ def test_page_wires_select_mode_and_copy():
     assert "term.focus" in page.split('id="sel-copy"')[0] or "term.focus()" in page, page
 
 
+def test_page_inline_script_passes_csp():
+    """The hardened CSP (script-src 'self') BLOCKED the page's own inline
+    <script>: the mirror rendered NOTHING in a real browser while the
+    string-asserting tests stayed green — the exact mock-boundary bug class.
+    The inline script is now fully static (cols/rows ride <body data-*>) and
+    its sha256 hash is whitelisted in the CSP header; this test recomputes the
+    hash from the SERVED bytes and matches it against the SERVED header, so
+    any drift (a second inline script, an edit without a rehash) fails here
+    instead of blanking the page. (#audit-csp-inline)"""
+    import base64 as _b64
+    import hashlib as _hl
+    import re as _re
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, cols=61, rows=19)
+    port = hub.serve()
+    try:
+        resp = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/?token=secret", timeout=3.0)
+        page = resp.read().decode("utf-8")
+        csp = resp.headers.get("Content-Security-Policy", "")
+    finally:
+        hub.stop()
+    # cols/rows must NOT be substituted inside the script (that would change
+    # its hash per size) — they ride data attributes on <body>.
+    assert 'data-cols="61"' in page and 'data-rows="19"' in page, page[:300]
+    assert "__COLS__" not in page and "__ROWS__" not in page, "unsubstituted markers"
+    # exactly one inline script, and its hash is whitelisted in the header.
+    inline = _re.findall(r"<script>(.*?)</script>", page, _re.S)
+    assert len(inline) == 1, f"expected exactly ONE inline script, got {len(inline)}"
+    digest = _b64.b64encode(_hl.sha256(inline[0].encode("utf-8")).digest()).decode()
+    assert f"'sha256-{digest}'" in csp, \
+        f"served inline script hash not whitelisted by CSP: {csp}"
+    assert "script-src 'self'" in csp and "unsafe-inline" not in csp.split("style-src")[0], \
+        f"script-src must stay strict (self + hash only): {csp}"
+
+
 def test_page_key_bar_flow_and_labels():
     """Key-bar layout follows the remote workflow and drops the confusing labels:
     F12 (connection QR) is setup, not a during-session key, so it lives in the
@@ -1124,6 +1159,7 @@ if __name__ == "__main__":
     test_page_wires_touch_swipe_to_scroll()
     test_page_wires_mouse_drag_to_scroll()
     test_page_wires_select_mode_and_copy()
+    test_page_inline_script_passes_csp()
     test_page_key_bar_flow_and_labels()
     test_page_wires_long_press_context_menu()
     print("OK test_mirror_input")

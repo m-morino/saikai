@@ -1032,11 +1032,13 @@ flex:0 0 auto;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 #kb-arrows>[data-k="up"]{grid-area:up}#kb-arrows>[data-k="down"]{grid-area:down}
 #kb-arrows>[data-k="left"]{grid-area:left}#kb-arrows>[data-k="right"]{grid-area:right}
 #kb-arrows>button{min-width:52px;padding:8px 0;flex:0 0 auto}</style></head>
-<body><div id="t"></div>
+<body data-cols="__COLS__" data-rows="__ROWS__"><div id="t"></div>
 <script src="/xterm.min.js"></script>
 <script src="/addon-canvas.js"></script>
 <script>
-const term = new Terminal({cols: __COLS__, rows: __ROWS__, scrollback:0, convertEol:false});
+const term = new Terminal({cols: parseInt(document.body.dataset.cols, 10),
+                           rows: parseInt(document.body.dataset.rows, 10),
+                           scrollback:0, convertEol:false});
 term.open(document.getElementById('t'));
 try {
   const _CA = (window.CanvasAddon && window.CanvasAddon.CanvasAddon) || window.CanvasAddon;
@@ -1562,6 +1564,24 @@ window.addEventListener('resize', fitChrome);
 </script></body></html>"""
 
 
+# CSP hash of the page's ONE inline <script>. script-src 'self' alone BLOCKS
+# inline scripts — the hardening shipped with exactly that, so the mirror page
+# rendered NOTHING in a real browser (string-asserting tests and a Node harness
+# both bypass CSP; only a real browser run caught it). The script is fully
+# static now (cols/rows ride <body data-*>), so one import-time hash is exact.
+# (#audit-csp-inline)
+def _inline_script_hash() -> str:
+    import hashlib
+    import base64 as _b64
+    i = _PAGE_HTML.rindex("<script>") + len("<script>")
+    j = _PAGE_HTML.index("</script>", i)
+    digest = hashlib.sha256(_PAGE_HTML[i:j].encode("utf-8")).digest()
+    return "sha256-" + _b64.b64encode(digest).decode("ascii")
+
+
+_INLINE_SCRIPT_HASH = _inline_script_hash()
+
+
 class _Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):           # silence default stderr logging
         pass
@@ -1601,7 +1621,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy",
-                         "default-src 'self'; script-src 'self'; connect-src 'self'; "
+                         "default-src 'self'; "
+                         f"script-src 'self' '{_INLINE_SCRIPT_HASH}'; "
+                         "connect-src 'self'; "
                          "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
                          "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
@@ -1708,6 +1730,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path in self._STATIC:               # public library asset; no token
             self._serve_static(path, self._STATIC[path])
+            return
+        if path == "/favicon.ico":             # tokenless browser request; not an auth failure
+            self.send_error(404)
             return
         if not self._token_ok():
             self.send_error(403, "forbidden")
