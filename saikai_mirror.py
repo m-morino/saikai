@@ -11,6 +11,7 @@ import base64
 import collections
 import hmac
 import http.server
+import ipaddress
 import json
 import os
 import queue
@@ -66,16 +67,26 @@ def _paste_framing_ok(data: str) -> bool:
 
 def _norm_src(ip: str) -> str:
     """Collapse a peer address to a stable lockout identity so one attacker can't
-    rotate identities to dodge the per-source cooldown: strip the IPv4-mapped-IPv6
-    prefix (so '::ffff:1.2.3.4' and '1.2.3.4' are ONE source), and truncate a real
-    IPv6 address to its /64 prefix (a single LAN host owns every address in its
-    prefix and SLAAC privacy addresses rotate within it)."""
+    rotate identities to dodge the per-source cooldown / connection cap: a
+    v4-mapped-v6 address folds to its bare v4 (so '::ffff:1.2.3.4' and '1.2.3.4'
+    are ONE source), and a real IPv6 address folds to its /64 network (a single
+    LAN host owns every address in its prefix and SLAAC privacy addresses rotate
+    within it). Canonicalised via `ipaddress` so the SAME address in different
+    textual forms (compressed '2001:db8::1' vs expanded) maps to ONE key — a naive
+    string split would give a compressed and an expanded form two buckets and hand
+    the attacker back the identity-rotation it's meant to prevent."""
     ip = (ip or "?").strip()
-    if ip.startswith("::ffff:") and "." in ip:
-        return ip[7:]                       # v4-mapped-v6 → the bare v4 string
-    if ":" in ip:                           # real IPv6 → /64 (first four hextets)
-        return ":".join(ip.split(":")[:4]) + "::/64"
-    return ip
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip                            # hostname / "?" / malformed → as-is
+    if addr.version == 6:
+        mapped = addr.ipv4_mapped
+        if mapped is not None:
+            return str(mapped)               # ::ffff:v4 → the bare v4
+        net = ipaddress.ip_network((int(addr) >> 64 << 64, 64))
+        return f"{net.network_address}/64"   # canonical /64 network address
+    return str(addr)                         # canonical v4
 
 
 # pyte stores a colour as: a basic name, a "bright"+name, a 6-hex string
@@ -451,8 +462,16 @@ class MirrorHub:
             import ssl
             certfile, keyfile = self._tls
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2   # explicit; don't inherit a weak default
             ctx.load_cert_chain(certfile, keyfile)
-            self._httpd.socket = ctx.wrap_socket(self._httpd.socket, server_side=True)
+            # do_handshake_on_connect=False: the TLS handshake would otherwise run
+            # inside accept() on the single serve_forever thread, so a peer that
+            # completes the TCP connect then stalls the ClientHello would freeze the
+            # ENTIRE accept loop (no per-connection timeout applies there). Deferring
+            # it moves the handshake into the per-connection handler thread, under
+            # both _CONN_TIMEOUT and the verify_request connection caps. (#audit-mirror-tls-accept)
+            self._httpd.socket = ctx.wrap_socket(
+                self._httpd.socket, server_side=True, do_handshake_on_connect=False)
         threading.Thread(target=self._httpd.serve_forever,
                          name="saikai-mirror-http", daemon=True).start()
         self._drain = threading.Thread(target=self._drain_loop,
@@ -681,7 +700,7 @@ class MirrorHub:
     def url(self) -> str:
         # 0.0.0.0/"" is a bind wildcard, not browsable — resolve a reachable host
         # (the primary LAN/egress IP) so the URL works from another device.
-        host = _lan_ip() if self._host in ("0.0.0.0", "") else self._host
+        host = _lan_ip() if self._host in ("0.0.0.0", "::", "") else self._host
         if ":" in host and not host.startswith("["):
             host = f"[{host}]"   # bracket an IPv6 literal so the URL authority parses
         return f"{self._scheme}://{host}:{self._port}/?token={self._token}"
@@ -698,13 +717,23 @@ def mirror_config(env: dict) -> tuple[bool, str]:
     (#audit-mirror-wildcard-bind)"""
     val = str(env.get("SAIKAI_MIRROR", "")).strip().lower()
     enabled = val in ("1", "true", "yes", "on")
-    host = str(env.get("SAIKAI_MIRROR_HOST", "")).strip() or "127.0.0.1"
+    requested = str(env.get("SAIKAI_MIRROR_HOST", "")).strip()
+    host = requested or "127.0.0.1"
     if host in ("0.0.0.0", "::", ""):
         allow_all = str(env.get("SAIKAI_MIRROR_ALLOW_ALL_INTERFACES", "")
                         ).strip().lower() in ("1", "true", "yes", "on")
         if not allow_all:
             lan = _lan_ip()
             host = lan if lan != "127.0.0.1" else "127.0.0.1"
+            # Don't silently rebind what the user explicitly typed — surface the
+            # substitution (and the loopback-only fallback when offline) so a
+            # "why can't my phone connect" isn't a silent mystery. (#audit-mirror-wildcard-bind)
+            if enabled and requested in ("0.0.0.0", "::"):
+                _msg = (f"  ⚠ SAIKAI_MIRROR_HOST={requested} (wildcard) → binding {host}"
+                        + ("" if host != "127.0.0.1"
+                           else " (no LAN IP detected → loopback only)")
+                        + "; set SAIKAI_MIRROR_ALLOW_ALL_INTERFACES=1 to bind all interfaces")
+                print(_msg, file=sys.stderr)
     return enabled, host
 
 
@@ -739,12 +768,28 @@ def _openssl_run(argv: list, timeout: float) -> int:
         return 1
 
 
+def _cert_covers(certf: str, ips: set) -> bool:
+    """True if the cert's SANs already cover every address in `ips` — so a cached
+    cert is only reused while it still matches the current URL host. A network
+    change (new DHCP lease / different Wi-Fi) otherwise reuses a cert whose SAN no
+    longer matches, and the browser hard-fails past even the self-signed warning."""
+    try:
+        import ssl
+        txt = ssl._ssl._test_decode_cert(certf)   # dict incl. subjectAltName
+    except Exception:
+        return False
+    san_ips = {v for k, v in txt.get("subjectAltName", ()) if k == "IP Address"}
+    return ips.issubset(san_ips)
+
+
 def _gen_self_signed(cache_dir, host: str = "") -> "tuple[str, str] | None":
     """A cached self-signed cert/key under cache_dir, generated via openssl (the
     stdlib can serve TLS but can't MINT a cert). Reused across runs while still
-    valid so the browser isn't asked to re-trust every launch. Returns (cert, key)
-    or None when openssl is absent / generation fails → caller warns and stays
-    HTTP. SANs cover loopback + the detected LAN IP so the cert matches the URL."""
+    valid AND still covering the current host, so the browser isn't asked to
+    re-trust every launch but a network change forces a fresh cert. Returns
+    (cert, key) or None when openssl is absent / generation fails → caller warns
+    and stays HTTP. An EC P-256 key (near-instant keygen, cheap handshake) keeps
+    startup fast on a Pi and blunts TLS-handshake CPU amplification."""
     import os as _os
     import shutil
     from pathlib import Path
@@ -754,25 +799,43 @@ def _gen_self_signed(cache_dir, host: str = "") -> "tuple[str, str] | None":
     except OSError:
         return None
     certf, keyf = d / "mirror-cert.pem", d / "mirror-key.pem"
-    if certf.is_file() and keyf.is_file():
-        # -checkend 3600: exit 0 iff the cert is valid for at least another hour.
-        if _openssl_run(["openssl", "x509", "-checkend", "3600", "-noout",
-                         "-in", str(certf)], 5) == 0:
-            return (str(certf), str(keyf))
-    if not shutil.which("openssl"):
-        return None
     ips = {"127.0.0.1"}
     lan = _lan_ip()
     if lan and lan != "127.0.0.1":
         ips.add(lan)
     if host and host not in ("0.0.0.0", "", "::", "127.0.0.1", "localhost"):
         ips.add(host)
+    if certf.is_file() and keyf.is_file():
+        # Reuse only if it's valid for another hour AND still covers this host.
+        if (_openssl_run(["openssl", "x509", "-checkend", "3600", "-noout",
+                          "-in", str(certf)], 5) == 0
+                and _cert_covers(str(certf), ips)):
+            return (str(certf), str(keyf))
+    if not shutil.which("openssl"):
+        return None
     san = "subjectAltName=" + ",".join(
         ["DNS:localhost"] + [f"IP:{ip}" for ip in sorted(ips)])
-    rc = _openssl_run(
-        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "365",
-         "-nodes", "-keyout", str(keyf), "-out", str(certf),
-         "-subj", "/CN=saikai-mirror", "-addext", san], 30)
+    # Restrict the umask so the private key is NEVER group/world-readable, even in
+    # the window between openssl creating it and the chmod below (a TOCTOU an
+    # unprivileged local user / backup job could otherwise exploit). POSIX-only;
+    # os.umask is a no-op-ish on Windows but harmless.
+    old_umask = None
+    try:
+        old_umask = _os.umask(0o077)
+    except (AttributeError, OSError):
+        old_umask = None
+    try:
+        rc = _openssl_run(
+            ["openssl", "req", "-x509", "-newkey", "ec",
+             "-pkeyopt", "ec_paramgen_curve:P-256", "-sha256", "-days", "365",
+             "-nodes", "-keyout", str(keyf), "-out", str(certf),
+             "-subj", "/CN=saikai-mirror", "-addext", san], 30)
+    finally:
+        if old_umask is not None:
+            try:
+                _os.umask(old_umask)
+            except OSError:
+                pass
     if rc != 0:
         return None
     try:
@@ -1360,10 +1423,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # flood can't accumulate. (#audit-mirror-dos)
     timeout = _CONN_TIMEOUT
 
+    def end_headers(self) -> None:
+        """Inject the defense-in-depth headers into EVERY response — including the
+        stdlib send_error() rejections (403/404/413/503/…), which are exactly the
+        responses an attacker's probing sees most — by hooking the one method all
+        response paths funnel through, instead of a per-call-site header helper."""
+        self._security_headers()
+        super().end_headers()
+
     def _security_headers(self) -> None:
-        """Defense-in-depth headers on every response: block MIME sniffing, never
-        leak the tokened URL via Referer, and lock the page's origins down with a
-        CSP so a future template/asset bug can't exfiltrate or load off-origin."""
+        """Block MIME sniffing, never leak the tokened URL via Referer, and lock the
+        page's origins down with a CSP so a future template/asset bug can't
+        exfiltrate or load off-origin. Idempotent enough: end_headers runs once per
+        response, so each header is emitted exactly once."""
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy",
@@ -1411,7 +1483,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         port = self.server.hub._port
         hub_host = self.server.hub._host
         names = {"127.0.0.1", "localhost", "[::1]", "::1"}
-        if hub_host in ("0.0.0.0", ""):
+        if hub_host in ("0.0.0.0", "::", ""):
             # Wildcard bind: allow EVERY local IPv4, not just the one url() picked —
             # a phone reaching us by a different local address (multi-NIC, VPN +
             # LAN) would otherwise 403 even though it connected fine. Host-literal
@@ -1485,7 +1557,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")   # tokened page: never cache
-            self._security_headers()
             self.end_headers()
             self.wfile.write(body)
         elif path == "/stream":
@@ -1507,7 +1578,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "max-age=86400")
-        self._security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -1521,7 +1591,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
-        self._security_headers()
         self.end_headers()
         try:
             self._send_frame(snapshot)
@@ -1710,7 +1779,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _send_status(self, code):
         self.send_response(code)
         self.send_header("Content-Length", "0")
-        self._security_headers()
         self.end_headers()
 
 

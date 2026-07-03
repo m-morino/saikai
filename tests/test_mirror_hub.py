@@ -213,6 +213,11 @@ def test_norm_src_collapses_rotatable_identities():
     b = m._norm_src("2001:db8:1:2:1111:2222:3333:4444")
     assert a == b, "same /64 must map to one lockout identity"
     assert m._norm_src("2001:db8:1:9::1") != a, "different /64 stays distinct"
+    # The SAME address in compressed vs expanded form MUST map to one key (a naive
+    # string split gave two, handing back the identity-rotation this prevents).
+    assert m._norm_src("2001:db8::1:2:3:4") == m._norm_src("2001:db8:0:0:1:2:3:4")
+    # Malformed / hostname / sentinel pass through unchanged (no crash).
+    assert m._norm_src("not-an-ip") == "not-an-ip" and m._norm_src("?") == "?"
     # The write-key lockout keys through _norm_src, so two mapped forms share a bucket.
     hub = m.MirrorHub(token="t")
     hub._note_bad_key("::ffff:9.9.9.9")
