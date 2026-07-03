@@ -30,6 +30,52 @@ _Control = collections.namedtuple("_Control", ["json"])
 _BAD_KEY_LOCKOUT_THRESHOLD = 20
 _BAD_KEY_LOCKOUT_SECS = 30.0
 _BAD_KEY_TTL_SECS = 600.0   # idle sweep age for sub-threshold per-source entries
+# Read-token guessing gets its OWN per-source lockout (separate budget from the
+# write-key, so guessing one can't consume the other's) — the read token gates the
+# SSE stream that hands out the write-key, so hammering it must also be bounded.
+_BAD_TOKEN_LOCKOUT_THRESHOLD = 50
+# Availability caps (a single-user LAN mirror never needs many of any of these).
+# The connection + timeout caps bound an UNAUTHENTICATED Slowloris/socket flood
+# that would otherwise park a blocked thread per socket and freeze the host's own
+# UI thread; the client cap bounds a token-holder opening many SSE streams. (#audit-mirror-dos)
+_MAX_SSE_CLIENTS = 8        # concurrent /stream viewers
+_MAX_CONNECTIONS = 128      # concurrent accepted sockets, all sources
+_MAX_CONN_PER_IP = 16       # concurrent accepted sockets from one source IP
+_CONN_TIMEOUT = 20          # seconds; a socket idle on header/body reads is dropped
+
+
+def _paste_framing_ok(data: str) -> bool:
+    """Reject a browser /input batch that opens a bracketed paste (ESC[200~) and
+    embeds a raw ESC before the matching ESC[201~. A well-behaved browser client
+    never produces this (its JS flushes on every control byte); only a direct API
+    caller can, and it's the smuggling primitive that would reconstruct arbitrary
+    control bytes into the child PTY keystroke-by-keystroke via the parser's
+    escape-resolution fallback. Treat inside-paste as an unconditional raw region:
+    no interior ESC allowed. (#audit-mirror-paste-smuggle)"""
+    i = data.find("\x1b[200~")
+    while i != -1:
+        end = data.find("\x1b[201~", i + 6)
+        region = data[i + 6:] if end == -1 else data[i + 6:end]
+        if "\x1b" in region:                 # any ESC inside the paste body → smuggling
+            return False
+        if end == -1:
+            break
+        i = data.find("\x1b[200~", end + 6)
+    return True
+
+
+def _norm_src(ip: str) -> str:
+    """Collapse a peer address to a stable lockout identity so one attacker can't
+    rotate identities to dodge the per-source cooldown: strip the IPv4-mapped-IPv6
+    prefix (so '::ffff:1.2.3.4' and '1.2.3.4' are ONE source), and truncate a real
+    IPv6 address to its /64 prefix (a single LAN host owns every address in its
+    prefix and SLAAC privacy addresses rotate within it)."""
+    ip = (ip or "?").strip()
+    if ip.startswith("::ffff:") and "." in ip:
+        return ip[7:]                       # v4-mapped-v6 → the bare v4 string
+    if ":" in ip:                           # real IPv6 → /64 (first four hextets)
+        return ":".join(ip.split(":")[:4]) + "::/64"
+    return ip
 
 
 # pyte stores a colour as: a basic name, a "bright"+name, a 6-hex string
@@ -176,7 +222,9 @@ class MirrorHub:
         # return can't grow it for the life of the process. (#audit-mirror-ratecap)
         self._bad_key_lock = threading.Lock()
         # src IP -> (consecutive bad keys, lockout deadline, last seen) — monotonic.
+        # Two independent budgets: write-key guesses and read-token guesses.
         self._bad_key: dict[str, tuple[int, float, float]] = {}
+        self._bad_token: dict[str, tuple[int, float, float]] = {}
         self._last_accept_t = 0.0
         # Accepted-input rate cap (seconds between accepted injects). Now actually
         # REACHABLE at runtime via env (was hardcoded 0.0 → the documented flood
@@ -215,38 +263,56 @@ class MirrorHub:
         except queue.Full:
             pass
 
-    def _note_bad_key(self, src: str = "?") -> None:
-        """Count a bad write-key attempt from `src`; arm a per-source cooldown at
-        the threshold so one peer's guesses can't lock out anyone else. Sweeps
-        entries idle past _BAD_KEY_TTL_SECS (and not locked) — many one-off
-        strangers must not leak an entry each forever."""
+    def _note_bad(self, store: dict, src: str, threshold: int) -> None:
+        """Count a bad-credential attempt from `src` into `store`; arm a per-source
+        cooldown at `threshold` so one peer's guesses can't lock out anyone else.
+        `src` is normalised (v4-mapped-v6 / IPv6-/64) so identity-rotation can't
+        dodge it. Sweeps entries idle past _BAD_KEY_TTL_SECS (and not locked) so
+        many one-off strangers can't leak an entry each forever."""
         import time as _t
+        src = _norm_src(src)
         now = _t.monotonic()
         with self._bad_key_lock:
-            for k in [k for k, (_, until, seen) in self._bad_key.items()
+            for k in [k for k, (_, until, seen) in store.items()
                       if now >= until and now - seen > _BAD_KEY_TTL_SECS]:
-                del self._bad_key[k]
-            n = self._bad_key.get(src, (0, 0.0, 0.0))[0] + 1
-            until = (now + _BAD_KEY_LOCKOUT_SECS
-                     if n >= _BAD_KEY_LOCKOUT_THRESHOLD else 0.0)
-            self._bad_key[src] = (n, until, now)
+                del store[k]
+            n = store.get(src, (0, 0.0, 0.0))[0] + 1
+            until = now + _BAD_KEY_LOCKOUT_SECS if n >= threshold else 0.0
+            store[src] = (n, until, now)
 
-    def _clear_bad_key(self, src: str = "?") -> None:
-        """A legit key from `src` clears its streak and any pending lockout."""
+    def _clear_bad(self, store: dict, src: str) -> None:
         with self._bad_key_lock:
-            self._bad_key.pop(src, None)
+            store.pop(_norm_src(src), None)
 
-    def _input_locked_out(self, src: str = "?") -> bool:
-        """True while `src`'s bad-key cooldown is active; auto-resets afterwards."""
+    def _locked_out(self, store: dict, src: str) -> bool:
         import time as _t
+        src = _norm_src(src)
         with self._bad_key_lock:
-            until = self._bad_key.get(src, (0, 0.0, 0.0))[1]
+            until = store.get(src, (0, 0.0, 0.0))[1]
             if until <= 0.0:
                 return False
             if _t.monotonic() < until:
                 return True
-            self._bad_key.pop(src, None)
+            store.pop(src, None)
             return False
+
+    # Write-key wrappers (public names kept for the tests + call sites).
+    def _note_bad_key(self, src: str = "?") -> None:
+        self._note_bad(self._bad_key, src, _BAD_KEY_LOCKOUT_THRESHOLD)
+
+    def _clear_bad_key(self, src: str = "?") -> None:
+        self._clear_bad(self._bad_key, src)
+
+    def _input_locked_out(self, src: str = "?") -> bool:
+        return self._locked_out(self._bad_key, src)
+
+    # Read-token wrappers (separate budget so guessing one secret can't consume the
+    # other's cooldown, and a token guess is bounded just like a write-key guess).
+    def _note_bad_token(self, src: str = "?") -> None:
+        self._note_bad(self._bad_token, src, _BAD_TOKEN_LOCKOUT_THRESHOLD)
+
+    def _token_locked_out(self, src: str = "?") -> bool:
+        return self._locked_out(self._bad_token, src)
 
     def broadcast(self, data: str) -> None:
         """Called from Textual's UI thread (MirrorDriver.write). MUST NOT block.
@@ -276,12 +342,18 @@ class MirrorHub:
                 pass   # never block the UI thread
 
     def _add_client(self):
+        """Register a new SSE viewer. Returns (cq, snapshot), or (None, None) when
+        the concurrent-viewer cap is hit — a single-user mirror never needs many
+        streams, so the cap bounds a token-holder opening streams in a loop (each
+        one forces a UI-thread repaint)."""
         cq: "queue.Queue[Optional[str]]" = queue.Queue(256)
         # Snapshot + registration ATOMIC vs the drain thread's feed, so no diff
         # is lost or applied twice across the join boundary.
         with self._mirror_lock:
             snapshot = _synth_full_frame(self._screen, self._cols, self._rows)
             with self._clients_lock:
+                if len(self._clients) >= _MAX_SSE_CLIENTS:
+                    return None, None
                 self._clients.add(cq)
         if self._repaint_request is not None:
             try:
@@ -559,6 +631,12 @@ class MirrorHub:
                 item = self._inject_q.get(timeout=0.25)
             except queue.Empty:
                 continue
+            # Re-check the advisory gate at DISPATCH time, not just at enqueue: an
+            # item queued the instant before idle auto-off (or a Shift+F12 toggle)
+            # must not still be delivered after control went OFF. Fails closed —
+            # the hub flag is set to False synchronously, before the app copy. (#audit-mirror-idle-race)
+            if not self._control_enabled:
+                continue
             try:
                 if isinstance(item, tuple) and item:
                     tag = item[0]
@@ -595,10 +673,23 @@ class MirrorHub:
 
 
 def mirror_config(env: dict) -> tuple[bool, str]:
-    """(enabled, host) from the environment. OFF unless SAIKAI_MIRROR is truthy."""
+    """(enabled, host) from the environment. OFF unless SAIKAI_MIRROR is truthy.
+
+    A wildcard bind (0.0.0.0 / ::) exposes the mirror on EVERY interface the host
+    has — including a corporate VPN, a Docker/WSL bridge, or a Tailscale tunnel —
+    which is far wider than 'my LAN'. Refuse it unless the operator explicitly
+    opts in with SAIKAI_MIRROR_ALLOW_ALL_INTERFACES=1; otherwise fall back to the
+    single detected LAN IP so the listen surface matches the QR the user shares.
+    (#audit-mirror-wildcard-bind)"""
     val = str(env.get("SAIKAI_MIRROR", "")).strip().lower()
     enabled = val in ("1", "true", "yes", "on")
     host = str(env.get("SAIKAI_MIRROR_HOST", "")).strip() or "127.0.0.1"
+    if host in ("0.0.0.0", "::", ""):
+        allow_all = str(env.get("SAIKAI_MIRROR_ALLOW_ALL_INTERFACES", "")
+                        ).strip().lower() in ("1", "true", "yes", "on")
+        if not allow_all:
+            lan = _lan_ip()
+            host = lan if lan != "127.0.0.1" else "127.0.0.1"
     return enabled, host
 
 
@@ -1167,12 +1258,38 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     # HTTP/1.1 so keep-alive + SSE behave; ALWAYS emit Content-Length or use 204.
     protocol_version = "HTTP/1.1"
+    # StreamRequestHandler.setup() applies this via socket.settimeout(), so a peer
+    # that stalls on a header/body read (Slowloris) is dropped instead of parking a
+    # blocked thread forever. Long enough for a real slow phone; short enough that a
+    # flood can't accumulate. (#audit-mirror-dos)
+    timeout = _CONN_TIMEOUT
+
+    def _security_headers(self) -> None:
+        """Defense-in-depth headers on every response: block MIME sniffing, never
+        leak the tokened URL via Referer, and lock the page's origins down with a
+        CSP so a future template/asset bug can't exfiltrate or load off-origin."""
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'self'; connect-src 'self'; "
+                         "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                         "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
     def _token_ok(self) -> bool:
+        # Per-source lockout on read-token guessing (its own budget, keyed to the
+        # normalised peer) — the token gates the SSE stream that hands out the
+        # write-key, so hammering it must be bounded like the write-key is. (#audit-mirror-ratecap)
+        hub = self.server.hub
+        src = self.client_address[0] if self.client_address else "?"
+        if hub._token_locked_out(src):
+            return False
         from urllib.parse import urlparse, parse_qs
         q = parse_qs(urlparse(self.path).query)
         got = (q.get("token") or [""])[0]
-        return hmac.compare_digest(got, self.server.hub._token)
+        ok = hmac.compare_digest(got, hub._token)
+        if not ok:
+            hub._note_bad_token(src)
+        return ok
 
     def _write_key_ok(self) -> bool:
         hub = self.server.hub
@@ -1269,6 +1386,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")   # tokened page: never cache
+            self._security_headers()
             self.end_headers()
             self.wfile.write(body)
         elif path == "/stream":
@@ -1290,17 +1409,22 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "max-age=86400")
+        self._security_headers()
         self.end_headers()
         self.wfile.write(body)
 
     def _stream(self):
         hub = self.server.hub
+        cq, snapshot = hub._add_client()
+        if cq is None:                       # viewer cap hit — don't hold a thread
+            self._reject(503, "too many viewers", drain=False)
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
+        self._security_headers()
         self.end_headers()
-        cq, snapshot = hub._add_client()
         try:
             self._send_frame(snapshot)
             # Write-key (only ever over this authenticated channel) + current
@@ -1410,8 +1534,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._reject(413, "payload too large", drain=False); return None
         raw = self.rfile.read(length) if length else b""
         try:
+            # RecursionError (a RuntimeError, NOT a ValueError) is reachable from a
+            # small deeply-nested body well under the cap — catch it so a crafted
+            # payload can't abort the handler uncleanly / spam a traceback. (#audit-mirror-json)
             obj = json.loads(raw.decode("utf-8")) if raw else {}
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             self.send_error(400, "bad json"); return None
         if not isinstance(obj, dict):
             self.send_error(400, "bad json"); return None
@@ -1428,6 +1555,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         if data == "":
             self._send_status(204)                      # no-op, but accepted
+            return
+        if not _paste_framing_ok(data):
+            self.send_error(400, "bad paste framing")   # ESC smuggled inside a paste
             return
         if not hub._control_enabled:                    # advisory fast-reject
             self.send_error(409, "control off")
@@ -1449,6 +1579,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 or not isinstance(row, int) or isinstance(row, bool)
                 or not isinstance(button, int) or isinstance(button, bool)
                 or kind not in self._MOUSE_KINDS):
+            self.send_error(400, "bad mouse")
+            return
+        # Range-bound the coordinates at the mirror layer too (the app layer clamps
+        # as well) so a crafted huge/negative col/row can't reach the encoder. (#audit-mirror-mouse-range)
+        if not (0 <= col < 100000 and 0 <= row < 100000 and 0 <= button < 256):
             self.send_error(400, "bad mouse")
             return
         if not hub._control_enabled:
@@ -1477,11 +1612,45 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _send_status(self, code):
         self.send_response(code)
         self.send_header("Content-Length", "0")
+        self._security_headers()
         self.end_headers()
 
 
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        # Concurrent-connection accounting for the DoS caps. verify_request rejects
+        # a socket BEFORE a handler thread is spawned, so an unauthenticated flood
+        # can't park a blocked thread per connection and freeze the host UI thread.
+        self._conn_lock = threading.Lock()
+        self._conn_total = 0
+        self._conn_per_ip: dict = {}
+        self._conn_ip: dict = {}     # request socket -> normalised ip (for decrement)
+        super().__init__(*args, **kwargs)
+
+    def verify_request(self, request, client_address):
+        ip = _norm_src(client_address[0]) if client_address else "?"
+        with self._conn_lock:
+            if (self._conn_total >= _MAX_CONNECTIONS
+                    or self._conn_per_ip.get(ip, 0) >= _MAX_CONN_PER_IP):
+                return False                 # over cap → socket closed, no thread
+            self._conn_total += 1
+            self._conn_per_ip[ip] = self._conn_per_ip.get(ip, 0) + 1
+            self._conn_ip[request] = ip
+        return True
+
+    def shutdown_request(self, request):
+        with self._conn_lock:
+            ip = self._conn_ip.pop(request, None)   # only accepted sockets were counted
+            if ip is not None:
+                self._conn_total -= 1
+                n = self._conn_per_ip.get(ip, 0) - 1
+                if n <= 0:
+                    self._conn_per_ip.pop(ip, None)
+                else:
+                    self._conn_per_ip[ip] = n
+        super().shutdown_request(request)
     # POSIX: SO_REUSEADDR lets a restart rebind a port still in TIME_WAIT.
     # Windows: SO_REUSEADDR instead lets a SECOND process bind the same port
     # (hijack/share) — two saikai instances would then both "listen" on the

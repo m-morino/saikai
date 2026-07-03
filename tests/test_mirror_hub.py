@@ -84,8 +84,13 @@ def test_env_gate_default_off():
     import saikai_mirror as _m
     assert _m.mirror_config({}) == (False, "127.0.0.1")
     assert _m.mirror_config({"SAIKAI_MIRROR": "1"}) == (True, "127.0.0.1")
-    assert _m.mirror_config({"SAIKAI_MIRROR": "0", "SAIKAI_MIRROR_HOST": "0.0.0.0"}) == (False, "0.0.0.0")
-    assert _m.mirror_config({"SAIKAI_MIRROR": "1", "SAIKAI_MIRROR_HOST": "0.0.0.0"}) == (True, "0.0.0.0")
+    # A wildcard bind is refused unless explicitly opted in: 0.0.0.0 falls back to a
+    # concrete address (the LAN IP, or loopback offline), never stays 0.0.0.0. (#audit-mirror-wildcard-bind)
+    en, host = _m.mirror_config({"SAIKAI_MIRROR": "1", "SAIKAI_MIRROR_HOST": "0.0.0.0"})
+    assert en is True and host != "0.0.0.0"
+    # ...but WITH the opt-in, the wildcard is honored verbatim.
+    assert _m.mirror_config({"SAIKAI_MIRROR": "1", "SAIKAI_MIRROR_HOST": "0.0.0.0",
+                             "SAIKAI_MIRROR_ALLOW_ALL_INTERFACES": "1"}) == (True, "0.0.0.0")
 
 
 def test_url_includes_token_and_resolves_wildcard_host():
@@ -198,7 +203,68 @@ def test_min_accept_gap_reads_env():
     assert m.MirrorHub(token="t")._min_accept_gap == 0.0   # absent → off (no regression)
 
 
+def test_norm_src_collapses_rotatable_identities():
+    """A lockout key must be stable so an attacker can't rotate source identities:
+    v4-mapped-v6 collapses to the bare v4, and an IPv6 address collapses to its
+    /64 prefix (one host owns the whole prefix). (#audit-mirror-ratecap)"""
+    assert m._norm_src("::ffff:1.2.3.4") == "1.2.3.4"
+    assert m._norm_src("1.2.3.4") == "1.2.3.4"
+    a = m._norm_src("2001:db8:1:2:aaaa:bbbb:cccc:dddd")
+    b = m._norm_src("2001:db8:1:2:1111:2222:3333:4444")
+    assert a == b, "same /64 must map to one lockout identity"
+    assert m._norm_src("2001:db8:1:9::1") != a, "different /64 stays distinct"
+    # The write-key lockout keys through _norm_src, so two mapped forms share a bucket.
+    hub = m.MirrorHub(token="t")
+    hub._note_bad_key("::ffff:9.9.9.9")
+    assert "9.9.9.9" in hub._bad_key and "::ffff:9.9.9.9" not in hub._bad_key
+
+
+def test_read_token_has_its_own_lockout():
+    """The read token gets a per-source lockout in a SEPARATE budget from the
+    write-key, so guessing one can't consume the other's cooldown. (#audit-mirror-ratecap)"""
+    hub = m.MirrorHub(token="t")
+    src = "10.1.1.1"
+    assert hub._token_locked_out(src) is False
+    for _ in range(m._BAD_TOKEN_LOCKOUT_THRESHOLD):
+        hub._note_bad_token(src)
+    assert hub._token_locked_out(src) is True
+    # separate budget: write-key lockout for the same src is untouched.
+    assert hub._input_locked_out(src) is False
+    assert src in hub._bad_token and src not in hub._bad_key
+
+
+def test_paste_framing_rejects_embedded_esc():
+    """A bracketed-paste region with an interior raw ESC is the injection-smuggling
+    pattern; a well-behaved browser never sends it. (#audit-mirror-paste-smuggle)"""
+    assert m._paste_framing_ok("\x1b[200~hello world\x1b[201~") is True
+    assert m._paste_framing_ok("plain keystrokes \x1b[A") is True   # arrow key, no paste
+    assert m._paste_framing_ok("\x1b[200~a\x1b]52;c;AAAA\x07b\x1b[201~") is False
+    assert m._paste_framing_ok("\x1b[200~no end marker but \x1b here") is False
+
+
+def test_add_client_caps_concurrent_viewers():
+    """The SSE viewer cap bounds a token-holder opening streams in a loop (each
+    forces a UI-thread repaint). Over cap → (None, None), no registration. (#audit-mirror-dos)"""
+    hub = m.MirrorHub(token="t", cols=4, rows=2)
+    held = []
+    for _ in range(m._MAX_SSE_CLIENTS):
+        cq, snap = hub._add_client()
+        assert cq is not None
+        held.append(cq)
+    cq, snap = hub._add_client()            # one past the cap
+    assert cq is None and snap is None
+    assert hub.client_count() == m._MAX_SSE_CLIENTS
+
+
 if __name__ == "__main__":
+    test_norm_src_collapses_rotatable_identities()
+    print("PASS test_norm_src_collapses_rotatable_identities")
+    test_read_token_has_its_own_lockout()
+    print("PASS test_read_token_has_its_own_lockout")
+    test_paste_framing_rejects_embedded_esc()
+    print("PASS test_paste_framing_rejects_embedded_esc")
+    test_add_client_caps_concurrent_viewers()
+    print("PASS test_add_client_caps_concurrent_viewers")
     test_broadcast_is_nonblocking_and_drops_oldest()
     test_broadcast_overflow_flags_resync()
     test_resync_client_replaces_backlog_with_snapshot_and_control()
