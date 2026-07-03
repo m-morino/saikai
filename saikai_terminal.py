@@ -2283,9 +2283,19 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             pass
 
     def on_blur(self, event=None) -> None:
-        # Hide the native cursor (Windows) so an unfocused pane / the list doesn't
-        # carry a stray cursor.
-        self._show_hw_cursor(False)
+        # Hide the native cursor so an unfocused pane / the list doesn't carry a
+        # stray cursor — but NOT when focus moved to a widget that OWNS the cursor
+        # (the search Input / a TextArea copy-mode): it needs the cursor visible at
+        # its OWN caret. Forcing ?25l here made WT anchor the IME composition window
+        # at the last-VISIBLE cell (this pane's prompt) instead of the search box.
+        # (#ime-search-cursor)
+        try:
+            from textual.widgets import Input, TextArea
+            _hands_off = isinstance(self.screen.focused, (Input, TextArea))
+        except Exception:
+            _hands_off = False
+        if not _hands_off:
+            self._show_hw_cursor(False)
         if getattr(self, "_focus_reporting", False):                # ?1004: tell the child it lost focus
             self._send_to_child("\x1b[O")
         self._cancel_forwarded_drag()          # a lost MouseUp must not stick capture
