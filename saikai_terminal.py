@@ -2516,6 +2516,13 @@ class LiveSessionManager:
         old is absent."""
         if old_sid == new_sid or old_sid not in self._terms:
             return
+        if new_sid in self._terms:
+            # The target sid already has its OWN registered pane (a user opened
+            # the child row in the seconds before the checkpoint re-key landed).
+            # Overwriting would silently orphan that live pane's bookkeeping —
+            # keep both intact instead; the old pane just stays keyed as-is
+            # (same degraded-but-safe behaviour as a failed child detect).
+            return
         self._terms[new_sid] = self._terms.pop(old_sid)
         if old_sid in self._status:
             self._status[new_sid] = self._status.pop(old_sid)
@@ -2591,7 +2598,13 @@ STATUS_GLYPH = {
 
 def tab_label(title: str, status: str) -> str:
     """Build a TabPane label like '~ saikai' / '? docs' / 'x myproj' — the same
-    status glyphs the session list uses."""
+    status glyphs the session list uses.
+
+    Titles derive from USER content (the first message, an AI title), so strip
+    ANSI escapes and collapse control chars/newlines BEFORE truncating — a
+    "\\n" or ESC sequence in a tab label corrupts the whole tab bar, and
+    slicing first could cut an escape sequence in half. (#audit-hostile-title)"""
     glyph = STATUS_GLYPH.get(status, "")
-    name = (title or "agent")[:18]
+    name = _ANSI_RE.sub("", str(title or "agent"))
+    name = re.sub(r"[\x00-\x1f\x7f]+", " ", name).strip()[:18] or "agent"
     return f"{glyph} {name}".strip()

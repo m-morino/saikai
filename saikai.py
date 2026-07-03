@@ -763,7 +763,12 @@ def _load_custom_titles() -> dict:
     if _CUSTOM_TITLES_CACHE is not None and m == _CUSTOM_TITLES_MTIME:
         return _CUSTOM_TITLES_CACHE
     raw = _read_json(CUSTOM_TITLES_FILE, {})
-    _CUSTOM_TITLES_CACHE = raw if isinstance(raw, dict) else {}
+    # keep only str->str entries: a hand-edited/corrupt value (dict, int) would
+    # otherwise flow into the title pipeline and TypeError at render slicing,
+    # breaking every list rebuild until the file is fixed. (#audit-hostile-files)
+    _CUSTOM_TITLES_CACHE = ({k: v for k, v in raw.items()
+                             if isinstance(k, str) and isinstance(v, str)}
+                            if isinstance(raw, dict) else {})
     _CUSTOM_TITLES_MTIME = m
     return _CUSTOM_TITLES_CACHE
 
@@ -2462,6 +2467,8 @@ def git_commits_in_range(start_iso: str, end_iso: str, repo: Path) -> list[str]:
 
 # ── Formatting ───────────────────────────────────────────────────────────────
 def fmt_ts(iso: str) -> str:
+    if not isinstance(iso, str):
+        return ""          # None/int first_ts must not TypeError inside the except
     try:
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
         return dt.astimezone().strftime("%m/%d %H:%M")
@@ -3640,6 +3647,17 @@ def _ram_per_pane_mb() -> float:
 _CTX_USAGE_CACHE: dict = {}    # str(path) -> (mtime, size, (tokens, model))
 
 
+def _usage_int(v) -> int:
+    """Coerce a transcript usage field to int, best-effort. Healthy transcripts
+    carry ints, but one corrupt/foreign record ("12k", None, a float string)
+    must degrade to 0 — the raw int() here leaked ValueError/TypeError out of
+    the gauge on every statusbar rebuild. (#audit-hostile-usage)"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _ctx_usage_from_jsonl(path) -> "tuple[int | None, str | None]":
     """(live context size, model id) from the LAST transcript record that carries a
     usage block: tokens = input + cache_read + cache_creation input tokens (the
@@ -3682,9 +3700,9 @@ def _ctx_usage_from_jsonl(path) -> "tuple[int | None, str | None]":
             continue
         if isinstance(u, dict) and "input_tokens" in u:
             _model = msg.get("model") if isinstance(msg, dict) else None
-            _toks = (int(u.get("input_tokens", 0))
-                     + int(u.get("cache_read_input_tokens", 0))
-                     + int(u.get("cache_creation_input_tokens", 0)))
+            _toks = (_usage_int(u.get("input_tokens"))
+                     + _usage_int(u.get("cache_read_input_tokens"))
+                     + _usage_int(u.get("cache_creation_input_tokens")))
             # Skip <synthetic> / all-zero interrupt records (written on Esc / abort /
             # API error): they carry a usage block but 0 tokens, so accepting one as
             # the "last usage" would make the gauge read 0K (empty/green) and MASK a
@@ -3698,9 +3716,9 @@ def _ctx_usage_from_jsonl(path) -> "tuple[int | None, str | None]":
     if last is None:
         result = (None, None)
     else:
-        tokens = (int(last.get("input_tokens", 0))
-                  + int(last.get("cache_read_input_tokens", 0))
-                  + int(last.get("cache_creation_input_tokens", 0)))
+        tokens = (_usage_int(last.get("input_tokens"))
+                  + _usage_int(last.get("cache_read_input_tokens"))
+                  + _usage_int(last.get("cache_creation_input_tokens")))
         result = (tokens, last_model)
     _CTX_USAGE_CACHE[key] = (mtime, size, result)   # cache the (None,None) too
     return result
@@ -4202,6 +4220,8 @@ def _live_ram_segment(cnt, att, ms, fit, per_pane_mb, max_load) -> str:
 
 
 def _ctx_severity(pct) -> str:
+    if pct is None:
+        return "ok"        # unknown fill reads calm, never TypeErrors (#audit-hostile-usage)
     if pct >= 0.70:
         return "crit"
     if pct >= 0.55:
@@ -7465,8 +7485,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             opened = 0
             skipped = {"no_id": 0, "already_live": 0, "no_cwd": 0}
             for row in cands:
-                sid = (row.get("id") if isinstance(row, dict) else row) or ""
-                if not sid:
+                sid = row.get("id") if isinstance(row, dict) else row
+                if not isinstance(sid, str) or not sid:
+                    # a corrupt open-panes entry (int/null/nested) must be skipped,
+                    # not TypeError later at sid[:8]. (#audit-hostile-files)
                     skipped["no_id"] += 1
                     continue
                 if self._live.has(sid):

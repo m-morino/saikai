@@ -441,6 +441,50 @@ def test_ctx_gauge_segment_formats_and_colours():
     assert "[yellow]" in s3
 
 
+def test_hostile_inputs_degrade_instead_of_raising():
+    """Internal-layer hostile-input battery (#audit-hostile-*): every helper
+    that renders or parses USER-derived / on-disk data must degrade to a calm
+    default instead of raising — one corrupt record or hand-edited pref file
+    must never break every list rebuild."""
+    import json as _json
+    import tempfile as _tf
+    from pathlib import Path as _P
+    import saikai_terminal as st
+
+    # fmt_ts: None/int first_ts must not TypeError inside its except handler
+    assert saikai.fmt_ts(None) == ""
+    assert saikai.fmt_ts(12345) == ""
+    assert saikai.fmt_ts("garbage-string")[:7] == "garbage"
+    # _ctx_severity: unknown fill reads calm
+    assert saikai._ctx_severity(None) == "ok"
+    # usage coercion: corrupt/foreign usage fields degrade to 0, not ValueError
+    assert saikai._usage_int("12k") == 0
+    assert saikai._usage_int(None) == 0
+    assert saikai._usage_int(7) == 7
+    with _tf.TemporaryDirectory() as td:
+        j = _P(td) / "s.jsonl"
+        j.write_text(_json.dumps({
+            "type": "assistant", "timestamp": "2026-07-02T01:00:01.000Z",
+            "message": {"role": "assistant", "model": "claude-opus-4-8",
+                        "content": [{"type": "text", "text": "a"}],
+                        "usage": {"input_tokens": "12k", "output_tokens": -5,
+                                  "cache_read_input_tokens": None}}}) + "\n",
+            encoding="utf-8")
+        assert saikai._ctx_usage_from_jsonl(j) == (None, None)   # all-zero → skipped
+    # tab_label: newline/ANSI in a user-derived title must not corrupt the tab bar
+    lbl = st.tab_label("evil\ntitle \x1b[2Jx", "busy")
+    assert "\n" not in lbl and "\x1b" not in lbl and "evil title" in lbl
+    assert st.tab_label(None, "idle") == "= agent"
+    # rekey collision: never orphan an already-registered pane
+    m = st.LiveSessionManager(max_live=4)
+    a, b = object(), object()
+    m.register("parent", a)
+    m.register("child", b)
+    m.rekey("parent", "child")
+    assert m.get("child") is b and m.get("parent") is a, \
+        "rekey onto an existing sid must be a no-op, not an overwrite"
+
+
 def test_memory_safety_presets_and_override():
     """The one-knob memory_safety maps to gate-threshold presets: 'on' == the old
     per-OS defaults (no behaviour change), 'off' loosens the headroom, 'strict'
@@ -480,6 +524,8 @@ def test_memory_safety_presets_and_override():
 
 
 if __name__ == "__main__":
+    test_hostile_inputs_degrade_instead_of_raising()
+    print("PASS test_hostile_inputs_degrade_instead_of_raising")
     test_memory_safety_presets_and_override()
     print("PASS test_memory_safety_presets_and_override")
     test_na_cache_is_bounded()
