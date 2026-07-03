@@ -260,7 +260,8 @@ def _cfg(section: str, key: str, env_var: str, default, cast=str):
     cast-safe (a bad value → default). Empty env string is treated as unset."""
     v = os.environ.get(env_var)
     if v is None or (isinstance(v, str) and v == ""):
-        v = _load_config().get(section, {}).get(key, None)
+        _sec = _load_config().get(section)
+        v = _sec.get(key, None) if isinstance(_sec, dict) else None  # non-table section (#audit-codex-cfgshape)
     if v is None:
         return default
     try:
@@ -548,7 +549,8 @@ def _resolved_settings() -> list:
         ev = os.environ.get(env)
         if ev not in (None, ""):
             src, val = "env", ev
-        elif cfg.get(sec, {}).get(key) is not None:
+        elif (isinstance(cfg.get(sec), dict)
+              and cfg[sec].get(key) is not None):   # non-table section (#audit-codex-cfgshape)
             src, val = "config", cfg[sec][key]
         else:
             src, val = "default", default
@@ -700,7 +702,8 @@ def _log(msg: str) -> None:
 
 
 def _load_options() -> dict:
-    return _read_json(OPTIONS_FILE, {})
+    raw = _read_json(OPTIONS_FILE, {})
+    return raw if isinstance(raw, dict) else {}   # corrupt shape (#audit-codex-prefshape)
 
 
 def _save_options(opts: dict) -> None:
@@ -850,7 +853,10 @@ def _set_lineage(child: str, parent: str, parent_jsonl: str) -> None:
 
 
 def _load_set(path: Path) -> set[str]:
-    return set(_pref_cached(path, lambda: _read_json(path, []), []))
+    raw = _pref_cached(path, lambda: _read_json(path, []), [])
+    if not isinstance(raw, list):
+        return set()                               # corrupt shape (#audit-codex-prefshape)
+    return {x for x in raw if isinstance(x, str)}
 
 
 def _save_set(path: Path, ids: set[str]) -> None:
@@ -1117,13 +1123,13 @@ def _is_recent_now(s: dict, now_ts: float) -> bool:
     time — not the load-time is_recent snapshot, which goes stale as the picker
     stays open (a ':recent' search 40 min in would otherwise return the set that
     was recent AT LAUNCH). Uses the stored mtime; a reload re-stats it."""
-    return (now_ts - (s.get("mtime") or 0.0)) < 1800
+    return 0 <= (now_ts - (s.get("mtime") or 0.0)) < 1800   # future mtime ≠ recent (#audit-codex-futuremtime)
 
 
 def _is_active_now(s: dict, now_ts: float) -> bool:
     """True if running (live-registry snapshot) or touched < 5 min ago, evaluated
     against the current time (see _is_recent_now re: staleness)."""
-    return bool(s.get("is_open")) or (now_ts - (s.get("mtime") or 0.0)) < 300
+    return bool(s.get("is_open")) or 0 <= (now_ts - (s.get("mtime") or 0.0)) < 300  # (#audit-codex-futuremtime)
 
 
 def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
@@ -1569,6 +1575,9 @@ def _is_session_pid_live(pid: int, pid_index: "dict | None") -> bool:
 # ever targets os.getpid()'s tree, so it can never touch another session.
 _SHELL_ANCESTOR_NAMES = frozenset({
     "pwsh.exe", "powershell.exe", "cmd.exe", "bash.exe", "sh.exe", "zsh.exe",
+    # modern shells: absent, a tab launched from them anchored nothing and the
+    # terminal-close watchdog silently never armed (#audit-codex-shells)
+    "nu.exe", "fish.exe", "xonsh.exe", "elvish.exe", "powershell_ise.exe",
 })
 # Terminal emulators sit ABOVE the tab shell and survive a single-tab close, so
 # the ancestor walk stops here — the tab shell is the last shell seen before the
@@ -1873,9 +1882,12 @@ def _invalidate_active_sessions() -> None:
 
 def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> dict:
     """Wrap parsed session data with runtime state (active/recent/status)."""
-    # Clock skew (NTP correction, restored backup) can put mtime in the future
-    # → negative age_sec was incorrectly < 300 → falsely is_active. Floor at 0.
-    age_sec = max(0.0, time.time() - mtime)
+    # Clock skew (NTP correction, restored backup) can put mtime in the FUTURE.
+    # The old `max(0.0, …)` floor was meant to stop the false is_active but did
+    # the OPPOSITE: age 0 reads as "touched just now". A future mtime now maps
+    # to +inf age, so is_active/is_recent read False for it. (#audit-codex-futuremtime)
+    _raw_age = time.time() - mtime
+    age_sec = _raw_age if _raw_age >= 0 else float("inf")
     active = _load_active_sessions()
     cwd = parsed.get("cwd", "")
     # origin_cwd = where Claude originally indexed the session (first cwd in JSONL).
@@ -2673,6 +2685,8 @@ def _extract_edited_files(jsonl_path, limit: int = 8) -> list[str]:
                     obj = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(obj, dict):
+                    continue          # non-dict JSON line must not abort the scan (#audit-codex-nondict)
                 if obj.get("type") != "assistant":
                     continue
                 content = (obj.get("message") or {}).get("content", [])
@@ -2826,6 +2840,8 @@ def _render_preview_full(s: dict) -> str:
                     obj = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(obj, dict):
+                    continue          # (#audit-codex-nondict)
                 t = obj.get("type", "")
                 if t == "user":
                     text = _extract_text((obj.get("message") or {}).get("content", ""))
@@ -2861,6 +2877,8 @@ def _extract_session_changes(jsonl_path, max_ops: int = 40):
                     obj = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(obj, dict):
+                    continue          # non-dict JSON line must not abort the scan (#audit-codex-nondict)
                 if obj.get("type") != "assistant":
                     continue
                 content = (obj.get("message") or {}).get("content", [])
@@ -3969,6 +3987,8 @@ def _last_assistant_text_from_jsonl(path) -> "str | None":
                 obj = json.loads(ln)
             except Exception:
                 continue
+            if not isinstance(obj, dict):
+                continue              # (#audit-codex-nondict)
             if obj.get("type") != "assistant":
                 continue
             msg = obj.get("message") or {}
@@ -4051,6 +4071,8 @@ def _first_cwd_from_jsonl(path) -> "str | None":
                     obj = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(obj, dict):
+                    continue          # a [] line aborted b2 child detection (#audit-codex-nondict)
                 if isinstance(obj.get("cwd"), str) and obj["cwd"]:
                     return obj["cwd"]
     except OSError:
@@ -4075,6 +4097,8 @@ def _first_ts_from_jsonl(path) -> "str | None":
                     obj = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(obj, dict):
+                    continue          # (#audit-codex-nondict)
                 ts = obj.get("timestamp")
                 if isinstance(ts, str) and ts:
                     return ts
@@ -5100,7 +5124,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def compose(self) -> ComposeResult:
             with Vertical(id="oe-box"):
                 yield Static("[bold yellow]Already open elsewhere[/bold yellow]")
-                yield Static(f"[dim]'{self._title}' is open in another Claude "
+                from rich.markup import escape as _esc
+                # the title is USER content — unescaped, "[/x]" in it raised
+                # MarkupError and crashed the whole UI when this modal opened. (#audit-codex-oe-markup)
+                yield Static(f"[dim]'{_esc(self._title)}' is open in another Claude "
                              "window. Resuming starts a SECOND Claude on the same "
                              "conversation — they can clobber each other's writes.[/dim]")
                 yield Static("[dim]Enter resumes anyway · Esc cancels[/dim]")
@@ -10025,7 +10052,10 @@ def _child_spawn_env(base: "dict | None" = None) -> dict:
     if leaked_venv:
         bin_dir = "Scripts" if sys.platform == "win32" else "bin"
         venv_bin = str(Path(leaked_venv) / bin_dir)
-        cmp = (lambda p: p.lower()) if sys.platform == "win32" else (lambda p: p)
+        # normcase+normpath: "C:\Tmp\.venv\Scripts\" (trailing separator) or
+        # mixed slashes must still match, or the stale venv survives on PATH. (#audit-codex-venvpath)
+        def cmp(p):
+            return os.path.normcase(os.path.normpath(p)) if p else p
         parts = [p for p in env.get("PATH", "").split(os.pathsep) if cmp(p) != cmp(venv_bin)]
         env["PATH"] = os.pathsep.join(parts)
     return env
@@ -10627,6 +10657,8 @@ def _read_subagent_summary(agent_file: Path) -> dict:
                     obj = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(obj, dict):
+                    continue          # (#audit-codex-nondict)
                 summary["n_msgs"] += 1
                 ts = obj.get("timestamp") or ""
                 if ts and not summary["first_ts"]:
@@ -10845,7 +10877,8 @@ def _desktop_account_dir_from_config() -> Path | None:
     beats the mtime heuristic on a multi-account machine where a signed-out account
     was written more recently by an unrelated process. (#recon-desktop-acct)"""
     cfgdir = _DESKTOP_APPDATA / "Claude"
-    org = (_read_json(cfgdir / "cowork-enabled-cli-ops.json", {}) or {}).get("ownerAccountId")
+    _org_raw = _read_json(cfgdir / "cowork-enabled-cli-ops.json", {})
+    org = _org_raw.get("ownerAccountId") if isinstance(_org_raw, dict) else None  # (#audit-codex-desktopshape)
     if not org:
         return None
     cfg = _read_json(cfgdir / "config.json", {}) or {}
@@ -10935,7 +10968,8 @@ def _desktop_default_model(idx: Path) -> str | None:
     best_mtime = -1.0
     model = None
     for p in idx.glob("local_*.json"):
-        m = _read_json(p, {}).get("model")
+        _e = _read_json(p, {})
+        m = _e.get("model") if isinstance(_e, dict) else None   # (#audit-codex-desktopshape)
         if not m:
             continue
         try:
@@ -11020,7 +11054,8 @@ def cmd_sync_desktop() -> None:
             pass
     known = set()
     for p in idx.glob("local_*.json"):
-        c = _read_json(p, {}).get("cliSessionId")
+        _e = _read_json(p, {})
+        c = _e.get("cliSessionId") if isinstance(_e, dict) else None  # (#audit-codex-desktopshape)
         if c:
             known.add(c)
     default_model = _desktop_default_model(idx)

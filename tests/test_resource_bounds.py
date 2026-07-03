@@ -586,6 +586,72 @@ def test_codex_round2_regressions():
     saikai._CUSTOM_TITLES_CACHE = None
 
 
+def test_codex_round3_regressions():
+    """Locks in the round-3 external-audit fixes (#audit-codex-*)."""
+    import json as _json
+    import tempfile as _tf
+    import time as _time
+    from pathlib import Path as _P
+
+    # 2. non-dict JSONL lines must not abort any scanner (b2 child detection,
+    # previews, edited files, changes all shared the hole)
+    with _tf.TemporaryDirectory() as td:
+        j = _P(td) / "s.jsonl"
+        j.write_text(
+            "[]\n"
+            + _json.dumps({"type": "user", "cwd": "/w",
+                           "timestamp": "2026-07-01T00:00:00.000Z",
+                           "message": {"role": "user", "content": "hi"}}) + "\n"
+            + _json.dumps({"type": "assistant",
+                           "timestamp": "2026-07-01T00:00:01.000Z",
+                           "message": {"role": "assistant", "content": [
+                               {"type": "tool_use", "name": "Write",
+                                "input": {"file_path": "/w/x.py"}},
+                               {"type": "text", "text": "done"}]}}) + "\n",
+            encoding="utf-8")
+        assert saikai._first_cwd_from_jsonl(j) == "/w"
+        assert saikai._first_ts_from_jsonl(j) == "2026-07-01T00:00:00.000Z"
+        assert saikai._extract_edited_files(j) == ["x.py"]
+        assert "done" in (saikai._last_assistant_text_from_jsonl(j) or "")
+
+    # 3. a syntactically-valid but non-table config section must not crash _cfg
+    _orig_cache = getattr(saikai, "_CONFIG_CACHE", None)
+    try:
+        saikai._CONFIG_CACHE = ({"display": 1}, saikai._CONFIG_CACHE[1]) \
+            if isinstance(_orig_cache, tuple) else None
+    except Exception:
+        pass
+    # direct shape check on the resolution logic (env unset -> config path)
+    os.environ.pop("SAIKAI_TEST_SHAPE", None)
+    _lc = saikai._load_config
+    saikai._load_config = lambda: {"display": 1}
+    try:
+        assert saikai._cfg("display", "split_ratio", "SAIKAI_TEST_SHAPE",
+                           0.5, float) == 0.5
+    finally:
+        saikai._load_config = _lc
+
+    # 4. corrupt option/set files must not crash startup
+    saikai.OPTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    saikai.OPTIONS_FILE.write_text("[1]", encoding="utf-8")
+    assert saikai._load_options() == {}
+    saikai.OPTIONS_FILE.unlink()
+    with _tf.TemporaryDirectory() as td:
+        p = _P(td) / "set.json"
+        p.write_text("123", encoding="utf-8")
+        assert saikai._load_set(p) == set()
+        p.write_text('["a", 1, null, "b"]', encoding="utf-8")
+        saikai._invalidate_pref(p)
+        assert saikai._load_set(p) == {"a", "b"}
+
+    # 8. a FUTURE mtime is neither active nor recent
+    now = _time.time()
+    future = {"mtime": now + 86400}
+    assert saikai._is_recent_now(future, now) is False
+    assert saikai._is_active_now(future, now) is False
+    assert saikai._is_recent_now({"mtime": now - 60}, now) is True
+
+
 def test_memory_safety_presets_and_override():
     """The one-knob memory_safety maps to gate-threshold presets: 'on' == the old
     per-OS defaults (no behaviour change), 'off' loosens the headroom, 'strict'
@@ -629,6 +695,8 @@ if __name__ == "__main__":
     print("PASS test_hostile_inputs_degrade_instead_of_raising")
     test_codex_round2_regressions()
     print("PASS test_codex_round2_regressions")
+    test_codex_round3_regressions()
+    print("PASS test_codex_round3_regressions")
     test_memory_safety_presets_and_override()
     print("PASS test_memory_safety_presets_and_override")
     test_na_cache_is_bounded()
