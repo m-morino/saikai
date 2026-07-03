@@ -5,20 +5,20 @@
   <!-- left: wordmark + tagline -->
   <text x="80" y="150" font-family="DejaVu Sans Mono, monospace" font-size="30" fill="#565f89">▌ saikai</text>
 
-  <text x="78" y="248" font-size="58" font-weight="bold" fill="#e6e9f0">動いている Claude Code</text>
-  <text x="78" y="320" font-size="58" font-weight="bold" fill="#e6e9f0">セッションの、ライブ管制室</text>
+  <text x="78" y="248" font-size="54" font-weight="bold" fill="#e6e9f0">複数の Claude Code セッションを</text>
+  <text x="78" y="316" font-size="54" font-weight="bold" fill="#e6e9f0">一覧して、切り替える。</text>
 
-  <text x="80" y="388" font-size="30" fill="#c0caf5">どれが<tspan fill="#5eead4" font-weight="bold">あなたを待っているか</tspan>——全リポジトリ横断で</text>
-  <text x="80" y="430" font-size="30" fill="#c0caf5">一目で見て、そのまま飛び込む。</text>
+  <text x="80" y="384" font-size="30" fill="#c0caf5">リポジトリをまたいで全部まとめて表示。</text>
+  <text x="80" y="426" font-size="30" fill="#c0caf5"><tspan fill="#5eead4" font-weight="bold">応答待ち</tspan>のセッションがすぐ分かる。</text>
 
   <!-- value chips -->
   <g font-size="24">
-    <rect x="80" y="500" width="272" height="56" rx="10" fill="#161821"/>
-    <text x="102" y="536"><tspan font-family="DejaVu Sans Mono, monospace" fill="#5eead4" font-weight="bold">●</tspan> <tspan fill="#c0caf5">誰が待っているか</tspan></text>
-    <rect x="370" y="500" width="248" height="56" rx="10" fill="#161821"/>
-    <text x="392" y="536"><tspan font-family="DejaVu Sans Mono, monospace" fill="#c9cfdd">~</tspan> <tspan fill="#c0caf5">複数をライブ</tspan></text>
-    <rect x="636" y="500" width="272" height="56" rx="10" fill="#161821"/>
-    <text x="658" y="536"><tspan font-family="DejaVu Sans Mono, monospace" fill="#565f89">→</tspan> <tspan fill="#c0caf5">次の要応答へ</tspan></text>
+    <rect x="80" y="500" width="252" height="56" rx="10" fill="#161821"/>
+    <text x="102" y="536"><tspan font-family="DejaVu Sans Mono, monospace" fill="#5eead4" font-weight="bold">●</tspan> <tspan fill="#c0caf5">応答待ちが分かる</tspan></text>
+    <rect x="350" y="500" width="262" height="56" rx="10" fill="#161821"/>
+    <text x="372" y="536"><tspan font-family="DejaVu Sans Mono, monospace" fill="#c9cfdd">~</tspan> <tspan fill="#c0caf5">複数を同時に表示</tspan></text>
+    <rect x="630" y="500" width="272" height="56" rx="10" fill="#161821"/>
+    <text x="652" y="536"><tspan font-family="DejaVu Sans Mono, monospace" fill="#565f89">→</tspan> <tspan fill="#c0caf5">次のセッションへ</tspan></text>
   </g>
 
   <!-- right: a tiny attention-first list motif -->
