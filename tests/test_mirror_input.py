@@ -998,6 +998,14 @@ def test_page_key_bar_flow_and_labels():
     # the primary bar leads with Esc then Enter (confirm/cancel are the most-used).
     assert page.index('data-k="escape"') < page.index('data-k="enter"') \
         < page.index('data-k="tab"'), "primary bar not ordered by flow"
+    # Handedness: a ⇄ Hand toggle mirrors the bars (row-reverse) so the d-pad
+    # cluster sits under the LEFT thumb for left-handed users, persisted per
+    # browser (localStorage). All three bars flip together.
+    assert 'id="kb-hand"' in page, "no handedness toggle"
+    assert "saikai-hand" in page, "handedness must persist (localStorage key)"
+    assert "row-reverse" in page, "handedness must mirror via flex row-reverse"
+    assert "applyHand" in page and "selBar.style.flexDirection" in page, \
+        "the select bar must mirror with the key bar"
 
 
 def test_page_wires_long_press_context_menu():

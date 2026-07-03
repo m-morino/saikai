@@ -1028,7 +1028,7 @@ border:1px solid #4a4;border-radius:6px;background:#2c4a2c;color:#eee;
 flex:0 0 auto;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 #selbar button:active{background:#3a3}
 #kb{align-items:center}
-#kb-arrows{display:grid;grid-template-areas:". up ." "left down right";gap:4px;flex:0 0 auto}
+#kb-arrows{display:grid;grid-template-areas:". up ." "left down right";gap:4px;flex:0 0 auto;margin-left:auto}
 #kb-arrows>[data-k="up"]{grid-area:up}#kb-arrows>[data-k="down"]{grid-area:down}
 #kb-arrows>[data-k="left"]{grid-area:left}#kb-arrows>[data-k="right"]{grid-area:right}
 #kb-arrows>button{min-width:52px;padding:8px 0;flex:0 0 auto}</style></head>
@@ -1464,6 +1464,7 @@ kbBar.innerHTML =
   // with a pane focused); "Find" (slash) opens search and PgUp/PgDn/Top/End page
   // the list (these work when the list, not a pane, is focused).
   '<div id="kb2" style="display:none;flex-basis:100%;flex-wrap:wrap;gap:4px">'+
+    '<button id="kb-hand" data-k="">&#8644; Right</button>'+
     '<button data-k="slash">Find</button>'+
     '<button data-k="f5">Refresh</button>'+
     '<button data-k="shift+f3">Next!</button>'+
@@ -1482,6 +1483,27 @@ kbBar.innerHTML =
 document.body.appendChild(kbBar);
 const kbCtrl = document.getElementById('kb-ctrl');
 const kbMore = document.getElementById('kb-more');
+// ── Handedness: 'R' (default) puts the d-pad cluster under the RIGHT thumb;
+//    'L' mirrors every bar (key bar, More row, select bar) for left-thumb
+//    reach. Persisted per browser in localStorage. ──────────────────────────
+let hand = 'R';
+try { hand = localStorage.getItem('saikai-hand') === 'L' ? 'L' : 'R'; } catch (e) {}
+function applyHand() {
+  const dir = (hand === 'L') ? 'row-reverse' : 'row';
+  kbBar.style.flexDirection = dir;
+  try { document.getElementById('kb2').style.flexDirection = dir; } catch (e) {}
+  try { selBar.style.flexDirection = dir; } catch (e) {}
+  // When the bar WRAPS (phones), a wrapped row starts at the main-start edge —
+  // an auto-margin pins the d-pad to the thumb side in both modes.
+  const ar = document.getElementById('kb-arrows');
+  if (ar) {
+    ar.style.marginLeft  = (hand === 'L') ? '0' : 'auto';
+    ar.style.marginRight = (hand === 'L') ? 'auto' : '0';
+  }
+  const hb = document.getElementById('kb-hand');
+  if (hb) hb.textContent = (hand === 'L') ? '\u21c4 Left' : '\u21c4 Right';
+}
+applyHand();
 kbBar.querySelectorAll('button').forEach((b) => {
   b.addEventListener('click', (e) => {
     e.preventDefault();
@@ -1492,6 +1514,12 @@ kbBar.querySelectorAll('button').forEach((b) => {
     }
     if (b.id === 'kb-select') {               // toggle drag-to-select-text mode
       setSelectMode(!selectMode);
+      return;
+    }
+    if (b.id === 'kb-hand') {                 // mirror the bars for the other thumb
+      hand = (hand === 'L') ? 'R' : 'L';
+      try { localStorage.setItem('saikai-hand', hand); } catch (e) {}
+      applyHand();
       return;
     }
     if (b.id === 'kb-more') {                 // reveal/hide the secondary action row
