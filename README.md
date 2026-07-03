@@ -214,14 +214,9 @@ mirror to watch *all* your local sessions from the couch.
 | `SAIKAI_SUMMARIZE_CMD` | — | command to summarize with (prompt on stdin → summary on stdout) instead of `claude -p` |
 | `SAIKAI_SUMMARIZE_MODEL` | haiku | model used when summarizing through `claude -p` |
 | `SAIKAI_AUTO_PERMISSION` | off | opt in to adding `--permission-mode auto` for frequently used workspaces |
-| `SAIKAI_MAX_MEM_LOAD` | 85 Win / 95 POSIX | refuse/warn opening a pane above this memory-load %. On Windows `dwMemoryLoad` is an independent kernel signal; on Linux/macOS the load is *derived from the same availability number as the floor*, so it defaults higher and acts as a backstop |
-| `SAIKAI_MAX_MEM_PRESSURE` | 10 | Linux/macOS: refuse a new pane when measured memory **pressure** crosses this (Linux PSI `some avg10` % — the stall-time metric systemd-oomd acts on; macOS gates on the kernel's *critical* pressure level). No effect on Windows |
-| `SAIKAI_MIN_COMMIT_MB` | 2048 | keep this much **commit headroom** free — the system-freeze guard. Windows always; Linux **only under strict overcommit** (`vm.overcommit_memory=2`) — in the default heuristic mode CommitLimit isn't enforced and is skipped |
-| `SAIKAI_MIN_FREE_PHYS_PCT` | 8 | keep ≥ this % of physical RAM available (anti-thrash floor, machine-relative) |
-| `SAIKAI_CLAUDE_MB` | 600 | estimated RAM per live pane |
-| `SAIKAI_MIN_FREE_MB` | 0 | optional absolute physical floor (legacy; max'd with the % floor) |
-| `SAIKAI_HARD_RAM_GATE` | off | `1` refuses (vs warns) when the gate would be crossed |
+| `SAIKAI_MEM_SAFETY` | on | **the one memory knob.** `on` = balanced gating; `off` = refuse only at true exhaustion (plus `SAIKAI_MAX_LIVE`); `strict` = refuse earlier, keep more headroom, and hard-stop instead of warn. Every mode still refuses when a pane's RAM isn't actually free — this only tunes how much headroom to hold back |
 | `SAIKAI_MAX_LIVE` | 64 | hard cap on concurrent live panes (backstop) |
+| `SAIKAI_CLAUDE_MB` | 600 | estimated RAM per live pane (used by the gate and the statusbar `fit` count) |
 | `SAIKAI_SCROLLBACK` | 2000 | per-pane scrollback lines kept by saikai. This controls the number of pyte cells held in memory; lower it (e.g. 1000) on a memory-tight machine, raise it for deeper history |
 | `SAIKAI_COLOR_BY` | project | what tints the session title: `project` / `worktree` / `topic` / `none` |
 | `SAIKAI_SPLIT_RATIO` | 0.34 | initial list/pane split (drag the divider to change; the dragged value persists) |
@@ -230,6 +225,19 @@ mirror to watch *all* your local sessions from the couch.
 | `SAIKAI_MIRROR_HOST` | `127.0.0.1` | mirror bind address; set to a LAN IP to reach it from another device |
 | `SAIKAI_MIRROR_PORT` | `0` | fixed mirror port so a firewall rule can target it; `0` lets the OS pick a free port |
 | `SAIKAI_MIRROR_ALLOW_LAN_INPUT` | off | allow control **input** over a non-loopback bind; otherwise a LAN mirror stays read-only (loopback always permits input) |
+
+<details><summary><b>Advanced: fine-grained memory-gate thresholds</b> (you rarely need these — <code>SAIKAI_MEM_SAFETY</code> sets them for you; anything set here overrides the preset)</summary>
+
+| Variable | Default (`on`) | Meaning |
+|---|---|---|
+| `SAIKAI_MAX_MEM_LOAD` | 85 Win / 95 POSIX | refuse/warn opening a pane above this memory-load %. On Windows `dwMemoryLoad` is an independent kernel signal; on Linux/macOS the load is *derived from the same availability number as the floor*, so it defaults higher and acts as a backstop |
+| `SAIKAI_MAX_MEM_PRESSURE` | 10 | Linux/macOS: refuse a new pane when measured memory **pressure** crosses this (Linux PSI `some avg10` %; macOS the kernel's *critical* pressure level). No effect on Windows |
+| `SAIKAI_MIN_COMMIT_MB` | 2048 | keep this much **commit headroom** free — the system-freeze guard. Windows always; Linux only under strict overcommit (`vm.overcommit_memory=2`) |
+| `SAIKAI_MIN_FREE_PHYS_PCT` | 8 | keep ≥ this % of physical RAM available (anti-thrash floor, machine-relative) |
+| `SAIKAI_MIN_FREE_MB` | 0 | optional absolute physical floor (legacy; max'd with the % floor) |
+| `SAIKAI_HARD_RAM_GATE` | off | `1` refuses (vs warns) when the gate would be crossed |
+
+</details>
 
 saikai also reads an optional **TOML config file** for these same knobs (with
 `env > config > default` precedence) plus `[keys]` rebinds. Run `saikai

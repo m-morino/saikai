@@ -421,7 +421,47 @@ def test_ctx_gauge_segment_formats_and_colours():
     assert "[yellow]" in s3
 
 
+def test_memory_safety_presets_and_override():
+    """The one-knob memory_safety maps to gate-threshold presets: 'on' == the old
+    per-OS defaults (no behaviour change), 'off' loosens the headroom, 'strict'
+    tightens it and hard-refuses — and an explicit granular knob still overrides
+    the preset. (#mem-safety-preset)"""
+    saved = {k: os.environ.get(k) for k in ("SAIKAI_MEM_SAFETY", "SAIKAI_MAX_MEM_LOAD")}
+    try:
+        for k in ("SAIKAI_MEM_SAFETY", "SAIKAI_MAX_MEM_LOAD"):
+            os.environ.pop(k, None)
+        # default / on == the platform default max-load, warn (not hard).
+        assert saikai._mem_safety_mode() == "on"
+        on = saikai._ram_gate_kwargs()
+        assert on["max_load"] == saikai._DEFAULT_MAX_LOAD
+        assert saikai._mem_safety_preset()["hard"] is False
+        # off: no conservative headroom (very high caps, zero floors), still warn.
+        os.environ["SAIKAI_MEM_SAFETY"] = "off"
+        off = saikai._ram_gate_kwargs()
+        assert off["max_load"] >= 200 and off["min_free_phys_pct"] == 0 and off["min_commit_mb"] == 0
+        # strict: refuse earlier + hard stop.
+        os.environ["SAIKAI_MEM_SAFETY"] = "strict"
+        st = saikai._ram_gate_kwargs()
+        assert st["max_load"] < saikai._DEFAULT_MAX_LOAD and st["min_free_phys_pct"] >= 15
+        assert saikai._mem_safety_preset()["hard"] is True
+        # a bogus value falls back to 'on'.
+        os.environ["SAIKAI_MEM_SAFETY"] = "banana"
+        assert saikai._mem_safety_mode() == "on"
+        # explicit granular knob overrides the preset (even in off mode).
+        os.environ["SAIKAI_MEM_SAFETY"] = "off"
+        os.environ["SAIKAI_MAX_MEM_LOAD"] = "70"
+        assert saikai._ram_gate_kwargs()["max_load"] == 70.0
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 if __name__ == "__main__":
+    test_memory_safety_presets_and_override()
+    print("PASS test_memory_safety_presets_and_override")
     test_na_cache_is_bounded()
     print("PASS test_na_cache_is_bounded")
     test_load_severity_bands()

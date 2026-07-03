@@ -291,15 +291,19 @@ _CONFIG_TEMPLATE = (
     "split_ratio  = 0.34       # initial list share; dragging / Alt+arrows persists over it\n\n"
     "[launch]\n"
     "auto_permission = false   # true = add --permission-mode auto in frequent workspaces\n\n"
-    "[limits]                       # live-pane memory gate (per-OS signals)\n"
-    "# max_memory_load      = 85    # refuse/warn above this % memory load (default 85 Win / 95 POSIX)\n"
-    "max_memory_pressure    = 10    # Linux PSI some-avg10 % / macOS critical -> refuse (no effect on Win)\n"
-    "min_commit_headroom_mb = 2048  # keep this much commit headroom free (Win; Linux only if strict overcommit)\n"
-    "min_free_phys_pct      = 8     # keep >= this % of physical RAM free/available\n"
-    "per_pane_mb            = 600   # estimated RAM per live pane\n"
-    "hard_ram_gate          = false # true = refuse (vs warn) when crossed\n"
+    "[limits]                       # live-pane memory safety\n"
+    'memory_safety          = "on"  # ONE knob: on (balanced) | off (only refuse at true\n'
+    "#                                exhaustion + max_live) | strict (refuse earlier, hard stop)\n"
     "max_live               = 64    # hard cap on concurrent live panes\n"
-    "scrollback_lines       = 2000  # per-pane scrollback kept in memory (biggest RAM lever)\n\n"
+    "scrollback_lines       = 2000  # per-pane scrollback kept in memory (biggest RAM lever)\n"
+    "per_pane_mb            = 600   # estimated RAM per live pane (used by the gate + 'fit')\n"
+    "# ── advanced: fine-grained gate thresholds. You rarely need these — memory_safety\n"
+    "#    sets sensible values for all of them; anything set here OVERRIDES that preset.\n"
+    "# max_memory_load      = 85    # refuse/warn above this % memory load (default 85 Win / 95 POSIX)\n"
+    "# max_memory_pressure  = 10    # Linux PSI some-avg10 % / macOS critical -> refuse (no effect on Win)\n"
+    "# min_commit_headroom_mb = 2048# keep this much commit headroom free (Win; Linux only if strict overcommit)\n"
+    "# min_free_phys_pct    = 8     # keep >= this % of physical RAM free/available\n"
+    "# hard_ram_gate        = false # true = refuse (vs warn) when crossed\n\n"
     "[keys]\n"
     "# Keyboard-first: Space (in the list) is a LEADER key by default — press it,\n"
     "# then a mnemonic letter: f=favorite h=hide e=rename r=refresh d=diff y=copy\n"
@@ -519,6 +523,7 @@ _CONFIG_SPECS = [
     ("display", "color_by", "SAIKAI_COLOR_BY", "project"),
     ("display", "split_ratio", "SAIKAI_SPLIT_RATIO", 0.34),
     ("launch", "auto_permission", "SAIKAI_AUTO_PERMISSION", False),
+    ("limits", "memory_safety", "SAIKAI_MEM_SAFETY", "on"),   # on | off | strict (one knob)
     ("limits", "max_memory_load", "SAIKAI_MAX_MEM_LOAD",
      85 if sys.platform == "win32" else 95),
     ("limits", "max_memory_pressure", "SAIKAI_MAX_MEM_PRESSURE", 10),
@@ -3587,15 +3592,43 @@ def _ram_gate_decision(st, per_pane_mb, **kw):
 _DEFAULT_MAX_LOAD = 85.0 if sys.platform == "win32" else 95.0
 
 
+def _mem_safety_mode() -> str:
+    """Live-pane memory safety as ONE knob: 'on' (default, balanced) | 'off'
+    (minimal — refuse only at true exhaustion, plus the max_live cap) | 'strict'
+    (refuse earlier, keep more headroom, hard-refuse instead of warn). The
+    granular limits.* thresholds are advanced overrides that still win when set."""
+    m = str(_cfg("limits", "memory_safety", "SAIKAI_MEM_SAFETY", "on")).strip().lower()
+    return m if m in ("on", "off", "strict") else "on"
+
+
+def _mem_safety_preset() -> dict:
+    """Threshold DEFAULTS for the current safety mode, fed as the defaults to the
+    granular _cfg reads below — so an explicitly-set limits.* / SAIKAI_* knob still
+    overrides. EVERY mode keeps true-exhaustion protection (_ram_fit never opens a
+    pane when the estimated per-pane RAM isn't actually free); the mode only tunes
+    how much conservative HEADROOM to hold back on top of that."""
+    mode = _mem_safety_mode()
+    if mode == "off":
+        return dict(max_load=200.0, pressure=200.0, commit_mb=0.0,
+                    phys_pct=0.0, phys_mb=0.0, hard=False)
+    if mode == "strict":
+        return dict(max_load=max(0.0, _DEFAULT_MAX_LOAD - 10.0), pressure=6.0,
+                    commit_mb=4096.0, phys_pct=15.0, phys_mb=0.0, hard=True)
+    return dict(max_load=_DEFAULT_MAX_LOAD, pressure=10.0, commit_mb=2048.0,
+                phys_pct=8.0, phys_mb=0.0, hard=False)
+
+
 def _ram_gate_kwargs() -> dict:
-    """Live-pane gate thresholds resolved env > config > default (spec §A.1). Shared
-    by the open-gate and the statusbar 'fit' indicator so they can't disagree."""
+    """Live-pane gate thresholds resolved env > config > memory_safety preset (spec
+    §A.1). Shared by the open-gate and the statusbar 'fit' indicator so they can't
+    disagree. The preset supplies the DEFAULT; a granular limits.* knob overrides."""
+    _pre = _mem_safety_preset()
     return dict(
-        max_load=_cfg("limits", "max_memory_load", "SAIKAI_MAX_MEM_LOAD", _DEFAULT_MAX_LOAD, float),
-        min_commit_mb=_cfg("limits", "min_commit_headroom_mb", "SAIKAI_MIN_COMMIT_MB", 2048.0, float),
-        min_free_phys_pct=_cfg("limits", "min_free_phys_pct", "SAIKAI_MIN_FREE_PHYS_PCT", 8.0, float),
-        min_free_phys_mb=_cfg("limits", "min_free_mb", "SAIKAI_MIN_FREE_MB", 0.0, float),
-        max_pressure=_cfg("limits", "max_memory_pressure", "SAIKAI_MAX_MEM_PRESSURE", 10.0, float),
+        max_load=_cfg("limits", "max_memory_load", "SAIKAI_MAX_MEM_LOAD", _pre["max_load"], float),
+        min_commit_mb=_cfg("limits", "min_commit_headroom_mb", "SAIKAI_MIN_COMMIT_MB", _pre["commit_mb"], float),
+        min_free_phys_pct=_cfg("limits", "min_free_phys_pct", "SAIKAI_MIN_FREE_PHYS_PCT", _pre["phys_pct"], float),
+        min_free_phys_mb=_cfg("limits", "min_free_mb", "SAIKAI_MIN_FREE_MB", _pre["phys_mb"], float),
+        max_pressure=_cfg("limits", "max_memory_pressure", "SAIKAI_MAX_MEM_PRESSURE", _pre["pressure"], float),
     )
 
 
@@ -7236,7 +7269,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             _per = _ram_per_pane_mb()
             _ok, _why = _ram_gate_decision(_mem_status(), _per, **_ram_gate_kwargs())
             if not _ok:
-                if _cfg("limits", "hard_ram_gate", "SAIKAI_HARD_RAM_GATE", False, _cfg_bool):
+                if _cfg("limits", "hard_ram_gate", "SAIKAI_HARD_RAM_GATE",
+                        _mem_safety_preset()["hard"], _cfg_bool):
                     self.notify(
                         f"refusing to open — {_why}; ~{_per:.0f} MB/pane would cross "
                         f"the floor. Close a pane (F10), lower SAIKAI_CLAUDE_MB, or "
