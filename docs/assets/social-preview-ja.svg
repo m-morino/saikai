@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" font-family="VL PGothic, DejaVu Sans, sans-serif">
+  <rect width="1280" height="640" fill="#0f1017"/>
+  <rect x="0" y="0" width="1280" height="6" fill="#5eead4"/>
+
+  <!-- left: wordmark + tagline -->
+  <text x="80" y="150" font-family="DejaVu Sans Mono, monospace" font-size="30" fill="#565f89">▌ saikai</text>
+
+  <text x="78" y="248" font-size="58" font-weight="bold" fill="#e6e9f0">動いている Claude Code</text>
+  <text x="78" y="320" font-size="58" font-weight="bold" fill="#e6e9f0">セッションの、ライブ管制室</text>
+
+  <text x="80" y="388" font-size="30" fill="#c0caf5">どれが<tspan fill="#5eead4" font-weight="bold">あなたを待っているか</tspan>——全リポジトリ横断で</text>
+  <text x="80" y="430" font-size="30" fill="#c0caf5">一目で見て、そのまま飛び込む。</text>
+
+  <!-- value chips -->
+  <g font-size="24">
+    <rect x="80" y="500" width="272" height="56" rx="10" fill="#161821"/>
+    <text x="102" y="536"><tspan font-family="DejaVu Sans Mono, monospace" fill="#5eead4" font-weight="bold">●</tspan> <tspan fill="#c0caf5">誰が待っているか</tspan></text>
+    <rect x="370" y="500" width="248" height="56" rx="10" fill="#161821"/>
+    <text x="392" y="536"><tspan font-family="DejaVu Sans Mono, monospace" fill="#c9cfdd">~</tspan> <tspan fill="#c0caf5">複数をライブ</tspan></text>
+    <rect x="636" y="500" width="272" height="56" rx="10" fill="#161821"/>
+    <text x="658" y="536"><tspan font-family="DejaVu Sans Mono, monospace" fill="#565f89">→</tspan> <tspan fill="#c0caf5">次の要応答へ</tspan></text>
+  </g>
+
+  <!-- right: a tiny attention-first list motif -->
+  <g font-family="DejaVu Sans Mono, monospace" font-size="21">
+    <rect x="1044" y="96" width="176" height="452" rx="14" fill="#12131a" stroke="#23252e" stroke-width="1"/>
+    <text x="1066" y="140" font-size="17" fill="#5eead4" font-weight="bold">▌ Needs input</text>
+    <rect x="1054" y="152" width="156" height="30" rx="5" fill="#1c2740"/>
+    <text x="1062" y="174"><tspan fill="#5eead4" font-weight="bold">! </tspan><tspan fill="#e6e9f0">watchdog</tspan></text>
+    <text x="1062" y="206"><tspan fill="#5eead4" font-weight="bold">! </tspan><tspan fill="#c0caf5">mirror</tspan></text>
+    <text x="1066" y="250" font-size="17" fill="#8a8f9c" font-weight="bold">▌ Running</text>
+    <text x="1062" y="282"><tspan fill="#c9cfdd">~ </tspan><tspan fill="#c0caf5">tests</tspan></text>
+    <text x="1062" y="312"><tspan fill="#c9cfdd">~ </tspan><tspan fill="#c0caf5">refactor</tspan></text>
+    <text x="1062" y="342"><tspan fill="#565f89">&amp; </tspan><tspan fill="#c0caf5">audit</tspan></text>
+    <text x="1066" y="386" font-size="17" fill="#565f89" font-weight="bold">▌ Idle</text>
+    <text x="1062" y="418" fill="#565f89">= notes</text>
+    <text x="1062" y="448" fill="#414f67">. recap</text>
+    <text x="1062" y="500" font-size="16" fill="#565f89"><tspan fill="#5eead4" font-weight="bold">!2</tspan><tspan font-family="VL PGothic, sans-serif"> 要応答</tspan></text>
+  </g>
+</svg>
