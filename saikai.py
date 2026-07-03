@@ -6024,6 +6024,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             n = 0
             n_sessions = 0
             first_session_row = None   # row index of the first real session (cursor-off-header)
+            first_attention_row = None # row index of the first session that NEEDS YOU (front-door home)
             self._header_labels = {}
             for s in visible:
                 # Emit a section-header row just before its first member.
@@ -6069,6 +6070,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 marker_s = ("*" if s["id"] in favorites
                             else "x" if is_hidden else " ")
                 marker = f"{marker_a}{marker_s}"
+                # "Needs you" for the front-door home: waiting (?) / reply-due (!) /
+                # a background agent blocked on your clarification — the same states
+                # the ATTENTION accent tints.
+                is_attention = (marker_a in ("?", "!")
+                                or (marker_a == "&" and s.get("job_needs")))
                 # Tint the marker by its activity state (marker_a); the fav/hidden
                 # suffix rides the same colour. Glyph stays the alignment anchor.
                 # _marker_tint applies the single ATTENTION accent + bg job-state.
@@ -6096,6 +6102,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     table.add_row(*row, key=s["id"])
                     if first_session_row is None:
                         first_session_row = n
+                    if is_attention and first_attention_row is None:
+                        first_attention_row = n
                     n += 1
                     n_sessions += 1
                     continue
@@ -6110,13 +6118,29 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 table.add_row(*row, key=s["id"])
                 if first_session_row is None:
                     first_session_row = n
+                if is_attention and first_attention_row is None:
+                    first_attention_row = n
                 n += 1
                 n_sessions += 1
             self._n_sessions = n_sessions
             # Restore the cursor onto the SAME session (its row index shifts when
             # grouping/filtering/headers change); fall back to the old clamp.
             restored = False
-            if saved_sid:
+            # Front door (one-shot): the FIRST paint homes the cursor on the first
+            # session that needs you — waiting / reply-due / bg-blocked — so the list
+            # opens on "who needs me", not the newest row. Fires once; later refreshes
+            # restore by session as usual so navigation is never yanked away. Skipped
+            # when a filter/search is active (the user is already driving the cursor).
+            if (not getattr(self, "_did_attention_home", False)
+                    and not self._filter_is_engaged()):
+                self._did_attention_home = True
+                if first_attention_row is not None:
+                    try:
+                        table.move_cursor(row=first_attention_row, scroll=True)
+                        restored = True
+                    except Exception:
+                        restored = False
+            if not restored and saved_sid:
                 try:
                     table.move_cursor(row=table.get_row_index(saved_sid), scroll=False)
                     restored = True

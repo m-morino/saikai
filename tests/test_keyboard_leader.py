@@ -2029,6 +2029,76 @@ def test_pilot_double_space_does_not_leave_leader_armed():
         f"key after double-Space was hijacked instead of reaching search: {facts}"
 
 
+def _write_session_ex(last_role: str, ts: str, title: str):
+    """A demo session whose LAST transcript record is a user prompt (reply-due →
+    'needs you') or an assistant turn (answered → not). Returns (sid, path)."""
+    sid = str(uuid.uuid4())
+    pdir = _FAKE_HOME / ".claude" / "projects" / "-home-alex-code-demo"
+    pdir.mkdir(parents=True, exist_ok=True)
+    recs = [
+        {"type": "ai-title", "aiTitle": title, "timestamp": ts,
+         "cwd": "/home/alex/code/demo"},
+        {"type": "user", "timestamp": ts, "cwd": "/home/alex/code/demo",
+         "message": {"content": "a demo prompt long enough to count as real"}},
+    ]
+    if last_role == "assistant":
+        recs.append({"type": "assistant", "timestamp": ts,
+                     "cwd": "/home/alex/code/demo",
+                     "message": {"role": "assistant",
+                                 "content": [{"type": "text", "text": "answered."}]}})
+    p = pdir / f"{sid}.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+    return sid, p
+
+
+def test_pilot_front_door_homes_on_needs_you():
+    """The FIRST paint lands the cursor on the first session that NEEDS YOU
+    (reply-due), not the newest row — even under flat (non-state) grouping where
+    the newest, already-answered session sorts to the top. (#front-door)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_front_door_homes_on_needs_you (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+
+    # Flat list so recency alone orders rows: the front-door home is then the ONLY
+    # thing that could move the cursor off the newest (answered) top row.
+    saikai._write_text_atomic(saikai.GROUP_BY_FILE, "none")
+    saikai._invalidate_pref(saikai.GROUP_BY_FILE)
+    # Newer session is already ANSWERED (not attention); older one is reply-due.
+    sid_new, p_new = _write_session_ex("assistant", "2026-06-20T00:00:00.000Z", "Answered newest")
+    sid_att, p_att = _write_session_ex("user", "2026-06-10T00:00:00.000Z", "Waiting on you")
+    os.utime(p_new, (1_750_000_000, 1_750_000_000))   # newer mtime → sorts first
+    os.utime(p_att, (1_749_000_000, 1_749_000_000))   # older mtime → below it
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.5)
+                facts["cursor_sid"] = self._cursor_sid()
+                facts["homed"] = getattr(self, "_did_attention_home", None)
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+        saikai._write_text_atomic(saikai.GROUP_BY_FILE, "state")   # restore default
+        saikai._invalidate_pref(saikai.GROUP_BY_FILE)
+
+    assert facts.get("homed") is True, f"front-door home did not run: {facts}"
+    assert facts.get("cursor_sid") == sid_att, \
+        f"cursor should home on the reply-due session, not the newest: {facts}"
+
+
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
@@ -2092,6 +2162,8 @@ if __name__ == "__main__":
     test_pilot_cycle_tab_skips_dead_pane()
     test_pilot_double_space_does_not_leave_leader_armed()
     print("PASS test_pilot_double_space_does_not_leave_leader_armed")
+    test_pilot_front_door_homes_on_needs_you()
+    print("PASS test_pilot_front_door_homes_on_needs_you")
     print("PASS test_pilot_mirror_space_leader_runs_mnemonic")
     print("PASS test_pilot_ctx_gauge_in_statusbar")
     print("PASS test_pilot_open_parent")
