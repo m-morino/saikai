@@ -129,12 +129,16 @@ def test_static_assets_served_locally_without_token():
 def test_page_injects_terminal_size():
     """The browser xterm must be sized to the host terminal's cols/rows; the
     mirror streams absolute-positioned ANSI, so a size mismatch garbles the
-    layout. The page bakes the live cols/rows into the Terminal() options."""
+    layout. The size rides <body data-cols/data-rows> — NOT inline-script
+    substitution, which would change the script's bytes per size and break its
+    CSP hash whitelist (#audit-csp-inline) — and the script reads the dataset
+    into Terminal()."""
     hub = m.MirrorHub(token="t", cols=137, rows=43)
     port = hub.serve()
     try:
         page = _get(f"http://127.0.0.1:{port}/?token=t").read().decode("utf-8")
-        assert "cols: 137" in page and "rows: 43" in page
+        assert 'data-cols="137"' in page and 'data-rows="43"' in page
+        assert "dataset.cols" in page and "dataset.rows" in page
         assert "__COLS__" not in page and "__ROWS__" not in page
     finally:
         hub.stop()
