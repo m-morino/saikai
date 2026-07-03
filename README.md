@@ -13,7 +13,9 @@
 > straight into it.** One searchable list on the left; the session you pick
 > running live, right beside it.
 
-![saikai demo](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-demo.gif)
+<!-- Interim hero: the current split-live cockpit (SVG, matches the shipped UI).
+     Restore the animated saikai-demo.gif here once it's re-recorded to match. -->
+![saikai — the session list on the left, a live claude session running on the right](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-split-live.svg)
 
 **vs. `claude --resume`:** `-r` opens *one* session in the folder you're in.
 saikai watches **all** of them at once — every repo and worktree — runs several
@@ -43,10 +45,9 @@ view right where you already work.
 
 ## Features
 
-The screen is two panes: **the session list on the left, the Claude session you
-picked on the right** (saikai calls this *split-live*; on by default).
-
-![Split-live: the session list on the left with a live claude pane on the right](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-split-live.svg)
+The screen is two panes (shown above): **the session list on the left, the
+Claude session you picked on the right** — saikai calls this *split-live*, on by
+default.
 
 > **Back and forth:** `Enter` opens the selected session on the right · `Ctrl+]`
 > returns to the list · `F2`/`F3` switch panes.

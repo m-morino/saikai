@@ -12,7 +12,9 @@
 > **どれがあなたを待っているか**を——全リポジトリ・worktree を横断して——一目で見て、
 > そのまま飛び込む。左に検索できる一覧、右に選んだセッションがライブで動きます。
 
-![saikai demo](docs/assets/saikai-demo-ja.gif)
+<!-- 暫定ヒーロー: 現行の split-live 艦橋（SVG・実UIと一致）。アニメGIFを撮り直したら
+     ここを saikai-demo-ja.gif に戻す。 -->
+![saikai — 左にセッション一覧、右で選んだ Claude がライブで動く](docs/assets/saikai-split-live.svg)
 
 **`claude --resume` との違い:** `-r` は今いるフォルダの *1つ* を開くだけ。saikai は
 **全部**を同時に見張り、複数を**ライブ**で並走させ、どれが作業中・入力待ち・完了して
@@ -37,10 +39,8 @@ saikai はその穴を埋めます。たとえばこんなとき:
 
 ## 主な機能
 
-画面は **左がセッション一覧、右が選んだ Claude** の2ペイン構成です（saikai はこれを
-split-live と呼びます。既定で有効）。
-
-![左にセッション一覧、右に選んだ Claude が動くライブペイン](docs/assets/saikai-split-live.svg)
+画面は **左がセッション一覧、右が選んだ Claude** の2ペイン構成です（上の画像。saikai は
+これを split-live と呼びます。既定で有効）。
 
 > **行ったり来たり**: 一覧で `Enter` → 右ペインで Claude ／ `Ctrl+]` で一覧へ戻る ／ `F2` `F3` でペインを切り替え
 
