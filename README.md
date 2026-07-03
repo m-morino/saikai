@@ -86,7 +86,7 @@ actionable:
 - **quiet** (dim): `=` idle live pane · `@` open elsewhere · `$` running a shell · `R` Remote Control · `+` active · `.` recent · `&` background agent
 - **tags** (separate column): `*` favorite · `x` hidden
 
-![The list grouped by date, with a ★ favorite, status markers, and the sort/group state in the status bar](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-browse.svg)
+![The list grouped by state — Needs input first — with the cyan "needs you" accent, a ★ favorite, and the sort/group state in the status bar](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-browse.svg)
 
 ## Install
 

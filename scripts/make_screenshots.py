@@ -91,9 +91,10 @@ def fake_run(self, *a, **kw):
         async with self.run_test(size=SIZE) as pilot:
             await pilot.pause(0.8)
             ASSETS.mkdir(parents=True, exist_ok=True)
-            # Show the browser off properly: Date grouping (the default since
-            # 2026-06: section headers appear without any keypress), a ★
-            # favorite, and the Sort/Group state visible in the status bar.
+            # Show the browser off properly: State grouping (the default —
+            # Needs input / Running / Open / Idle sections appear without any
+            # keypress, so "who needs me" reads at a glance), a ★ favorite, and
+            # the Sort/Group state visible in the status bar.
             await pilot.press("f6")             # ★ the selected session
             await pilot.press("down")
             await pilot.pause(0.4)
