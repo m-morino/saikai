@@ -1292,7 +1292,50 @@ def test_osc52_re_extracts_payload_and_needs_terminator():
     assert rt._OSC52_RE.findall(f"\x1b]52;c;{b64}") == []
 
 
+def test_answer_queries_responds_to_terminal_probes():
+    """saikai answers the child's terminal queries (it sits between the child and the
+    real terminal): Primary DA, DSR status/cursor-position (private ?6n → private
+    reply), DECRQM ?2026 (supported), XTVERSION, OSC 10/11 color. No query → silent."""
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    sent = []
+    t._send_to_child = lambda d: sent.append(d)
+    t._marshal = lambda fn: fn()                 # run the marshalled write inline
+    t._cursor_rowcol = lambda: (3, 7)
+    def _one(q):
+        sent.clear(); t._answer_queries(q); return sent[-1] if sent else None
+    assert _one("\x1b[c") == "\x1b[?6c"
+    assert _one("\x1b[0c") == "\x1b[?6c"
+    assert _one("\x1b[?6n") == "\x1b[?3;7R"       # private cursor-position reply
+    assert _one("\x1b[6n") == "\x1b[3;7R"         # standard cursor-position reply
+    assert _one("\x1b[5n") == "\x1b[0n"           # device status OK
+    assert _one("\x1b[?2026$p") == "\x1b[?2026;2$y"    # synchronized output supported
+    assert _one("\x1b[?1000$p") == "\x1b[?1000;0$y"    # other mode: not recognised
+    assert _one("\x1b[>0q") == "\x1bP>|saikai\x1b\\"   # XTVERSION
+    assert _one("\x1b]11;?\x07") == "\x1b]11;rgb:1e1e/1e1e/1e1e\x07"  # bg (dark)
+    assert _one("\x1b]10;?\x07") == "\x1b]10;rgb:c0c0/c0c0/c0c0\x07"  # fg (light)
+    sent.clear(); t._answer_queries("plain \x1b[1m bold \x1b[0m"); assert sent == []
+
+
+def test_osc_notification_parsing_and_notify_host():
+    """OSC 9/777/99 desktop notifications are parsed (OSC 9;4 progress excluded) and
+    surfaced as a stripped, non-empty saikai toast."""
+    assert rt._OSC9_NOTIFY_RE.findall("\x1b]9;Task done\x07") == ["Task done"]
+    assert rt._OSC9_NOTIFY_RE.findall("\x1b]9;4;1;50\x07") == []       # 9;4 progress, not a notify
+    assert rt._OSC777_RE.findall("\x1b]777;notify;Title;Body\x07") == ["Title;Body"]
+    assert rt._OSC99_RE.findall("\x1b]99;i=1:d=0:p=title;Hello\x1b\\") == ["Hello"]
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    notes = []
+    t.notify = lambda m, **k: notes.append(m)
+    t._marshal = lambda fn: fn()
+    t._notify_host("  hi  "); assert notes == ["hi"]
+    t._notify_host("   "); assert notes == ["hi"]                       # empty → no toast
+
+
 if __name__ == "__main__":
+    test_osc_notification_parsing_and_notify_host()
+    print("PASS test_osc_notification_parsing_and_notify_host")
+    test_answer_queries_responds_to_terminal_probes()
+    print("PASS test_answer_queries_responds_to_terminal_probes")
     test_honor_osc52_decodes_and_copies()
     print("PASS test_honor_osc52_decodes_and_copies")
     test_osc52_re_extracts_payload_and_needs_terminator()

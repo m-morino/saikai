@@ -264,6 +264,16 @@ try:
                         self.cursor.x = min(self.cursor.x + char_width, self.columns)
                 self.dirty.add(self.cursor.y)
 
+            _bell_rang = False
+
+            def bell(self, *a) -> None:
+                # pyte calls this only for a REAL BEL (it consumes an OSC's
+                # terminator BEL as part of the OSC, so this can't false-fire on a
+                # title/clipboard write). AgentTerminal._consume drains the flag and
+                # rings the host bell — claude's notification-fallback is a BEL, since
+                # saikai isn't a recognised rich-notification terminal. (#bell)
+                self._bell_rang = True
+
         _HistoryScreenBase = _SaikaiHistoryScreen
     except Exception:
         pass
@@ -658,6 +668,22 @@ _DEC_PRIVATE_RE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
 # the copy never reaches the host clipboard. base64 group is empty for a "?" (read)
 # query, which we ignore. (#osc52-clipboard)
 _OSC52_RE = re.compile(r"\x1b\]52;[^;]*;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)")
+# Terminal QUERIES the child sends that expect a written reply (it queries saikai —
+# which sits between it and the real terminal — not WT; pyte computes some replies
+# but routes them to a no-op). Unanswered, claude's startup capability handshake
+# (Primary-DA sentinel, no local timeout) silently disables rich features (OSC 8 /
+# 133 / notifications / theme / synchronized output) and its alt-screen redraw probe
+# (private ?6n) can block. See _answer_queries. (#term-queries)
+_DA_RE = re.compile(r"\x1b\[0?c")                        # Primary Device Attributes
+_DSR_RE = re.compile(r"\x1b\[(\??)([56])n")             # DSR: 5=status, 6=cursor position
+_DECRQM_RE = re.compile(r"\x1b\[\?(\d+)\$p")            # DECRQM (mode support query)
+_XTVERSION_RE = re.compile(r"\x1b\[>0?q")               # XTVERSION (terminal name/version)
+_OSC_COLOR_Q_RE = re.compile(r"\x1b\](1[01]);\?(?:\x07|\x1b\\)")  # OSC 10/11 fg/bg color query
+# Desktop notifications the child may emit. claude usually falls back to a BEL in
+# saikai (it isn't a recognised rich-notification terminal), but honour these too.
+_OSC9_NOTIFY_RE = re.compile(r"\x1b\]9;(?!4;)([^\x07\x1b]*)\x07")       # iTerm2 (not 9;4 progress)
+_OSC777_RE = re.compile(r"\x1b\]777;notify;([^\x07]*)\x07")            # ghostty: title;body
+_OSC99_RE = re.compile(r"\x1b\]99;[^;]*;([^\x1b\x07]*)(?:\x07|\x1b\\)") # kitty: metadata;payload
 # Synchronized output (DEC mode 2026, BSU/ESU): a TUI brackets a full frame's writes
 # in ?2026h … ?2026l so the terminal presents the COMPLETE frame, not the half-drawn
 # intermediate. saikai feeds pyte continuously but DEFERS the pane repaint until the
@@ -877,6 +903,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._mouse_click = False      # ?1000 press/release
         self._mouse_btn_motion = False # ?1002 motion while a button is held (drag)
         self._mouse_any_motion = False # ?1003 motion always (hover)
+        self._focus_reporting = False  # ?1004: child wants \x1b[I / \x1b[O on focus change
         self._fwd_buttons = set()      # forwarded buttons currently held (a drag in progress)
         self._fwd_captured = False     # captured the mouse for the current forwarded gesture?
         self._fwd_last = (1, 1)        # last forwarded (col,row) — for a synthetic release
@@ -1689,6 +1716,81 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if text:
             self._marshal(lambda t=text: self._copy_text(t))
 
+    def _send_to_child(self, data: str) -> None:
+        """Write bytes to the child PTY (guarded). Called on the UI thread (via
+        _marshal) so a query reply can't interleave a concurrent keystroke."""
+        if self._pty is None or self.is_dead:
+            return
+        try:
+            self._pty.write(data)
+        except Exception:
+            pass
+
+    def _ring_bell(self) -> None:
+        """Ring the host terminal bell (UI thread)."""
+        try:
+            self.app.bell()
+        except Exception:
+            pass
+
+    def _notify_host(self, msg: str) -> None:
+        """Surface a child desktop-notification (OSC 9/777/99) as a saikai toast.
+        Reader thread → marshal the toast onto the UI thread. (#osc-notify)"""
+        msg = (msg or "").strip()
+        if not msg:
+            return
+        self._marshal(lambda m=msg[:200]: self._safe_notify(m))
+
+    def _safe_notify(self, msg: str) -> None:
+        try:
+            self.notify(msg, title="claude", timeout=6)
+        except Exception:
+            pass
+
+    def _cursor_rowcol(self) -> tuple:
+        """Current pyte cursor as 1-based (row, col), for a Cursor-Position reply."""
+        with self._lock:
+            scr = self._screen
+            if scr is None:
+                return 1, 1
+            try:
+                return int(scr.cursor.y) + 1, int(scr.cursor.x) + 1
+            except Exception:
+                return 1, 1
+
+    def _answer_queries(self, chunk: str) -> None:
+        """Reply to terminal queries the child emitted in this chunk. saikai — not
+        the real terminal — receives them, and pyte never writes replies back, so
+        without this claude's capability handshake degrades and its private-?6n
+        redraw probe can block. Reads run here (reader thread); the actual PTY write
+        is marshalled to the UI thread so it can't interleave a keystroke. Answers:
+        Primary DA, DSR (status / cursor position, honouring the private ?6n form),
+        DECRQM ?2026 (we honour synchronized output), XTVERSION, OSC 10/11 color.
+        (#term-queries)"""
+        out = []
+        if _DA_RE.search(chunk):
+            out.append("\x1b[?6c")                       # Primary DA → a VT102-class terminal
+        for _priv, _kind in _DSR_RE.findall(chunk):
+            if _kind == "5":
+                out.append("\x1b[0n")                    # device status: OK
+            else:                                        # 6 = cursor position report
+                r, c = self._cursor_rowcol()
+                out.append(f"\x1b[{_priv}{r};{c}R")      # keep the private '?' if queried
+        for _mode in _DECRQM_RE.findall(chunk):
+            # saikai honours synchronized output (?2026) → "reset but recognised" (2);
+            # any other mode → "not recognised" (0).
+            out.append(f"\x1b[?{_mode};{'2' if _mode == '2026' else '0'}$y")
+        if _XTVERSION_RE.search(chunk):
+            out.append("\x1bP>|saikai\x1b\\")
+        for _code in _OSC_COLOR_Q_RE.findall(chunk):
+            # Report a dark background (11) / light foreground (10) so the child picks
+            # a dark theme, matching a typical terminal.
+            _rgb = "1e1e/1e1e/1e1e" if _code == "11" else "c0c0/c0c0/c0c0"
+            out.append(f"\x1b]{_code};rgb:{_rgb}\x07")
+        if out:
+            resp = "".join(out)
+            self._marshal(lambda r=resp: self._send_to_child(r))
+
     def _consume(self, chunk: str) -> None:
         """Feed a decoded chunk to pyte (handling alt-screen resets) and update
         the rolling tail + status. Runs on the reader thread."""
@@ -1734,6 +1836,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                         self._mouse_btn_motion = _on   # motion while a button is held
                     elif _p == "1003":
                         self._mouse_any_motion = _on   # any motion (hover)
+                    elif _p == "1004":
+                        self._focus_reporting = _on    # child wants focus in/out events
                     elif _p == "1006":
                         self._mouse_sgr = _on          # SGR extended encoding
             # any tracking on ⇒ the child owns the mouse (incl. wheel + drag-select)
@@ -1759,6 +1863,15 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             _open = _clip.rfind("\x1b]52;")
             if _open >= _last and _OSC52_RE.search(_clip[_open:]) is None:
                 self._osc52_carry = _clip[_open:][-131072:]   # unterminated tail (capped)
+        # Surface the child's desktop notifications (OSC 9 / 777 / 99) as a saikai
+        # toast. (#osc-notify)
+        if "\x1b]9;" in chunk or "\x1b]777;" in chunk or "\x1b]99;" in chunk:
+            for _msg in _OSC9_NOTIFY_RE.findall(chunk):
+                self._notify_host(_msg)
+            for _msg in _OSC777_RE.findall(chunk):
+                self._notify_host(_msg.replace(";", ": ", 1))
+            for _msg in _OSC99_RE.findall(chunk):
+                self._notify_host(_msg)
         if not chunk:
             return
         with self._lock:
@@ -1820,6 +1933,18 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # / answered prompts that scrolled up and would misclassify an idle pane.
         _txt, _title = self._current_screen()
         self._update_status(self._classify(_txt, _title))
+        # Answer any terminal queries in this chunk AFTER the feed, so a cursor-
+        # position reply reflects the cursor this chunk just moved. (#term-queries)
+        if "\x1b[" in chunk or "\x1b]1" in chunk:
+            self._answer_queries(chunk)
+        # A real BEL from the child (pyte distinguishes it from an OSC terminator):
+        # ring the host bell — claude's attention signal / notification fallback.
+        # Gated by SAIKAI_NO_BELL. (#bell)
+        _scr = self._screen
+        if _scr is not None and getattr(_scr, "_bell_rang", False):
+            _scr._bell_rang = False
+            if not os.environ.get("SAIKAI_NO_BELL"):
+                self._marshal(lambda: self._ring_bell())
 
     def _current_screen(self) -> tuple:
         """(visible text, title) under the lock. `title` is claude's OSC-0 title
@@ -2051,6 +2176,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # Show the terminal's native cursor (Windows) — see _show_hw_cursor.
         self._show_hw_cursor(True)
         self._sync_terminal_cursor(reason="focus")
+        if getattr(self, "_focus_reporting", False):                # ?1004: tell the child it's focused
+            self._send_to_child("\x1b[I")
         # The immediate sync above can fire before layout settles — inside the
         # focus event `content_region`/`has_focus` may not be valid yet, so the
         # anchor silently skips and WT shows the IME disabled (×) on focus
@@ -2146,6 +2273,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # Hide the native cursor (Windows) so an unfocused pane / the list doesn't
         # carry a stray cursor.
         self._show_hw_cursor(False)
+        if getattr(self, "_focus_reporting", False):                # ?1004: tell the child it lost focus
+            self._send_to_child("\x1b[O")
         self._cancel_forwarded_drag()          # a lost MouseUp must not stick capture
 
     # ── thread → UI marshaling (defensive) ─────────────────────────────────────
