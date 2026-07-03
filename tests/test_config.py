@@ -325,8 +325,11 @@ def test_activity_marker_shell_distinct_from_open():
     assert "$" not in saikai._activity_marker({"is_open": True, "session_status": "busy"})
     # bg wins over shell (a bg agent is never an attachable shell window)
     assert "&" in saikai._activity_marker({"is_bg": True, "is_open": True, "session_status": "shell"})
-    # '$' is colour-mapped for the TUI list marker too
-    assert saikai._MARKER_COLOR.get("$") == "yellow"
+    # '$' (open-elsewhere shell) is in the calm/dim tier for the TUI list marker;
+    # the single saturated accent is reserved for "needs you" (waiting/reply-due).
+    assert saikai._MARKER_COLOR.get("$") == "dim"
+    assert saikai._MARKER_COLOR.get("!") == saikai._ATTENTION_STYLE   # reply-due = the accent
+    assert saikai._MARKER_COLOR.get("?") == saikai._ATTENTION_STYLE   # waiting = the accent
 
 
 def test_color_map_is_stable_across_visible_sets():

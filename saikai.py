@@ -2938,29 +2938,52 @@ _MARKER_BLANK = " "
 # the terminal module and loads after this), so cross-check both when adding or
 # renaming a status. "idle" is intentionally absent: the list resolves it to "!"
 # (reply-due) vs "=" from app state in _refresh_table, not from the raw status.
+# saikai's SINGLE attention accent. Exactly one saturated colour across the whole
+# marker vocabulary means "this needs you right now" — a live session waiting on
+# input, a dormant session whose last turn was yours, or a background agent blocked
+# on your clarification. Everything else reads in calm greyscale WEIGHT: running
+# work at normal weight (visible, not shouting), quiet/open-elsewhere/background
+# state dimmed. So the eye lands on exactly what's actionable instead of parsing a
+# dozen competing hues. RED is reserved for a genuine failure only; favourite (gold)
+# and hidden live in a SEPARATE column (a different axis: user tags, not urgency).
+ATTENTION = CYAN
+_ATTENTION_STYLE = "bold cyan"   # Rich/Textual equivalent for the TUI table tint
+
 _LIVE_MARKER = {
-    "waiting": ("?", "red"),    # needs input — matches the statusbar ?N badge
-    "busy":    ("~", "cyan"),   # working / running
+    "waiting": ("?", _ATTENTION_STYLE),   # needs you NOW — the single attention accent
+    "busy":    ("~", ""),                 # working — normal weight (default fg), not accented
 }
 
-# Per-state colour for the TUI list's activity marker (the ? ~ ! = R @ + . glyph),
-# which was distinguished by GLYPH only. Tint it so state reads at a glance, using
-# the SAME palette as the toast severities ($warning≈yellow, $success≈green) and
-# the CLI --table _activity_marker — so the colour language is consistent across
-# the list, the CLI, and notifications. The live-state colours come from
-# _LIVE_MARKER (single source); the rest are list-only reply-due / file-registry
-# markers. Markers not listed stay the default colour.
+# Per-glyph Rich style for the TUI list's activity marker. Three tiers only:
+# ATTENTION accent (needs you) · default (running now) · dim (quiet / elsewhere /
+# background). The live-state styles come from _LIVE_MARKER (single source); the
+# rest are file-registry / reply-due markers. bg (&) re-tints by job state in
+# _marker_tint so a BLOCKED agent still gets the accent. Glyphs not listed = default.
 _MARKER_COLOR = {_g: _c for _g, _c in _LIVE_MARKER.values()}
 _MARKER_COLOR.update({
-    "!": "yellow",    # reply due — your last turn is unanswered (statusbar !M)
-    "R": "cyan",      # Remote Control enabled in another Claude session
-    "@": "green",     # opened in another window
-    "$": "yellow",    # open & running a shell command (registry status=="shell")
-    "&": "magenta",   # running bg agent/job (headless; colour = job state: yellow=blocked, red=failed, dim=done)
-    "+": "green",     # recently active
-    ".": "yellow",    # recent (dormant) — matches the CLI --table '.' tint so the
-    #                   comment's "same palette as the CLI" claim actually holds
+    "!": _ATTENTION_STYLE,   # reply due — needs you (dormant): same accent as waiting
+    "=": "dim",              # idle live pane, no reply due
+    "R": "dim",              # Remote Control in another session (someone else's)
+    "@": "dim",              # open in another window
+    "$": "dim",              # open & running a shell command elsewhere
+    "&": "dim",              # bg agent/job (job STATE re-tints via _marker_tint)
+    "+": "dim",              # recently active
+    ".": "dim",              # recent (dormant)
 })
+
+
+def _marker_tint(glyph: str, s: dict) -> str:
+    """Rich style for a TUI activity glyph. A background agent (&) re-tints by job
+    state so a BLOCKED agent (awaiting your clarification) gets the same attention
+    accent as a waiting session, and a failed one goes red — the two bg states you'd
+    act on — while a merely-running/done bg stays dim like the rest of the calm tier."""
+    if glyph == "&":
+        if s.get("job_needs"):
+            return _ATTENTION_STYLE                       # blocked → needs you (accent)
+        if s.get("job_state") in ("failed", "stopped"):
+            return "red"
+        return "dim"
+    return _MARKER_COLOR.get(glyph, "")
 
 
 # Markers are intentionally ASCII (1 cell, terminal-width-independent). The
@@ -2974,32 +2997,32 @@ _TABLE_NA_CACHE: dict = {}   # mtime-keyed reply-due cache for the --table activ
 
 def _activity_marker(s: dict) -> str:
     """Activity column: bg / Remote Control / open / active / reply-due / recent."""
+    # Three tiers of colour only: ATTENTION accent (needs you) · default (running
+    # now) · DIM (quiet / open-elsewhere / background). RED = genuine failure only.
     if s.get("is_bg"):
         # Same glyph '&' (no new marker — '?' already means live-waiting); the bg
         # JOB state is conveyed by COLOUR so it can't collide with other markers.
         _jst = s.get("job_state")
         if s.get("job_needs"):
-            return _c("&", YELLOW, BOLD)     # bg agent BLOCKED — awaiting your clarification
+            return _c("&", ATTENTION, BOLD)  # bg agent BLOCKED — awaiting your clarification
         if _jst in ("failed", "stopped"):
             return _c("&", RED)              # bg job ended abnormally
-        if _jst == "done":
-            return _c("&", DIM)              # bg job finished
-        return _c("&", MAGENTA, BOLD)        # running background agent/job (headless)
+        return _c("&", DIM)                  # running / done bg agent — calm tier
     if s.get("is_remote_control"):
-        return _c("R", CYAN, BOLD)       # open with Claude Remote Control enabled
+        return _c("R", DIM)              # Remote Control elsewhere — someone else's session
     if s.get("is_open"):
         _ss = s.get("session_status")
-        if _ss == "shell":
-            return _c("$", YELLOW, BOLD)  # open & running a shell command (a Bash tool call)
         if _ss == "busy":
-            return _c("@", CYAN, BOLD)   # open & currently responding
-        return _c("@", GREEN, BOLD)      # open & idle in another Claude window
+            return _c("@")               # open & responding — running now (default weight)
+        if _ss == "shell":
+            return _c("$", DIM)          # open & running a shell command elsewhere
+        return _c("@", DIM)              # open & idle in another Claude window
     if s.get("is_active"):
-        return _c("+", GREEN)
+        return _c("+", DIM)
     if _needs_attention(s, _TABLE_NA_CACHE):
-        return _c("!", YELLOW, BOLD)     # dormant: your last turn is unanswered
+        return _c("!", ATTENTION, BOLD)  # dormant: your last turn is unanswered — needs you
     if s.get("is_recent"):
-        return _c(".", YELLOW)
+        return _c(".", DIM)
     return _MARKER_BLANK
 
 
@@ -3129,11 +3152,12 @@ def display_table(sessions: list[dict], repo: Path | None, show_project: bool,
     print()
     view_mode = _get_view_mode()
     mode_tag = _c(" [show-hidden mode]", RED) if view_mode == "show-hidden" else ""
+    # Lead with the ONE accent (needs-you); the calm tier is listed plainly, the
+    # fav/hidden tags keep their own column colours. Short on purpose.
     legend = (f"  {len(sessions)} sessions{mode_tag}  ·  "
-              f"{_c('*', GOLD)} fav  {_c('+', GREEN)} active(<5m)  "
-              f"{_c('.', YELLOW)} recent(<30m)  {_c('x', RED)} hidden  "
-              f"{_c('R', CYAN)} remote-control  {_c('@', GREEN)} open  "
-              f"{_c('$', YELLOW)} shell  ·  saikai to resume")
+              f"{_c('!', ATTENTION, BOLD)}/{_c('?', ATTENTION, BOLD)} needs you  "
+              f"~ running  @ open  & bg  ·  "
+              f"{_c('*', GOLD)} fav  {_c('x', RED)} hidden  ·  saikai to resume")
     print(_c(legend, DIM))
     print()
 
@@ -4532,7 +4556,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  Age       last 1d / 3d / 7d / 30d / All time\n"
                 "  Search    [yellow]/[/yellow] or type to open the bar; tokens AND with text + each other —\n"
                 "            :fav  :hidden  :open  :active  :recent   (Esc clears)\n"
-                "  Markers   R remote-control · @ open elsewhere · $ open+running a shell · & bg agent (yellow=blocked/needs-you, red=failed, dim=done) · + active · . recent · live ~ busy · ? waiting · ! reply due · = idle · * fav · x hidden\n"
+                "  Markers   [bold cyan]needs you[/bold cyan] (cyan): [bold cyan]?[/bold cyan] waiting · [bold cyan]![/bold cyan] reply due · [bold cyan]&[/bold cyan] bg blocked\n"
+                "            running (normal): ~ busy · @ responding elsewhere\n"
+                "            quiet (dim): = idle · @ open · $ shell · R remote · + active · . recent · & bg\n"
+                "            tags: [#e0af68]*[/#e0af68] favorite · [red]x[/red] hidden · [red]&[/red] bg failed\n"
                 "  [yellow]/[/yellow] shows the bar with the dropdowns; [yellow]Tab[/yellow]/[yellow]Shift-Tab[/yellow] walk into them, [yellow]Enter[/yellow]\n"
                 "  opens one. Leader [yellow]s[/yellow]/[yellow]o[/yellow] cycles the sort column / direction without the bar\n"
                 "  (a column-header click still sorts too)\n\n"
@@ -6044,7 +6071,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 marker = f"{marker_a}{marker_s}"
                 # Tint the marker by its activity state (marker_a); the fav/hidden
                 # suffix rides the same colour. Glyph stays the alignment anchor.
-                marker_cell = Text(marker, style=_MARKER_COLOR.get(marker_a, ""))
+                # _marker_tint applies the single ATTENTION accent + bg job-state.
+                marker_cell = Text(marker, style=_marker_tint(marker_a, s))
                 # Plain title; collapse any newline/tab so a multi-line ai_title
                 # doesn't push the row to multiple terminal lines. _list_title uses
                 # claude's own ai-title / first msg / project — never `claude -p` —

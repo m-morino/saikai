@@ -77,11 +77,14 @@ saikai
 By default, sessions from the same project share a title color, so related work
 stays recognizable when the project column is hidden in the narrow split view.
 Set `display.color_by` to `worktree`, `topic`, or `none` to change the grouping.
-The leading glyph is the session's status:
+The leading glyph is the session's status. One accent colour (cyan) means **needs
+you**; everything else is calm greyscale weight, so your eye lands on what's
+actionable:
 
-`~` working · `?` waiting for you · `!` finished, awaiting your reply · `=` idle
-live pane, no reply due · `R` Remote Control · `@` open elsewhere · `+` active · `.` recent · `*` favorite ·
-`x` hidden
+- **needs you** (cyan): `?` waiting for input · `!` finished, awaiting your reply · `&` background agent blocked
+- **running now** (normal): `~` working · `@` responding in another window
+- **quiet** (dim): `=` idle live pane · `@` open elsewhere · `$` running a shell · `R` Remote Control · `+` active · `.` recent · `&` background agent
+- **tags** (separate column): `*` favorite · `x` hidden
 
 ![The list grouped by date, with a ★ favorite, status markers, and the sort/group state in the status bar](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-browse.svg)
 
