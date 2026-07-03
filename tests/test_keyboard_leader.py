@@ -2072,6 +2072,58 @@ def test_statusbar_markup_escapes_user_search_and_folder():
         "an unescaped stray close tag must MarkupError — the hazard is real"
 
 
+def test_tab_glyph_updates_via_tab_label_not_pane_label():
+    """A live pane's status glyph (idle/busy/dead, and a rename) is refreshed by
+    relabelling its tab. TabPane has NO `label` property, so `pane.label = …` only
+    set a dead instance attribute — the DISPLAYED glyph never changed. The update
+    must go through the Tab widget: tabs.get_tab(pane).label = Content(…), whose
+    setter calls update(). Passing Content (not str) keeps a '[' in a session
+    title literal, since Tab.label's Content.from_text defaults to markup=True.
+    (#tab-glyph-update)"""
+    # (1) Source guard — the no-op form must be gone, the Tab.label form wired in
+    # at all three glyph-update sites (status poll, dead pane, rename).
+    src = Path(saikai.__file__).read_text(encoding="utf-8")
+    assert "pane.label = Content(" not in src, \
+        "TabPane.label is a no-op — relabel via tabs.get_tab(pane).label"
+    assert src.count("get_tab(pane).label = Content(") >= 3, \
+        "all three glyph-update sites must relabel the Tab, not the TabPane"
+
+    # (2) Behavioral — prove the contract saikai now relies on, on a minimal app:
+    # get_tab().label updates the displayed tab (pane.label does NOT), bracket-safe.
+    try:
+        from textual.app import App
+        from textual.widgets import TabbedContent, TabPane, Static
+        from textual.content import Content
+    except Exception:
+        print("SKIP test_tab_glyph_updates_via_tab_label_not_pane_label "
+              "(textual unavailable)")
+        return
+    import asyncio
+    facts: dict = {}
+
+    class _Mini(App):
+        def compose(self):
+            with TabbedContent(id="tc"):
+                with TabPane(Content("~ old"), id="p1"):
+                    yield Static("body")
+
+    async def go():
+        app = _Mini()
+        async with app.run_test() as _pilot:
+            tc = app.query_one("#tc", TabbedContent)
+            pane = tc.get_pane("p1")
+            pane.label = Content("X ignored")                 # the old no-op path
+            facts["after_pane_label"] = tc.get_tab(pane).label.plain
+            tc.get_tab(pane).label = Content("x [wip] new")   # the fix path
+            facts["after_tab_label"] = tc.get_tab(pane).label.plain
+    asyncio.run(go())
+
+    assert facts.get("after_pane_label") == "~ old", \
+        f"pane.label must NOT change the displayed tab (it is a no-op): {facts}"
+    assert facts.get("after_tab_label") == "x [wip] new", \
+        f"get_tab().label must update the tab, brackets literal: {facts}"
+
+
 def test_pilot_filter_engaged_window_survives_focus_move():
     """Filtering must not switch the foreground live pane out from under the user.
     The post-filter RowHighlighted is queued (the rebuild is call_after_refresh'd),
@@ -2383,6 +2435,8 @@ if __name__ == "__main__":
     print("PASS test_tabpane_title_uses_markup_safe_content_not_rich_text")
     test_statusbar_markup_escapes_user_search_and_folder()
     print("PASS test_statusbar_markup_escapes_user_search_and_folder")
+    test_tab_glyph_updates_via_tab_label_not_pane_label()
+    print("PASS test_tab_glyph_updates_via_tab_label_not_pane_label")
     test_pilot_cycle_tab_skips_dead_pane()
     test_pilot_double_space_does_not_leave_leader_armed()
     print("PASS test_pilot_double_space_does_not_leave_leader_armed")

@@ -7727,7 +7727,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 title = _pane_title(s, sid, self._live.get(sid))
                 pane = tabs.get_pane(self._live.pane_id(sid))
                 if pane is not None:
-                    pane.label = Content(_LIVE_TERM.tab_label(title, status))  # (#audit-toast-markup)
+                    # Relabel via the DISPLAYED Tab widget: TabPane has no `label`
+                    # property, so `pane.label = …` only set a dead attribute and the
+                    # glyph never changed. Tab.label's setter calls update(); passing
+                    # Content keeps a '[' in the title literal. (#tab-glyph-update)
+                    tabs.get_tab(pane).label = Content(_LIVE_TERM.tab_label(title, status))
             except Exception:
                 pass
 
@@ -7835,7 +7839,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 title = _pane_title(s, sid, self._live.get(sid))
                 pane = tabs.get_pane(self._live.pane_id(sid))
                 if pane is not None:
-                    pane.label = Content(_LIVE_TERM.tab_label(title, "dead"))  # (#audit-toast-markup)
+                    tabs.get_tab(pane).label = Content(_LIVE_TERM.tab_label(title, "dead"))  # Tab.label (not TabPane) updates the display (#tab-glyph-update)
             except Exception:
                 pass
             self._live.forget(sid)
@@ -8370,7 +8374,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         pane = tabs.get_pane(self._live.pane_id(sid))
                         if pane is not None:
                             title = _pane_title(_live_s, sid, self._live.get(sid))
-                            pane.label = Content(_LIVE_TERM.tab_label(title, self._live.status(sid)))  # (#audit-toast-markup)
+                            tabs.get_tab(pane).label = Content(_LIVE_TERM.tab_label(title, self._live.status(sid)))  # Tab.label (not TabPane) updates the display (#tab-glyph-update)
                 except Exception:
                     pass
                 self.notify("name cleared — back to auto-title" if not clean
