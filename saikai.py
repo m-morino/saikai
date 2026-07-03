@@ -2686,9 +2686,10 @@ def _render_header(s: dict) -> list[str]:
     if pid:
         score = s.get("parent_score", 0.0)
         reasons = s.get("parent_reasons", [])
-        # Confidence marker reuses --related's legend: ● green ≥0.70, ● yellow
-        # ≥0.40, ○ gray ≥0.20 — so a low-confidence "parent" link is visually
-        # distinguishable from a strong one (the forest is heuristic).
+        # Confidence marker reuses --related's legend: ● ≥0.70, dim ● ≥0.40,
+        # dim ○ ≥0.20 — so a low-confidence "parent" link is visually
+        # distinguishable from a strong one (the forest is heuristic). Encoded in
+        # glyph + weight, not hue, so it stays clear of the cyan attention accent.
         marker = _confidence_marker(score)
         rs = "  ·  ".join(reasons) if reasons else ""
         lines.append(f"  parent:   {marker} {pid[:8]}  [score {score:.2f}]  {_c(rs, GRAY)}")
@@ -2932,12 +2933,13 @@ def preview_session_full(session_id: str) -> None:
 _MARKER_BLANK = " "
 
 # Single source for the LIVE-status markers in the session list — glyph + colour
-# together, so the activity column and its tint can't drift. The SAME live states
-# are also rendered by the tab labels (saikai_terminal.STATUS_GLYPH) in a separate
-# calm/loud glyph vocabulary; the two can't share one constant (STATUS_GLYPH is in
-# the terminal module and loads after this), so cross-check both when adding or
-# renaming a status. "idle" is intentionally absent: the list resolves it to "!"
-# (reply-due) vs "=" from app state in _refresh_table, not from the raw status.
+# together, so the activity column and its tint can't drift. The tab labels
+# (saikai_terminal.STATUS_GLYPH) now use the SAME glyph vocabulary (? ~ =), so a
+# glyph reads the same in the list and on a tab; they can't share one Python
+# constant (STATUS_GLYPH lives in the terminal module, which loads after this), so
+# keep the two in step when adding or renaming a status. "idle" is intentionally
+# absent here: the list resolves it to "!" (reply-due) vs "=" from app state in
+# _refresh_table, not from the raw status.
 # saikai's SINGLE attention accent. Exactly one saturated colour across the whole
 # marker vocabulary means "this needs you right now" — a live session waiting on
 # input, a dormant session whose last turn was yours, or a background agent blocked
@@ -6981,7 +6983,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             A DEAD pane (claude exited) deliberately counts as None: otherwise
             Enter/Esc/Tab/? all SkipAction into a corpse and the user can neither
             relaunch nor leave. Treating it as not-focused lets Enter fall through
-            to relaunch and Esc/F10 close the ✓ tab."""
+            to relaunch and Esc/F10 close the x tab."""
             if _LIVE_TERM is None:
                 return None
             foc = self.focused
@@ -7594,7 +7596,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._mark_not_open(sid)         # exited → no longer Open (drop the @ marker)
             # A session whose claude EXITED on its own shouldn't reappear on the
             # next Shift+F4 restore (matches explicit-close in _close_live_sid).
-            # The dead ✓ tab stays visible THIS session; re-launching it with Enter
+            # The dead x tab stays visible THIS session; re-launching it with Enter
             # re-adds it via _open_or_attach_live. Persist the trimmed snapshot now.
             # EXCEPTION: during quit teardown (_quitting), kill_all fires this for
             # every pane — eroding + re-saving here empties the restore snapshot we
@@ -7603,7 +7605,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if not getattr(self, "_quitting", False):
                 self._opened_sids.discard(sid)
                 self._save_open_panes()
-            self._prune_dead_panes()   # bound retained ✓ dead-pane memory (#H6)
+            self._prune_dead_panes()   # bound retained x dead-pane memory (#H6)
             self._refresh_table()
             if _was_focused:
                 try:
@@ -7612,7 +7614,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     pass
 
         def _prune_dead_panes(self) -> None:
-            """Unmount the OLDEST dead (✓) panes so their pyte buffers are freed. A
+            """Unmount the OLDEST dead (x) panes so their pyte buffers are freed. A
             dead pane is kept mounted to show its final frame, but it's forgotten
             from self._live, so the MAX_LIVE gate doesn't count it — without a cap,
             letting claude exit repeatedly (without F10) grows memory unbounded (each
@@ -7755,7 +7757,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             pane_id = self._live.pane_id(sid)
             # Land on the ADJACENT pane (DOM order), not the last-registered one,
             # so closing C in [A,B,C,D] goes to its neighbour, not whatever opened
-            # last. _live_pane_ids() is DOM order and includes dead ✓ panes.
+            # last. _live_pane_ids() is DOM order and includes dead x panes.
             ids_before = self._live_pane_ids()
             try:
                 idx = ids_before.index(pane_id)
@@ -7935,7 +7937,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     for sid in self._live.statuses():
                         if self._live.pane_id(sid) == ids[i]:
                             t = self._live.get(sid)
-                            # Never focus a DEAD ✓ pane — it has no PTY, so keys
+                            # Never focus a DEAD x pane — it has no PTY, so keys
                             # would vanish into a corpse (and a stray printable
                             # would bubble to the list as type-to-search). Land on
                             # the list instead, same guard as action_toggle_list.
@@ -7967,7 +7969,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         term = None
                 if term is not None and not getattr(term, "is_dead", False):
                     try:
-                        term.focus()        # never focus a dead ✓ pane (keys would vanish)
+                        term.focus()        # never focus a dead x pane (keys would vanish)
                     except Exception:
                         pass
             else:
@@ -8635,7 +8637,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     pass
                 return
             # A focused terminal → Esc returns to the list. _focused_terminal()
-            # only counts LIVE panes; a focused DEAD (✓) pane bubbles Esc here too
+            # only counts LIVE panes; a focused DEAD (x) pane bubbles Esc here too
             # (its on_key lets keys through with no PTY), so match the widget type
             # directly — otherwise Esc on a corpse falls through to the quit prompt
             # instead of releasing to the list.
@@ -10035,12 +10037,15 @@ def _score_relation(target: dict, other: dict) -> tuple[float, list[str]]:
 
 
 def _confidence_marker(score: float) -> str:
+    # Relationship CONFIDENCE is a different axis from urgency, so it stays OUT of
+    # the single cyan attention accent: the gradient reads from glyph + weight
+    # (solid ● vs hollow ○, full vs dim), not from a competing green/yellow hue.
     if score >= 0.7:
-        return _c("●", GREEN)
+        return "●"                # strong link — solid, full weight
     if score >= 0.4:
-        return _c("●", YELLOW)
+        return _c("●", DIM)       # medium — solid, dimmed
     if score >= 0.2:
-        return _c("○", GRAY)
+        return _c("○", DIM)       # weak — hollow, dimmed
     return " "
 
 
@@ -10098,9 +10103,8 @@ def cmd_related(target_id_prefix: str, sessions: list[dict]) -> None:
         return
 
     print(_c(f"Related ({len(candidates)} candidates, sorted by score):", BOLD))
-    print(_c("  " + _c("●", GREEN) + " high (≥0.70)   " +
-            _c("●", YELLOW) + " med (≥0.40)   " +
-            _c("○", GRAY) + " low (≥0.20)", DIM))
+    print(_c("  ● high (≥0.70)   " + _c("●", DIM) + " med (≥0.40)   " +
+            _c("○", DIM) + " low (≥0.20)", DIM))
     print()
     for s, score, reasons in candidates[:20]:
         marker = _confidence_marker(score)
@@ -10290,13 +10294,15 @@ def _tree_walk(sessions: list[dict]) -> list[tuple[dict, str]]:
         if prefix:
             base = "\\-" if is_last else "+-"
             score = s.get("parent_score", 0.0)
+            # Confidence via WEIGHT, not hue (kept clear of the cyan attention
+            # accent): a strong link is a full-weight dash, weaker ones dim, and a
+            # low-confidence link degrades the dash to a dot.
             if score >= 0.7:
-                glyph = _c(base, GREEN)
+                glyph = base                       # strong — full weight
             elif score >= 0.4:
-                glyph = _c(base, YELLOW)
+                glyph = _c(base, DIM)              # medium — dimmed dash
             else:
-                # weak parent link: low-confidence glyph (dot instead of dash)
-                glyph = _c(base[0] + ".", GRAY)
+                glyph = _c(base[0] + ".", DIM)     # weak — dimmed dot
             node_prefix = prefix + glyph + " "
         else:
             node_prefix = ""

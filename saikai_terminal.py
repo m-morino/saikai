@@ -2563,22 +2563,22 @@ class LiveSessionManager:
             self.join_reaps()
 
 
-# Status → a compact glyph for the tab label. Loud on "waiting" so a session
-# needing input is visible even when its tab isn't focused; calm on idle. The
-# session LIST in saikai.py renders these SAME live states in its own ASCII marker
-# vocabulary (_LIVE_MARKER: waiting "?", busy "~", idle "="/"!"); the two are
-# deliberately distinct glyph sets, so keep both in step when adding/renaming a
-# status. "dead" → ✓ here; the list drops a dead pane to its dormant file markers.
+# Status → a compact glyph for the tab label. Uses the SAME vocabulary as the
+# session LIST (saikai.py _LIVE_MARKER: waiting "?", busy "~", idle "="), so a
+# glyph means the same thing whether you read it in the list or on a tab — one
+# vocabulary to learn, not two. Keep both in step when adding/renaming a status.
+# "dead" → "x" (exited) is tab-only; the list drops a dead pane to its file markers.
 STATUS_GLYPH = {
-    "busy": "◐",      # ◐ working
-    "waiting": "⏳",   # ⏳ needs input
-    "idle": "○",      # ○ ready
-    "dead": "✓",      # ✓ exited
+    "busy": "~",      # working
+    "waiting": "?",   # needs input
+    "idle": "=",      # ready / idle
+    "dead": "x",      # exited
 }
 
 
 def tab_label(title: str, status: str) -> str:
-    """Build a TabPane label like '◐ saikai' / '⏳ docs' / '✓ myproj'."""
+    """Build a TabPane label like '~ saikai' / '? docs' / 'x myproj' — the same
+    status glyphs the session list uses."""
     glyph = STATUS_GLYPH.get(status, "")
     name = (title or "agent")[:18]
     return f"{glyph} {name}".strip()
