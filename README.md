@@ -206,7 +206,7 @@ mirror to watch *all* your local sessions from the couch.
 | Variable | Default | Meaning |
 |---|---|---|
 | `SAIKAI_SPLIT_LIVE` | on | live-pane mode; set `0`/`false`/`no`/`off` to disable → list-only browser + full-takeover resume |
-| `SAIKAI_AUTO_REFRESH` | off | seconds between background re-scans; `0` disables, minimum active interval is `2` |
+| `SAIKAI_AUTO_REFRESH` | off | extra fixed-interval background re-scan, in seconds (`0` disables, min `2`). Independent of this, sessions started elsewhere are picked up automatically within ~2s via a cheap mtime gate — set this only if you also want a guaranteed fixed cadence |
 | `SAIKAI_SUMMARIZE_ENABLED` | off | opt in to AI summaries through `claude -p` |
 | `SAIKAI_SUMMARIZE_CMD` | — | command to summarize with (prompt on stdin → summary on stdout) instead of `claude -p` |
 | `SAIKAI_SUMMARIZE_MODEL` | haiku | model used when summarizing through `claude -p` |

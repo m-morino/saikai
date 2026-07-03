@@ -652,6 +652,12 @@ _BRACKETED_RE = re.compile(r"\x1b\[\?2004([hl])")
 # form. We act on the mouse-tracking + SGR-encoding params; others are ignored here
 # (bracketed paste / sync-update keep their own trackers below). (#faithful-mouse)
 _DEC_PRIVATE_RE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
+# OSC 52 clipboard WRITE from the child (\x1b]52;<sel>;<base64>\x07 or …ST). claude's
+# fullscreen renderer copies a mouse selection this way; saikai consumes the child's
+# output (the real terminal never sees it) and pyte ignores OSC 52, so without this
+# the copy never reaches the host clipboard. base64 group is empty for a "?" (read)
+# query, which we ignore. (#osc52-clipboard)
+_OSC52_RE = re.compile(r"\x1b\]52;[^;]*;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)")
 # Synchronized output (DEC mode 2026, BSU/ESU): a TUI brackets a full frame's writes
 # in ?2026h … ?2026l so the terminal presents the COMPLETE frame, not the half-drawn
 # intermediate. saikai feeds pyte continuously but DEFERS the pane repaint until the
@@ -881,6 +887,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                                      # (the reader keeps mutating screen.buffer, so
                                      # render + copy must read the FROZEN frame)
         self._esc_carry = ""         # trailing partial escape held across read()s
+        self._osc52_carry = ""       # partial OSC 52 clipboard write held across read()s (base64 can span chunks)
         self._reader: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._lock = threading.Lock()   # guards pyte feed vs render_line read
@@ -902,11 +909,20 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
 
     # ── geometry helpers ──────────────────────────────────────────────────────
     def _dims(self) -> tuple[int, int]:
-        """Current (rows, cols), floored at a sane minimum so pyte / ConPTY
-        never get a zero dimension during early layout."""
-        cols = max(int(self.size.width or 0), 2)
-        rows = max(int(self.size.height or 0), 2)
-        return rows, cols
+        """Current (rows, cols). When the widget has NO real size yet — an inactive
+        TabbedContent pane (ContentSwitcher sets display:none → size 0) or pre-layout
+        — fall back to 80x24 instead of the old 2x2 floor: a child spawned into a 2x2
+        PTY can't render its UI, so its trust-gate / prompts never appear and the
+        status classifier can't see "waiting" until the tab is activated and resized
+        (the "restored pane isn't flagged needs-input until I select it" bug). 80x24
+        lets the child render + be classified while still backgrounded; on_resize
+        corrects to the exact size when the tab is shown. (#inactive-pane-size)"""
+        w = int(self.size.width or 0)
+        h = int(self.size.height or 0)
+        if w < 8 or h < 4:                       # inactive/hidden pane or pre-layout
+            w = w if w >= 8 else 80
+            h = h if h >= 4 else 24
+        return max(h, 2), max(w, 2)
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
     def on_mount(self) -> None:
@@ -1659,6 +1675,20 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         finally:
             self._finalize()
 
+    def _honor_osc52(self, b64: str) -> None:
+        """Put an OSC 52 clipboard-write payload from the child onto the HOST
+        clipboard. Ignores a "?"/empty payload (a read query). Runs on the reader
+        thread → marshals the actual clipboard set onto the UI thread. (#osc52-clipboard)"""
+        if not b64 or b64 == "?":
+            return
+        try:
+            import base64
+            text = base64.b64decode(b64, validate=False).decode("utf-8", "replace")
+        except Exception:
+            return
+        if text:
+            self._marshal(lambda t=text: self._copy_text(t))
+
     def _consume(self, chunk: str) -> None:
         """Feed a decoded chunk to pyte (handling alt-screen resets) and update
         the rolling tail + status. Runs on the reader thread."""
@@ -1715,6 +1745,20 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._in_sync_update = (_su[-1] == "h")
             if self._in_sync_update:
                 self._sync_started = time.monotonic()
+        # Honor the child's OSC 52 clipboard writes (e.g. claude's fullscreen 'copy
+        # selection'): saikai consumes the child's output and pyte ignores OSC 52, so
+        # decode + set the HOST clipboard ourselves. Reassemble across reads — a large
+        # selection's base64 can span chunks. (#osc52-clipboard)
+        if "\x1b]52;" in chunk or getattr(self, "_osc52_carry", ""):
+            _clip = getattr(self, "_osc52_carry", "") + chunk
+            self._osc52_carry = ""
+            _last = 0
+            for _mo in _OSC52_RE.finditer(_clip):
+                self._honor_osc52(_mo.group(1))
+                _last = _mo.end()
+            _open = _clip.rfind("\x1b]52;")
+            if _open >= _last and _OSC52_RE.search(_clip[_open:]) is None:
+                self._osc52_carry = _clip[_open:][-131072:]   # unterminated tail (capped)
         if not chunk:
             return
         with self._lock:

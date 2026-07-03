@@ -1268,7 +1268,35 @@ def test_cancel_forwarded_drag_sends_release():
     assert not t._fwd_buttons and t._fwd_captured is False
 
 
+def test_honor_osc52_decodes_and_copies():
+    """A child's OSC 52 clipboard write (e.g. claude's fullscreen copy) is base64-
+    decoded onto the HOST clipboard; a "?"/empty (read query) is ignored."""
+    import base64
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    copied = []
+    t._copy_text = lambda s: copied.append(s)
+    t._marshal = lambda fn: fn()                 # run the marshalled copy inline
+    t._honor_osc52(base64.b64encode("hello ぺ".encode()).decode())
+    assert copied == ["hello ぺ"], copied
+    t._honor_osc52("?"); t._honor_osc52("")      # read query / empty → no copy
+    assert copied == ["hello ぺ"], copied
+
+
+def test_osc52_re_extracts_payload_and_needs_terminator():
+    """_OSC52_RE matches a BEL- or ST-terminated OSC 52 and yields the base64; an
+    UNterminated sequence doesn't match (it's carried across reads in _consume)."""
+    import base64
+    b64 = base64.b64encode(b"xy").decode()
+    assert rt._OSC52_RE.findall(f"\x1b]52;c;{b64}\x07") == [b64]
+    assert rt._OSC52_RE.findall(f"\x1b]52;c;{b64}\x1b\\") == [b64]
+    assert rt._OSC52_RE.findall(f"\x1b]52;c;{b64}") == []
+
+
 if __name__ == "__main__":
+    test_honor_osc52_decodes_and_copies()
+    print("PASS test_honor_osc52_decodes_and_copies")
+    test_osc52_re_extracts_payload_and_needs_terminator()
+    print("PASS test_osc52_re_extracts_payload_and_needs_terminator")
     test_consume_collapses_alt_screen_reset_amplification()
     print("PASS test_consume_collapses_alt_screen_reset_amplification")
     test_finalize_preserves_active_drag_snapshot()

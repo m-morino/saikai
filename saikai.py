@@ -91,11 +91,13 @@ def _list_title(s: dict) -> str:
     in as claude writes the first message and its own ai-title.
     (project_short / _first_msg resolved at call time.)
 
-    `claude_name` (Claude's OWN session name, from the live registry) sits just
-    below the user's Shift+F2 override so the list matches what Claude shows in
-    its session/agent switcher — instead of a divergent saikai-only title."""
-    return (s.get("custom_title") or s.get("claude_name") or s.get("ai_title")
-            or _first_msg(s)
+    `claude_name` (Claude's OWN session name, from the live registry) is only a
+    FALLBACK below ai_title / first message: Claude auto-names sessions after the
+    project (e.g. "saikai-d1"), which is less informative than the ai_title, so it
+    must not override it — it fills in only when there's no ai_title/first message
+    (and still below a user's Shift+F2 override)."""
+    return (s.get("custom_title") or s.get("ai_title") or _first_msg(s)
+            or s.get("claude_name")
             or project_short(s.get("project_name") or "")
             or (s.get("id") or "")[:8])
 
@@ -2541,13 +2543,14 @@ def label_for(s: dict) -> str:
 
 
 def _pane_title(s: "dict | None", sid: str, term=None) -> str:
-    """Human label for a live pane's tab — custom name (Shift+F2) → Claude's own
-    session name (switcher label) → ai_title → summary → first user message → the
-    term's launch title (e.g. a new session's folder name) → a short id only as a
-    last resort, so a tab never shows just a bare session id."""
+    """Human label for a live pane's tab — custom name (Shift+F2) → ai_title →
+    summary → first user message → Claude's own session name (a project auto-slug
+    like "saikai-d1", so only a fallback below the descriptive titles) → the term's
+    launch title (e.g. a new session's folder name) → a short id only as a last
+    resort, so a tab never shows just a bare session id."""
     if s:
-        t = (s.get("custom_title") or s.get("claude_name") or s.get("ai_title")
-             or s.get("summary") or _first_msg(s) or "").strip()
+        t = (s.get("custom_title") or s.get("ai_title") or s.get("summary")
+             or _first_msg(s) or s.get("claude_name") or "").strip()
         if t:
             return t
     if term is not None:
@@ -4984,6 +4987,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("v", "toggle_select", "Select"),
             Binding("y", "yank", "Yank"),
             Binding("enter", "yank", show=False),
+            Binding("ctrl+c", "yank", show=False),   # modern copy; coexists with y/Enter
             Binding("Y", "yank_all", "Yank all"),
             Binding("escape", "quit_copy", "Close"),
             Binding("q", "quit_copy", show=False),
@@ -5074,9 +5078,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def compose(self) -> ComposeResult:
             with Vertical(id="cm-box"):
-                yield Static("[bold cyan]Copy mode[/bold cyan]   [dim]j/k move · "
-                             "v select→move · y copy (line/selection) · "
-                             "[b]Y copy all[/b] · g/G top·bottom · Esc close[/dim]",
+                yield Static("[bold cyan]Copy mode[/bold cyan]   [dim]drag to select · "
+                             "Ctrl+C / y copy · [b]Y copy all[/b] · "
+                             "j/k·v vi-select · g/G top·bottom · Esc close[/dim]",
                              id="cm-hint")
                 yield _CopyModeArea(self._text, read_only=True, soft_wrap=True,
                                     language=None, id="cm-area")
@@ -5555,6 +5559,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         self.set_interval(_secs, self._auto_tick)
                 except Exception:
                     pass
+            # Default-on auto-pickup of sessions started elsewhere: a cheap mtime gate
+            # (stat the registry + projects dirs) kicks the OFF-thread rescan ONLY when
+            # something changed — no constant disk walk, no needless table rebuild.
+            # SAIKAI_AUTO_REFRESH above adds a fixed-interval scan on top. (#recon-autorefresh)
+            try:
+                self._sessions_mtime = self._sessions_dirs_mtime()
+            except Exception:
+                self._sessions_mtime = 0.0
+            self.set_interval(2.0, self._rescan_if_changed)
             # Poll live-pane status so a backgrounded pane that starts WAITING
             # for input raises a toast, and the list markers stay live.
             if self._live is not None:
@@ -8398,6 +8411,34 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self._auto_busy = False
 
             _thr.Thread(target=_work, daemon=True).start()
+
+        def _sessions_dirs_mtime(self) -> float:
+            """Cheap change signal for auto-refresh: the newest mtime of the live
+            registry dir and the projects root. A session started elsewhere writes
+            ~/.claude/sessions/<pid>.json, bumping the registry dir's mtime — that's
+            what we watch, so a full disk walk runs only when something changed.
+            (#recon-autorefresh)"""
+            m = 0.0
+            for d in (CLAUDE_CONFIG_ROOT / "sessions", PROJECTS_ROOT):
+                try:
+                    m = max(m, d.stat().st_mtime)
+                except OSError:
+                    pass
+            return m
+
+        def _rescan_if_changed(self) -> None:
+            """Default-on auto-refresh tick: kick the OFF-thread rescan only when the
+            registry/projects dirs changed since the last scan, so a session started
+            elsewhere appears within ~2s without a constant disk walk or needless
+            rebuild. _auto_tick guards focus (skip while typing in a pane) + overlap;
+            _do_refresh_table preserves the cursor by sid. (#recon-autorefresh)"""
+            try:
+                m = self._sessions_dirs_mtime()
+            except Exception:
+                return
+            if m > getattr(self, "_sessions_mtime", 0.0):
+                self._sessions_mtime = m
+                self._auto_tick()
 
         def action_refresh(self) -> None:
             # F5: re-scan ~/.claude/projects for new / updated sessions
