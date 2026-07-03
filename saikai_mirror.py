@@ -589,6 +589,8 @@ class MirrorHub:
         # 0.0.0.0/"" is a bind wildcard, not browsable — resolve a reachable host
         # (the primary LAN/egress IP) so the URL works from another device.
         host = _lan_ip() if self._host in ("0.0.0.0", "") else self._host
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"   # bracket an IPv6 literal so the URL authority parses
         return f"http://{host}:{self._port}/?token={self._token}"
 
 
@@ -623,19 +625,53 @@ def mirror_idle_secs(env: dict) -> float:
         return 600.0
 
 
-def _lan_ip() -> str:
-    """Best-effort primary LAN/egress IPv4 (the interface used to reach the
-    network), so a 0.0.0.0-bound mirror prints a URL reachable from another
-    device. No packet is sent; falls back to 127.0.0.1 when offline."""
+def _is_private_ipv4(ip: str) -> bool:
+    """True for an RFC1918 LAN address (10/8, 172.16/12, 192.168/16) — the ranges a
+    phone on the same Wi-Fi actually reaches. Excludes CGNAT/VPN (100.64/10) etc."""
+    parts = ip.split(".")
+    if len(parts) != 4 or not all(p.isdigit() for p in parts):
+        return False
+    a, b = int(parts[0]), int(parts[1])
+    return a == 10 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168)
+
+
+def _local_ipv4s() -> set:
+    """Every local IPv4 we can discover without extra deps: the default-route
+    egress IP (UDP-connect trick, no packet sent) plus all addresses the hostname
+    resolves to. Used to build the Host allow-list so a phone reaching us by ANY
+    local IP isn't 403'd, and to pick the URL/QR host."""
     import socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ips: set = set()
     try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ips.add(s.getsockname()[0])
+        finally:
+            s.close()
     except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    ips.discard("0.0.0.0")
+    return ips
+
+
+def _lan_ip() -> str:
+    """Best-effort LAN IPv4 for the URL/QR a 0.0.0.0-bound mirror advertises.
+    Prefers a private (phone-reachable) address over a VPN/CGNAT egress IP — the
+    UDP-connect trick alone picks whatever the default route is, which on a host
+    running Tailscale/WireGuard is the tunnel address a LAN phone can't reach.
+    Falls back to 127.0.0.1 when offline. No packet is sent."""
+    ips = _local_ipv4s()
+    priv = sorted(ip for ip in ips if _is_private_ipv4(ip))
+    if priv:
+        return priv[0]
+    other = sorted(ip for ip in ips if not ip.startswith("127."))
+    return other[0] if other else "127.0.0.1"
 
 
 def qr_matrix(url: str, border: int = 2) -> list:
@@ -1134,7 +1170,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         hub_host = self.server.hub._host
         names = {"127.0.0.1", "localhost", "[::1]", "::1"}
         if hub_host in ("0.0.0.0", ""):
-            names.add(_lan_ip())             # wildcard bind: allow the LAN IP url() advertises
+            # Wildcard bind: allow EVERY local IPv4, not just the one url() picked —
+            # a phone reaching us by a different local address (multi-NIC, VPN +
+            # LAN) would otherwise 403 even though it connected fine. Host-literal
+            # matching still blocks DNS-rebinding (an attacker's Host is a hostname,
+            # not one of our IP literals).
+            names |= _local_ipv4s()
         elif hub_host not in ("127.0.0.1", "localhost"):
             names.add(hub_host)              # the specific bound LAN IP
         allowed = set()
@@ -1144,8 +1185,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         return allowed
 
     def _host_ok(self) -> bool:
-        host = self.headers.get("Host", "")
-        return host in self._allowed_hosts()
+        # Case-fold + strip a resolver's trailing dot so a browser sending
+        # 'MyPi.local' / 'mypi.local.' against a configured 'mypi.local' still
+        # matches. IP literals are unaffected by the fold.
+        host = self.headers.get("Host", "").strip().rstrip(".").lower()
+        return host in {h.lower() for h in self._allowed_hosts()}
+
+    def _peer_is_loopback(self) -> bool:
+        """True when the real TCP peer is the local host (v4, v4-mapped-v6, or v6
+        loopback). Used to gate remote input per-connection."""
+        ip = (self.client_address[0] if self.client_address else "") or ""
+        return ip == "::1" or ip == "::ffff:127.0.0.1" or ip.startswith("127.")
 
     def _server_origins(self) -> set:
         """The exact Origin/Referer-host values that count as same-origin."""
@@ -1306,6 +1356,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         route checks the hub's advisory gate itself so an empty keyboard batch
         can 204 without it (matches Phase B do_POST)."""
         if not self._host_ok():
+            self._reject(403, "forbidden"); return None
+        # Per-connection input gate (defense-in-depth over the app's advisory
+        # control flag): a NON-loopback peer may drive input only when LAN input
+        # was explicitly opted in. This is checked against the real TCP peer
+        # (unspoofable on an established connection), so a wide 0.0.0.0 bind still
+        # can't accept remote input without SAIKAI_MIRROR_ALLOW_LAN_INPUT even if
+        # the advisory flag were somehow on. Viewing (GET) is unaffected.
+        if not self._peer_is_loopback() and not self.server.hub.allow_lan_input:
             self._reject(403, "forbidden"); return None
         if not self._write_key_ok():
             self._reject(403, "forbidden"); return None

@@ -782,14 +782,31 @@ def test_new_session_stub_preserves_drive_letter_case():
 
 
 def test_session_pid_live_rejects_reused_pid():
-    """A registered PID counts as live only if the snapshot shows it's a Claude
+    """A registered PID counts as live only if the process is actually a Claude
     process; a recycled PID owned by something else is rejected. (#audit-pidreuse)"""
-    assert saikai._is_session_pid_live(os.getpid(), None) is True   # no snapshot → bare liveness
+    # Windows-style image-name snapshot (platform-independent — takes a dict).
     idx = {111: ("claude.exe", 1), 222: ("explorer.exe", 1), 444: ("node.exe", 1)}
     assert saikai._is_session_pid_live(111, idx) is True
     assert saikai._is_session_pid_live(444, idx) is True
     assert saikai._is_session_pid_live(222, idx) is False           # reused → unrelated proc
     assert saikai._is_session_pid_live(333, idx) is False           # not in snapshot at all
+
+    # POSIX /proc/<pid>/comm check (Linux path): fixture procfs so it runs anywhere.
+    proc = Path(tempfile.mkdtemp())
+    for _pid, _comm in (("101", "node"), ("102", "claude"), ("103", "sshd"),
+                        ("104", "claude-code")):
+        (proc / _pid).mkdir()
+        (proc / _pid / "comm").write_text(_comm + "\n", encoding="utf-8")
+    saved = saikai._PROC_ROOT
+    try:
+        saikai._PROC_ROOT = proc
+        assert saikai._linux_pid_is_claude(101) is True    # node runtime
+        assert saikai._linux_pid_is_claude(102) is True    # claude
+        assert saikai._linux_pid_is_claude(104) is True    # claude-code wrapper (prefix)
+        assert saikai._linux_pid_is_claude(103) is False   # unrelated → recycled pid rejected
+        assert saikai._linux_pid_is_claude(999) is False   # no /proc/<pid> → dead
+    finally:
+        saikai._PROC_ROOT = saved
 
 
 def test_resolve_resume_cwd_prefers_recent_sibling():

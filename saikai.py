@@ -608,7 +608,18 @@ def _write_text_atomic(path: Path, text: str, mode: "int | None" = None) -> None
                 f.write(text)
         else:
             tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
+        # On Windows os.replace fails with PermissionError if another process holds
+        # the DESTINATION open without FILE_SHARE_DELETE (another saikai tab, a
+        # PowerShell `type`, an editor). The lock is transient, so retry briefly
+        # before giving up. No-op on POSIX, where replace-over-open succeeds.
+        for _attempt in range(4):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if _attempt == 3:
+                    raise
+                time.sleep(0.05)
     finally:
         if tmp.exists():
             try:
@@ -890,6 +901,19 @@ def _bulk_toggle_in_set(path: Path, sids, force: "bool | None" = None) -> bool:
     return target
 
 
+def _write_pref_atomic(path: Path, value: str) -> None:
+    """Best-effort atomic pref write + cache invalidation. A UI pref (view/tree/
+    group/status/lastact) is non-critical: a transient os.replace failure — e.g.
+    Windows PermissionError when another tab/editor holds the file open past the
+    retry window — must not crash the key-binding action that triggered it. The
+    setting simply isn't persisted this time and is retried on the next toggle."""
+    try:
+        _write_text_atomic(path, value)
+    except Exception:
+        pass
+    _invalidate_pref(path)
+
+
 def _load_hidden() -> set[str]:
     return _load_set(HIDDEN_FILE)
 
@@ -906,8 +930,7 @@ def _get_view_mode() -> str:
 
 def _toggle_view_mode() -> str:
     new_mode = "show-hidden" if _get_view_mode() == "default" else "default"
-    _write_text_atomic(VIEW_MODE_FILE, new_mode)
-    _invalidate_pref(VIEW_MODE_FILE)
+    _write_pref_atomic(VIEW_MODE_FILE, new_mode)
     return new_mode
 
 
@@ -920,8 +943,7 @@ def _get_tree_mode() -> bool:
 
 def _toggle_tree_mode() -> bool:
     new = not _get_tree_mode()
-    _write_text_atomic(TREE_MODE_FILE, "on" if new else "off")
-    _invalidate_pref(TREE_MODE_FILE)
+    _write_pref_atomic(TREE_MODE_FILE, "on" if new else "off")
     return new
 
 
@@ -939,8 +961,7 @@ def _get_group_by() -> str:
 def _set_group_by(value: str) -> None:
     if value not in ("none", "date", "project", "state"):
         value = "none"
-    _write_text_atomic(GROUP_BY_FILE, value)
-    _invalidate_pref(GROUP_BY_FILE)
+    _write_pref_atomic(GROUP_BY_FILE, value)
 
 
 def _get_split_ratio() -> float:
@@ -975,8 +996,7 @@ def _get_status_filter() -> str:
 def _set_status_filter(value: str) -> None:
     if value not in ("active", "archived", "all"):
         value = "active"
-    _write_text_atomic(STATUS_FILTER_FILE, value)
-    _invalidate_pref(STATUS_FILTER_FILE)
+    _write_pref_atomic(STATUS_FILTER_FILE, value)
 
 
 def _get_lastact_days() -> int:
@@ -990,8 +1010,7 @@ def _get_lastact_days() -> int:
 
 
 def _set_lastact_days(days: int) -> None:
-    _write_text_atomic(LASTACT_FILTER_FILE, str(int(days)))
-    _invalidate_pref(LASTACT_FILTER_FILE)
+    _write_pref_atomic(LASTACT_FILTER_FILE, str(int(days)))
 
 
 def _iso_dt(ts_iso: str):
@@ -1469,16 +1488,38 @@ def _is_pid_alive(pid: int) -> bool:
 
 
 _CLAUDE_PROC_NAMES = frozenset({"claude.exe", "node.exe"})
+# POSIX /proc/<pid>/comm equivalents (no ".exe"; comm is truncated to 15 chars).
+_CLAUDE_PROC_COMMS = frozenset({"claude", "node"})
+_PROC_ROOT = Path("/proc")   # Linux procfs root; module-level so tests can point it at a fixture
+
+
+def _linux_pid_is_claude(pid: int) -> bool:
+    """Linux PID-reuse guard: verify /proc/<pid>/comm names a Claude runtime, the
+    POSIX analogue of the Windows image-name check. A missing /proc/<pid> means the
+    process is gone (dead); an unreadable comm for any other reason falls back to a
+    bare liveness check so we never FALSE-kill a live session. (#audit-pidreuse)"""
+    if pid <= 0:
+        return False
+    try:
+        comm = (_PROC_ROOT / str(pid) / "comm").read_text(
+            encoding="utf-8", errors="replace").strip()
+    except FileNotFoundError:
+        return False          # /proc/<pid> absent → process no longer exists
+    except OSError:
+        return _is_pid_alive(pid)   # unreadable for another reason → don't false-kill
+    return comm in _CLAUDE_PROC_COMMS or comm.startswith("claude")
 
 
 def _is_session_pid_live(pid: int, pid_index: "dict | None") -> bool:
     """A registered session PID counts as live only if it's alive AND actually a
-    Claude process. Guards against Windows PID reuse: the `~/.claude/sessions/<pid>.json`
+    Claude process. Guards against PID reuse: the `~/.claude/sessions/<pid>.json`
     registry has no TTL, so a stale entry whose PID the OS has recycled to an
-    unrelated process would otherwise read as a live (is_open) session. With no
-    process snapshot (POSIX, or a failed snapshot) fall back to a bare liveness
-    check. (#audit-pidreuse)"""
+    unrelated process would otherwise read as a live (is_open) session. Windows uses
+    the CreateToolhelp32 image name; Linux uses /proc/<pid>/comm; other POSIX (macOS,
+    no /proc) falls back to a bare liveness check. (#audit-pidreuse)"""
     if pid_index is None:
+        if sys.platform.startswith("linux"):
+            return _linux_pid_is_claude(pid)
         return _is_pid_alive(pid)
     info = pid_index.get(pid)
     if info is None:
@@ -1513,8 +1554,11 @@ _SHELL_ANCESTOR_NAMES = frozenset({
 # the ancestor walk stops here — the tab shell is the last shell seen before the
 # emulator (anchoring on the emulator would only fire on whole-window close).
 _TERM_EMULATOR_NAMES = frozenset({
-    "wezterm-gui.exe", "windowsterminal.exe", "openconsole.exe",
-    "alacritty.exe", "kitty.exe",
+    "wezterm-gui.exe", "wezterm.exe", "windowsterminal.exe",
+    "windowsterminalpreview.exe", "wt.exe",          # WT + its app-alias launcher
+    "openconsole.exe", "conhost.exe",                # classic/legacy console host
+    "alacritty.exe", "kitty.exe", "mintty.exe",      # git-bash/msys
+    "conemu64.exe", "conemu.exe", "hyper.exe", "tabby.exe",
 })
 
 
@@ -1767,15 +1811,16 @@ def _job_state_for(sid: str) -> "dict | None":
         return None
     p = CLAUDE_CONFIG_ROOT / "jobs" / job_id / "state.json"
     try:
-        mt = p.stat().st_mtime
-    except OSError:
-        return None
+        st = p.stat()
+        key = (st.st_mtime, st.st_size)   # size too: a coarse-mtime FS (FAT/SMB/NFS
+    except OSError:                       # roaming profile) can rewrite state.json
+        return None                       # within one mtime tick — size disambiguates
     hit = _JOB_STATE_CACHE.get(job_id)
-    if hit is not None and hit[0] == mt:
+    if hit is not None and hit[0] == key:
         return hit[1]
     d = _read_json(p, None)
     val = d if isinstance(d, dict) else None
-    _JOB_STATE_CACHE[job_id] = (mt, val)
+    _JOB_STATE_CACHE[job_id] = (key, val)
     return val
 
 
@@ -3112,16 +3157,25 @@ def _reset_terminal_modes() -> None:
             return
         if sys.platform == "win32":
             # Re-arm VT processing so the sequence is INTERPRETED, not printed,
-            # even if the console mode was reset on the way down.
+            # even if the console mode was reset on the way down. If VT can't be
+            # enabled (a genuine legacy conhost that never supported it), the mouse/
+            # focus/paste modes below were never enabled either — and writing raw
+            # ANSI would print visible garbage on every exit path. Bail instead.
+            vt_ok = False
             try:
                 import ctypes
                 k32 = ctypes.windll.kernel32
                 h = k32.GetStdHandle(-12)        # STD_ERROR_HANDLE
                 mode = ctypes.c_uint32()
                 if k32.GetConsoleMode(h, ctypes.byref(mode)):
-                    k32.SetConsoleMode(h, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                    if mode.value & 0x0004:      # already VT-enabled
+                        vt_ok = True
+                    elif k32.SetConsoleMode(h, mode.value | 0x0004):  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                        vt_ok = True
             except Exception:
-                pass
+                vt_ok = False
+            if not vt_ok:
+                return
         out.write(
             "\033[?1000l\033[?1002l\033[?1003l\033[?1004l"
             "\033[?1006l\033[?1015l\033[?2004l\033[?25h"
@@ -4065,6 +4119,20 @@ def _copy_to_host_clipboard(text: str) -> bool:
     return False
 
 
+def _copy_host_or_osc52(text: str, app) -> bool:
+    """Host-clipboard copy with an OSC-52 fallback via the Textual `app`, so a
+    headless / SSH terminal with no wl-copy/xclip/xsel (a minimal Pi over SSH) can
+    still copy — the same escape hatch the F9 copy-prompt path already uses. OSC-52
+    has no acknowledgement, so a clean emit is reported as copied."""
+    if _copy_to_host_clipboard(text):
+        return True
+    try:
+        app.copy_to_clipboard(text)
+        return True
+    except Exception:
+        return False
+
+
 class _MirrorControl:
     """Phase B web-mirror interactive control, mixed into PickerApp.
 
@@ -4971,7 +5039,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if not (text or "").strip():
                 self.app.notify("nothing to copy here", timeout=3)
                 return
-            if _copy_to_host_clipboard(text):
+            if _copy_host_or_osc52(text, self.app):
                 self.app.notify(f"copied {what} ({len(text)} chars) to clipboard",
                                 timeout=4)
                 self.action_quit_copy()
@@ -7287,7 +7355,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 r = subprocess.run(
                     ["git", "worktree", "list", "--porcelain"],
                     cwd=(str(repo) if repo else None),
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace",   # git emits UTF-8; don't decode as cp932
+                    timeout=5, creationflags=NO_WINDOW)
                 for line in r.stdout.splitlines():
                     if line.startswith("worktree "):
                         p = line[9:].strip()
@@ -8224,7 +8294,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if not (text or "").strip():
                 self.notify("no preview text to copy", timeout=3)
                 return
-            if _copy_to_host_clipboard(text):
+            if _copy_host_or_osc52(text, self):
                 self.notify("preview copied to clipboard", timeout=3)
             else:
                 self.notify("could not copy the preview", severity="warning", timeout=3)
@@ -8608,7 +8678,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             _url = _hub.url()
             # Copy on EVERY open (not just at startup) so F12 reliably puts the
             # tokened URL on the clipboard; tell the truth if the copy failed.
-            _copied = _copy_to_host_clipboard(_url)
+            # OSC-52 fallback so a headless/SSH host without xclip can still copy.
+            _copied = _copy_host_or_osc52(_url, self)
             try:
                 import saikai_mirror as _m
                 self.push_screen(MirrorScreen(_url, _m.qr_matrix(_url), _copied,
@@ -9667,8 +9738,9 @@ def _worktree_project_dirs(cwd: Path, projects_root: Path,
     try:
         r = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, cwd=cwd, timeout=5,
-            creationflags=NO_WINDOW,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",   # git emits UTF-8; don't decode as cp932
+            cwd=cwd, timeout=5, creationflags=NO_WINDOW,
         )
         if r.returncode != 0:
             return []
@@ -10459,7 +10531,57 @@ def cmd_sync_desktop() -> None:
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
+def _sweep_cache_litter() -> None:
+    """Startup housekeeping (run in a daemon; best-effort, never raises).
+
+    (1) Remove orphaned ``*.tmp.<pid>.<tid>`` files a killed _write_text_atomic
+        left behind between write and os.replace (a crash / power loss / End Task).
+        Under ~/.claude/state — Claude Code's own dir — match ONLY our filename
+        prefix so nothing of Claude's is touched. Age-gated so an in-flight tmp
+        from a concurrent saikai is never removed.
+    (2) Prune parsed/preview cache files not rewritten in 90 days (a long-gone
+        session); they self-heal via re-parse if the session still exists. Bounds
+        unbounded cache growth on a long-lived host (e.g. a Pi's small eMMC).
+    (#audit-cache-hygiene)"""
+    now = time.time()
+    tmp_cutoff = now - 300
+    cache_cutoff = now - 90 * 86400
+    try:
+        for f in CACHE_DIR.rglob("*.tmp.*"):
+            try:
+                if f.is_file() and f.stat().st_mtime < tmp_cutoff:
+                    f.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
+    try:
+        for f in _SAIKAI_SUPPRESS_PATH.parent.glob(_SAIKAI_SUPPRESS_PATH.name + ".tmp.*"):
+            try:
+                if f.stat().st_mtime < tmp_cutoff:
+                    f.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
+    for d in (PARSED_DIR, PREVIEW_DIR, PREVIEW_FULL_DIR):
+        try:
+            for f in d.glob("*"):
+                try:
+                    if f.is_file() and f.stat().st_mtime < cache_cutoff:
+                        f.unlink()
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+
 def main():
+    try:                       # housekeeping off the launch path (see docstring)
+        threading.Thread(target=_sweep_cache_litter, daemon=True,
+                         name="saikai-cache-sweep").start()
+    except Exception:
+        pass
     p = argparse.ArgumentParser(
         description="Claude Code session history viewer. Shows all history by factory default; "
                     "use --days N to limit. Filters (--days/--here/--all) are one-shot "
@@ -10733,8 +10855,9 @@ def main():
 
     try:
         r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                          capture_output=True, text=True, cwd=cwd, timeout=3,
-                          creationflags=NO_WINDOW)
+                          capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",   # git emits UTF-8; don't decode as cp932
+                          cwd=cwd, timeout=3, creationflags=NO_WINDOW)
         repo = Path(r.stdout.strip()) if r.returncode == 0 else None
     except Exception:
         repo = None

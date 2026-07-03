@@ -208,8 +208,75 @@ try:
         pyte.screens.wcwidth = _wcwidth_flag_aware
     except Exception:
         pass
+
+    # pyte's Screen.draw merges only TRUE combining marks (unicodedata.combining
+    # != 0) into the previous cell and `break`s on any OTHER width-0 char — which
+    # ABORTS the whole draw() call, silently dropping every remaining character in
+    # that chunk. ZWJ (U+200D, category Cf, combining==0) and emoji variation
+    # selectors (U+FE0F) are width-0 non-combining, so a single ZWJ-emoji family
+    # (👨‍👩‍👧‍👦) or a VS16 emoji (❤️) in claude's output truncated the pane from that
+    # point on. Subclass to merge ANY width-0 char into the previous cell (keeping
+    # the grapheme's codepoints contiguous so the outer terminal can render it) and
+    # to SKIP (not break on) width<0 chars. Faithful copy of pyte's draw otherwise;
+    # guarded so a pyte-internal change just falls back to the stock screen. (#audit-zwj)
+    _HistoryScreenBase = pyte.HistoryScreen
+    try:
+        import unicodedata as _ud
+        from pyte import modes as _mo
+
+        class _SaikaiHistoryScreen(pyte.HistoryScreen):  # type: ignore[misc]
+            def draw(self, data: str) -> None:
+                data = data.translate(
+                    self.g1_charset if self.charset else self.g0_charset)
+                _ww = pyte.screens.wcwidth   # the flag-aware wrapper installed above
+                for char in data:
+                    char_width = _ww(char)
+                    if self.cursor.x == self.columns:
+                        if _mo.DECAWM in self.mode:
+                            self.dirty.add(self.cursor.y)
+                            self.carriage_return()
+                            self.linefeed()
+                        elif char_width > 0:
+                            self.cursor.x -= char_width
+                    if _mo.IRM in self.mode and char_width > 0:
+                        self.insert_characters(char_width)
+                    line = self.buffer[self.cursor.y]
+                    if char_width == 1:
+                        line[self.cursor.x] = self.cursor.attrs._replace(data=char)
+                    elif char_width == 2:
+                        line[self.cursor.x] = self.cursor.attrs._replace(data=char)
+                        if self.cursor.x + 1 < self.columns:
+                            line[self.cursor.x + 1] = self.cursor.attrs._replace(data="")
+                    elif char_width == 0:
+                        # Merge ANY zero-width char (combining mark, ZWJ, VS16, other
+                        # Cf) into the preceding cell instead of pyte's break. NFC-fold
+                        # only real combining marks, to match pyte's prior behaviour.
+                        if self.cursor.x:
+                            last = line[self.cursor.x - 1]
+                            merged = last.data + char
+                            if _ud.combining(char):
+                                merged = _ud.normalize("NFC", merged)
+                            line[self.cursor.x - 1] = last._replace(data=merged)
+                        elif self.cursor.y:
+                            prev = self.buffer[self.cursor.y - 1][self.columns - 1]
+                            merged = prev.data + char
+                            if _ud.combining(char):
+                                merged = _ud.normalize("NFC", merged)
+                            self.buffer[self.cursor.y - 1][self.columns - 1] = \
+                                prev._replace(data=merged)
+                        # else: leading zero-width char, nothing on-screen to attach to.
+                    else:
+                        continue   # width < 0: unprintable; skip it, DON'T abort the chunk
+                    if char_width > 0:
+                        self.cursor.x = min(self.cursor.x + char_width, self.columns)
+                self.dirty.add(self.cursor.y)
+
+        _HistoryScreenBase = _SaikaiHistoryScreen
+    except Exception:
+        pass
 except Exception:  # pragma: no cover - exercised only when dep absent
     pyte = None  # type: ignore
+    _HistoryScreenBase = None  # type: ignore
 
 _PTY_IMPORT_ERROR: Optional[str] = None
 PtyProcess = None  # type: ignore
@@ -450,7 +517,10 @@ for _i, _ch in enumerate("abcdefghijklmnopqrstuvwxyz", 1):
     _KEYMAP[f"ctrl+{_ch}"] = chr(_i)
 # A few extra control combos readline / claude use.
 _KEYMAP.update({
-    "ctrl+@": "\x00", "ctrl+space": "\x00",
+    # Textual names the '@' key "at" (KEY_NAME_REPLACEMENTS), so the event.key for
+    # Ctrl+@ (natural NUL on a JIS layout) is "ctrl+at" — the literal "ctrl+@" here
+    # never matched and the key was silently swallowed. Keep both forms.
+    "ctrl+at": "\x00", "ctrl+@": "\x00", "ctrl+space": "\x00",
     "ctrl+backslash": "\x1c", "ctrl+right_square_bracket": "\x1d",
     "ctrl+circumflex_accent": "\x1e", "ctrl+underscore": "\x1f",
 })
@@ -469,7 +539,8 @@ def _normalize_key(spec: str) -> str:
     ('ctrl+right_square_bracket') so SAIKAI_RELEASE_KEY accepts either form."""
     s = (spec or "").strip().lower()
     repl = {"]": "right_square_bracket", "[": "left_square_bracket",
-            "\\": "backslash", "_": "underscore", "^": "circumflex_accent"}
+            "\\": "backslash", "_": "underscore", "^": "circumflex_accent",
+            "@": "at"}   # Textual names Ctrl+@ as 'ctrl+at' (JIS layout NUL)
     if "+" in s:
         head, _, tail = s.rpartition("+")
         return f"{head}+{repl.get(tail, tail)}"
@@ -596,6 +667,15 @@ _SYNC_RE = re.compile(r"\x1b\[\?2026([hl])")
 # typed-and-submitted input (the classic bracketed-paste breakout). Strip both
 # markers from the content first, exactly as real terminals sanitize a paste.
 _PASTE_MARKER_RE = re.compile(r"\x1b\[20[01]~")
+
+
+def _normalize_paste_newlines(text: str) -> str:
+    """Collapse CRLF to LF in pasted text. A Windows clipboard (Notepad, a CRLF
+    file, browser text) delivers '\\r\\n' per line; forwarded verbatim into the
+    PTY the child's readline sees CR *and* LF for every line and submits/blanks
+    twice ('double-enter'). Real terminals strip the CR before delivering a paste.
+    Lone '\\r' is left alone (rare, and may be intentional)."""
+    return text.replace("\r\n", "\n")
 
 
 def _wrap_bracketed_paste(text: str) -> str:
@@ -824,7 +904,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # HistoryScreen keeps scrolled-off lines in .history.top so the pane
             # can scroll back (claude renders to the NORMAL buffer — verified by
             # probe: no ?1049h alt-screen — so terminal-side scrollback applies).
-            self._screen = pyte.HistoryScreen(cols, rows, history=SCROLLBACK_LINES)  # (cols, rows)!
+            self._screen = _HistoryScreenBase(cols, rows, history=SCROLLBACK_LINES)  # (cols, rows)!
             self._stream = pyte.Stream(self._screen)        # feed str; pywinpty already decodes
         except Exception as e:  # pragma: no cover
             self._fail(f"pyte init failed: {e!r}")
@@ -853,10 +933,35 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         kwargs: dict = {"dimensions": (rows, cols)}
         if self._cwd:
             kwargs["cwd"] = self._cwd
-        if self._env is not None:
-            kwargs["env"] = self._env
+        # The child renders into saikai's pyte grid (full 24-bit SGR), NOT the host
+        # terminal — so advertise a truecolor xterm to it regardless of the host's
+        # own TERM. Without this a host with TERM unset (legacy conhost) or without
+        # truecolor (Apple Terminal) made the child under-/over-estimate colour
+        # support, so pane colours varied by host OS/shell rather than being
+        # deterministic. pyte stores whatever the child emits; Rich/Textual then
+        # downsamples to the OUTER terminal as needed. (#audit-term)
+        base_env = self._env if self._env is not None else os.environ
+        env = dict(base_env)
+        env["TERM"] = "xterm-256color"
+        env["COLORTERM"] = "truecolor"
+        kwargs["env"] = env
         # argv MUST be a list (pywinpty spike gotcha #3).
         self._pty = PtyProcess.spawn(self._argv, **kwargs)
+        # POSIX ptyprocess.PtyProcessUnicode decodes with codec_errors='strict'
+        # by default, so a single invalid UTF-8 byte from the child (a binary blob
+        # cat'd into the pane, a legacy-encoded log) raises UnicodeDecodeError out
+        # of read() and kills the reader thread — the pane freezes instead of just
+        # showing a replacement char. Swap in a lenient decoder right after spawn
+        # (nothing has been read yet, so no buffered state is lost). winpty returns
+        # str already and has no decoder attr, so this is POSIX-only. (#audit-pty-decode)
+        if not _IS_WIN and self._pty is not None:
+            try:
+                import codecs
+                enc = getattr(self._pty, "encoding", None) or "utf-8"
+                self._pty.codec_errors = "replace"
+                self._pty.decoder = codecs.getincrementaldecoder(enc)(errors="replace")
+            except Exception:
+                pass
         self._pid = getattr(self._pty, "pid", None)
         _log(f"spawn: sid={(getattr(self, 'sid', None) or '?')[:8]} pid={self._pid}")
 
@@ -1034,6 +1139,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     def on_paste(self, event) -> None:  # events.Paste (bracketed paste)
         text = getattr(event, "text", "")
         if self._pty is not None and not self.is_dead and text:
+            text = _normalize_paste_newlines(text)   # CRLF → LF (Windows double-enter)
             # Re-wrap in bracketed-paste markers when claude enabled the mode
             # (?2004h, tracked in _consume) so it knows this is a PASTE — else each
             # embedded newline submits the line and a multi-line paste runs early.
@@ -1052,6 +1158,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         ?2004h) so embedded newlines don't submit line-by-line. UI-thread only."""
         if self._pty is None or self.is_dead or not text:
             return
+        text = _normalize_paste_newlines(text)   # CRLF → LF (Windows double-enter)
         if getattr(self, "_bracketed_paste", False):
             text = _wrap_bracketed_paste(text)   # strips embedded markers (breakout)
         self._snap_to_live()   # injected input returns the view to the live bottom

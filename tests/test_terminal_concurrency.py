@@ -501,6 +501,10 @@ def test_copy_text_uses_pbcopy_on_macos_before_osc52():
 
     old_platform = rt.sys.platform
     old_run = rt.subprocess.run
+    # set_clipboard_macos declines over SSH (so OSC-52 can target the client), so
+    # this darwin-path test must run as if local — otherwise it fails spuriously
+    # when the suite itself is invoked over SSH (the CI/dev-on-Pi case).
+    old_ssh = {k: os.environ.pop(k, None) for k in ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT")}
     term = rt.AgentTerminal.__new__(rt.AgentTerminal)
     try:
         rt.sys.platform = "darwin"
@@ -509,6 +513,9 @@ def test_copy_text_uses_pbcopy_on_macos_before_osc52():
     finally:
         rt.sys.platform = old_platform
         rt.subprocess.run = old_run
+        for k, v in old_ssh.items():
+            if v is not None:
+                os.environ[k] = v
     assert calls and calls[0][0] == ["pbcopy"], calls
     assert calls[0][1]["input"] == "日本語".encode("utf-8")
 
@@ -520,19 +527,21 @@ def test_set_clipboard_macos_skips_remote_sessions():
         calls.append((argv, kwargs))
 
     old_run = rt.subprocess.run
-    old_ssh = os.environ.get("SSH_TTY")
+    # Clear EVERY SSH marker set_clipboard_macos consults (not just SSH_TTY) so the
+    # 'local' leg is genuinely local even when the suite is invoked over SSH, where
+    # the ambient SSH_CONNECTION/SSH_CLIENT would otherwise force the remote path.
+    old_ssh = {k: os.environ.pop(k, None) for k in ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT")}
     try:
         rt.subprocess.run = fake_run
-        os.environ.pop("SSH_TTY", None)
         assert rt.set_clipboard_macos("local") is True
         os.environ["SSH_TTY"] = "/dev/pts/1"
         assert rt.set_clipboard_macos("remote") is False
     finally:
         rt.subprocess.run = old_run
-        if old_ssh is None:
-            os.environ.pop("SSH_TTY", None)
-        else:
-            os.environ["SSH_TTY"] = old_ssh
+        os.environ.pop("SSH_TTY", None)
+        for k, v in old_ssh.items():
+            if v is not None:
+                os.environ[k] = v
     assert len(calls) == 1 and calls[0][0] == ["pbcopy"], calls
 
 
