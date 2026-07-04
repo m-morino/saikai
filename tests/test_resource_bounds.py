@@ -275,6 +275,28 @@ def test_resolve_handoff_prompt_override():
         os.environ.pop("SAIKAI_HANDOFF_PROMPT_FILE", None)
 
 
+def test_handoff_prompt_forbids_identifier_truncation():
+    """Regression for a real handoff defect (graded by an expert review): the built-in
+    prompt listed identifiers to KEEP but never forbade abbreviating their VALUES, so a
+    152-char Outlook message ID was "..."-elided in a checkpoint handoff — leaving the
+    successor unable to run `mail delete` from the handoff alone and at risk of
+    mis-deleting a near-identical ID (two drafts differing only in the tail). The prompt
+    must now (a) widen the identifier category to opaque command-consumed handles,
+    (b) forbid truncating/eliding an identifier VALUE, and (c) carve non-secret
+    identifiers out of the 'refer to secrets by name/location' clause so the two rules
+    don't fight. (#handoff-id-verbatim)"""
+    p = saikai._B2_HANDOFF_PROMPT
+    assert "VERBATIM and in FULL" in p, \
+        "handoff prompt must require identifiers reproduced verbatim and in full"
+    assert "elide an identifier value" in p, \
+        "handoff prompt must forbid '...'-eliding an identifier value"
+    assert "opaque handle a later command will consume" in p, \
+        "identifier category must include opaque command-consumed handles (message/record IDs)"
+    assert "This carve-out does NOT cover non-secret resource identifiers" in p, \
+        "the secret/PII clause must carve out non-secret resource identifiers"
+    assert "NEW SESSION PROMPT" in p, "the load-bearing reseed contract must survive the edit"
+
+
 def test_last_assistant_text_from_jsonl_reads_tail():
     import json, tempfile, os
     d = tempfile.mkdtemp(prefix="saikai-b2-")
@@ -827,6 +849,8 @@ if __name__ == "__main__":
     print("PASS test_extract_handoff_prompt_slices_new_session_block")
     test_resolve_handoff_prompt_override()
     print("PASS test_resolve_handoff_prompt_override")
+    test_handoff_prompt_forbids_identifier_truncation()
+    print("PASS test_handoff_prompt_forbids_identifier_truncation")
     test_last_assistant_text_from_jsonl_reads_tail()
     print("PASS test_last_assistant_text_from_jsonl_reads_tail")
     test_first_cwd_from_jsonl_scans_early_records()
