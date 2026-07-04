@@ -956,7 +956,16 @@ def test_page_wires_select_mode_and_copy():
     assert "translateToString" in page, "copy must read rows from the xterm buffer"
     assert "clearSel" in page, "toggling select off must clear the rectangle"
     # near the top/bottom edge the drag auto-scrolls the HOST (Chrome-like).
+    # The zone must hug the VISIBLE terminal box (.xterm-screen) — #t spans the
+    # viewport behind the fixed key bar, so a #t-based bottom zone sat ~150px
+    # under the bar and never fired. (#mirror-edgezone)
     assert "edgeScroll" in page and "scrollup" in page, "no edge auto-scroll"
+    _edge = page[page.index("function edgeScroll"):page.index("function selectTo")]
+    assert ".xterm-screen" in _edge, \
+        "edge zone must be measured on the visible terminal box, not #t"
+    # the select drag must keep flowing over the fixed overlays (window-level
+    # mousemove — an el-scoped listener went silent over the key bar).
+    assert "window.addEventListener('mousemove'" in page, page
     # a tap while selecting must NOT click a row (SGR forwarding suppressed).
     assert "taps drive selection" in page or "selectMode) return" in page, \
         "SGR mouse must be suppressed while selecting"

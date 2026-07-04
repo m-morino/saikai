@@ -1286,9 +1286,14 @@ term.onData((d) => {
   let edgeT = null;
   function stopEdge() { if (edgeT) { clearInterval(edgeT); edgeT = null; } }
   function edgeScroll(y) {
-    const r = el.getBoundingClientRect();
-    const dir = (y < r.top + 44) ? 'scrollup'
-              : (y > r.bottom - 44) ? 'scrolldown' : null;
+    // Thresholds hug the VISIBLE terminal box (.xterm-screen), not #t: #t
+    // spans the full viewport BEHIND the fixed banner/key-bar overlays, so the
+    // old bottom zone sat ~150px under the key bar and never fired — "edge
+    // auto-scroll doesn't work" on phones. (#mirror-edgezone)
+    const scr = el.querySelector('.xterm-screen') || el;
+    const r = scr.getBoundingClientRect();
+    const dir = (y < r.top + 36) ? 'scrollup'
+              : (y > r.bottom - 36) ? 'scrolldown' : null;
     if (!dir) { stopEdge(); return; }
     if (edgeT) return;
     edgeT = setInterval(() => {
@@ -1381,7 +1386,7 @@ term.onData((d) => {
   // become SGR press/release); mouseup is on window so a release outside #t ends
   // the drag. Right-click opens the same context menu (the desktop gesture).
   el.addEventListener('mousedown', (e) => { if (e.button === 0) begin(e.clientX, e.clientY); });
-  el.addEventListener('mousemove', (e) => {
+  window.addEventListener('mousemove', (e) => {           // window: overlays cover #t
     if (lastY === null || !(e.buttons & 1)) return;        // only while left held
     if (drag(e.clientY, e.clientX)) e.preventDefault();
   });
