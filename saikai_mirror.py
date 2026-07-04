@@ -1285,24 +1285,44 @@ term.onData((d) => {
   // the copy is always exactly the on-screen cells in the rectangle.
   let edgeT = null;
   function stopEdge() { if (edgeT) { clearInterval(edgeT); edgeT = null; } }
-  function edgeScroll(y) {
-    // Thresholds hug the VISIBLE terminal box (.xterm-screen), not #t: #t
-    // spans the full viewport BEHIND the fixed banner/key-bar overlays, so the
-    // old bottom zone sat ~150px under the key bar and never fired — "edge
-    // auto-scroll doesn't work" on phones. (#mirror-edgezone)
+  function edgeZone(y) {
+    // The zone is the VISIBLE slice of the terminal: the .xterm-screen box
+    // clamped to #t's padded viewport. On a phone the canvas is BIGGER than
+    // the screen (the host grid renders full-size and #t pans it), so the raw
+    // canvas bottom can sit far below the physical display — the previous
+    // zone was unreachable there. (#mirror-edgezone)
     const scr = el.querySelector('.xterm-screen') || el;
     const r = scr.getBoundingClientRect();
-    const dir = (y < r.top + 36) ? 'scrollup'
-              : (y > r.bottom - 36) ? 'scrolldown' : null;
+    const tr = el.getBoundingClientRect();
+    const top = Math.max(r.top, tr.top + (parseFloat(el.style.paddingTop) || 0));
+    const bottom = Math.min(r.bottom, tr.bottom - (parseFloat(el.style.paddingBottom) || 0));
+    return (y < top + 36) ? 'up' : (y > bottom - 36) ? 'down' : null;
+  }
+  function edgeScroll(y) {
+    const dir = edgeZone(y);
     if (!dir) { stopEdge(); return; }
     if (edgeT) return;
     edgeT = setInterval(() => {
-      if (!controlOn || fatal || !selectMode) { stopEdge(); return; }
+      if (!selectMode || fatal) { stopEdge(); return; }
+      const d = edgeZone(lastPY);          // finger may have left the zone
+      if (!d) { stopEdge(); return; }
+      // Stage 1 (Chrome-like, works read-only too): pan #t locally while the
+      // oversized canvas still has hidden pixels in that direction.
+      const before = el.scrollTop;
+      el.scrollTop = before + (d === 'down' ? 28 : -28);
+      if (el.scrollTop !== before) {
+        selectTo(lastPX, lastPY);          // grow the selection under the still finger
+        return;
+      }
+      // Stage 2: the canvas edge is on screen — scroll the HOST (control only).
+      if (!controlOn) return;
       const at = selB || {c: scol, r: srow};
-      postMouse(at.c, at.r, 0, dir);
+      postMouse(at.c, at.r, 0, d === 'down' ? 'scrolldown' : 'scrollup');
     }, 150);
   }
+  let lastPX = 0, lastPY = 0;
   function selectTo(x, y) {
+    lastPX = x; lastPY = y;
     const cc = cellAt(x, y);
     selB = {c: cc[0], r: cc[1]};
     drawSel();

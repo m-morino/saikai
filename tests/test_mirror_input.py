@@ -960,9 +960,14 @@ def test_page_wires_select_mode_and_copy():
     # viewport behind the fixed key bar, so a #t-based bottom zone sat ~150px
     # under the bar and never fired. (#mirror-edgezone)
     assert "edgeScroll" in page and "scrollup" in page, "no edge auto-scroll"
-    _edge = page[page.index("function edgeScroll"):page.index("function selectTo")]
-    assert ".xterm-screen" in _edge, \
-        "edge zone must be measured on the visible terminal box, not #t"
+    _edge = page[page.index("function edgeZone"):page.index("function selectTo")]
+    assert ".xterm-screen" in _edge and "paddingTop" in _edge, \
+        "edge zone must be the VISIBLE slice (canvas box clamped to #t's padded viewport)"
+    # Two-stage: pan the oversized canvas locally FIRST (works read-only; the
+    # selection grows under a stationary finger), then drive the HOST at the
+    # canvas edge. (#mirror-edgezone)
+    assert "scrollTop" in _edge, "stage 1 (local pan) missing"
+    assert "lastPY" in _edge, "the tick must re-check the finger position"
     # the select drag must keep flowing over the fixed overlays (window-level
     # mousemove — an el-scoped listener went silent over the key bar).
     assert "window.addEventListener('mousemove'" in page, page
