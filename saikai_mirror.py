@@ -1054,9 +1054,14 @@ try {
 // Keep the keyboard wired to saikai: focus the terminal on load, and re-focus on
 // every tap. Without this the xterm textarea can lose focus (mouse tracking eats
 // the tap) and keys (Space, etc.) fall through to the browser instead of saikai.
-try { term.focus(); } catch (e) {}
-document.getElementById('t').addEventListener('pointerdown', () => {
-  try { term.focus(); } catch (e) {}
+// Focus policy: a MOUSE keeps the hardware keyboard wired (focus on load +
+// every click). TOUCH must NOT focus the xterm textarea — focusing summons the
+// soft keyboard/IME on every tap, covering the key bar (the reported phone
+// pain). Phones type via the row-1 keyboard toggle instead. (#mirror-ime)
+const coarse = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
+if (!coarse) { try { term.focus(); } catch (e) {} }
+document.getElementById('t').addEventListener('pointerdown', (e) => {
+  if (e.pointerType === 'mouse') { try { term.focus(); } catch (err) {} }
 });
 // ESC built at runtime (never a literal ESC byte in this served string — a lone
 // CR/ESC once broke the page; the no-control-byte test guards it).
@@ -1267,22 +1272,36 @@ term.onData((d) => {
     return [Math.max(0, Math.min(term.cols - 1, c)),
             Math.max(0, Math.min(term.rows - 1, w))];
   }
-  let pressX = 0, pressY = 0, startIdx = 0;
+  let pressX = 0, pressY = 0;
   function begin(x, y) {
     lastY = y; accum = 0; pressX = x; pressY = y;
     const cc = cellAt(x, y); scol = cc[0]; srow = cc[1];
-    startIdx = srow * term.cols + scol;       // reading-order index of the anchor
-    if (selectMode) { try { term.clearSelection(); } catch (e) {} }
+    if (selectMode) { selA = {c: scol, r: srow}; selB = selA; drawSel(); }
   }
-  // SELECT mode: extend a character-precise, reading-order selection from the
-  // anchor cell to the cell under the pointer, driven by OUR drag so it works
-  // regardless of xterm's app mouse-mode (no mode-fight with saikai/claude). A
-  // linear length that wraps across rows == the text a mouse-drag would grab.
+  // SELECT mode: extend the RECTANGLE to the cell under the pointer (block
+  // selection — see the model above). Near the top/bottom edge, auto-scroll the
+  // HOST under the fixed rectangle (Chrome-like edge scroll; control only —
+  // read-only has no host to scroll). The mirror has no local scrollback, so
+  // the copy is always exactly the on-screen cells in the rectangle.
+  let edgeT = null;
+  function stopEdge() { if (edgeT) { clearInterval(edgeT); edgeT = null; } }
+  function edgeScroll(y) {
+    const r = el.getBoundingClientRect();
+    const dir = (y < r.top + 44) ? 'scrollup'
+              : (y > r.bottom - 44) ? 'scrolldown' : null;
+    if (!dir) { stopEdge(); return; }
+    if (edgeT) return;
+    edgeT = setInterval(() => {
+      if (!controlOn || fatal || !selectMode) { stopEdge(); return; }
+      const at = selB || {c: scol, r: srow};
+      postMouse(at.c, at.r, 0, dir);
+    }, 150);
+  }
   function selectTo(x, y) {
     const cc = cellAt(x, y);
-    const curIdx = cc[1] * term.cols + cc[0];
-    const a = Math.min(startIdx, curIdx), b = Math.max(startIdx, curIdx);
-    try { term.select(a % term.cols, Math.floor(a / term.cols), (b - a) + 1); } catch (e) {}
+    selB = {c: cc[0], r: cc[1]};
+    drawSel();
+    edgeScroll(y);
   }
   function drag(y, x) {                   // returns true once it consumes the move
     if (lastY === null) return false;
@@ -1296,7 +1315,7 @@ term.onData((d) => {
     while (accum >=  STEP) { accum -= STEP; postMouse(scol, srow, 0, 'scrollup');   moved = true; }
     return moved;
   }
-  function end() { lastY = null; cancelLongPress(); }
+  function end() { lastY = null; cancelLongPress(); stopEdge(); }
 
   // ── Context menu (long-press on touch / right-click on mouse): act on the row
   //    under the pointer. Open => tap that cell to SELECT the row, then show an
@@ -1375,6 +1394,56 @@ term.onData((d) => {
   });
 })();
 
+// ── BLOCK selection model (select mode v2). A linear reading-order selection
+//    crossed the split divider and picked garbage from BOTH panes; a RECTANGLE
+//    wraps at the column bounds the user draws — the "smart, pane-respecting"
+//    selection claude's own alt-screen gives. Visuals are OUR overlay (xterm's
+//    selection API is linear-only); the copied text is read straight from the
+//    xterm buffer per row. Cells are SCREEN cells (alt-screen mirror: no local
+//    scrollback), so what you see in the rectangle is what you copy. (#mirror-blocksel)
+const selRect = document.createElement('div');
+selRect.id = 'selrect';
+selRect.style.cssText = 'position:fixed;display:none;pointer-events:none;z-index:8;'+
+  'background:rgba(80,140,255,.30);border:1px solid #7ab8ff';
+document.body.appendChild(selRect);
+let selA = null, selB = null;                  // anchor / current cell {c,r}
+function _selGeom() {
+  const el = document.getElementById('t');
+  const scr = el.querySelector('.xterm-screen') || el;
+  const r = scr.getBoundingClientRect();
+  return {left: r.left, top: r.top, cw: r.width / term.cols, ch: r.height / term.rows};
+}
+function drawSel() {
+  if (!selA || !selB) { selRect.style.display = 'none'; return; }
+  const g = _selGeom();
+  const c1 = Math.min(selA.c, selB.c), c2 = Math.max(selA.c, selB.c);
+  const r1 = Math.min(selA.r, selB.r), r2 = Math.max(selA.r, selB.r);
+  selRect.style.display = 'block';
+  selRect.style.left = (g.left + c1 * g.cw) + 'px';
+  selRect.style.top = (g.top + r1 * g.ch) + 'px';
+  selRect.style.width = ((c2 - c1 + 1) * g.cw) + 'px';
+  selRect.style.height = ((r2 - r1 + 1) * g.ch) + 'px';
+}
+function clearSel() { selA = selB = null; drawSel(); }
+function blockText() {
+  if (!selA || !selB) return '';
+  const c1 = Math.min(selA.c, selB.c), c2 = Math.max(selA.c, selB.c);
+  const r1 = Math.min(selA.r, selB.r), r2 = Math.max(selA.r, selB.r);
+  const out = [];
+  for (let y = r1; y <= r2; y++) {
+    let s = '';
+    try {
+      const line = term.buffer.active.getLine(y);
+      s = line ? line.translateToString(true, c1, c2 + 1) : '';
+    } catch (e) {}
+    out.push(s.trimEnd ? s.trimEnd() : s);
+  }
+  while (out.length && out[out.length - 1] === '') out.pop();  // drop blank tail rows
+  // NL built at runtime: this file forbids backslash escapes in the served JS
+  // (Python's triple-quote would turn them into real control bytes).
+  return out.join(String.fromCharCode(10));
+}
+
 // ── Copy to clipboard, LAN-safe: navigator.clipboard needs a secure context
 //    (https / localhost) which a plain-http LAN mirror is NOT, so fall back to a
 //    hidden-textarea + execCommand('copy'). Returns a promise-ish boolean. ──────
@@ -1411,18 +1480,19 @@ function setSelectMode(on) {
   selectMode = on;
   selBar.style.display = on ? 'flex' : 'none';
   applyTouchAction();
-  if (!on) { try { term.clearSelection(); } catch (e) {} }
+  if (!on) { clearSel(); }
   const sb = document.getElementById('kb-select');
   if (sb) sb.style.background = on ? '#3a3' : '';
   fitChrome();
 }
 document.getElementById('sel-copy').addEventListener('click', (e) => {
   e.preventDefault();
-  let s = ''; try { s = term.getSelection(); } catch (_) {}
+  const s = blockText();
   const hint = document.getElementById('sel-hint');
   if (!s) { hint.textContent = 'nothing selected — drag first'; return; }
   hint.textContent = copyText(s) ? ('copied ' + s.length + ' chars') : 'copy failed';
-  try { term.focus(); } catch (_) {}      // hidden-textarea copy stole the keyboard
+  if (!coarse) { try { term.focus(); } catch (_) {} }  // give the keyboard back
+  //                                     (mouse only:焦点=soft-KB on touch)
 });
 document.getElementById('sel-done').addEventListener('click', (e) => {
   e.preventDefault(); setSelectMode(false);
@@ -1458,11 +1528,27 @@ kbBar.style.cssText =
 //     and row-picking ride swipe/tap directly, so the d-pad mainly serves
 //     claude's own menus; arrow buttons get hold-to-repeat below.
 kbBar.innerHTML =
+  // Composer tray (hidden until ⌨): a VISIBLE textarea so a phone can use the
+  // OS paste bubble and compose long/IME text comfortably — the xterm helper
+  // textarea is 1px/invisible, so mobile paste was impossible and every tap
+  // used to summon a blind keyboard. Send frames the text as a bracketed
+  // paste when the host has ?2004h on (mirrored into term.modes), so embedded
+  // newlines do not submit line-by-line; Send ⏎ appends a CR. (#mirror-composer)
+  '<div class="kb-row" id="kb-comp" style="display:none;gap:4px">'+
+    '<textarea id="comp-text" rows="2" enterkeyhint="send" style="flex:1;'+
+      'background:#111;color:#eee;border:1px solid #555;border-radius:6px;'+
+      'font:14px monospace;padding:6px;resize:vertical"></textarea>'+
+    '<div style="display:flex;flex-direction:column;gap:4px">'+
+      '<button id="comp-send-cr" style="min-height:40px">Send &#9166;</button>'+
+      '<button id="comp-send" class="sm">Send</button>'+
+    '</div>'+
+  '</div>'+
   '<div class="kb-row" id="kb-row1">'+
     '<button class="sm" data-k="tab">Tab</button>'+
     '<button class="sm" data-k="space">Leader</button>'+
     '<button class="sm" id="kb-ctrl" data-k="">Ctrl</button>'+
     '<button class="sm" id="kb-select" data-k="">&#9986; Select</button>'+
+    '<button class="sm" id="kb-kbd" data-k="">&#9000;</button>'+
     '<button class="sm" id="kb-more" data-k="">More</button>'+
   '</div>'+
   '<div class="kb-row" id="kb-row2">'+
@@ -1494,6 +1580,7 @@ kbBar.innerHTML =
     '<button data-k="shift+f4">Restore</button>'+
     '<button data-k="f11">Notifs</button>'+
     '<button data-k="shift+f11">Compact</button>'+
+    '<button data-k="checkpoint">Checkpoint</button>'+
     '<button data-k="f12">Mirror QR</button>'+
     '<button data-k="pageup">PgUp</button>'+
     '<button data-k="pagedown">PgDn</button>'+
@@ -1553,6 +1640,39 @@ kbBar.querySelectorAll('button').forEach((b) => {
     }
     if (b.id === 'kb-select') {               // toggle drag-to-select-text mode
       setSelectMode(!selectMode);
+      return;
+    }
+    if (b.id === 'kb-kbd') {                  // toggle the composer tray
+      const tray = document.getElementById('kb-comp');
+      const show = tray.style.display === 'none';
+      tray.style.display = show ? 'flex' : 'none';
+      b.style.background = show ? '#3a3' : '';
+      fitChrome();
+      if (show) { try { document.getElementById('comp-text').focus(); } catch (e) {} }
+      return;
+    }
+    if (b.id === 'comp-send' || b.id === 'comp-send-cr') {
+      const ta = document.getElementById('comp-text');
+      let v = ta.value;
+      if (v !== '') {
+        // frame as a bracketed paste when the HOST enabled ?2004h (the mode
+        // rides the mirrored byte stream into term.modes) — else raw. Markers
+        // built from ESC at runtime (no control bytes in this served string).
+        let framed = v;
+        try {
+          if (term.modes && term.modes.bracketedPasteMode) {
+            framed = ESC + '[200~' + v + ESC + '[201~';
+          }
+        } catch (e) {}
+        if (b.id === 'comp-send-cr') framed += String.fromCharCode(13);
+        pending += framed;
+        pump();
+        ta.value = '';
+      } else if (b.id === 'comp-send-cr') {
+        pending += String.fromCharCode(13);   // empty + Send⏎ = bare Enter
+        pump();
+      }
+      try { ta.focus(); } catch (e) {}        // keep composing (keyboard stays up)
       return;
     }
     if (b.id === 'kb-hand') {                 // mirror the bars for the other thumb

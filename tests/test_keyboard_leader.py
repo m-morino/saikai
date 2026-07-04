@@ -946,6 +946,49 @@ def test_pilot_mirror_arrow_byte_drives_app():
         f"down-arrow byte did not reach on_key to move focus to the list: {facts}"
 
 
+def test_pilot_mirror_checkpoint_pseudo_key():
+    """The mirror More row exposes checkpoint as the pseudo-key "checkpoint":
+    it is a LEADER gesture (␣ c) in the TUI with no single key to synthesize,
+    so _mirror_inject_key dispatches action_checkpoint directly — gated on
+    control being ON, and never posted as a garbage Key event. (#mirror-checkpoint)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_mirror_checkpoint_pseudo_key (textual unavailable)")
+        return
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(120, 24)) as pilot:
+                await pilot.pause(0.3)
+                calls = []
+                self.action_checkpoint = lambda: calls.append(True)
+                self._control_enabled = False
+                self._mirror_inject_key("checkpoint")
+                facts["gated_off"] = len(calls) == 0
+                self._control_enabled = True
+                self._mirror_inject_key("checkpoint")
+                facts["dispatched"] = len(calls) == 1
+                await pilot.pause(0.05)
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+    assert facts.get("gated_off") is True, f"control OFF must not dispatch: {facts}"
+    assert facts.get("dispatched") is True, f"pseudo-key must run action_checkpoint: {facts}"
+
+
 def test_pilot_mirror_space_leader_runs_mnemonic():
     """Browser Space leader: a Space byte then a mnemonic byte ('f' = favorite),
     injected via the mirror input path with the list focused, must arm the Space
@@ -2417,6 +2460,7 @@ if __name__ == "__main__":
     print("PASS test_pilot_mirror_text_drives_search")
     test_pilot_mirror_arrow_byte_drives_app()
     print("PASS test_pilot_mirror_arrow_byte_drives_app")
+    test_pilot_mirror_checkpoint_pseudo_key()
     test_pilot_mirror_space_leader_runs_mnemonic()
     test_pilot_rename_modal_enter_saves_not_resumes()
     test_pilot_ctrlc_over_modal_does_not_quit()

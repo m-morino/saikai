@@ -948,10 +948,15 @@ def test_page_wires_select_mode_and_copy():
     assert 'id="kb-select"' in page, "no Select toggle in the key bar"
     assert "selectMode" in page, "no select-mode state"
     assert "setSelectMode" in page, "no select-mode toggle handler"
-    # the drag drives a real xterm selection (char-precise, not whole-line).
-    assert "term.select(" in page, "select mode must drive term.select()"
-    assert "getSelection" in page, "no way to read the selection for copy"
-    assert "clearSelection" in page, "toggling select off must clear the selection"
+    # the drag drives a BLOCK (rectangle) selection: our own overlay + per-row
+    # buffer reads — a linear selection crossed the split divider and picked
+    # garbage from both panes. (#mirror-blocksel)
+    assert "blockText" in page and "selrect" in page, \
+        "select mode must be the block model (overlay + blockText)"
+    assert "translateToString" in page, "copy must read rows from the xterm buffer"
+    assert "clearSel" in page, "toggling select off must clear the rectangle"
+    # near the top/bottom edge the drag auto-scrolls the HOST (Chrome-like).
+    assert "edgeScroll" in page and "scrollup" in page, "no edge auto-scroll"
     # a tap while selecting must NOT click a row (SGR forwarding suppressed).
     assert "taps drive selection" in page or "selectMode) return" in page, \
         "SGR mouse must be suppressed while selecting"
@@ -1045,6 +1050,23 @@ def test_page_key_bar_flow_and_labels():
     # hold-to-repeat on the d-pad (buttons have no key repeat otherwise).
     assert "pointerdown" in page and "setInterval" in page \
         and "pointerleave" in page, "d-pad hold-to-repeat missing"
+    # Phones must not get the soft keyboard on every tap (it hid the key bar):
+    # focus follows MOUSE pointers only, and typing rides the ⌨ composer. (#mirror-ime)
+    assert 'id="kb-kbd"' in page, "no composer toggle for touch typing"
+    # The composer is a VISIBLE textarea (the OS paste bubble works — the xterm
+    # helper textarea is 1px/invisible so mobile PASTE was impossible), and Send
+    # frames the text as a bracketed paste when the host mirrored ?2004h in.
+    # (#mirror-composer)
+    assert 'id="kb-comp"' in page and 'id="comp-text"' in page, "no composer tray"
+    assert 'id="comp-send-cr"' in page and 'id="comp-send"' in page, \
+        "composer needs Send and Send-⏎"
+    assert "bracketedPasteMode" in page, \
+        "composer must frame sends as a bracketed paste when the host has ?2004h"
+    assert "pointer: coarse" in page and "pointerType" in page, \
+        "touch taps must not focus the xterm textarea"
+    # Checkpoint rides the More row as a pseudo-key the app dispatches.
+    assert 'data-k="checkpoint"' in page and ">Checkpoint<" in page, \
+        "no Checkpoint button in the More row"
     # Handedness: a ⇄ Hand toggle mirrors the bars (row-reverse) so the d-pad
     # cluster sits under the LEFT thumb for left-handed users, persisted per
     # browser (localStorage). All three bars flip together.

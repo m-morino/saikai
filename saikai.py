@@ -3835,6 +3835,9 @@ _B2_HANDOFF_PROMPT = (
     "Wrap up THIS session so a brand-new session can resume the work. Do not keep "
     "working here. Goal: hand off the least context that is still SUFFICIENT — "
     "short on narration, complete on anything expensive or impossible to rederive.\n"
+    "Write it from what you already know in this conversation: do NOT run tools or "
+    "commands for this handoff — if something was not actually observed, mark it "
+    "UNVERIFIED instead of checking now.\n"
     "\n"
     "DROP: exploration play-by-play, tool output, long quotes, history. (The old "
     "session stays reopenable, so detail is recoverable — don't pad.)\n"
@@ -4515,6 +4518,16 @@ class _MirrorControl:
             return
         if not isinstance(key, str) or key == "":
             return                             # never post a garbage Key
+        if key == "checkpoint":
+            # The mirror's More row exposes checkpoint directly: in the TUI it is
+            # a LEADER gesture (␣ c), so there is no single key to synthesize —
+            # dispatch the action itself. All of b2's own gates (already-running,
+            # no live target, mid-turn) still apply inside. (#mirror-checkpoint)
+            try:
+                self.action_checkpoint()
+            except Exception:
+                pass
+            return
         from textual import events
         character = key if len(key) == 1 else None
         try:
@@ -9709,6 +9722,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # detect_child timed out WITH a mint: the pane was reseeded
                     # above, but no falsifiable child sid → skip lineage/re-key
                     # (guessing would wire Shift+F6 to the wrong session).
+                    try:
+                        self.set_timer(0.8, self.action_refresh)   # (#audit-b2-autorefresh)
+                    except Exception:
+                        pass
                     self._b2_finish(
                         "checkpoint: reseeded, but the new session could not be "
                         "identified — no lineage recorded" + _unv_suffix, "warning")
@@ -9775,6 +9792,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
                 self._b2_mark_dirty()      # focus-safe list repaint for the re-key
+                # Materialize the parent (now historical) and the child stub as
+                # REAL scanned sessions right away — without this the list only
+                # showed them after a manual F5. Delay a beat so the child's
+                # first records are on disk. (#audit-b2-autorefresh)
+                try:
+                    self.set_timer(0.8, self.action_refresh)
+                except Exception:
+                    pass
                 if _unv:
                     self._b2_finish("checkpoint: lineage recorded, but the reseed "
                                     "did NOT visibly submit — open the pane and "
