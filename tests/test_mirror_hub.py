@@ -277,10 +277,15 @@ def test_paste_framing_rejects_embedded_esc():
 
 
 def test_tls_scheme_and_url():
-    """TLS is off by default (http); when the hub is given a cert/key pair its
-    scheme + url() flip to https so the QR/URL advertise the encrypted origin. (#audit-mirror-tls)"""
-    assert m.mirror_tls_enabled({}) is False
+    """TLS is ON by DEFAULT (opt-out via SAIKAI_MIRROR_TLS=0/false/no/off) so the LAN
+    transport is encrypted and the browser gets a secure context; when the hub is
+    given a cert/key pair its scheme + url() flip to https so the QR/URL advertise
+    the encrypted origin. (#audit-mirror-tls, #mirror-tls-default-on)"""
+    assert m.mirror_tls_enabled({}) is True                           # unset → default-on
     assert m.mirror_tls_enabled({"SAIKAI_MIRROR_TLS": "1"}) is True
+    assert m.mirror_tls_enabled({"SAIKAI_MIRROR_TLS": "0"}) is False   # explicit opt-out
+    assert m.mirror_tls_enabled({"SAIKAI_MIRROR_TLS": "off"}) is False
+    assert m.mirror_tls_enabled({"SAIKAI_MIRROR_TLS": ""}) is True     # empty → default-on
     plain = m.MirrorHub(token="tok", host="127.0.0.1", port=9999)
     assert plain._scheme == "http" and plain.url().startswith("http://")
     secure = m.MirrorHub(token="tok", host="127.0.0.1", port=9999,

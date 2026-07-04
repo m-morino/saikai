@@ -772,12 +772,16 @@ def mirror_port(env: dict) -> int:
 
 
 def mirror_tls_enabled(env: dict) -> bool:
-    """Whether the operator asked for TLS (SAIKAI_MIRROR_TLS truthy). Encrypting the
-    LAN transport is what stops a passive sniffer from harvesting the token, the
-    SSE-delivered write-key, and every keystroke — the one gap the app-layer
-    controls can't close."""
-    return str(env.get("SAIKAI_MIRROR_TLS", "")).strip().lower() in (
-        "1", "true", "yes", "on")
+    """Whether to encrypt the LAN transport with TLS — ON BY DEFAULT (opt-out).
+    Encrypting the transport is what stops a passive sniffer from harvesting the
+    token, the SSE-delivered write-key, and every keystroke — the one gap the
+    app-layer controls can't close — and https also gives the browser a secure
+    context (navigator.clipboard, etc.). Set SAIKAI_MIRROR_TLS to a falsy token
+    (0/false/no/off) to force plain HTTP; unset / empty / truthy → TLS. When no
+    cert can be minted (openssl absent and no user cert), the caller warns and
+    falls back to HTTP rather than failing launch."""
+    return str(env.get("SAIKAI_MIRROR_TLS", "")).strip().lower() not in (
+        "0", "false", "no", "off")
 
 
 def _openssl_run(argv: list, timeout: float) -> int:
