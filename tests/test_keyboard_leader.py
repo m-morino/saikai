@@ -1944,6 +1944,58 @@ def test_pilot_checkpoint_marker_on_row():
     assert "↻" not in facts.get("after", ""), f"marker must clear after: {facts}"
 
 
+def test_pilot_toast_rows_self_heal():
+    """WT hover artifact mitigation (#toast-heal): while a toast is visible, a
+    0.4s tick re-emits it, so a row punched out by the Windows-driver↔WT layer
+    repaints itself. Assert the tick actually re-EMITS partial updates carrying
+    the toast rows (headless probes proved the emitted content is correct)."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_toast_rows_self_heal (textual unavailable)")
+        return
+    import asyncio
+    from textual.app import App
+    from textual._compositor import Compositor
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 24), notifications=True) as pilot:
+                await pilot.pause(0.4)
+                self.notify("HEALMARK toast row", timeout=30)
+                await pilot.pause(0.4)
+                emitted = []
+                _orig = Compositor.render_partial_update
+
+                def _spy(comp):
+                    r = _orig(comp)
+                    if r is not None:
+                        emitted.append(r)
+                    return r
+
+                Compositor.render_partial_update = _spy
+                try:
+                    await pilot.pause(1.0)    # ≥2 heal ticks, no other activity
+                finally:
+                    Compositor.render_partial_update = _orig
+                facts["updates"] = len(emitted)
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+    assert facts.get("updates", 0) >= 2, \
+        f"the heal tick must re-emit visible toasts (~0.4s cadence): {facts}"
+
+
 def test_pilot_toast_user_content_renders_verbatim():
     """Toast messages carry USER content — session titles ('needs input:
     {title}'), exception reprs, paths. Textual renders notifications as content
@@ -2474,6 +2526,7 @@ if __name__ == "__main__":
     test_pilot_refresh_preserves_scroll_position()
     test_pilot_filter_engaged_window_survives_focus_move()
     test_pilot_checkpoint_marker_on_row()
+    test_pilot_toast_rows_self_heal()
     test_pilot_toast_user_content_renders_verbatim()
     test_tabpane_title_uses_markup_safe_content_not_rich_text()
     print("PASS test_tabpane_title_uses_markup_safe_content_not_rich_text")

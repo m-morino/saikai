@@ -5746,7 +5746,27 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             auto-dismissed). Opens a scrollable, mirror-visible panel."""
             self.push_screen(NotificationsScreen(getattr(self, "_notif_log", [])))
 
+        def _heal_toasts(self) -> None:
+            """Self-heal for the WT hover artifact: rows of a HOVERED toast
+            intermittently vanish on Windows Terminal. Headless probes prove the
+            compositor AND the partial-update chops both emit the toast rows
+            correctly, so the loss happens in the Windows-driver-ANSI ↔ WT
+            rendering layer (out of our reach). While any toast is visible,
+            re-emit it on a short tick — a punched row repaints within ~0.4s,
+            and the tick is a cheap no-op when no toast is up. (#toast-heal)"""
+            try:
+                from textual.widgets._toast import Toast
+                for t in self.screen.query(Toast):
+                    t.refresh()
+            except Exception:
+                pass
+
         def on_mount(self) -> None:
+            # WT toast-row self-heal (see _heal_toasts).
+            try:
+                self.set_interval(0.4, self._heal_toasts)
+            except Exception:
+                pass
             # Gated OUTPUT capture: tee everything saikai writes to the REAL
             # terminal to a file, so the cursor/IME escape stream around focus can
             # be inspected byte-for-byte (does our ?25h survive, or does a later
