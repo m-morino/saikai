@@ -1027,11 +1027,18 @@ background:#333;color:#eee;touch-action:manipulation;-webkit-tap-highlight-color
 border:1px solid #4a4;border-radius:6px;background:#2c4a2c;color:#eee;
 flex:0 0 auto;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 #selbar button:active{background:#3a3}
-#kb{align-items:center}
-#kb-arrows{display:grid;grid-template-areas:". up ." "left down right";gap:4px;flex:0 0 auto;margin-left:auto}
+#kb{flex-direction:column;align-items:stretch}
+#kb .kb-row{display:flex;gap:4px}
+#kb .sm{min-height:40px;font-size:14px;padding:6px 8px}
+#kb .mid{min-height:46px;flex:0 1 150px;min-width:104px}
+#kb .esc{border-color:#a66;color:#faa;min-width:96px;flex:0 0 auto;align-self:flex-end}
+#kb .enter{border-color:#4a4;color:#9f9;min-width:96px;font-size:17px;flex:0 0 auto}
+#kb .next{border-color:#2aa;color:#7ee}
+#kb-row2{justify-content:flex-end}
+#kb-arrows{display:grid;grid-template-areas:". up ." "left down right";gap:4px;flex:0 0 auto}
 #kb-arrows>[data-k="up"]{grid-area:up}#kb-arrows>[data-k="down"]{grid-area:down}
 #kb-arrows>[data-k="left"]{grid-area:left}#kb-arrows>[data-k="right"]{grid-area:right}
-#kb-arrows>button{min-width:52px;padding:8px 0;flex:0 0 auto}</style></head>
+#kb-arrows>button{min-width:58px;padding:13px 0;flex:0 0 auto}</style></head>
 <body data-cols="__COLS__" data-rows="__ROWS__"><div id="t"></div>
 <script src="/xterm.min.js"></script>
 <script src="/addon-canvas.js"></script>
@@ -1440,36 +1447,47 @@ kbBar.style.cssText =
   'padding:4px;background:#222;z-index:9;font:bold 14px monospace';
 // Action keys grouped on the left; the four arrows form a d-pad cross on the
 // right (↑ over ←↓→) so list/dropdown navigation reads like a real keypad.
-// Primary row ordered by how often a remote hand reaches for each, grouped by
-// intent: cancel/confirm first, then the saikai command gestures, then the
-// text-select toggle, then More, with the four arrows as a d-pad cross on the
-// right (up over left/down/right) so list/dropdown navigation reads like a
-// real keypad. F12 (connection QR) moved to the secondary row — it's setup,
-// not a during-session key.
+// Ergonomic v3 (user-flow measured): three tiers by thumb reach.
+//   Row 1 (stretch zone, smaller): rare keys — Tab / Leader / Ctrl / Select / More.
+//   Row 2 (shoulder, thumb side):  the LOOP keys — ☰List (pane→list, the only
+//     way back: typed text rides to the pane) and !Next (shift+f3, jump to the
+//     next needs-you session — saikai's hero flow, cyan like the TUI accent).
+//   Row 3 (prime band): Esc far-left (rare + high-stakes interrupt: MAXIMUM
+//     separation from confirm = error prevention), d-pad + tall green Enter in
+//     the easy arc — choose→confirm is one thumb move. On touch, list scrolling
+//     and row-picking ride swipe/tap directly, so the d-pad mainly serves
+//     claude's own menus; arrow buttons get hold-to-repeat below.
 kbBar.innerHTML =
-  '<button data-k="escape">Esc</button>'+
-  '<button data-k="enter">&#9166; Enter</button>'+
-  '<button data-k="tab">Tab</button>'+
-  '<button data-k="space">Leader</button>'+
-  '<button id="kb-ctrl" data-k="">Ctrl</button>'+
-  '<button data-k="ctrl+right_square_bracket">&#9776; List</button>'+
-  '<button id="kb-select" data-k="">&#9986; Select</button>'+
-  '<button id="kb-more" data-k="">More</button>'+
-  '<div id="kb-arrows">'+
-    '<button data-k="up">&#8593;</button>'+
-    '<button data-k="left">&#8592;</button>'+
-    '<button data-k="down">&#8595;</button>'+
-    '<button data-k="right">&#8594;</button>'+
+  '<div class="kb-row" id="kb-row1">'+
+    '<button class="sm" data-k="tab">Tab</button>'+
+    '<button class="sm" data-k="space">Leader</button>'+
+    '<button class="sm" id="kb-ctrl" data-k="">Ctrl</button>'+
+    '<button class="sm" id="kb-select" data-k="">&#9986; Select</button>'+
+    '<button class="sm" id="kb-more" data-k="">More</button>'+
+  '</div>'+
+  '<div class="kb-row" id="kb-row2">'+
+    '<button class="mid" data-k="ctrl+right_square_bracket">&#9776; List</button>'+
+    '<button class="mid next" data-k="shift+f3">! Next</button>'+
+  '</div>'+
+  '<div class="kb-row" id="kb-row3">'+
+    '<button class="esc" data-k="escape">Esc</button>'+
+    '<div style="flex:1"></div>'+
+    '<div id="kb-arrows">'+
+      '<button data-k="up">&#8593;</button>'+
+      '<button data-k="left">&#8592;</button>'+
+      '<button data-k="down">&#8595;</button>'+
+      '<button data-k="right">&#8594;</button>'+
+    '</div>'+
+    '<button class="enter" data-k="enter">&#9166;<br>Enter</button>'+
   '</div>'+
   // Secondary row: saikai's OWN actions, hidden until 'More' so the default bar
-  // stays compact. f5/f9/f10/shift+f3/shift+f4 are PRIORITY bindings (fire even
-  // with a pane focused); "Find" (slash) opens search and PgUp/PgDn/Top/End page
-  // the list (these work when the list, not a pane, is focused).
-  '<div id="kb2" style="display:none;flex-basis:100%;flex-wrap:wrap;gap:4px">'+
+  // stays compact. f5/f9/f10/shift+f4 are PRIORITY bindings (fire even with a
+  // pane focused); "Find" (slash) opens search and PgUp/PgDn/Top/End page the
+  // list (these work when the list, not a pane, is focused).
+  '<div class="kb-row" id="kb2" style="display:none;flex-wrap:wrap">'+
     '<button id="kb-hand" data-k="">&#8644; Right</button>'+
     '<button data-k="slash">Find</button>'+
     '<button data-k="f5">Refresh</button>'+
-    '<button data-k="shift+f3">Next!</button>'+
     '<button data-k="f10">Close pane</button>'+
     '<button data-k="f9">Copy prompt</button>'+
     '<button data-k="shift+f2">Rename</button>'+
@@ -1491,22 +1509,41 @@ const kbMore = document.getElementById('kb-more');
 let hand = 'R';
 try { hand = localStorage.getItem('saikai-hand') === 'L' ? 'L' : 'R'; } catch (e) {}
 function applyHand() {
+  // The bar is a COLUMN of rows; mirror each row (and the select bar) so the
+  // whole thumb map flips: shoulder keys, Esc↔cluster, More row. The row-3
+  // spacer keeps Esc and the d-pad/Enter cluster at opposite edges in both.
   const dir = (hand === 'L') ? 'row-reverse' : 'row';
-  kbBar.style.flexDirection = dir;
-  try { document.getElementById('kb2').style.flexDirection = dir; } catch (e) {}
+  kbBar.querySelectorAll('.kb-row').forEach((r) => { r.style.flexDirection = dir; });
   try { selBar.style.flexDirection = dir; } catch (e) {}
-  // When the bar WRAPS (phones), a wrapped row starts at the main-start edge —
-  // an auto-margin pins the d-pad to the thumb side in both modes.
-  const ar = document.getElementById('kb-arrows');
-  if (ar) {
-    ar.style.marginLeft  = (hand === 'L') ? '0' : 'auto';
-    ar.style.marginRight = (hand === 'L') ? 'auto' : '0';
-  }
   const hb = document.getElementById('kb-hand');
   if (hb) hb.textContent = (hand === 'L') ? '\u21c4 Left' : '\u21c4 Right';
 }
 applyHand();
+// Hold-to-repeat for the d-pad: buttons have no key-repeat, so a long menu
+// or an in-pane scroll needed one tap per step. pointerdown fires the key at
+// once, holding repeats it (400ms delay, then 80ms — physical-keyboard feel);
+// pointerup/cancel/leave stops. These buttons are EXCLUDED from the generic
+// click path below (a click after pointerdown would double-fire).
+(function () {
+  let rptT = null, rptI = null;
+  function stopRepeat() {
+    if (rptT) { clearTimeout(rptT); rptT = null; }
+    if (rptI) { clearInterval(rptI); rptI = null; }
+  }
+  kbBar.querySelectorAll('#kb-arrows button').forEach((b) => {
+    const k = b.getAttribute('data-k');
+    b.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      stopRepeat();
+      postKey(k);
+      rptT = setTimeout(() => { rptI = setInterval(() => postKey(k), 80); }, 400);
+    });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach((t) =>
+      b.addEventListener(t, stopRepeat));
+  });
+})();
 kbBar.querySelectorAll('button').forEach((b) => {
+  if (b.closest && b.closest('#kb-arrows')) return;   // hold-to-repeat path above
   b.addEventListener('click', (e) => {
     e.preventDefault();
     if (b.id === 'kb-ctrl') {                 // arm/disarm the sticky modifier

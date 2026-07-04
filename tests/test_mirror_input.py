@@ -811,9 +811,10 @@ def test_page_routes_mouse_and_has_key_bar():
         assert "mouseQueue" in page, "postMouse must queue (not drop) down/up"
         # (b) postKey single-flight to /key with the write-key header.
         assert "/key" in page and "X-Mirror-Write-Key" in page, page
-        # (c) the on-screen key bar buttons.
-        for label in ("Leader", "Esc", "Tab", "Enter", "Ctrl", "F12", "List"):
+        # (c) the on-screen key bar buttons (F12 rides kb2 as "Mirror QR").
+        for label in ("Leader", "Esc", "Tab", "Enter", "Ctrl", "List", "Mirror QR"):
             assert label in page, f"key bar missing {label}: {page[:200]}"
+        assert 'data-k="f12"' in page, page
         # Enter (resume + focus a pane from the list, or submit to a focused
         # pane) and the release key (ctrl+] -> drop pane focus back to the list)
         # MUST be tappable: typed text rides /input to the focused pane, so these
@@ -1030,9 +1031,20 @@ def test_page_key_bar_flow_and_labels():
     assert 'data-k="shift+f11"' in page and ">Compact<" in page, page
     assert page.count("Refresh") == 1, \
         f"'Refresh' must be unambiguous (f5 only), found {page.count('Refresh')}"
-    # the primary bar leads with Esc then Enter (confirm/cancel are the most-used).
-    assert page.index('data-k="escape"') < page.index('data-k="enter"') \
-        < page.index('data-k="tab"'), "primary bar not ordered by flow"
+    # Ergonomic v3 tiers (reach-ordered, not reading-ordered): row1 rare keys,
+    # row2 the LOOP keys (List + promoted !Next), row3 Esc | d-pad | Enter.
+    assert 'id="kb-row1"' in page and 'id="kb-row2"' in page \
+        and 'id="kb-row3"' in page, "three-tier bar missing"
+    r2 = page[page.index('id="kb-row2"'):page.index('id="kb-row3"')]
+    assert 'data-k="ctrl+right_square_bracket"' in r2 \
+        and 'data-k="shift+f3"' in r2, "loop keys (List/Next) must ride row 2"
+    r3 = page[page.index('id="kb-row3"'):page.index('id="kb2"')]
+    assert r3.index('data-k="escape"') < r3.index('id="kb-arrows"') \
+        < r3.index('data-k="enter"'), \
+        "row3 must run Esc (far side) → d-pad → Enter (thumb side)"
+    # hold-to-repeat on the d-pad (buttons have no key repeat otherwise).
+    assert "pointerdown" in page and "setInterval" in page \
+        and "pointerleave" in page, "d-pad hold-to-repeat missing"
     # Handedness: a ⇄ Hand toggle mirrors the bars (row-reverse) so the d-pad
     # cluster sits under the LEFT thumb for left-handed users, persisted per
     # browser (localStorage). All three bars flip together.
