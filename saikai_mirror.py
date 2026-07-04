@@ -1071,6 +1071,24 @@ const ESC = String.fromCharCode(27);
 // DOM listeners and reports taps/scrolls as ESC[<b;col;row(M|m) via onData.
 try { term.write(ESC + '[?1000;1006h'); } catch (e) {}
 const token = new URLSearchParams(location.search).get('token');
+// ── &debug=1: a one-line live diagnostic (control/zone/ticks/scrollTop) so a
+//    misbehaving remote can be diagnosed from the phone/desktop itself without
+//    DevTools. Counters are written by the edge/select machinery. ─────────────
+window.__dbg = {zone: null, arm: 0, tick: 0, st1: 0, st2: 0};
+if (new URLSearchParams(location.search).get('debug') === '1') {
+  const dbgLine = document.createElement('div');
+  dbgLine.style.cssText = 'position:fixed;left:0;bottom:0;z-index:30;'+
+    'font:11px monospace;background:#001a33;color:#8cf;padding:2px 6px;opacity:.9';
+  document.body.appendChild(dbgLine);
+  setInterval(() => {
+    const el = document.getElementById('t');
+    dbgLine.textContent =
+      'ctl=' + controlOn + ' sel=' + selectMode + ' zone=' + window.__dbg.zone +
+      ' arm=' + window.__dbg.arm + ' tick=' + window.__dbg.tick +
+      ' pan=' + window.__dbg.st1 + ' host=' + window.__dbg.st2 +
+      ' scrollTop=' + (el ? el.scrollTop : '-');
+  }, 300);
+}
 const es = new EventSource('/stream?token=' + encodeURIComponent(token));
 
 // ── Output (unchanged): default-event base64 frames -> xterm ────────────────
@@ -1300,9 +1318,12 @@ term.onData((d) => {
   }
   function edgeScroll(y) {
     const dir = edgeZone(y);
+    window.__dbg.zone = dir;
     if (!dir) { stopEdge(); return; }
     if (edgeT) return;
+    window.__dbg.arm++;
     edgeT = setInterval(() => {
+      window.__dbg.tick++;
       if (!selectMode || fatal) { stopEdge(); return; }
       const d = edgeZone(lastPY);          // finger may have left the zone
       if (!d) { stopEdge(); return; }
@@ -1311,11 +1332,20 @@ term.onData((d) => {
       const before = el.scrollTop;
       el.scrollTop = before + (d === 'down' ? 28 : -28);
       if (el.scrollTop !== before) {
+        window.__dbg.st1++;
         selectTo(lastPX, lastPY);          // grow the selection under the still finger
         return;
       }
       // Stage 2: the canvas edge is on screen — scroll the HOST (control only).
-      if (!controlOn) return;
+      if (!controlOn) {
+        // read-only CANNOT drive the host (the server would 409 anyway) — say
+        // so instead of silently not scrolling. (#mirror-edge-hint)
+        const hint = document.getElementById('sel-hint');
+        if (hint) hint.textContent =
+          'edge reached — scrolling the host needs CONTROL ON (Shift+F12 at the terminal)';
+        return;
+      }
+      window.__dbg.st2++;
       const at = selB || {c: scol, r: srow};
       postMouse(at.c, at.r, 0, d === 'down' ? 'scrolldown' : 'scrollup');
     }, 150);

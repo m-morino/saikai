@@ -968,6 +968,10 @@ def test_page_wires_select_mode_and_copy():
     # canvas edge. (#mirror-edgezone)
     assert "scrollTop" in _edge, "stage 1 (local pan) missing"
     assert "lastPY" in _edge, "the tick must re-check the finger position"
+    # read-only must SAY why the host won't scroll instead of silently stalling,
+    # and &debug=1 exposes live counters for on-machine diagnosis.
+    assert "CONTROL ON" in page, "no read-only edge hint"
+    assert "'debug'" in page and "__dbg" in page, "no debug overlay"
     # the select drag must keep flowing over the fixed overlays (window-level
     # mousemove — an el-scoped listener went silent over the key bar).
     assert "window.addEventListener('mousemove'" in page, page
