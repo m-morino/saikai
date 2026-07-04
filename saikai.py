@@ -3402,12 +3402,18 @@ def _assign_primary_topic(sessions: list[dict]) -> None:
 # (project / topic) get a stable hash-derived colour so the same value renders
 # in the same colour every time and the eye can group rows by colour even
 # faster than by reading the cell text.
-_PROJECT_PALETTE = ("cyan", "yellow", "green", "magenta", "bright_blue",
-                    "bright_red", "white", "bright_cyan", "bright_yellow",
-                    "bright_green", "bright_magenta")
-_TOPIC_PALETTE = ("magenta", "cyan", "yellow", "green", "bright_blue",
-                  "bright_red", "white", "bright_magenta", "bright_cyan",
-                  "bright_yellow", "bright_green")
+#
+# LOW-SATURATION by design (user: the saturated ANSI set read as garish and
+# fought the calm baseline): tinting is a GROUPING cue, not an accent, so it
+# must sit close to the neutral foreground. CYAN IS BANISHED from both
+# palettes — it is the reserved needs-you accent and must never appear on a
+# row that doesn't need you. (#palette-muted)
+_PROJECT_PALETTE = ("#9aa5ce", "#b8a965", "#8fae8b", "#b48ead", "#7f9fbf",
+                    "#bf8f8f", "#a8a8a8", "#87afaf", "#c0a36e",
+                    "#95b1a4", "#a48fbf")
+_TOPIC_PALETTE = ("#b48ead", "#9aa5ce", "#b8a965", "#8fae8b", "#7f9fbf",
+                  "#bf8f8f", "#a8a8a8", "#a48fbf", "#87afaf",
+                  "#c0a36e", "#95b1a4")
 
 
 def _stable_color(value: str, palette) -> str:

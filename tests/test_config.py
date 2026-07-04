@@ -332,6 +332,23 @@ def test_activity_marker_shell_distinct_from_open():
     assert saikai._MARKER_COLOR.get("?") == saikai._ATTENTION_STYLE   # waiting = the accent
 
 
+def test_palettes_are_muted_and_cyan_free():
+    """The tint palettes are a GROUPING cue, not an accent: low-saturation hex
+    only (the saturated ANSI set read as garish against the calm baseline), and
+    CYAN never appears — it is the reserved needs-you accent, so a row that
+    doesn't need you must never wear it. (#palette-muted)"""
+    for pal in (saikai._PROJECT_PALETTE, saikai._TOPIC_PALETTE):
+        for c in pal:
+            assert c.startswith("#") and len(c) == 7, \
+                f"palette entry {c!r} is not a curated hex tone"
+            r, g, b = int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
+            assert max(r, g, b) - min(r, g, b) <= 90, \
+                f"{c} is too saturated for a grouping tint"
+            # cyan-ish = green+blue high together while red trails far behind
+            assert not (g > 140 and b > 140 and r < 100), \
+                f"{c} reads as cyan — reserved for the attention accent"
+
+
 def test_color_map_is_stable_across_visible_sets():
     """Option A (#stable-hue): a value's hue is a pure function of the value, so
     a project keeps its colour when the visible set changes (filter / search /
@@ -1103,6 +1120,8 @@ if __name__ == "__main__":
     print("PASS test_activity_marker_bg_agent_distinct_from_open")
     test_activity_marker_shell_distinct_from_open()
     print("PASS test_activity_marker_shell_distinct_from_open")
+    test_palettes_are_muted_and_cyan_free()
+    print("PASS test_palettes_are_muted_and_cyan_free")
     test_color_map_is_stable_across_visible_sets()
     print("PASS test_color_map_is_stable_across_visible_sets")
     test_complete_dir_lists_and_filters_child_dirs()
