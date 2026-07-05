@@ -2579,6 +2579,22 @@ function fitChrome() {
   }
   tdiv.style.paddingTop = top + 'px';
   tdiv.style.paddingBottom = kbBar.offsetHeight + 'px';
+  // Hug the TERMINAL's bottom edge when the whole canvas fits above the bar:
+  // on a window taller than the mirrored screen the bar otherwise sits at the
+  // viewport bottom with dead space between it and the content — keys far from
+  // what they act on. When the canvas is TALLER than the viewport (phones),
+  // the condition never holds mid-pan and the bar stays viewport-anchored; at
+  // full pan both anchors coincide, so it never jumps. (#kb-hug)
+  let hug = '';
+  const scr = tdiv.querySelector('.xterm-screen');
+  if (scr) {
+    const r = scr.getBoundingClientRect();
+    if (r.height > 0 && r.bottom + kbBar.offsetHeight <= window.innerHeight) {
+      hug = Math.ceil(r.bottom) + 'px';
+    }
+  }
+  if (hug) { kbBar.style.top = hug; kbBar.style.bottom = 'auto'; }
+  else { kbBar.style.top = 'auto'; kbBar.style.bottom = '0'; }
 }
 fitChrome();
 window.addEventListener('resize', fitChrome);

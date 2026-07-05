@@ -1234,6 +1234,10 @@ def test_page_pane_view_contracts():
     assert "function stashDraft()" in page and "sessionStorage.getItem('saikai-draft')" in page
     # unseeded-but-open pane view retries (bounded)
     assert "saikai-seed-retry" in page and "location.reload();" in page
+    # key bar hugs the terminal's bottom edge when the canvas fits above it
+    # (dead space otherwise separates the keys from the content) — #kb-hug
+    assert "r.bottom + kbBar.offsetHeight <= window.innerHeight" in page
+    assert "kbBar.style.top = hug; kbBar.style.bottom = 'auto';" in page
     # composer strips embedded paste markers before framing (early-close guard)
     assert "v.split(ESC + '[200~').join('').split(ESC + '[201~').join('')" in page
     # a new pane generation regates output + re-arms the blank-view backstop
