@@ -48,6 +48,11 @@ _PaneData = collections.namedtuple("_PaneData", ["data"])    # raw child bytes
 # at source, so nothing else would ever resend it. (#review-pane-meta-loss)
 _PaneReset = collections.namedtuple("_PaneReset", ["seed", "meta"])
 _PaneMeta = collections.namedtuple("_PaneMeta", ["json"])    # geometry/liveness
+# Clipboard frame: the child's OSC 52 copy, relayed so "copy in claude" lands
+# on the DEVICE THE VIEWER IS HOLDING. App-view clients need it (their stream
+# is Textual frames — OSC 52 never reaches them); pane-view pages decode OSC 52
+# themselves and ignore this event. (#app-native-select)
+_Clip = collections.namedtuple("_Clip", ["json"])
 # The pane tee may not starve app frames out of the SHARED ingest queue: raw
 # child output is unthrottled (a flood workload writes at PTY throughput while
 # Textual frames are render-paced), so pane data is capped to half the queue —
@@ -841,6 +846,22 @@ class MirrorHub:
         request has been answered."""
         self._pane_reseed_pending = 0.0
         self._ingest_put(_PaneReset(seed, self._pane_meta_json))
+
+    def send_clip(self, text: str) -> None:
+        """Relay a child's OSC 52 clipboard write to the browsers (bounded).
+        UI thread (the app's marshal target calls it). Best-effort: a clipboard
+        payload is transient — a fallen-behind client just misses it."""
+        if not text:
+            return
+        frame = _Clip(json.dumps(
+            {"b64": base64.b64encode(text[:262144].encode("utf-8")).decode("ascii")}))
+        with self._clients_lock:
+            targets = list(self._clients) + list(self._pane_clients)
+        for cq in targets:
+            try:
+                cq.put_nowait(frame)
+            except queue.Full:
+                pass
 
     def set_pane_strip(self, regex) -> None:
         # Child-emitted terminal QUERIES (DA/DSR/DECRQM/DECRQSS/…) must not
@@ -1742,6 +1763,24 @@ es.addEventListener('control', (e) => {
   let s = {}; try { s = JSON.parse(e.data); } catch (_) {}
   setBanner(!!s.on, s.target);
 });
+// The child's OSC 52 copy, relayed by the host (#app-native-select). Pane view
+// decodes OSC 52 straight off its raw stream — ignore the relay there.
+es.addEventListener('clip', (e) => {
+  if (paneView) return;
+  try {
+    const bin = atob(JSON.parse(e.data).b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+    const text = new TextDecoder('utf-8').decode(bytes);
+    if (!text) return;
+    lastOsc52 = text;
+    const ok = copyText(text);
+    const hint = document.getElementById('sel-hint');
+    if (hint) hint.textContent = ok
+      ? ('claude copied ' + text.length + ' chars to your clipboard')
+      : ('claude copied ' + text.length + ' chars — tap Copy to take it');
+  } catch (_) {}
+});
 
 // ── Pane view: full-state seed + geometry/liveness (#pane-direct) ───────────
 let paneOpen = false;
@@ -1929,6 +1968,10 @@ async function postMouse(col, row, button, kind) {
     // captured with no matching release. Bounded so a wild burst can't grow forever.
     const last = mouseQueue[mouseQueue.length - 1];
     if ((kind === 'scrollup' || kind === 'scrolldown') && last && last.kind === kind) return;
+    if (kind === 'move' && last && last.kind === 'move') {   // drag: newest wins
+      mouseQueue[mouseQueue.length - 1] = msg;
+      return;
+    }
     mouseQueue.push(msg);
     if (mouseQueue.length > 64) mouseQueue.shift();
     return;
@@ -2013,13 +2056,35 @@ term.onData((d) => {
             Math.max(0, Math.min(term.rows - 1, w))];
   }
   let pressX = 0, pressY = 0;
+  let selPane = false;                // app view: this drag is the CHILD's selection
+  let tSelApp = null;                 // last forwarded cell of that drag
+  function paneRegionAt(c, r) {
+    for (const rg of hostRegions) {
+      if (rg.k === 'pane' && c >= rg.x && c < rg.x + rg.w
+          && r >= rg.y && r < rg.y + rg.h) return rg;
+    }
+    return null;
+  }
   function begin(x, y) {
     lastY = y; accum = 0; pressX = x; pressY = y;
     const cc = cellAt(x, y); scol = cc[0]; srow = cc[1];
     // Pane view: selection is the CHILD's own (claude) — no local overlay.
     // Mouse drags reach it through xterm's reporting; touch is synthesized in
     // the touch handlers below. (#pane-native-select)
-    if (selectMode && !paneView) { selA = {c: scol, r: srow}; selB = selA; drawSel(); }
+    if (selectMode && !paneView) {
+      // App view, anchor INSIDE the claude pane: delegate the drag to the
+      // child's own selection (down/move/up ride /mouse; the pane forwards
+      // them per ?1002) — content-anchored, self-scrolling, and the copy
+      // comes back via the 'clip' event. Elsewhere (session list): the local
+      // block overlay. (#app-native-select)
+      if (controlOn && !fatal && paneRegionAt(scol, srow)) {
+        selPane = true; tSelApp = [scol, srow];
+        postMouse(scol, srow, 1, 'down');
+        return;
+      }
+      selPane = false;
+      selA = {c: scol, r: srow}; selB = selA; drawSel();
+    }
   }
   // Touch → the SGR reports a mouse drag would produce, so the child's own
   // selection machinery runs for a finger too. Motion deduped per cell.
@@ -2141,8 +2206,18 @@ term.onData((d) => {
     if (selectMode) {
       // Pane view: a MOUSE drag already reaches the child through xterm's own
       // reporting (claude runs its selection) — do nothing here. App view:
-      // extend the local block overlay. (#pane-native-select)
-      if (!paneView) selectTo(x, y);
+      // delegated drag → forward motion per cell change; else extend the
+      // local block overlay. (#pane-native-select #app-native-select)
+      if (paneView) return true;
+      if (selPane) {
+        const cc = cellAt(x, y);
+        if (!tSelApp || tSelApp[0] !== cc[0] || tSelApp[1] !== cc[1]) {
+          tSelApp = cc;
+          postMouse(cc[0], cc[1], 1, 'move');
+        }
+        return true;
+      }
+      selectTo(x, y);
       return true;
     }
     if (!controlOn || fatal) return false;
@@ -2163,7 +2238,14 @@ term.onData((d) => {
     }
     return moved;
   }
-  function end() { lastY = null; cancelLongPress(); stopEdge(); }
+  function end() {
+    if (selPane) {                    // finish the delegated drag with a release
+      const cc = tSelApp || [scol, srow];
+      postMouse(cc[0], cc[1], 1, 'up');
+      selPane = false; tSelApp = null;
+    }
+    lastY = null; cancelLongPress(); stopEdge();
+  }
 
   // ── Context menu (long-press on touch / right-click on mouse): act on the row
   //    under the pointer. Open => tap that cell to SELECT the row, then show an
@@ -2351,7 +2433,7 @@ function setSelectMode(on) {
     // local block overlay. (#pane-native-select)
     if (hint) hint.textContent = paneView
       ? 'drag: claude selects & copies (needs CONTROL ON)'
-      : 'drag to select a block';
+      : 'in the claude pane: claude selects (CONTROL ON) — elsewhere: block select';
   }
   fitChrome();
 }
@@ -2367,7 +2449,17 @@ document.getElementById('sel-copy').addEventListener('click', (e) => {
     return;
   }
   const s = blockText();
-  if (!s) { hint.textContent = 'nothing selected — drag first'; return; }
+  if (!s) {
+    // a delegated in-pane drag leaves no local overlay — the child's OSC 52
+    // copy is stashed instead; re-copy it inside this user gesture
+    if (lastOsc52) {
+      hint.textContent = copyText(lastOsc52)
+        ? ('copied ' + lastOsc52.length + ' chars') : 'copy failed';
+      return;
+    }
+    hint.textContent = 'nothing selected — drag first';
+    return;
+  }
   hint.textContent = copyText(s) ? ('copied ' + s.length + ' chars') : 'copy failed';
   if (!coarse) { try { term.focus(); } catch (_) {} }  // give the keyboard back
   //                                     (mouse only:焦点=soft-KB on touch)
@@ -3051,6 +3143,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 if isinstance(data, _PaneMeta):
                     self._send_event("pane-meta", data.json)
                     continue
+                if isinstance(data, _Clip):      # child OSC 52 copy (#app-native-select)
+                    self._send_event("clip", data.json)
+                    continue
                 self._send_frame(data)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -3205,7 +3300,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         self._send_status(204)
 
-    _MOUSE_KINDS = {"down", "up", "scrollup", "scrolldown"}
+    # "move" carries a held-button drag so the CHILD's own selection machinery
+    # runs from the app view too (#app-native-select); the browser only sends it
+    # per cell change during a select-in-pane drag.
+    _MOUSE_KINDS = {"down", "up", "move", "scrollup", "scrolldown"}
 
     def _do_mouse(self):
         obj = self._post_gate_and_json()

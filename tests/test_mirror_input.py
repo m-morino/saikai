@@ -1249,8 +1249,17 @@ def test_page_pane_view_contracts():
     assert "function paneSelReport(kind, x, y)" in page
     assert "registerOscHandler(52," in page and "let lastOsc52 = ''" in page
     assert "claude selects & copies" in page
-    assert "if (!paneView) selectTo(x, y);" in page, \
-        "app view keeps the local block overlay; pane view defers to the child"
+    assert "selectTo(x, y);" in page, \
+        "app view keeps the local block overlay outside the pane"
+    # app view select INSIDE the claude pane delegates to the child's own
+    # selection: down/move/up ride /mouse and the copy returns via 'clip'
+    # (#app-native-select)
+    assert "function paneRegionAt(c, r)" in page
+    assert "postMouse(scol, srow, 1, 'down');" in page
+    assert "postMouse(cc[0], cc[1], 1, 'move');" in page
+    assert "postMouse(cc[0], cc[1], 1, 'up');" in page
+    assert "es.addEventListener('clip'" in page
+    assert "if (kind === 'move' && last && last.kind === 'move')" in page
     assert "if (selectMode && d.match(sgrMouseRe)) return;" not in page, \
         "select mode must NOT swallow pane-view mouse reports anymore"
     # key bar hugs the terminal's bottom edge when the canvas fits above it

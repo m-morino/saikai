@@ -822,6 +822,12 @@ def set_clipboard_macos(text: str) -> bool:
         return False
 
 
+# Mirror clipboard relay (#app-native-select): the app sets this to the mirror
+# hub's send_clip at mount, so a child's OSC 52 copy (claude's copy-selection)
+# reaches the browsers too. Module-level (one app per process); None = no mirror.
+MIRROR_CLIP = None
+
+
 class AltScreenTracker:
     """Track alt-screen enter/leave transitions in a raw VT byte stream."""
 
@@ -1745,8 +1751,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
 
     def _honor_osc52(self, b64: str) -> None:
         """Put an OSC 52 clipboard-write payload from the child onto the HOST
-        clipboard. Ignores a "?"/empty payload (a read query). Runs on the reader
-        thread → marshals the actual clipboard set onto the UI thread. (#osc52-clipboard)"""
+        clipboard — and, when the mirror is up, relay it to the BROWSERS via
+        MIRROR_CLIP (set by the app at mount): a phone driving claude's own
+        copy-selection must receive the copy on the device it's holding, not
+        just on the host. Ignores a "?"/empty payload (a read query). Runs on
+        the reader thread → marshals both effects onto the UI thread.
+        (#osc52-clipboard #app-native-select)"""
         if not b64 or b64 == "?":
             return
         try:
@@ -1755,7 +1765,15 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             return
         if text:
-            self._marshal(lambda t=text: self._copy_text(t))
+            def _apply(t=text):
+                self._copy_text(t)
+                hook = MIRROR_CLIP
+                if hook is not None:
+                    try:
+                        hook(t)
+                    except Exception:
+                        pass
+            self._marshal(_apply)
 
     def _send_to_child(self, data: str) -> None:
         """Write bytes to the child PTY (guarded). Called on the UI thread (via

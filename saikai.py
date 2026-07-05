@@ -4518,14 +4518,20 @@ class _MirrorControl:
             cls = events.MouseDown
         elif kind == "up":
             cls = events.MouseUp
+        elif kind == "move":
+            # A held-button drag: routes to the pane under the press (Textual
+            # mouse capture after the first move), whose on_mouse_move forwards
+            # motion to a child that asked for ?1002/?1003 — the child's OWN
+            # selection runs from the browser. (#app-native-select)
+            cls = events.MouseMove
         elif kind == "scrollup":
             cls = events.MouseScrollUp
         elif kind == "scrolldown":
             cls = events.MouseScrollDown
         else:
             return                             # unknown kind: never post garbage
-        # Scroll has no pressed button (0); a click carries the SGR button index.
-        btn = button if kind in ("down", "up") else 0
+        # Scroll has no pressed button (0); a click/drag carries the SGR button.
+        btn = button if kind in ("down", "up", "move") else 0
         ev = cls(None, col, row, 0, 0, btn, False, False, False,
                  screen_x=col, screen_y=row)
         try:
@@ -6011,6 +6017,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if _LIVE_TERM is not None:
                     try:
                         _hub.set_pane_strip(_LIVE_TERM._MIRROR_QUERY_STRIP_RE)
+                    except Exception:
+                        pass
+                    # Relay child OSC 52 copies (claude's copy-selection) to the
+                    # browsers: the copy must land on the device driving the
+                    # selection, not only on the host. (#app-native-select)
+                    try:
+                        _LIVE_TERM.MIRROR_CLIP = _hub.send_clip
                     except Exception:
                         pass
 
