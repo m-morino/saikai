@@ -1268,6 +1268,14 @@ def test_page_pane_view_contracts():
     assert "function paneTracks()" in page   # only a TRACKING child gets synth reports
     assert "if (selectMode && d.match(sgrMouseRe)) return;" not in page, \
         "select mode must NOT swallow pane-view mouse reports anymore"
+    # cursor calm-down + DEC2026 (#mirror-cursor-flicker #mirror-sync-2026):
+    # app view hides the cursor during write bursts (host hid its own cursor
+    # before this client connected — xterm's would chase the paint position);
+    # pane view buffers claude's ?2026h..l frames (xterm lacks the mode)
+    assert "function calmCursor(bin)" in page and "weHidCursor" in page
+    assert "hostCurHidden" in page, "host-driven visibility must win"
+    assert "function paneSyncWrite(bin)" in page and "[?2026h'" in page
+    assert "setTimeout(syncFlush, 200)" in page, "a lost close must not wedge the view"
     # key bar hugs the terminal's bottom edge when the canvas fits above it
     # (dead space otherwise separates the keys from the content) — #kb-hug
     assert "r.bottom + kbBar.offsetHeight <= window.innerHeight" in page

@@ -1715,12 +1715,93 @@ const es = new EventSource('/stream?token=' + encodeURIComponent(token) +
 //    channel carries the child's raw bytes, gated until the first full-state
 //    seed arrives (frames racing ahead of it would paint on a blank grid). ───
 let paneSeeded = false;
-es.onmessage = (e) => {
-  if (paneView && !paneSeeded) return;
-  const bin = atob(e.data);
+// ── Cursor calm-down (app view, #mirror-cursor-flicker): the HOST hid its
+//    hardware cursor once at startup — before this client ever connected — so
+//    the browser xterm's cursor stays visible and CHASES the paint position
+//    through every repaint burst (a scroll = hundreds of KB of absolute moves):
+//    the "flickering cursor". Hide it while frames are arriving; re-show at the
+//    final (true) position after 150ms of quiet. Host-driven visibility, when
+//    it ever appears in the stream, wins. ─────────────────────────────────────
+let hostCurHidden = false;
+let weHidCursor = false;
+let curShowT = null;
+function calmCursor(bin) {
+  if (bin.indexOf(ESC + '[?25l') >= 0) hostCurHidden = true;
+  if (bin.indexOf(ESC + '[?25h') >= 0) hostCurHidden = false;
+  if (!weHidCursor) { term.write(ESC + '[?25l'); weHidCursor = true; }
+  if (curShowT) clearTimeout(curShowT);
+  curShowT = setTimeout(() => {
+    curShowT = null; weHidCursor = false;
+    if (!hostCurHidden) term.write(ESC + '[?25h');
+  }, 150);
+}
+// ── DEC 2026 for the pane view (#mirror-sync-2026): claude brackets each frame
+//    in ?2026h…?2026l, but xterm.js doesn't implement the mode — mid-frame
+//    bytes render, so the cursor dances and frames tear. Buffer while inside a
+//    sync block and write the COMPLETE frame at once. Markers can split across
+//    SSE messages (a short carry reassembles); a safety timeout flushes a block
+//    whose close was lost so the view can never wedge. ───────────────────────
+let syncBuf = '';
+let syncOn = false;
+let syncT = null;
+function syncFlush() {
+  if (syncT) { clearTimeout(syncT); syncT = null; }
+  syncOn = false;
+  if (syncBuf) { const b = syncBuf; syncBuf = ''; writeBin(b); }
+}
+function paneSyncWrite(bin) {
+  let s = syncBuf + bin;   // carry: an ESC[?2026x split across messages
+  syncBuf = '';
+  for (;;) {
+    if (!syncOn) {
+      const h = s.indexOf(ESC + '[?2026h');
+      if (h === -1) break;
+      writeBin(s.slice(0, h));
+      s = s.slice(h);
+      syncOn = true;
+      if (syncT) clearTimeout(syncT);
+      syncT = setTimeout(syncFlush, 200);
+    } else {
+      const l = s.indexOf(ESC + '[?2026l');
+      if (l === -1) break;
+      writeBin(s.slice(0, l + 8));
+      s = s.slice(l + 8);
+      if (syncT) { clearTimeout(syncT); syncT = null; }
+      syncOn = false;
+    }
+  }
+  if (syncOn) {
+    syncBuf = s;                      // inside a block: hold until close/timeout
+    if (syncBuf.length > 2097152) syncFlush();   // bound a runaway block
+    return;
+  }
+  // Outside a block: hold ONLY a suffix that is a genuine prefix of a split
+  // marker (rare) — never plain content, so quiet streams still render their
+  // last bytes. A short timer flushes even that if nothing follows.
+  const m = ESC + '[?2026';
+  let keep = 0;
+  for (let k = Math.min(7, s.length); k > 0; k--) {
+    if (s.slice(s.length - k) === m.slice(0, k)) { keep = k; break; }
+  }
+  writeBin(keep ? s.slice(0, s.length - keep) : s);
+  syncBuf = keep ? s.slice(s.length - keep) : '';
+  if (keep) {
+    if (syncT) clearTimeout(syncT);
+    syncT = setTimeout(syncFlush, 100);
+  }
+}
+function writeBin(bin) {
+  if (!bin) return;
   const bytes = new Uint8Array(bin.length);
   for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
   term.write(bytes);
+}
+es.onmessage = (e) => {
+  if (paneView && !paneSeeded) return;
+  const bin = atob(e.data);
+  if (paneView) { paneSyncWrite(bin); return; }
+  calmCursor(bin);
+  writeBin(bin);
 };
 
 // ── Phase B: write-key + control state over named SSE events ────────────────
