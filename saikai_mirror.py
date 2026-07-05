@@ -15,6 +15,7 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import socketserver
 import sys
 import threading
@@ -34,6 +35,29 @@ _Regions = collections.namedtuple("_Regions", ["json"])
 # page load and stays fixed otherwise, so absolute-positioned host ANSI would
 # garble against a stale grid — it must re-size live. (#mirror-resize)
 _Size = collections.namedtuple("_Size", ["json"])
+# ── Pane direct view (#pane-direct) ──────────────────────────────────────────
+# The app view re-renders the child through pyte + Textual — a double emulation
+# that loses cursor shape, mouse reporting and frame timing. The pane channel
+# instead tees the child PTY's (scrubbed) byte stream straight to the browser
+# xterm, which then IS the child's terminal. Three typed frames ride the same
+# ingest queue as app output so pane data, reseeds and meta stay ordered:
+_PaneData = collections.namedtuple("_PaneData", ["data"])    # raw child bytes
+# A reseed CARRIES the current meta: geometry must be applied before the seed
+# paints (the browser resizes, then resets+writes), and a _PaneMeta lost to any
+# backlog flush is re-delivered by the very next reseed — set_pane_meta dedups
+# at source, so nothing else would ever resend it. (#review-pane-meta-loss)
+_PaneReset = collections.namedtuple("_PaneReset", ["seed", "meta"])
+_PaneMeta = collections.namedtuple("_PaneMeta", ["json"])    # geometry/liveness
+# The pane tee may not starve app frames out of the SHARED ingest queue: raw
+# child output is unthrottled (a flood workload writes at PTY throughput while
+# Textual frames are render-paced), so pane data is capped to half the queue —
+# beyond it chunks are dropped and a reseed heals the gap. (#review-pane-flood)
+_PANE_INFLIGHT_CAP = 128
+# A DCS that saikai answers itself and must strip before the browser xterm can
+# auto-answer it: DECRQSS (ESC P $ q …) and XTGETTCAP (ESC P + q …). Used to
+# give a split target query a larger reassembly hold than a passed-through
+# sixel. (#review-dcs-bound)
+_DCS_TARGET_RE = re.compile(r"\x1bP[0-9;]*[$+]q")
 
 # Brute-force throttle for the SSE write-key: after this many bad attempts,
 # refuse input for a cooldown so a lost/guessed key can't be hammered. (#audit-mirror-ratecap)
@@ -67,7 +91,17 @@ def _paste_framing_ok(data: str) -> bool:
     caller can, and it's the smuggling primitive that would reconstruct arbitrary
     control bytes into the child PTY keystroke-by-keystroke via the parser's
     escape-resolution fallback. Treat inside-paste as an unconditional raw region:
-    no interior ESC allowed. (#audit-mirror-paste-smuggle)"""
+    no interior ESC allowed (this also rejects a nested ESC[200~ — it starts with
+    ESC). (#audit-mirror-paste-smuggle)
+
+    NOTE (#review-paste-earlyclose): an *early-close* shape (ESC[201~ then live
+    keystrokes) is deliberately NOT rejected here. /input requires the write key,
+    so the sender is a control-holder who can already send those same keystrokes
+    directly (or verbatim via /raw) — it is not a privilege boundary. The real
+    victim of an accidental early-close is the user's OWN composer paste, and
+    that is prevented at the source by stripping embedded markers before framing
+    (see the composer's marker-removal loop). Rejecting a lone trailing close
+    here would instead break a legitimately split large paste."""
     i = data.find("\x1b[200~")
     while i != -1:
         end = data.find("\x1b[201~", i + 6)
@@ -202,6 +236,51 @@ def _synth_full_frame(screen: "pyte.Screen", cols: int, rows: int) -> str:
     return "".join(out)
 
 
+def _synth_pane_seed(screen: "pyte.Screen", cols: int, rows: int,
+                     modes: dict) -> str:
+    """Serialize a live pane's CURRENT state — grid, cursor AND terminal modes —
+    into one self-contained ANSI string, so a browser xterm joining the raw
+    pane stream mid-session starts from exactly where the child's terminal is.
+
+    The mode replay matters as much as the grid: the child enabled alt-screen /
+    mouse tracking / bracketed paste BEFORE this client connected, and without
+    replaying them the browser xterm would neither generate mouse reports nor
+    frame pastes until the child happens to re-assert them. Every tracked mode
+    is emitted explicitly (set OR reset) so the seed is state-idempotent — it
+    lands the terminal in the same state whether applied after a term.reset()
+    or over a stale previous stream. (#pane-direct)"""
+    def _m(flag: str, seq: str) -> str:
+        return f"\x1b[?{seq}{'h' if modes.get(flag) else 'l'}"
+    # Mouse tracking (1000/1002/1003) is ONE exclusive protocol slot, and
+    # xterm.js resets it to NONE on ANY of the three 'l's regardless of which
+    # protocol is active (verified against the vendored 5.5 source — a naive
+    # h-then-l replay left tracking OFF). Reset the slot once, then enable only
+    # the STRONGEST tracked mode (any > drag > click), matching what a real
+    # terminal ends up with when the child stacked several enables.
+    mouse = ""
+    for flag, seq in (("mouse_any_motion", "1003"),
+                      ("mouse_btn_motion", "1002"),
+                      ("mouse_click", "1000")):
+        if modes.get(flag):
+            mouse = f"\x1b[?{seq}h"
+            break
+    parts = [
+        # Alt-screen FIRST: the paint below must land in the buffer the child
+        # is actually drawing into.
+        _m("alt", "1049"),
+        _synth_full_frame(screen, cols, rows),
+        _m("app_cursor", "1"),             # DECCKM — arrow keys SS3 vs CSI
+        "\x1b[?1000l\x1b[?1002l\x1b[?1003l",   # clear the protocol slot…
+        mouse,                                  # …then the strongest enable
+        _m("focus_reporting", "1004"),
+        _m("mouse_sgr", "1006"),
+        _m("bracketed_paste", "2004"),
+        # Cursor visibility LAST (the paint above ends on a cursor move).
+        "\x1b[?25l" if modes.get("cursor_hidden") else "\x1b[?25h",
+    ]
+    return "".join(parts)
+
+
 class MirrorHub:
     def __init__(self, token: str, host: str = "127.0.0.1", port: int = 0,
                  cols: int = 80, rows: int = 24, ingest_cap: int = 256,
@@ -231,6 +310,7 @@ class MirrorHub:
         self._input_handler = None             # _marshal-shaped, set at app mount
         self._mouse_handler = None             # _marshal-shaped, set at app mount
         self._key_handler = None               # _marshal-shaped, set at app mount
+        self._raw_handler = None               # _marshal-shaped, set at app mount (#pane-direct)
         self._client_change_handler = None     # notified (count) on connect/disconnect
         self._control_change_handler = None    # notified (bool) on HUB-initiated control changes
         self._control_target = None            # focused-pane title (advisory)
@@ -266,6 +346,22 @@ class MirrorHub:
             self._min_accept_gap = 0.0
         self._ingest_overflow = False  # set by broadcast() on overflow → drain requests a resync
         self.allow_lan_input = False  # set True only via the launch opt-in
+        # ── Pane direct view (#pane-direct) ───────────────────────────────────
+        # Pane-view SSE clients get the child's raw byte stream, not app frames.
+        # The hub keeps NO pane pyte model: the AgentTerminal's pyte screen is
+        # the single authority, and any recovery (fresh client, fallen-behind
+        # client, ingest overflow) asks the APP for a reseed via the marshal-
+        # shaped callback below — a full-state _PaneReset then flows through the
+        # ordered ingest queue to every pane client.
+        self._pane_clients: "set[queue.Queue]" = set()   # guarded by _clients_lock
+        self._pane_meta_json = json.dumps({"open": False}, sort_keys=True)
+        self._pane_reseed_request = None    # app-provided, marshal-shaped
+        self._pane_reseed_pending = 0.0     # monotonic deadline; 0 = none pending
+        self._pane_lost = False             # ingest overflow flushed pane frames
+        self._pane_strip = None             # child-query strip regex (drain-side)
+        self._pane_strip_carry = ""         # trailing split DCS held across chunks
+        self._pane_inflight = 0             # _PaneData currently in the ingest queue
+        self._pane_count_lock = threading.Lock()
 
     def _feed(self, data: str) -> None:
         with self._mirror_lock:
@@ -369,23 +465,31 @@ class MirrorHub:
         itself be dropped — never blocking the UI thread is the only invariant.
         In practice there is a single producer (the driver runs on the UI
         thread), so the queue stays FIFO."""
+        self._ingest_put(data)
+
+    def _ingest_put(self, item) -> None:
+        """Non-blocking put shared by app frames (bare str) and typed pane
+        frames. On overflow, do NOT drop a single oldest chunk: Textual splits
+        one logical frame into multiple chunks, so dropping a MIDDLE chunk
+        splices two unrelated byte ranges and permanently corrupts the server
+        pyte mirror — and the pane byte stream has the same property. Discard
+        the whole stale backlog and flag BOTH recoveries: the drain loop
+        requests an app repaint (resets the app pyte cleanly) and a pane reseed
+        (a _PaneReset resets every pane client). (#audit-mirror-broadcast-splice)"""
         try:
-            self._ingest.put_nowait(data)
+            self._ingest.put_nowait(item)
         except queue.Full:
-            # The drain (pyte feed) has fallen behind. Do NOT drop a single oldest
-            # chunk: Textual splits one logical frame into multiple chunks, so
-            # dropping a MIDDLE chunk splices two unrelated byte ranges and
-            # permanently corrupts the server pyte mirror. Discard the whole stale
-            # backlog and flag a resync — the drain loop requests a full repaint
-            # that resets pyte cleanly. (#audit-mirror-broadcast-splice)
             try:
                 while True:
                     self._ingest.get_nowait()
             except queue.Empty:
                 pass
             self._ingest_overflow = True
+            self._pane_lost = True
+            with self._pane_count_lock:
+                self._pane_inflight = 0   # the flush discarded any queued pane data
             try:
-                self._ingest.put_nowait(data)
+                self._ingest.put_nowait(item)
             except queue.Full:
                 pass   # never block the UI thread
 
@@ -400,7 +504,7 @@ class MirrorHub:
         with self._mirror_lock:
             snapshot = _synth_full_frame(self._screen, self._cols, self._rows)
             with self._clients_lock:
-                if len(self._clients) >= _MAX_SSE_CLIENTS:
+                if len(self._clients) + len(self._pane_clients) >= _MAX_SSE_CLIENTS:
                     return None, None
                 self._clients.add(cq)
         if self._repaint_request is not None:
@@ -411,15 +515,30 @@ class MirrorHub:
         self._notify_client_change()
         return cq, snapshot
 
+    def _add_pane_client(self):
+        """Register a pane-view SSE viewer (raw child stream, not app frames).
+        Shares the viewer cap with app clients. Returns the client queue or None
+        at the cap. The caller gets NO snapshot — pane state arrives as a
+        _PaneReset once the app answers the reseed request fired here."""
+        cq: "queue.Queue" = queue.Queue(256)
+        with self._clients_lock:
+            if len(self._clients) + len(self._pane_clients) >= _MAX_SSE_CLIENTS:
+                return None
+            self._pane_clients.add(cq)
+        self._notify_client_change()
+        self._request_pane_reseed()
+        return cq
+
     def _remove_client(self, cq):
         with self._clients_lock:
             self._clients.discard(cq)
+            self._pane_clients.discard(cq)
         self._notify_client_change()
 
     def client_count(self) -> int:
         """How many browsers currently hold the SSE stream open (≈ open tabs)."""
         with self._clients_lock:
-            return len(self._clients)
+            return len(self._clients) + len(self._pane_clients)
 
     def set_client_change_handler(self, fn) -> None:
         # Written from the UI thread (on_mount), read from the HTTP server thread.
@@ -450,6 +569,12 @@ class MirrorHub:
                 data = self._ingest.get(timeout=0.25)
             except queue.Empty:
                 continue
+            if isinstance(data, (_PaneData, _PaneReset, _PaneMeta)):
+                self._drain_pane_frame(data)
+                # A pane frame never touches the app pyte; fall through only to
+                # the overflow recovery below.
+                self._drain_overflow_recovery()
+                continue
             with self._mirror_lock:
                 self._stream.feed(data)
                 with self._clients_lock:
@@ -469,18 +594,155 @@ class MirrorHub:
                                 ctrl = _Control(json.dumps(
                                     {"on": True, "target": self._control_target}))
                         self._resync_client(cq, snapshot, ctrl)
-            # Server pyte may have lost data on an ingest overflow → ask the app for
-            # a full repaint so a clean frame resets it. Done OFF the mirror lock and
-            # from the drain thread (broadcast() on the UI thread can't call
-            # _repaint_request, which marshals via call_from_thread). (#audit-mirror-broadcast-splice)
-            if self._ingest_overflow:
-                self._ingest_overflow = False
-                fn = self._repaint_request
-                if fn is not None:
+            self._drain_overflow_recovery()
+
+    def _strip_pane_chunk(self, strip, text: str) -> str:
+        """Strip child terminal queries from a pane chunk, HOLDING a DCS split
+        across the chunk boundary. The reader thread already reassembles a split
+        CSI/OSC query via _esc_carry (so those never arrive halved here), but not
+        a DCS (ESC P … ST) — DECRQSS / XTGETTCAP could land split, sail past the
+        stateless regex, and let the browser xterm auto-answer the child. Carry
+        the trailing unterminated DCS to the next chunk. A STRIP-TARGET DCS
+        ($q/+q) gets a large hold so a long query can't slip past the bound and
+        reach the browser un-stripped (#review-dcs-bound); a non-target DCS
+        (sixel — passed through anyway) is released at a small bound to cap
+        latency/memory. Drain thread only. (#review-dcs-split)"""
+        carry, self._pane_strip_carry = self._pane_strip_carry, ""
+        if carry:
+            text = carry + text
+        p = text.rfind("\x1bP")
+        if p != -1:
+            tail = text[p:]
+            if "\x07" not in tail and "\x1b\\" not in tail:
+                limit = 8192 if _DCS_TARGET_RE.match(tail) else 512
+                if len(tail) < limit:
+                    self._pane_strip_carry = tail
+                    text = text[:p]
+        return strip.sub("", text)
+
+    @staticmethod
+    def _offer_sentinel(cq) -> None:
+        """Deliver the stop() shutdown sentinel even to a FULL client queue: make
+        room by dropping one frame (the client is stopping — its backlog is moot)
+        so the SSE handler's cq.get() returns None and the thread exits, instead
+        of looping on 30s keepalives until process death. (#review-stop-sentinel)"""
+        try:
+            cq.put_nowait(None)
+        except queue.Full:
+            try:
+                cq.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                cq.put_nowait(None)
+            except queue.Full:
+                pass
+
+    @staticmethod
+    def _flush_pane_backlog(cq) -> None:
+        """Drain a pane client's queue PRESERVING what a reseed cannot restore:
+        the last unconsumed _Control (the banner/input gate is only ever sent on
+        a state CHANGE, #audit-mirror-control-loss), the last _PaneMeta
+        (geometry — deduped at source), and the stop() sentinel (its loss would
+        leave the SSE thread looping on keepalives after shutdown). Pane data
+        and stale resets are the only frames dropped — the reseed replaces
+        exactly those. One helper for every pane flush site so the preservation
+        can't drift per-branch. (#review-pane-frame-loss)"""
+        ctrl = meta = None
+        sentinel = False
+        try:
+            while True:
+                item = cq.get_nowait()
+                if item is None:
+                    sentinel = True
+                elif isinstance(item, _Control):
+                    ctrl = item
+                elif isinstance(item, _PaneMeta):
+                    meta = item
+        except queue.Empty:
+            pass
+        for it in (ctrl, meta):
+            if it is not None:
+                try:
+                    cq.put_nowait(it)
+                except queue.Full:
+                    pass
+        if sentinel:                 # last: the client handles frames, then exits
+            try:
+                cq.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def _drain_pane_frame(self, data) -> None:
+        """Fan a typed pane frame out to the pane-view clients (drain thread).
+        A fallen-behind client can't be healed by drop-oldest (splicing a raw
+        byte stream corrupts it permanently) — flush its backlog (critical
+        frames preserved) and ask the app for a reseed; the arriving _PaneReset
+        replaces everyone's backlog with one clean full state. (#pane-direct)"""
+        if isinstance(data, _PaneData):
+            with self._pane_count_lock:
+                self._pane_inflight = max(0, self._pane_inflight - 1)
+            strip = self._pane_strip
+            if strip is not None:
+                try:
+                    data = _PaneData(self._strip_pane_chunk(strip, data.data))
+                except Exception:
+                    pass
+            if not data.data:
+                return
+        elif isinstance(data, _PaneReset):
+            # A reseed is a STREAM BOUNDARY (fresh client / retarget / reopen /
+            # overflow): drop any half-carried DCS from the OLD stream so it
+            # can't prefix the new pane's first bytes and swallow them into a
+            # bogus unterminated query. (#review-carry-boundary)
+            self._pane_strip_carry = ""
+        with self._clients_lock:
+            targets = list(self._pane_clients)
+        if not targets:
+            return
+        if isinstance(data, _PaneReset):
+            for cq in targets:
+                self._flush_pane_backlog(cq)
+                try:
+                    cq.put_nowait(data)
+                except queue.Full:
+                    pass
+            return
+        need_reseed = False
+        for cq in targets:
+            try:
+                cq.put_nowait(data)
+            except queue.Full:
+                self._flush_pane_backlog(cq)
+                need_reseed = True
+                if isinstance(data, _PaneMeta):
                     try:
-                        fn()
-                    except Exception:
+                        cq.put_nowait(data)   # newer than any meta the flush kept
+                    except queue.Full:
                         pass
+        if need_reseed:
+            self._request_pane_reseed()
+
+    def _drain_overflow_recovery(self) -> None:
+        """Server pyte may have lost data on an ingest overflow → ask the app for
+        a full repaint so a clean frame resets it; a flushed backlog also dropped
+        any pane frames → ask for a pane reseed too. Done OFF the mirror lock and
+        from the drain thread (broadcast() on the UI thread can't call
+        _repaint_request, which marshals via call_from_thread). (#audit-mirror-broadcast-splice)"""
+        if self._ingest_overflow:
+            self._ingest_overflow = False
+            fn = self._repaint_request
+            if fn is not None:
+                try:
+                    fn()
+                except Exception:
+                    pass
+        if self._pane_lost:
+            self._pane_lost = False
+            # the flush discarded queued pane data mid-stream — a half-carried
+            # DCS from before the gap would corrupt the post-reseed bytes
+            self._pane_strip_carry = ""
+            self._request_pane_reseed()
 
     def serve(self) -> int:
         self._httpd = _Server((self._host, self._port), _Handler)
@@ -520,11 +782,8 @@ class MirrorHub:
         self._stopped.set()
         self._cancel_idle_timer()
         with self._clients_lock:
-            for cq in list(self._clients):
-                try:
-                    cq.put_nowait(None)
-                except queue.Full:
-                    pass
+            for cq in list(self._clients) + list(self._pane_clients):
+                self._offer_sentinel(cq)   # even a full queue must get the sentinel
         if self._httpd is not None:
             try:
                 self._httpd.shutdown()
@@ -547,6 +806,88 @@ class MirrorHub:
                 cq.put_nowait(frame)
             except queue.Full:
                 pass
+
+    # ── Pane direct view (#pane-direct) ──────────────────────────────────────
+    def pane_feed(self, data: str) -> None:
+        """Tee one scrubbed child-PTY chunk to the pane channel. Called from the
+        pane's READER thread while it holds the AgentTerminal lock — the seed in
+        pane_reset() is computed under that same lock, so 'chunk is in the seed'
+        and 'chunk is enqueued after the seed' are mutually exclusive and the
+        browser never applies a chunk twice. put_nowait only: never blocks,
+        never marshals (safe under the terminal lock)."""
+        if not data:
+            return
+        if not self._pane_clients:
+            # Advisory zero-viewer gate (GIL-atomic set read): with the mirror
+            # merely ENABLED but no pane browser connected — the steady state —
+            # the tee must not tax the reader/drain threads for nothing. A
+            # first client's connect fires a reseed, which restores full state,
+            # so the dropped bytes are recoverable by design. (#review-pane-flood)
+            return
+        with self._pane_count_lock:
+            if self._pane_inflight >= _PANE_INFLIGHT_CAP:
+                # Cap this producer's share of the SHARED ingest queue so a
+                # flooding child degrades only the pane channel (healed by the
+                # reseed below), never the app view. (#review-pane-flood)
+                self._pane_lost = True
+                return
+            self._pane_inflight += 1
+        self._ingest_put(_PaneData(data))
+
+    def pane_reset(self, seed: str) -> None:
+        """Enqueue a full-state pane reseed (grid + cursor + terminal modes),
+        CARRYING the current meta (see _PaneReset). Every pane client's backlog
+        is replaced by it in the drain. Clears the pending-reseed flag — the
+        request has been answered."""
+        self._pane_reseed_pending = 0.0
+        self._ingest_put(_PaneReset(seed, self._pane_meta_json))
+
+    def set_pane_strip(self, regex) -> None:
+        # Child-emitted terminal QUERIES (DA/DSR/DECRQM/DECRQSS/…) must not
+        # reach the browser xterm — it would auto-answer via onData and, with
+        # pane input wired, the child receives every reply twice (a duplicated
+        # CPR confuses claude's redraw probe). saikai owns the PTY and answers
+        # them itself. Applied on the DRAIN thread so the reader never pays the
+        # regex while holding the terminal lock. GIL-atomic single-attr set.
+        self._pane_strip = regex
+
+    def set_pane_meta(self, meta: dict) -> None:
+        """Publish the followed pane's geometry/liveness ({open, cols, rows,
+        title}). Deduped; rides the ingest queue so a size change stays ordered
+        against the repaint bytes that follow it."""
+        j = json.dumps(meta, sort_keys=True)
+        if j == self._pane_meta_json:
+            return
+        self._pane_meta_json = j
+        self._ingest_put(_PaneMeta(j))
+
+    def set_pane_reseed_request(self, fn) -> None:
+        # Written from the UI thread (on_mount), read from hub threads. The fn is
+        # marshal-shaped (bounces to the UI thread, swallows exceptions).
+        self._pane_reseed_request = fn
+
+    def _request_pane_reseed(self) -> None:
+        """Ask the app for a fresh pane seed (fresh client / fallen-behind client
+        / ingest overflow). Deduped with a deadline, not a bool: a marshal lost
+        to app teardown must not wedge the channel forever — after 2s a new
+        request may fire. The deadline check runs FIRST so the hot fallen-behind
+        path pays no lock inside the dedup window. No-op without pane clients or
+        a wired callback."""
+        import time as _t
+        now = _t.monotonic()
+        if now < self._pane_reseed_pending:
+            return
+        with self._clients_lock:
+            if not self._pane_clients:
+                return
+        fn = self._pane_reseed_request
+        if fn is None:
+            return
+        self._pane_reseed_pending = now + 2.0
+        try:
+            fn()
+        except Exception:
+            pass
 
     def set_repaint_request(self, fn) -> None:
         # Written from the UI thread (on_mount), read from the HTTP server thread
@@ -607,19 +948,7 @@ class MirrorHub:
         self._control_target = target if enabled else None
         frame = _Control(json.dumps(
             {"on": self._control_enabled, "target": self._control_target}))
-        with self._clients_lock:
-            targets = list(self._clients)
-        snap = None
-        for cq in targets:
-            try:
-                cq.put_nowait(frame)
-            except queue.Full:
-                # Fallen behind: resync (full repaint + this control frame) rather
-                # than drop-oldest, which could evict an unconsumed control frame
-                # and leave the browser banner stale. (#audit-mirror-control-loss)
-                if snap is None:
-                    snap = self._snapshot()
-                self._resync_client(cq, snap, frame)
+        self._broadcast_control_frame(frame)
         if self._control_enabled:
             self._arm_idle_timer()
         else:
@@ -636,16 +965,38 @@ class MirrorHub:
             return
         self._control_target = target
         frame = _Control(json.dumps({"on": True, "target": self._control_target}))
+        self._broadcast_control_frame(frame)
+
+    def _broadcast_control_frame(self, frame) -> None:
+        """Deliver a control frame to EVERY viewer — app view and pane view. A
+        fallen-behind client can't drop-oldest (it could evict an unconsumed
+        control frame and leave the banner stale, #audit-mirror-control-loss):
+        an app client resyncs with a full repaint + the frame; a pane client is
+        flushed, gets the frame, and a pane reseed is requested."""
         with self._clients_lock:
-            targets = list(self._clients)
+            app_targets = list(self._clients)
+            pane_targets = list(self._pane_clients)
         snap = None
-        for cq in targets:
+        for cq in app_targets:
             try:
                 cq.put_nowait(frame)
             except queue.Full:
-                if snap is None:                    # resync, don't drop-oldest (#audit-mirror-control-loss)
+                if snap is None:
                     snap = self._snapshot()
                 self._resync_client(cq, snap, frame)
+        need_reseed = False
+        for cq in pane_targets:
+            try:
+                cq.put_nowait(frame)
+            except queue.Full:
+                self._flush_pane_backlog(cq)   # preserves an older meta/sentinel
+                need_reseed = True
+                try:
+                    cq.put_nowait(frame)
+                except queue.Full:
+                    pass
+        if need_reseed:
+            self._request_pane_reseed()
 
     def _arm_idle_timer(self) -> None:
         with self._idle_lock:
@@ -706,6 +1057,20 @@ class MirrorHub:
             return False
         return self._enqueue(("key", key))
 
+    def inject_raw(self, data: str) -> bool:
+        """Accept pane-view terminal bytes (xterm onData: keys, mouse reports,
+        paste) IFF control is on AND a raw handler is wired. The app writes them
+        VERBATIM to the followed pane's child PTY — the browser xterm acts as
+        that child's real terminal, so no key translation happens on this path.
+        Same FIFO, same rate cap, same idle re-arm as the other kinds. (#pane-direct)"""
+        if self._raw_handler is None or not self._control_enabled:
+            return False
+        return self._enqueue(("raw", data))
+
+    def set_raw_handler(self, fn) -> None:
+        # Same GIL-atomic single-attribute pattern as set_input_handler.
+        self._raw_handler = fn
+
     def _enqueue(self, item) -> bool:
         """Shared tail of inject/inject_mouse/inject_key: accepted-input rate cap,
         bounded put, idle-timer rearm. `item` is a bare str (keyboard) or a tagged
@@ -748,6 +1113,10 @@ class MirrorHub:
                             fn(col, row, button, kind)
                     elif tag == "key":
                         fn = self._key_handler
+                        if fn is not None:
+                            fn(item[1])
+                    elif tag == "raw":                 # pane-view PTY bytes (#pane-direct)
+                        fn = self._raw_handler
                         if fn is not None:
                             fn(item[1])
                     elif tag == "input":
@@ -1113,10 +1482,16 @@ document.getElementById('t').addEventListener('pointerdown', (e) => {
 // ESC built at runtime (never a literal ESC byte in this served string — a lone
 // CR/ESC once broke the page; the no-control-byte test guards it).
 const ESC = String.fromCharCode(27);
+// Pane direct view (#pane-direct): ?view=pane joins the RAW child-PTY channel —
+// this xterm then IS the claude pane's terminal (exact bytes, native mouse
+// reporting, real alt-screen), not a re-render of the whole saikai app.
+const paneView = new URLSearchParams(location.search).get('view') === 'pane';
 // Turn on mouse tracking (VT200 button + SGR encoding) by writing the DECSET
 // enable into the terminal: xterm's core mouse service then attaches its own
 // DOM listeners and reports taps/scrolls as ESC[<b;col;row(M|m) via onData.
-try { term.write(ESC + '[?1000;1006h'); } catch (e) {}
+// NOT in pane view — there the CHILD owns the terminal modes; forcing tracking
+// on would misstate the child's actual state.
+if (!paneView) { try { term.write(ESC + '[?1000;1006h'); } catch (e) {} }
 const token = new URLSearchParams(location.search).get('token');
 // ── &debug=1: a one-line live diagnostic (control/zone/ticks/scrollTop) so a
 //    misbehaving remote can be diagnosed from the phone/desktop itself without
@@ -1136,10 +1511,15 @@ if (new URLSearchParams(location.search).get('debug') === '1') {
       ' scrollTop=' + (el ? el.scrollTop : '-');
   }, 300);
 }
-const es = new EventSource('/stream?token=' + encodeURIComponent(token));
+const es = new EventSource('/stream?token=' + encodeURIComponent(token) +
+                           (paneView ? '&view=pane' : ''));
 
-// ── Output (unchanged): default-event base64 frames -> xterm ────────────────
+// ── Output: default-event base64 frames -> xterm. In pane view the same
+//    channel carries the child's raw bytes, gated until the first full-state
+//    seed arrives (frames racing ahead of it would paint on a blank grid). ───
+let paneSeeded = false;
 es.onmessage = (e) => {
+  if (paneView && !paneSeeded) return;
   const bin = atob(e.data);
   const bytes = new Uint8Array(bin.length);
   for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
@@ -1177,6 +1557,11 @@ function setBanner(on, target) {
   } else {
     banner.style.background = '#555';
     banner.textContent = 'CONTROL OFF (read-only)';
+    // Drop any input buffered while the gates raced: a backlog surviving into
+    // the next control-ON would replay stale keys (a buffered CR could accept
+    // a live confirmation prompt). (#review-raw-gate)
+    try { pendingRaw = ''; } catch (e) {}
+    try { pending = ''; } catch (e) {}
   }
 }
 
@@ -1184,6 +1569,7 @@ es.addEventListener('writekey', (e) => {
   try { writeKey = JSON.parse(e.data).key; } catch (_) {}
 });
 es.addEventListener('size', (e) => {          // host terminal resized (#mirror-resize)
+  if (paneView) return;   // pane view sizes from pane-meta, never the host grid
   try {
     const s = JSON.parse(e.data);
     if (s.cols > 0 && s.rows > 0) { term.resize(s.cols, s.rows); fitChrome(); }
@@ -1196,6 +1582,74 @@ es.addEventListener('regions', (e) => {
 es.addEventListener('control', (e) => {
   let s = {}; try { s = JSON.parse(e.data); } catch (_) {}
   setBanner(!!s.on, s.target);
+});
+
+// ── Pane view: full-state seed + geometry/liveness (#pane-direct) ───────────
+let paneOpen = false;
+const panePh = document.createElement('div');
+panePh.style.cssText = 'position:fixed;top:40%;left:0;right:0;z-index:8;'+
+  'display:none;text-align:center;font:bold 15px monospace;color:#9aa5ce';
+panePh.textContent = 'no live pane - open a split pane at the host, or switch to App view';
+document.body.appendChild(panePh);
+let paneGen = null;
+let seedRetryTimer = null;
+// The reseed request is fire-and-forget server-side (a marshal lost to app
+// teardown is swallowed), and until the CURRENT generation's seed arrives every
+// pane frame is dropped — so an unseeded-but-open pane view would stay blank
+// FOREVER. Client-side backstop: retry via reload (draft stashed), bounded so a
+// truly dead server can't reload-loop. Re-armed on every generation change
+// (retarget / reopen), not just the first connect. (#review-seed-retry #review-pane-gen)
+function armSeedRetry() {
+  if (!paneView) return;
+  if (seedRetryTimer) clearTimeout(seedRetryTimer);
+  seedRetryTimer = setTimeout(() => {
+    seedRetryTimer = null;
+    if (paneSeeded || !paneOpen) return;   // seeded, or placeholder is correct
+    let n = 0;
+    try { n = parseInt(sessionStorage.getItem('saikai-seed-retry') || '0', 10) || 0; } catch (_) {}
+    if (n >= 3) return;
+    try { sessionStorage.setItem('saikai-seed-retry', String(n + 1)); } catch (_) {}
+    stashDraft();
+    location.reload();
+  }, 5000);
+}
+es.addEventListener('pane-reset', (e) => {
+  if (!paneView) return;
+  try {
+    const bin = atob(JSON.parse(e.data).seed);
+    const bytes = new Uint8Array(bin.length);
+    for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+    term.reset();                    // deterministic base for the mode replay
+    term.write(bytes);
+    paneSeeded = true;
+    if (seedRetryTimer) { clearTimeout(seedRetryTimer); seedRetryTimer = null; }
+    try { sessionStorage.removeItem('saikai-seed-retry'); } catch (_) {}
+  } catch (_) {}
+});
+if (paneView) armSeedRetry();
+es.addEventListener('pane-meta', (e) => {
+  if (!paneView) return;
+  try {
+    const m = JSON.parse(e.data);
+    paneOpen = !!m.open;
+    panePh.style.display = paneOpen ? 'none' : 'block';
+    // A new generation means the pane the browser was seeded for is gone
+    // (retarget / close+reopen): gate output until THIS generation's seed and
+    // re-arm the blank-view backstop, so a lost seed can't leave a stale screen
+    // treated as current. (#review-pane-gen)
+    if (m.gen !== undefined && m.gen !== paneGen) {
+      paneGen = m.gen;
+      paneSeeded = false;
+      try { sessionStorage.removeItem('saikai-seed-retry'); } catch (_) {}
+      armSeedRetry();
+    }
+    if (paneOpen && m.cols > 0 && m.rows > 0
+        && (m.cols !== term.cols || m.rows !== term.rows)) {
+      term.resize(m.cols, m.rows);   // follower: the HOST pane owns the PTY size
+      fitChrome();
+    }
+    if (m.title) { try { document.title = m.title + ' - saikai'; } catch (_) {} }
+  } catch (_) {}
 });
 
 // ── Input: onData -> coalesce (~25ms, flush on control bytes) -> single-flight
@@ -1231,6 +1685,48 @@ async function pump() {
   finally {
     sending = false;
     if (pending.length > 0) pump();     // drain anything queued while in flight
+  }
+}
+
+// ── Pane view: single-flight raw pump -> POST /raw (#pane-direct). The bytes
+//    go VERBATIM to the followed pane's child PTY, so keys, xterm's own mouse
+//    reports and bracketed pastes behave exactly as at a local terminal. Same
+//    coalescing + gates as pump(); separate latch so app-view /input and
+//    pane-view /raw can't starve each other. ─────────────────────────────────
+let pendingRaw = '';
+let rawFlushTimer = null;
+let rawSending = false;
+async function pumpRaw() {
+  if (rawSending || fatal || !controlOn || writeKey === null) return;
+  if (pendingRaw.length === 0) return;
+  rawSending = true;
+  const batch = pendingRaw; pendingRaw = '';
+  try {
+    const resp = await fetch('/raw', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Mirror-Write-Key': writeKey},
+      body: JSON.stringify({data: batch})
+    });
+    reactStatus(resp.status);   // shared 409 banner-off / 403 fatal reactions
+    if (resp.status === 409 || resp.status === 403) { pendingRaw = ''; }
+  } catch (_) { /* transient; drop the batch, keep going */ }
+  finally {
+    rawSending = false;
+    if (pendingRaw.length > 0) pumpRaw();
+  }
+}
+function sendRaw(d) {
+  // Same admission gate as postKey/pump: input while control is OFF is DROPPED,
+  // not buffered — a backlog accumulated read-only (hold-to-repeat fires every
+  // 80ms) would burst verbatim into the child the moment control turns on.
+  // (#review-raw-gate)
+  if (fatal || !controlOn || writeKey === null) return;
+  pendingRaw += d;
+  if (isControlByte(d)) {
+    if (rawFlushTimer) { clearTimeout(rawFlushTimer); rawFlushTimer = null; }
+    pumpRaw();
+  } else if (!rawFlushTimer) {
+    rawFlushTimer = setTimeout(() => { rawFlushTimer = null; pumpRaw(); }, 25);
   }
 }
 
@@ -1306,6 +1802,15 @@ async function postMouse(col, row, button, kind) {
 const sgrMouseRe = new RegExp('^' + ESC + '[[]<([0-9]+);([0-9]+);([0-9]+)([Mm])');
 term.onData((d) => {
   if (!controlOn || fatal) return;      // disabled until a control on-frame
+  if (paneView) {
+    // Everything — keys, xterm-generated mouse reports (the CHILD enabled
+    // tracking; its DECSETs rode the raw stream into this term), pastes —
+    // goes verbatim to the child's PTY. Except while selecting: taps drive
+    // the local selection, not the child.
+    if (selectMode && d.match(sgrMouseRe)) return;
+    sendRaw(d);
+    return;
+  }
   const mm = d.match(sgrMouseRe);
   if (mm) {
     if (selectMode) return;             // taps drive selection, not the host, while selecting
@@ -1422,6 +1927,12 @@ term.onData((d) => {
       }
       window.__dbg.st2++;
       let at = selB || {c: scol, r: srow};
+      if (paneView) {
+        // The whole canvas IS the pane here — scroll the child directly via a
+        // raw wheel report (regions/mouse coords are app-view concepts).
+        paneWheel(at.c, at.r, d);
+        return;
+      }
       const rg = anchorRegion();
       if (rg) {
         at = {c: Math.max(rg.x, Math.min(rg.x + rg.w - 1, at.c)),
@@ -1438,6 +1949,18 @@ term.onData((d) => {
     drawSel();
     edgeScroll(y);
   }
+  function paneWheel(col, row, dir) {
+    // Pane view: a drag-scroll becomes the SGR wheel report a local terminal
+    // would emit at that cell (64=up 65=down), sent raw to the child — claude's
+    // own scroll handling runs, not an emulation. Only when the child actually
+    // tracks the mouse; otherwise return false so the caller leaves the drag
+    // to the browser/xterm (native pan + local scrollback). (#pane-direct)
+    let mode = 'none';
+    try { mode = term.modes.mouseTrackingMode || 'none'; } catch (e) {}
+    if (mode === 'none') return false;
+    sendRaw(ESC + '[<' + (dir === 'down' ? 65 : 64) + ';' + (col + 1) + ';' + (row + 1) + 'M');
+    return true;
+  }
   function drag(y, x) {                   // returns true once it consumes the move
     if (lastY === null) return false;
     // Selection is LOCAL (never touches the host) — usable in read-only too.
@@ -1446,8 +1969,18 @@ term.onData((d) => {
     accum += y - lastY; lastY = y;
     let moved = false;
     // pointer up (y decreases) -> see items below -> scroll the list DOWN.
-    while (accum <= -STEP) { accum += STEP; postMouse(scol, srow, 0, 'scrolldown'); moved = true; }
-    while (accum >=  STEP) { accum -= STEP; postMouse(scol, srow, 0, 'scrollup');   moved = true; }
+    while (accum <= -STEP) {
+      accum += STEP;
+      if (paneView) { if (!paneWheel(scol, srow, 'down')) return false; }
+      else postMouse(scol, srow, 0, 'scrolldown');
+      moved = true;
+    }
+    while (accum >=  STEP) {
+      accum -= STEP;
+      if (paneView) { if (!paneWheel(scol, srow, 'up')) return false; }
+      else postMouse(scol, srow, 0, 'scrollup');
+      moved = true;
+    }
     return moved;
   }
   function end() { lastY = null; cancelLongPress(); stopEdge(); }
@@ -1460,6 +1993,7 @@ term.onData((d) => {
   function cancelLongPress() { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } }
   function closeMenu() { if (menuEl) { menuEl.remove(); menuEl = null; } }
   function armLongPress() {
+    if (paneView) return;   // row actions are an app-view concept (#pane-direct)
     if (!controlOn || fatal) return;
     cancelLongPress();
     const c = scol, r = srow, px = pressX, py = pressY;
@@ -1706,6 +2240,7 @@ kbBar.innerHTML =
   // pane focused); "Find" (slash) opens search and PgUp/PgDn/Top/End page the
   // list (these work when the list, not a pane, is focused).
   '<div class="kb-row" id="kb2" style="display:none;flex-wrap:wrap">'+
+    '<button id="kb-view" data-k="">Pane view</button>'+
     '<button id="kb-hand" data-k="">&#8644; Right</button>'+
     '<button data-k="slash">Find</button>'+
     '<button data-k="f5">Refresh</button>'+
@@ -1723,8 +2258,41 @@ kbBar.innerHTML =
     '<button data-k="end">End</button>'+
   '</div>';
 document.body.appendChild(kbBar);
+// Composer-draft persistence across the view-toggle / seed-retry reloads: the
+// draft is typed on a phone keyboard — losing it to a navigation is expensive.
+// (#review-composer-draft)
+function stashDraft() {
+  try {
+    const ta = document.getElementById('comp-text');
+    if (ta && ta.value) sessionStorage.setItem('saikai-draft', ta.value);
+  } catch (e) {}
+}
+try {
+  const draft = sessionStorage.getItem('saikai-draft');
+  if (draft) {
+    sessionStorage.removeItem('saikai-draft');
+    const ta = document.getElementById('comp-text');
+    if (ta) ta.value = draft;
+  }
+} catch (e) {}
 const kbCtrl = document.getElementById('kb-ctrl');
 const kbMore = document.getElementById('kb-more');
+if (paneView) {   // the toggle names the view a press switches TO
+  const vb = document.getElementById('kb-view');
+  if (vb) { vb.textContent = 'App view'; vb.style.background = '#3a3'; }
+  // Hide keys that act on the HOST APP — invisible from pane view, so tapping
+  // them here would fire blind (dispatchKey drops them too; hiding keeps the
+  // bar honest about what works). Terminal keys (PgUp/PgDn/Top/End, d-pad,
+  // Esc/Enter/Tab) and the view/hand toggles stay. (#review-invisible-app-keys)
+  const appOnly = ['slash', 'f5', 'f10', 'f9', 'shift+f2', 'shift+f4', 'f11',
+                   'shift+f11', 'checkpoint', 'f12',
+                   'ctrl+right_square_bracket', 'shift+f3'];
+  kbBar.querySelectorAll('button[data-k]').forEach((b) => {
+    if (appOnly.indexOf(b.getAttribute('data-k')) >= 0) b.style.display = 'none';
+  });
+  const r2 = document.getElementById('kb-row2');
+  if (r2) r2.style.display = 'none';   // List/Next: both app-scoped
+}
 // ── Handedness: 'R' (default) puts the d-pad cluster under the RIGHT thumb;
 //    'L' mirrors every bar (key bar, More row, select bar) for left-thumb
 //    reach. Persisted per browser in localStorage. ──────────────────────────
@@ -1741,6 +2309,49 @@ function applyHand() {
   if (hb) hb.textContent = (hand === 'L') ? '\u21c4 Left' : '\u21c4 Right';
 }
 applyHand();
+// Pane view (#pane-direct): a key-bar press that IS terminal input goes to the
+// child's PTY as the raw sequence a local terminal would produce — honoring
+// DECCKM (application cursor keys, mirrored into term.modes by the raw
+// stream). saikai-level actions (checkpoint, f5, List, …) return null
+// here and stay on the /key path, acting on the host app as before.
+const CR = String.fromCharCode(13);
+function paneRawSeq(k) {
+  const app = !!(term.modes && term.modes.applicationCursorKeysMode);
+  const arrows = {up: 'A', down: 'B', right: 'C', left: 'D'};
+  if (arrows[k]) return ESC + (app ? 'O' : '[') + arrows[k];
+  if (k === 'enter') return CR;
+  if (k === 'escape') return ESC;
+  if (k === 'tab') return String.fromCharCode(9);
+  if (k === 'space') return ' ';
+  if (k === 'backspace') return String.fromCharCode(127);
+  if (k === 'pageup') return ESC + '[5~';
+  if (k === 'pagedown') return ESC + '[6~';
+  // Home/End are DECCKM cursor keys exactly like the arrows (xterm sends
+  // SS3 H/F under application-cursor mode — terminfo khome/kend under smkx).
+  if (k === 'home') return ESC + (app ? 'O' : '[') + 'H';
+  if (k === 'end') return ESC + (app ? 'O' : '[') + 'F';
+  if (k === 'slash') return '/';
+  if (k.indexOf('ctrl+') === 0) {
+    const c = k.slice(5);
+    if (c === 'right_square_bracket') return null;    // List = saikai action
+    if (c.length === 1 && c >= 'a' && c <= 'z')
+      return String.fromCharCode(c.charCodeAt(0) - 96);
+  }
+  return null;   // saikai pseudo/function keys -> /key as before
+}
+function dispatchKey(k) {
+  if (paneView) {
+    const seq = paneRawSeq(k);
+    if (seq !== null) { sendRaw(seq); }
+    // A key with no raw encoding is DROPPED in pane view — never forwarded to
+    // /key. The fallthrough target would be the INVISIBLE host app: a modal
+    // opened blind steals the host's focus and can't even be dismissed from
+    // here (Esc goes raw to the child). Safe default for future bar keys too.
+    // (#review-invisible-app-keys)
+    return;
+  }
+  postKey(k);
+}
 // Hold-to-repeat for the d-pad: buttons have no key-repeat, so a long menu
 // or an in-pane scroll needed one tap per step. pointerdown fires the key at
 // once, holding repeats it (400ms delay, then 80ms — physical-keyboard feel);
@@ -1757,8 +2368,8 @@ applyHand();
     b.addEventListener('pointerdown', (e) => {
       e.preventDefault();
       stopRepeat();
-      postKey(k);
-      rptT = setTimeout(() => { rptI = setInterval(() => postKey(k), 80); }, 400);
+      dispatchKey(k);
+      rptT = setTimeout(() => { rptI = setInterval(() => dispatchKey(k), 80); }, 400);
     });
     ['pointerup', 'pointercancel', 'pointerleave'].forEach((t) =>
       b.addEventListener(t, stopRepeat));
@@ -1790,6 +2401,17 @@ kbBar.querySelectorAll('button').forEach((b) => {
       const ta = document.getElementById('comp-text');
       let v = ta.value;
       if (v !== '') {
+        // Strip any bracketed-paste markers the user pasted INTO the draft
+        // before framing — an embedded ESC[201~ would early-close the paste,
+        // turning the rest (incl. newlines) into live keystrokes that submit
+        // to the child. Loop until stable: a single pass can re-form a marker at
+        // the deletion seam (e.g. ESC[2 + ESC[200~ + 00~). Mirrors the host's
+        // _wrap_bracketed_paste. (#review-paste-marker #review-paste-overlap)
+        let _prev;
+        do {
+          _prev = v;
+          v = v.split(ESC + '[200~').join('').split(ESC + '[201~').join('');
+        } while (v !== _prev);
         // frame as a bracketed paste when the HOST enabled ?2004h (the mode
         // rides the mirrored byte stream into term.modes) — else raw. Markers
         // built from ESC at runtime (no control bytes in this served string).
@@ -1800,14 +2422,30 @@ kbBar.querySelectorAll('button').forEach((b) => {
           }
         } catch (e) {}
         if (b.id === 'comp-send-cr') framed += String.fromCharCode(13);
-        pending += framed;
-        pump();
+        // Pane view: composed text goes straight to the child's PTY (the
+        // bracketed framing above already reflects the CHILD's ?2004 state,
+        // mirrored into term.modes by the raw stream). (#pane-direct)
+        if (paneView) { sendRaw(framed); }
+        else { pending += framed; pump(); }
         ta.value = '';
       } else if (b.id === 'comp-send-cr') {
-        pending += String.fromCharCode(13);   // empty + Send⏎ = bare Enter
-        pump();
+        if (paneView) { sendRaw(String.fromCharCode(13)); }
+        else { pending += String.fromCharCode(13); pump(); }   // empty + Send⏎ = bare Enter
       }
       try { ta.focus(); } catch (e) {}        // keep composing (keyboard stays up)
+      return;
+    }
+    if (b.id === 'kb-view') {                 // Pane <-> App view (#pane-direct)
+      // The view is a CONNECTION property (the SSE stream carries either app
+      // frames or raw pane bytes), so switching reloads with the param — a
+      // clean terminal, seed and mode replay instead of an in-place migration.
+      // The composer draft is NOT connection-scoped: stash it across the
+      // navigation (restored on load). (#review-composer-draft)
+      stashDraft();
+      const u = new URL(location.href);
+      if (paneView) { u.searchParams.delete('view'); }
+      else { u.searchParams.set('view', 'pane'); }
+      location.href = u.toString();
       return;
     }
     if (b.id === 'kb-hand') {                 // mirror the bars for the other thumb
@@ -1830,7 +2468,7 @@ kbBar.querySelectorAll('button').forEach((b) => {
       ctrlSticky = false;
       kbCtrl.style.background = '';
     }
-    postKey(k);
+    dispatchKey(k);
   });
 });
 
@@ -2065,7 +2703,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _stream(self):
         hub = self.server.hub
-        cq, snapshot = hub._add_client()
+        # ?view=pane joins the raw child-PTY channel instead of app frames; the
+        # page reloads with the param to switch views, so the choice is a
+        # connection property, not migrated in-place. Exact param parse — a
+        # substring test would let ?view=panel / ?preview=paneX select the raw
+        # channel by accident. (#pane-direct)
+        from urllib.parse import urlparse, parse_qs
+        pane_view = parse_qs(urlparse(self.path).query).get("view") == ["pane"]
+        if pane_view:
+            cq, snapshot = hub._add_pane_client(), None
+        else:
+            cq, snapshot = hub._add_client()
         if cq is None:                       # viewer cap hit — don't hold a thread
             self._reject(503, "too many viewers", drain=False)
             return
@@ -2075,15 +2723,22 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
         try:
-            self._send_frame(snapshot)
+            if snapshot is not None:
+                self._send_frame(snapshot)
             # Write-key (only ever over this authenticated channel) + current
             # control state, both as named raw-JSON events.
             self._send_event("writekey", json.dumps({"key": hub._write_key}))
             self._send_event("control", json.dumps(
                 {"on": hub._control_enabled, "target": hub._control_target}))
-            _rj = getattr(hub, "_regions_json", None)
-            if _rj:
-                self._send_event("regions", _rj)   # current layout for a fresh client
+            if pane_view:
+                # Current pane geometry/liveness; the full pane STATE arrives as
+                # a pane-reset once the app answers the reseed request that
+                # _add_pane_client fired.
+                self._send_event("pane-meta", hub._pane_meta_json)
+            else:
+                _rj = getattr(hub, "_regions_json", None)
+                if _rj:
+                    self._send_event("regions", _rj)   # current layout for a fresh client
             while True:
                 try:
                     data = cq.get(timeout=30.0)
@@ -2103,6 +2758,21 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     continue
                 if isinstance(data, _Size):      # host resized (#mirror-resize)
                     self._send_event("size", data.json)
+                    continue
+                if isinstance(data, _PaneData):  # raw child bytes (#pane-direct)
+                    self._send_frame(data.data)
+                    continue
+                if isinstance(data, _PaneReset):
+                    # Geometry FIRST: the browser must resize before the seed
+                    # paints, and this re-delivers a meta lost to any flush
+                    # (set_pane_meta dedups at source). (#review-pane-meta-loss)
+                    self._send_event("pane-meta", data.meta)
+                    self._send_event("pane-reset", json.dumps(
+                        {"seed": base64.b64encode(
+                            data.seed.encode("utf-8")).decode("ascii")}))
+                    continue
+                if isinstance(data, _PaneMeta):
+                    self._send_event("pane-meta", data.json)
                     continue
                 self._send_frame(data)
         except (BrokenPipeError, ConnectionResetError):
@@ -2156,6 +2826,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._do_mouse()
         elif path == "/key":
             self._do_key()
+        elif path == "/raw":
+            self._do_raw()
         else:
             self._reject(405, "method not allowed")
 
@@ -2225,6 +2897,34 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # silent 204 here made throttled keystrokes vanish with the browser
             # believing they landed. (#audit-codex-inject-429)
             self.send_error(429, "input throttled")
+            return
+        self._send_status(204)
+
+    def _do_raw(self):
+        """Pane-view terminal bytes (xterm onData) — written VERBATIM to the
+        followed pane's child PTY by the app. No paste-framing check: unlike
+        /input this stream legitimately carries ESC sequences (arrows, mouse
+        reports, the bracketed-paste frame xterm itself emits), and it never
+        passes through a key parser that framing could smuggle past — the pane's
+        child sees exactly what a local keyboard would produce. Same gate chain
+        (host, LAN opt-in, write key, origin, cap) as every other input route.
+        (#pane-direct)"""
+        obj = self._post_gate_and_json()
+        if obj is None:
+            return
+        hub = self.server.hub
+        data = obj.get("data")
+        if data is None or not isinstance(data, str):
+            self.send_error(400, "missing data")
+            return
+        if data == "":
+            self._send_status(204)                      # no-op, but accepted
+            return
+        if not hub._control_enabled:                    # advisory fast-reject
+            self.send_error(409, "control off")
+            return
+        if not hub.inject_raw(data):
+            self.send_error(429, "input throttled")     # (#audit-codex-inject-429)
             return
         self._send_status(204)
 

@@ -1190,7 +1190,62 @@ def test_client_count_and_change_handler():
     assert seen == [1, 2, 1, 0], seen
 
 
+
+def test_page_pane_view_contracts():
+    """Pane direct view page contracts (#pane-direct): the view rides the SSE
+    URL; output is gated until the first full-state seed; pane-reset resets the
+    terminal then applies the seed; pane-meta resizes the follower terminal;
+    onData routes VERBATIM to /raw in pane view; the key bar translates
+    terminal keys to raw sequences honoring DECCKM; the composer sends raw in
+    pane view; and the More row has the view toggle."""
+    page = m._PAGE_HTML
+    assert "view=pane" in page and "paneView" in page
+    assert "'/stream?token=' + encodeURIComponent(token) +" in page
+    assert "paneSeeded" in page, "output must be gated until the seed"
+    assert "pane-reset" in page and "term.reset()" in page
+    assert "pane-meta" in page and "term.resize(m.cols, m.rows)" in page
+    assert "fetch('/raw'" in page, "raw pump must post /raw"
+    assert "sendRaw(d)" in page, "pane-view onData must go raw"
+    assert "applicationCursorKeysMode" in page, "arrows must honor DECCKM"
+    assert "function dispatchKey" in page and "paneRawSeq" in page
+    assert "kb-view" in page, "the More row needs the Pane/App toggle"
+    assert "mouseTrackingMode" in page, \
+        "drag-scroll must emit raw wheel reports only when the child tracks the mouse"
+    # the app view must NOT force mouse tracking in pane view (the child owns modes)
+    assert "if (!paneView) { try { term.write(ESC + '[?1000;1006h'); } catch (e) {} }" in page
+    # ── review hardening (#review-*) ─────────────────────────────────────────
+    # raw input is DROPPED (not buffered) while control is off — a backlog
+    # replayed on control-ON could accept a live confirmation prompt
+    assert "if (fatal || !controlOn || writeKey === null) return;" in page.split(
+        "function sendRaw(d)")[1].split("}")[1] or \
+        "if (fatal || !controlOn || writeKey === null) return;" in page.split(
+        "function sendRaw(d)")[1][:400], "sendRaw needs the admission gate"
+    assert "try { pendingRaw = ''; } catch (e) {}" in page, \
+        "control-off must clear the raw backlog"
+    # host-size frames must not resize the pane-view terminal
+    assert "if (paneView) return;   // pane view sizes from pane-meta" in page
+    # Home/End honor DECCKM like the arrows
+    assert "if (k === 'home') return ESC + (app ? 'O' : '[') + 'H';" in page
+    # keys with no raw encoding are dropped in pane view (never the invisible app)
+    assert "never forwarded to" in page and "postKey(k);" in page
+    # app-only buttons hidden in pane view
+    assert "const appOnly = ['slash', 'f5', 'f10', 'f9', 'shift+f2', 'shift+f4', 'f11'," in page
+    # composer draft survives the view toggle / seed retry
+    assert "function stashDraft()" in page and "sessionStorage.getItem('saikai-draft')" in page
+    # unseeded-but-open pane view retries (bounded)
+    assert "saikai-seed-retry" in page and "location.reload();" in page
+    # composer strips embedded paste markers before framing (early-close guard)
+    assert "v.split(ESC + '[200~').join('').split(ESC + '[201~').join('')" in page
+    # a new pane generation regates output + re-arms the blank-view backstop
+    assert "let paneGen = null;" in page and "function armSeedRetry()" in page
+    assert "m.gen !== paneGen" in page and "paneSeeded = false;" in page
+    # paste-marker removal loops until stable (a single pass can re-form a
+    # marker at the deletion seam) — #review-paste-overlap
+    assert "do {" in page and "} while (v !== _prev);" in page
+    print("PASS test_page_pane_view_contracts")
+
 if __name__ == "__main__":
+    test_page_pane_view_contracts()
     test_inject_gate_off_by_default_and_requires_handler()
     test_inject_is_fifo_via_single_drain()
     test_typed_inject_dispatches_by_tag_in_order()

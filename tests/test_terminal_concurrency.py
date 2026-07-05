@@ -1334,6 +1334,132 @@ def test_osc_notification_parsing_and_notify_host():
     t._notify_host("   "); assert notes == ["hi"]                       # empty → no toast
 
 
+
+def test_mirror_tee_orders_seed_before_stream_verbatim():
+    """Pane-direct tee contract (#pane-direct): (1) attach_mirror computes the
+    seed and enqueues it UNDER _lock, and _consume tees under the same lock —
+    so a chunk is either inside the seed or ordered after it, never both;
+    (2) the tee'd bytes are VERBATIM — the query strip
+    happens on the hub's drain thread, not here under the reader lock; (3) DECCKM (?1) is tracked for the seed's mode replay;
+    (4) detach stops the tee."""
+    import pyte
+    term = rt.AgentTerminal(["agent"], status_classifier=rt.classify_pty_status)
+    term._screen = pyte.HistoryScreen(20, 5, history=50)
+    term._stream = pyte.Stream(term._screen)
+    events = []
+    def tee(d):
+        events.append(("tee", d))
+    def reset(seed):
+        events.append(("seed", seed))
+    def synth(scr, cols, rows, modes):
+        return f"SYNTH:{cols}x{rows}:alt={modes['alt']}:app={modes['app_cursor']}"
+    term._consume("before-attach")            # pre-attach bytes: seed-only
+    assert events == [], "nothing tees before attach"
+    term.attach_mirror(tee, reset, synth)
+    assert events and events[0][0] == "seed", "attach must emit the seed first"
+    assert "20x5" in events[0][1]
+    term._consume("\x1b[?1h")                 # DECCKM on — tracked + tee'd
+    term._consume("plain \x1b[6n text \x1b[0c and \x1b[?2026$p done")
+    tees = [d for k, d in events if k == "tee"]
+    assert tees[0] == "\x1b[?1h"
+    # the tee passes the chunk VERBATIM — the child-query strip runs on the
+    # mirror hub's drain thread (set_pane_strip), never on the reader thread
+    # under the terminal lock (#review-strip-offload)
+    assert tees[1] == "plain \x1b[6n text \x1b[0c and \x1b[?2026$p done", \
+        f"tee must be verbatim (strip is drain-side): {tees[1]!r}"
+    assert term._app_cursor is True
+    events.clear()
+    term.mirror_reseed()                       # hub-requested reseed
+    assert len(events) == 1 and events[0][0] == "seed"
+    assert "app=True" in events[0][1], "DECCKM must reach the seed's mode replay"
+    events.clear()
+    term.detach_mirror()
+    term._consume("after-detach")
+    assert events == [], "detach must stop the tee"
+
+
+def test_mirror_seed_and_tee_are_lock_consistent():
+    """The reader thread feeds pyte + tees under _lock while attach_mirror
+    seeds under the same lock from another thread: every byte must land in
+    EXACTLY one of (seed-covered screen state, tee'd stream) — the browser
+    applying a chunk that is also inside the seed garbles (relative cursor
+    moves run twice). Hammer attach/detach against a feeding thread and check
+    the invariant via a monotonically-increasing payload counter."""
+    import pyte
+    term = rt.AgentTerminal(["agent"], status_classifier=rt.classify_pty_status)
+    term._screen = pyte.HistoryScreen(40, 5, history=50)
+    term._stream = pyte.Stream(term._screen)
+    tee_log = []
+    seeds = []
+    def synth(scr, cols, rows, modes):
+        # capture the screen TEXT at seed time — the last counter painted
+        # under the lock is inside the seed
+        try:
+            txt = "".join(ch.data or " " for ch in scr.buffer[0].values()) \
+                  if hasattr(scr.buffer[0], "values") else \
+                  "".join((scr.buffer[0][x].data or " ") for x in range(scr.columns))
+        except Exception:
+            txt = ""
+        return "SEED[" + txt.strip() + "]"
+    stop = threading.Event()
+    def feeder():
+        i = 0
+        while not stop.is_set() and i < 4000:
+            i += 1
+            term._consume(f"\x1b[1;1Hn={i:06d}")
+    ft = threading.Thread(target=feeder)
+    ft.start()
+    for _ in range(200):
+        term.attach_mirror(lambda d: tee_log.append(d),
+                           lambda s: seeds.append((s, len(tee_log))),
+                           synth)
+        term.detach_mirror()
+    stop.set()
+    ft.join(5.0)
+    assert not ft.is_alive(), "feeder must not deadlock against attach/detach"
+    # For every seed: the first tee'd chunk AFTER it must carry a counter
+    # STRICTLY GREATER than the one captured inside the seed (no replay).
+    import re
+    for seed, mark in seeds:
+        sm = re.search(r"n=(\d+)", seed)
+        if sm is None:
+            continue                      # seeded before the first feed
+        for d in tee_log[mark:]:
+            dm = re.search(r"n=(\d+)", d)
+            if dm is None:
+                continue
+            assert int(dm.group(1)) > int(sm.group(1)), \
+                f"chunk n={dm.group(1)} tee'd after a seed that already contains n={sm.group(1)}"
+            break
+
+
+def test_mouse_tracking_is_one_exclusive_protocol_slot():
+    """DECSET 1000/1002/1003 share ONE protocol slot in real xterm and
+    xterm.js: an enable replaces the active protocol, a DECRST of ANY family
+    member turns tracking off entirely. Independent booleans left a stale flag
+    ("1000h…1003h…1003l" kept click-tracking True) and the mirror seed then
+    re-armed mouse reporting on a child that had turned it off.
+    (#review-mouse-slot)"""
+    import pyte
+    term = rt.AgentTerminal(["agent"], status_classifier=rt.classify_pty_status)
+    term._screen = pyte.HistoryScreen(20, 5, history=10)
+    term._stream = pyte.Stream(term._screen)
+    term._consume("\x1b[?1000h")
+    assert term._mouse_click and not term._mouse_any_motion
+    term._consume("\x1b[?1003h")             # upgrade replaces the protocol
+    assert term._mouse_any_motion and not term._mouse_click, \
+        "an enable must REPLACE the slot, not stack"
+    term._consume("\x1b[?1003l")             # any family reset → tracking OFF
+    assert not (term._mouse_click or term._mouse_btn_motion
+                or term._mouse_any_motion), \
+        "a family DECRST must clear the whole slot"
+    assert term._mouse_reporting is False
+    # combined enable ends on the LAST protocol in the sequence (like a real
+    # terminal applying them in order)
+    term._consume("\x1b[?1000;1002;1006h")
+    assert term._mouse_btn_motion and not term._mouse_click
+    assert term._mouse_sgr, "encoding (1006) is independent of the slot"
+
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
     print("PASS test_osc_notification_parsing_and_notify_host")
@@ -1417,6 +1543,12 @@ if __name__ == "__main__":
     print("PASS test_note_reap_prunes_finished_threads")
     test_kitty_keyboard_csi_u_is_scrubbed()
     print("PASS test_kitty_keyboard_csi_u_is_scrubbed")
+    test_mirror_tee_orders_seed_before_stream_verbatim()
+    print("PASS test_mirror_tee_orders_seed_before_stream_verbatim")
+    test_mirror_seed_and_tee_are_lock_consistent()
+    print("PASS test_mirror_seed_and_tee_are_lock_consistent")
+    test_mouse_tracking_is_one_exclusive_protocol_slot()
+    print("PASS test_mouse_tracking_is_one_exclusive_protocol_slot")
     test_selection_geometry_in_sel()
     print("PASS test_selection_geometry_in_sel")
     test_extract_selection_slices_and_joins()

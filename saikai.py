@@ -5972,6 +5972,35 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         pass
                 _hub.set_key_handler(_key_handler)
 
+                # Pane direct view (#pane-direct): raw terminal bytes from the
+                # browser xterm → the followed pane's child PTY, and the hub's
+                # reseed request → a fresh full-state seed. Same _marshal shape.
+                def _raw_handler(d, _app=_app_ref):
+                    if not getattr(_app, "is_running", False):
+                        return
+                    try:
+                        _app.call_from_thread(_app._mirror_inject_raw, d)
+                    except Exception:
+                        pass
+                _hub.set_raw_handler(_raw_handler)
+
+                def _pane_reseed(_app=_app_ref):
+                    if not getattr(_app, "is_running", False):
+                        return
+                    try:
+                        _app.call_from_thread(_app._mirror_pane_reseed)
+                    except Exception:
+                        pass
+                _hub.set_pane_reseed_request(_pane_reseed)
+                # Child-query strip for the pane stream — the union regex lives
+                # next to the query-answering code in saikai_terminal so the two
+                # can't drift; the hub applies it on its drain thread. (#pane-direct)
+                if _LIVE_TERM is not None:
+                    try:
+                        _hub.set_pane_strip(_LIVE_TERM._MIRROR_QUERY_STRIP_RE)
+                    except Exception:
+                        pass
+
                 def _client_change(n, _app=_app_ref):
                     if not getattr(_app, "is_running", False):
                         return
@@ -7908,6 +7937,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self._save_open_panes()
             self._prune_dead_panes()   # bound retained x dead-pane memory (#H6)
             self._refresh_table()
+            # The mirror's pane channel must learn of the death NOW (meta
+            # open:false / follow the next pane) — not at the next poll tick,
+            # during which phone keystrokes would drop silently against the
+            # nulled PTY. (#review-dead-pane-window)
+            self._mirror_sync_pane()
             if _was_focused:
                 try:
                     self.query_one("#table", DataTable).focus()
@@ -7964,10 +7998,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _hub.set_size(w, h)
             except Exception:
                 pass
-            # regions read content_region, which settles after this reflow —
-            # push them once layout is done.
+            # regions/pane geometry read content_region, which settles after
+            # this reflow — run the FULL sync then, so a host resize reaches the
+            # pane channel too: new pane cols/rows + a reseed. (The child's
+            # post-SIGWINCH repaint would otherwise land on a browser grid of
+            # the old size and stay garbled until an unrelated reseed.)
+            # (#review-pane-resize)
             try:
-                self.call_after_refresh(self._mirror_push_regions)
+                self.call_after_refresh(self._mirror_sync_geometry)
             except Exception:
                 pass
 
@@ -7985,6 +8023,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
             self._mirror_push_regions()
+            self._mirror_sync_pane()
 
         def _mirror_push_regions(self) -> None:
             """Publish the scrollable content rectangles (cell coords) to the
@@ -8016,6 +8055,137 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 pass
             try:
                 _hub.set_regions(regs)
+            except Exception:
+                pass
+
+        def _mirror_pane_target(self):
+            """The live pane the mirror's pane view should follow: the focused
+            AgentTerminal when one has focus, else the VISIBLE one in the split
+            (the phone watches claude while the local user browses the list).
+            None when no live pane is visible. (#pane-direct)"""
+            if _LIVE_TERM is None:
+                return None
+            t = self._focused_terminal()
+            if t is not None and not getattr(t, "is_dead", False):
+                return t
+            try:
+                for t in self.query(_LIVE_TERM.AgentTerminal):
+                    r = t.content_region
+                    if r.width > 0 and r.height > 0 and t.display \
+                            and not getattr(t, "is_dead", False):
+                        return t
+            except Exception:
+                pass
+            return None
+
+        def _mirror_sync_pane(self) -> bool:
+            """Keep the mirror's pane-direct channel following reality: publish
+            the target's geometry/liveness FIRST (the browser must resize before
+            any seed paints — FIFO delivery makes meta-then-seed the only safe
+            order, #review-seed-meta-order), then attach the tee to the current
+            target (detaching the previous one), and reseed when the SAME pane's
+            geometry changed (the child's repaint at the new size already
+            tee'd against the browser's old grid). Returns True when a seed was
+            sent (attach or reseed) so _mirror_pane_reseed doesn't send a second
+            identical one. Called from every layout-changing event, focus moves
+            and the poll backstop — the app-side meta-key compare keeps the
+            no-change hot path to one tuple compare. (#pane-direct)"""
+            _hub = getattr(self, "_mirror_hub", None)
+            if _hub is None:
+                return False
+            t = self._mirror_pane_target()
+            cur = getattr(self, "_mirror_pane_term", None)
+            # A per-target GENERATION rides the meta: the browser gates output
+            # until the seed for the CURRENT generation arrives, so a seed lost
+            # to a retarget/reopen (not just the very first connect) re-arms the
+            # blank-view backstop instead of trusting the stale screen forever.
+            # Bumped on every target change, BEFORE the meta is built. (#review-pane-gen)
+            gen = getattr(self, "_mirror_pane_gen", 0)
+            if t is not cur:
+                gen += 1
+                self._mirror_pane_gen = gen
+            if t is None:
+                meta = {"open": False, "gen": gen}
+                key = (False, 0, 0, "", gen)
+            else:
+                scr = getattr(t, "_screen", None)
+                meta = {
+                    "open": True,
+                    "cols": int(getattr(scr, "columns", 80) or 80),
+                    "rows": int(getattr(scr, "lines", 24) or 24),
+                    "title": str(getattr(t, "title", "") or "")[:120],
+                    "gen": gen,
+                }
+                key = (True, meta["cols"], meta["rows"], meta["title"], gen)
+            prev = getattr(self, "_mirror_pane_meta_key", None)
+            if key != prev:
+                self._mirror_pane_meta_key = key
+                try:
+                    _hub.set_pane_meta(meta)
+                except Exception:
+                    pass
+            seeded = False
+            if t is not cur:
+                if cur is not None:
+                    try:
+                        cur.detach_mirror()
+                    except Exception:
+                        pass
+                if t is not None:
+                    synth = getattr(self, "_mirror_seed_synth", None)
+                    if synth is None:
+                        from saikai_mirror import _synth_pane_seed as synth
+                        self._mirror_seed_synth = synth
+                    try:
+                        t.attach_mirror(_hub.pane_feed, _hub.pane_reset, synth)
+                        seeded = True
+                    except Exception:
+                        t = None
+                self._mirror_pane_term = t
+            elif t is not None and prev is not None and key[:3] != prev[:3]:
+                # same pane, new geometry (host resize / split-ratio change):
+                # the reseed carries the meta and repaints the resized browser
+                # grid. (#review-pane-resize)
+                try:
+                    t.mirror_reseed()
+                    seeded = True
+                except Exception:
+                    pass
+            return seeded
+
+        def _mirror_pane_reseed(self) -> None:
+            """Hub-requested full-state reseed (fresh pane client / fallen-behind
+            client / ingest overflow). UI thread (the hub callback marshals)."""
+            if self._mirror_sync_pane():
+                return         # the sync itself just seeded — don't send a twin
+            t = getattr(self, "_mirror_pane_term", None)
+            if t is not None:
+                try:
+                    t.mirror_reseed()
+                except Exception:
+                    pass
+
+        def _mirror_inject_raw(self, data: str) -> None:
+            """Write pane-view browser bytes VERBATIM to the followed pane's
+            child PTY — the browser xterm is that child's terminal, so arrows,
+            mouse reports and bracketed paste arrive exactly as a local terminal
+            would produce them. No Textual key translation, no focus routing:
+            the bytes go to the pane the browser is LOOKING AT, regardless of
+            local focus. Re-checks the authoritative control gate. (#pane-direct)"""
+            if not self._control_enabled or not isinstance(data, str) or not data:
+                return
+            t = getattr(self, "_mirror_pane_term", None)
+            if t is None or getattr(t, "is_dead", False) \
+                    or getattr(t, "_pty", None) is None:
+                # The followed pane closed/died (kill() nulls _pty immediately;
+                # is_dead lags until the reader's _finalize) — refresh the
+                # mirror's model NOW so meta flips to closed and a next pane can
+                # attach, instead of dropping bytes silently until the poll
+                # notices. (#review-dead-pane-window)
+                self._mirror_sync_pane()
+                return
+            try:
+                t._send_to_child(data)
             except Exception:
                 pass
 
@@ -8086,6 +8256,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # the actual focus while control is ON (a stale target was a lie that
             # sent remote keys blind into a different widget).
             self._resync_mirror_target()
+            # …and retarget the pane-direct channel IMMEDIATELY: leaving it to
+            # the 1.5s poll let a phone's in-flight keystrokes (typed against
+            # pane A's screen) land in newly-focused pane B — the reseed a
+            # retarget sends also makes the switch visible on the phone at the
+            # moment it happens. (#review-pane-target-divergence)
+            self._mirror_sync_pane()
             # Catch up a list rebuild that _poll_live_status deferred while a pane
             # was focused (markers weren't refreshed under the user's typing). Now
             # that focus has left every pane, rebuilding is safe.
@@ -8162,6 +8338,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 pass
             self.query_one("#table", DataTable).focus()
             self._refresh_table()
+            # Immediate pane-channel retarget: the closed pane's tee detaches,
+            # meta flips (closed / next pane), and remote input can't fall into
+            # the pty-None window until the next poll. (#review-dead-pane-window)
+            self._mirror_sync_pane()
 
         def action_close_all_live(self) -> None:
             # Shift+F10: close ALL live panes at once (parallel kill) but STAY in
@@ -8203,6 +8383,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 pass
             self.query_one("#table", DataTable).focus()
             self._refresh_table()
+            # Bulk close must retarget the mirror's pane channel NOW, like the
+            # single-close path — otherwise a pane viewer keeps seeing a killed
+            # pane (meta open:true) until the next poll. (#review-closeall-sync)
+            self._mirror_sync_pane()
             self.notify(f"closed {n} live tab(s)", timeout=3)
 
         def action_close_live(self) -> None:

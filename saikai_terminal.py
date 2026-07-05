@@ -679,6 +679,25 @@ _DSR_RE = re.compile(r"\x1b\[(\??)([56])n")             # DSR: 5=status, 6=curso
 _DECRQM_RE = re.compile(r"\x1b\[\?(\d+)\$p")            # DECRQM (mode support query)
 _XTVERSION_RE = re.compile(r"\x1b\[>0?q")               # XTVERSION (terminal name/version)
 _OSC_COLOR_Q_RE = re.compile(r"\x1b\](1[01]);\?(?:\x07|\x1b\\)")  # OSC 10/11 fg/bg color query
+# Queries stripped from the mirror pane stream (#pane-direct): saikai (the PTY
+# owner) answers them in _answer_queries; the browser xterm fed the raw stream
+# would ALSO auto-answer via onData, and with pane-view input wired the child
+# would receive every reply twice (a duplicated cursor-position report confuses
+# claude's redraw probe). Built as the UNION of the named request regexes above
+# — never hand-transcribed, so extending one of them extends the strip too —
+# plus the query shapes xterm.js answers that saikai deliberately ignores:
+# secondary/tertiary DA (vim's t_RV, tmux) and the DCS queries DECRQSS/XTGETTCAP
+# (browser replies would be foreign dialect the child never negotiated with
+# saikai). Applied on the mirror hub's DRAIN thread via set_pane_strip — not on
+# the reader thread under the terminal lock.
+_MIRROR_QUERY_STRIP_RE = re.compile("|".join(
+    [p.pattern for p in (_DA_RE, _DSR_RE, _DECRQM_RE, _XTVERSION_RE,
+                         _OSC_COLOR_Q_RE)]
+    + [r"\x1b\[>0?c",                       # secondary DA (vim t_RV, tmux)
+       r"\x1b\[=0?c",                       # tertiary DA
+       r"\x1bP\$q[^\x07\x1b]*(?:\x07|\x1b\\)",   # DECRQSS
+       r"\x1bP\+q[0-9a-fA-F;]*(?:\x07|\x1b\\)"]  # XTGETTCAP
+))
 # Desktop notifications the child may emit. claude usually falls back to a BEL in
 # saikai (it isn't a recognised rich-notification terminal), but honour these too.
 _OSC9_NOTIFY_RE = re.compile(r"\x1b\]9;(?!4;)([^\x07\x1b]*)\x07")       # iTerm2 (not 9;4 progress)
@@ -915,6 +934,15 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                                      # render + copy must read the FROZEN frame)
         self._esc_carry = ""         # trailing partial escape held across read()s
         self._osc52_carry = ""       # partial OSC 52 clipboard write held across read()s (base64 can span chunks)
+        self._app_cursor = False     # ?1 DECCKM — replayed in the mirror seed so a
+                                     # pane-view browser encodes arrows correctly (#pane-direct)
+        # Mirror pane-direct tee (#pane-direct): tee(str) forwards a scrubbed
+        # chunk to the mirror hub's pane channel; reset(str) enqueues a full-
+        # state seed; synth(screen, cols, rows, modes) serializes one. All three
+        # are set/cleared together under _lock so seed and stream stay ordered.
+        self._mirror_tee = None
+        self._mirror_reset = None
+        self._mirror_synth = None
         self._reader: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._lock = threading.Lock()   # guards pyte feed vs render_line read
@@ -1739,6 +1767,53 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             pass
 
+    # ── Mirror pane-direct view (#pane-direct) ────────────────────────────────
+    def attach_mirror(self, tee, reset, synth) -> None:
+        """Start teeing this pane's scrubbed PTY stream to the mirror's pane
+        channel. UI thread. The seed (current grid + cursor + terminal modes)
+        is computed AND enqueued under _lock, and _consume tees under the same
+        lock — so every chunk is either inside the seed or ordered after it,
+        never both. tee/reset are hub enqueues (put_nowait, no marshal)."""
+        with self._lock:
+            self._mirror_tee = tee
+            self._mirror_reset = reset
+            self._mirror_synth = synth
+            self._mirror_reseed_locked()
+
+    def detach_mirror(self) -> None:
+        """Stop teeing (pane lost focus / closed / app shutdown). UI thread."""
+        with self._lock:
+            self._mirror_tee = None
+            self._mirror_reset = None
+            self._mirror_synth = None
+
+    def mirror_reseed(self) -> None:
+        """Re-serialize full state into the pane channel — the hub asks for this
+        when a browser joins mid-session, falls behind, or the ingest queue
+        overflowed. UI thread (the hub's callback marshals here)."""
+        with self._lock:
+            self._mirror_reseed_locked()
+
+    def _mirror_reseed_locked(self) -> None:
+        reset, synth, scr = self._mirror_reset, self._mirror_synth, self._screen
+        if reset is None or synth is None or scr is None:
+            return
+        modes = {
+            "alt": self._alt.in_alt,
+            "app_cursor": self._app_cursor,
+            "mouse_click": self._mouse_click,
+            "mouse_btn_motion": self._mouse_btn_motion,
+            "mouse_any_motion": self._mouse_any_motion,
+            "mouse_sgr": self._mouse_sgr,
+            "focus_reporting": self._focus_reporting,
+            "bracketed_paste": getattr(self, "_bracketed_paste", False),
+            "cursor_hidden": bool(getattr(scr.cursor, "hidden", False)),
+        }
+        try:
+            reset(synth(scr, scr.columns, scr.lines, modes))
+        except Exception:
+            pass
+
     def _ring_bell(self) -> None:
         """Ring the host terminal bell (UI thread)."""
         try:
@@ -1843,12 +1918,20 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             for _params, _hl in _dec:
                 _on = (_hl == "h")
                 for _p in _params.split(";"):    # handle COMBINED params (?1002;1006h)
-                    if _p == "1000":
-                        self._mouse_click = _on
-                    elif _p == "1002":
-                        self._mouse_btn_motion = _on   # motion while a button is held
-                    elif _p == "1003":
-                        self._mouse_any_motion = _on   # any motion (hover)
+                    if _p == "1":
+                        self._app_cursor = _on         # DECCKM (#pane-direct seed replay)
+                    elif _p in ("1000", "1002", "1003"):
+                        # Mouse tracking is ONE exclusive protocol slot in both
+                        # real xterm and xterm.js: a DECSET replaces the active
+                        # protocol, and a DECRST of ANY family member turns
+                        # tracking off entirely. Three independent booleans left
+                        # a stale flag behind ("1000h…1003h…1003l" kept click
+                        # tracking True) and the mirror seed then re-armed mouse
+                        # reporting on a child that had turned it off — browser
+                        # SGR reports typed into its stdin. (#review-mouse-slot)
+                        self._mouse_click = _on and _p == "1000"
+                        self._mouse_btn_motion = _on and _p == "1002"   # drag motion
+                        self._mouse_any_motion = _on and _p == "1003"   # hover motion
                     elif _p == "1004":
                         self._focus_reporting = _on    # child wants focus in/out events
                     elif _p == "1006":
@@ -1941,6 +2024,23 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                     self._scroll = min(self._scroll + added,
                                        len(self._screen.history.top))
             self._scr_ver += 1   # screen mutated → invalidates the _current_screen cache
+            # Mirror pane-direct tee — INSIDE the lock, after the pyte feed, so
+            # attach_mirror()'s seed (computed under this same lock) strictly
+            # precedes every chunk tee'd after it: a chunk is either in the seed
+            # or in the stream, never both. The tee is a put_nowait into the hub
+            # ingest queue — no marshal, no blocking, no regex (invariant #1
+            # holds; the child-query strip runs on the hub's DRAIN thread via
+            # set_pane_strip(_MIRROR_QUERY_STRIP_RE), so a burst never pays a
+            # regex scan while holding this lock). The FULL scrubbed chunk goes
+            # through: the alt-collapse above may feed pyte only a suffix, but
+            # the browser xterm has both buffers natively and must see every
+            # byte. (#pane-direct)
+            _tee = getattr(self, "_mirror_tee", None)   # getattr: minimal test
+            if _tee is not None:                        # instances skip __init__
+                try:
+                    _tee(chunk)
+                except Exception:
+                    pass
         # Classify from the CURRENT screen + claude's OSC-0 title (its own state
         # glyph), not a rolling byte tail: a tail keeps stale "esc to interrupt"
         # / answered prompts that scrolled up and would misclassify an idle pane.

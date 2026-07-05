@@ -726,6 +726,12 @@ def test_pilot_mirror_control_toggle():
             pass
         def set_control_change_handler(self, *a):
             pass
+        def set_raw_handler(self, *a):              # pane-direct wiring (#pane-direct)
+            pass
+        def set_pane_reseed_request(self, *a):
+            pass
+        def set_pane_meta(self, *a):
+            pass
         def url(self):
             return "http://127.0.0.1:0/?token=x"
 
