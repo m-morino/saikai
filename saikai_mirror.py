@@ -1607,6 +1607,36 @@ document.getElementById('t').addEventListener('pointerdown', (e) => {
 // ESC built at runtime (never a literal ESC byte in this served string — a lone
 // CR/ESC once broke the page; the no-control-byte test guards it).
 const ESC = String.fromCharCode(27);
+// Pane view: honor the child's OSC 52 clipboard writes IN THE BROWSER — this
+// is how claude's own "copy selection" lands on the device you're holding
+// (the host tee also mirrors it to the HOST clipboard; both is right). The
+// text is stashed too: a clipboard write outside a user gesture can be
+// blocked, and the select bar's Copy button (a gesture) re-copies the stash.
+// (#pane-native-select)
+let lastOsc52 = '';
+try {
+  term.parser.registerOscHandler(52, (data) => {
+    try {
+      const i = data.indexOf(';');
+      const b64 = i >= 0 ? data.slice(i + 1) : data;
+      if (!b64 || b64 === '?') return true;      // read query — not a write
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+      const text = new TextDecoder('utf-8').decode(bytes);
+      if (text) {
+        lastOsc52 = text;
+        const ok = copyText(text);
+        const hint = document.getElementById('sel-hint');
+        if (hint) hint.textContent = ok
+          ? ('claude copied ' + text.length + ' chars to your clipboard')
+          : ('claude copied ' + text.length + ' chars — tap Copy to take it');
+      }
+    } catch (e) {}
+    return true;
+  });
+} catch (e) {}
+
 // Pane direct view (#pane-direct): ?view=pane joins the RAW child-PTY channel —
 // this xterm then IS the claude pane's terminal (exact bytes, native mouse
 // reporting, real alt-screen), not a re-render of the whole saikai app.
@@ -1934,9 +1964,10 @@ term.onData((d) => {
   if (paneView) {
     // Everything — keys, xterm-generated mouse reports (the CHILD enabled
     // tracking; its DECSETs rode the raw stream into this term), pastes —
-    // goes verbatim to the child's PTY. Except while selecting: taps drive
-    // the local selection, not the child.
-    if (selectMode && d.match(sgrMouseRe)) return;
+    // goes verbatim to the child's PTY. Mouse reports flow in Select mode
+    // too: pane-view selection IS the child's own smart selection (claude
+    // highlights, edge-scrolls its transcript, and copies via OSC 52) — not
+    // the local block overlay. (#pane-native-select)
     sendRaw(d);
     return;
   }
@@ -1985,7 +2016,22 @@ term.onData((d) => {
   function begin(x, y) {
     lastY = y; accum = 0; pressX = x; pressY = y;
     const cc = cellAt(x, y); scol = cc[0]; srow = cc[1];
-    if (selectMode) { selA = {c: scol, r: srow}; selB = selA; drawSel(); }
+    // Pane view: selection is the CHILD's own (claude) — no local overlay.
+    // Mouse drags reach it through xterm's reporting; touch is synthesized in
+    // the touch handlers below. (#pane-native-select)
+    if (selectMode && !paneView) { selA = {c: scol, r: srow}; selB = selA; drawSel(); }
+  }
+  // Touch → the SGR reports a mouse drag would produce, so the child's own
+  // selection machinery runs for a finger too. Motion deduped per cell.
+  let tSel = null;                    // last synthesized cell, null = no drag
+  function paneSelReport(kind, x, y) {
+    let cc = tSel || [0, 0];
+    if (kind !== 'up') cc = cellAt(x, y);
+    if (kind === 'move' && tSel && tSel[0] === cc[0] && tSel[1] === cc[1]) return;
+    const b = kind === 'move' ? 32 : 0;
+    sendRaw(ESC + '[<' + b + ';' + (cc[0] + 1) + ';' + (cc[1] + 1) +
+            (kind === 'up' ? 'm' : 'M'));
+    tSel = kind === 'up' ? null : cc;
   }
   // SELECT mode: extend the RECTANGLE to the cell under the pointer (block
   // selection — see the model above). Near the top/bottom edge, auto-scroll the
@@ -2092,8 +2138,13 @@ term.onData((d) => {
   }
   function drag(y, x) {                   // returns true once it consumes the move
     if (lastY === null) return false;
-    // Selection is LOCAL (never touches the host) — usable in read-only too.
-    if (selectMode) { selectTo(x, y); return true; }
+    if (selectMode) {
+      // Pane view: a MOUSE drag already reaches the child through xterm's own
+      // reporting (claude runs its selection) — do nothing here. App view:
+      // extend the local block overlay. (#pane-native-select)
+      if (!paneView) selectTo(x, y);
+      return true;
+    }
     if (!controlOn || fatal) return false;
     accum += y - lastY; lastY = y;
     let moved = false;
@@ -2165,15 +2216,27 @@ term.onData((d) => {
   el.addEventListener('touchstart', (e) => {
     if (e.touches.length !== 1) { lastY = null; cancelLongPress(); return; }  // pinch -> browser
     begin(e.touches[0].clientX, e.touches[0].clientY);
+    if (selectMode && paneView) {         // finger drives the CHILD's selection
+      paneSelReport('down', e.touches[0].clientX, e.touches[0].clientY);
+      return;
+    }
     if (!selectMode) armLongPress();      // hold without moving -> context menu (not while selecting)
   }, {passive: true});
   el.addEventListener('touchmove', (e) => {
     if (e.touches.length !== 1) return;
     const tx = e.touches[0].clientX, ty = e.touches[0].clientY;
+    if (selectMode && paneView) {
+      paneSelReport('move', tx, ty);
+      e.preventDefault();
+      return;
+    }
     if (Math.abs(ty - pressY) > 10 || Math.abs(tx - pressX) > 10) cancelLongPress();
     if (drag(ty, tx)) e.preventDefault();  // we consumed this drag (scroll or select)
   }, {passive: false});
-  el.addEventListener('touchend', end, {passive: true});
+  el.addEventListener('touchend', (e) => {
+    if (selectMode && paneView && tSel) paneSelReport('up', 0, 0);
+    end(e);
+  }, {passive: true});
   // Mouse: a held LEFT-button drag scrolls the surface under the cursor. Listens
   // on #t in the bubble phase (xterm's own listeners run first, so taps still
   // become SGR press/release); mouseup is on window so a release outside #t ends
@@ -2281,12 +2344,29 @@ function setSelectMode(on) {
   if (!on) { clearSel(); }
   const sb = document.getElementById('kb-select');
   if (sb) sb.style.background = on ? '#3a3' : '';
+  if (on) {
+    const hint = document.getElementById('sel-hint');
+    // Pane view = the CHILD's smart selection (content-anchored, claude
+    // edge-scrolls its own transcript, copies on release). App view = the
+    // local block overlay. (#pane-native-select)
+    if (hint) hint.textContent = paneView
+      ? 'drag: claude selects & copies (needs CONTROL ON)'
+      : 'drag to select a block';
+  }
   fitChrome();
 }
 document.getElementById('sel-copy').addEventListener('click', (e) => {
   e.preventDefault();
-  const s = blockText();
   const hint = document.getElementById('sel-hint');
+  if (paneView) {
+    // claude already copied via OSC 52 on release; this button re-copies the
+    // stash inside a USER GESTURE for browsers that blocked the async write.
+    if (!lastOsc52) { hint.textContent = 'drag first — claude copies on release'; return; }
+    hint.textContent = copyText(lastOsc52)
+      ? ('copied ' + lastOsc52.length + ' chars') : 'copy failed';
+    return;
+  }
+  const s = blockText();
   if (!s) { hint.textContent = 'nothing selected — drag first'; return; }
   hint.textContent = copyText(s) ? ('copied ' + s.length + ' chars') : 'copy failed';
   if (!coarse) { try { term.focus(); } catch (_) {} }  // give the keyboard back
@@ -2638,15 +2718,23 @@ function fitFont() {
     if (cur !== FIT_BASE) { try { term.options.fontSize = FIT_BASE; } catch (e) {} }
     return;
   }
-  const avail = document.documentElement.clientWidth;
-  const w = scr.getBoundingClientRect().width;
-  if (!avail || !w) return;
-  let want = Math.max(FIT_MIN, Math.min(FIT_MAX, Math.floor(cur * avail / w)));
+  // Fit BOTH axes: the grid must clear the banner AND the key bar — a
+  // width-only fit left the bottom rows hidden behind the bar on short
+  // windows. (#review-fit-height)
+  const availW = document.documentElement.clientWidth;
+  let availH = window.innerHeight - banner.offsetHeight - kbBar.offsetHeight;
+  if (selBar.style.display !== 'none') availH -= selBar.offsetHeight;
+  const r = scr.getBoundingClientRect();
+  if (!availW || availH <= 0 || !r.width || !r.height) return;
+  let want = Math.floor(cur * Math.min(availW / r.width, availH / r.height));
+  want = Math.max(FIT_MIN, Math.min(FIT_MAX, want));
   if (want !== cur) { try { term.options.fontSize = want; } catch (e) {} }
   // one correction pass: font metrics aren't perfectly linear in fontSize
-  const w2 = scr.getBoundingClientRect().width;
-  if (w2 > avail && want > FIT_MIN) {
-    try { term.options.fontSize = Math.max(FIT_MIN, Math.floor(want * avail / w2)); } catch (e) {}
+  const r2 = scr.getBoundingClientRect();
+  if ((r2.width > availW || r2.height > availH) && want > FIT_MIN) {
+    const f2 = Math.max(FIT_MIN, Math.floor(
+      want * Math.min(availW / r2.width, availH / r2.height)));
+    try { term.options.fontSize = f2; } catch (e) {}
   }
 }
 function fitChrome() {

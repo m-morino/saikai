@@ -1239,6 +1239,20 @@ def test_page_pane_view_contracts():
     assert "const FIT_BASE = 15, FIT_MIN = 9, FIT_MAX = 22;" in page
     assert "function fitFont()" in page and "kb-fit" in page
     assert "localStorage.getItem('saikai-fit')" in page
+    # fit accounts for HEIGHT too: the grid must clear banner + key bar
+    # (#review-fit-height)
+    assert "let availH = window.innerHeight - banner.offsetHeight - kbBar.offsetHeight;" in page
+    assert "Math.min(availW / r.width, availH / r.height)" in page
+    # pane view Select = the CHILD's own smart selection (#pane-native-select):
+    # mouse reports pass through even in select mode, touch is synthesized to
+    # SGR press/motion/release, and the child's OSC 52 copy lands in the page
+    assert "function paneSelReport(kind, x, y)" in page
+    assert "registerOscHandler(52," in page and "let lastOsc52 = ''" in page
+    assert "claude selects & copies" in page
+    assert "if (!paneView) selectTo(x, y);" in page, \
+        "app view keeps the local block overlay; pane view defers to the child"
+    assert "if (selectMode && d.match(sgrMouseRe)) return;" not in page, \
+        "select mode must NOT swallow pane-view mouse reports anymore"
     # key bar hugs the terminal's bottom edge when the canvas fits above it
     # (dead space otherwise separates the keys from the content) — #kb-hug
     assert "r.bottom + kbBar.offsetHeight <= window.innerHeight" in page
