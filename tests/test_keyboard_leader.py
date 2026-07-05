@@ -946,6 +946,63 @@ def test_pilot_mirror_arrow_byte_drives_app():
         f"down-arrow byte did not reach on_key to move focus to the list: {facts}"
 
 
+def test_pilot_autorefresh_gate_catches_transcript_growth():
+    """The default-on auto-refresh change signal must flip when a LISTED
+    session's transcript GROWS (a new turn = a flip to 'needs input') and when a
+    NEW session file lands in an EXISTING project dir. A directory mtime bumps
+    only on entry add/remove, so the old dirs-only gate left the '!' attention
+    marker frozen until F5 — the core value silently stale.
+    (#audit-attention-freshness)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_autorefresh_gate_catches_transcript_growth (textual unavailable)")
+        return
+    import asyncio, json, time, uuid
+    from textual.app import App
+
+    sid = _write_demo_session()
+    # find the demo session's transcript path via the loaded index
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 24)) as pilot:
+                await pilot.pause(0.4)
+                s = self._sid_index.get(sid) or next(iter(self._sid_index.values()), None)
+                path = s and s.get("jsonl_path")
+                if not path:
+                    facts["skip"] = "no jsonl path"; return
+                from pathlib import Path as _P
+                p = _P(path)
+                g0 = self._sessions_dirs_mtime()
+                time.sleep(1.1)
+                with open(p, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"type": "user", "cwd": "/w",
+                        "timestamp": "2026-07-01T00:09:00.000Z",
+                        "message": {"role": "user", "content": "waiting?"}}) + "\n")
+                facts["grew"] = self._sessions_dirs_mtime() > g0
+                time.sleep(1.1)
+                g1 = self._sessions_dirs_mtime()
+                (p.parent / f"{uuid.uuid4()}.jsonl").write_text("x\n", encoding="utf-8")
+                facts["new_file"] = self._sessions_dirs_mtime() > g1
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+    if facts.get("skip"):
+        print("SKIP:", facts["skip"]); return
+    assert facts.get("grew") is True, f"gate must flip on transcript growth: {facts}"
+    assert facts.get("new_file") is True, \
+        f"gate must flip on a new session in an existing project: {facts}"
+
+
 def test_pilot_mirror_resize_syncs_size():
     """A terminal resize must reach the mirror hub — it models the host at a
     fixed grid, so a frozen size garbles every absolute-positioned frame.
@@ -2602,6 +2659,7 @@ if __name__ == "__main__":
     print("PASS test_pilot_mirror_text_drives_search")
     test_pilot_mirror_arrow_byte_drives_app()
     print("PASS test_pilot_mirror_arrow_byte_drives_app")
+    test_pilot_autorefresh_gate_catches_transcript_growth()
     test_pilot_mirror_resize_syncs_size()
     test_pilot_mirror_push_regions()
     test_pilot_mirror_checkpoint_pseudo_key()

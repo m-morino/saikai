@@ -25,6 +25,7 @@ import math
 import os
 import re
 import shutil
+import stat as _stat
 import subprocess
 import sys
 import threading
@@ -8842,15 +8843,40 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             _thr.Thread(target=_work, daemon=True).start()
 
         def _sessions_dirs_mtime(self) -> float:
-            """Cheap change signal for auto-refresh: the newest mtime of the live
-            registry dir and the projects root. A session started elsewhere writes
-            ~/.claude/sessions/<pid>.json, bumping the registry dir's mtime — that's
-            what we watch, so a full disk walk runs only when something changed.
-            (#recon-autorefresh)"""
+            """Cheap change signal for auto-refresh — the newest mtime across three
+            layers, because a DIRECTORY mtime only bumps on entry add/remove, NOT
+            on a write to a file inside it:
+              1. the live registry dir (a new interactive session registers a pid);
+              2. every project SUBDIR (a NEW session file bumps its dir — the root
+                 does not, so watching only the root missed new sessions in an
+                 existing project); and
+              3. the KNOWN transcript files (a new TURN — a session flipping to
+                 'needs input' — appends CONTENT, which bumps no directory at all,
+                 so watching dirs alone left the '!' attention marker frozen until
+                 F5: the core value-prop silently stale). Stats known paths from
+                 _sid_index, never a glob/walk. (#audit-attention-freshness)"""
+            import os as _os
             m = 0.0
-            for d in (CLAUDE_CONFIG_ROOT / "sessions", PROJECTS_ROOT):
+            try:
+                m = max(m, (CLAUDE_CONFIG_ROOT / "sessions").stat().st_mtime)
+            except OSError:
+                pass
+            try:
+                for d in PROJECTS_ROOT.iterdir():   # one readdir of the root
+                    try:
+                        st = d.stat()
+                        if _stat.S_ISDIR(st.st_mode):
+                            m = max(m, st.st_mtime)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+            for s in list(getattr(self, "_sid_index", {}).values()):
+                p = s.get("jsonl_path")
+                if not p:
+                    continue
                 try:
-                    m = max(m, d.stat().st_mtime)
+                    m = max(m, _os.stat(p).st_mtime)   # transcript GROWTH (no glob)
                 except OSError:
                     pass
             return m
