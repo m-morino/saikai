@@ -25,6 +25,11 @@ from typing import Optional
 # A control frame travels over the SAME per-client queue as output frames, but
 # wrapped so _stream can send it as a named SSE event instead of base64 output.
 _Control = collections.namedtuple("_Control", ["json"])
+# Host-layout frame: cell-space rectangles of the SCROLLABLE content areas
+# (session list, visible live pane). The select-mode edge auto-scroll needs
+# them — the pane's top/bottom edges live mid-canvas, so a canvas-edge zone
+# never fires for a selection INSIDE the pane. (#mirror-regions)
+_Regions = collections.namedtuple("_Regions", ["json"])
 
 # Brute-force throttle for the SSE write-key: after this many bad attempts,
 # refuse input for a cooldown so a lost/guessed key can't be hammered. (#audit-mirror-ratecap)
@@ -547,6 +552,28 @@ class MirrorHub:
     def set_key_handler(self, fn) -> None:
         # Same GIL-atomic single-attribute pattern as set_input_handler.
         self._key_handler = fn
+
+    def set_regions(self, regions) -> None:
+        """Publish the host's scrollable-region rectangles (cell coords,
+        [{x,y,w,h,k}, …]) to every browser. Deduped: layout pushes ride hot
+        paths (list rebuilds, status polls), so identical layouts are dropped
+        here. Queue-full clients are skipped — regions repeat on the next
+        change and a stale layout only mis-places an edge zone. (#mirror-regions)"""
+        try:
+            j = json.dumps(regions, separators=(",", ":"), sort_keys=True)
+        except Exception:
+            return
+        if j == getattr(self, "_regions_json", None):
+            return
+        self._regions_json = j
+        frame = _Regions(j)
+        with self._clients_lock:
+            targets = list(self._clients)
+        for cq in targets:
+            try:
+                cq.put_nowait(frame)
+            except queue.Full:
+                pass
 
     def set_control_state(self, enabled: bool, target=None) -> bool:
         """Store the advisory control state + focused-pane title and broadcast a
@@ -1140,6 +1167,10 @@ function setBanner(on, target) {
 es.addEventListener('writekey', (e) => {
   try { writeKey = JSON.parse(e.data).key; } catch (_) {}
 });
+let hostRegions = [];        // host scrollable areas in CELL coords (#mirror-regions)
+es.addEventListener('regions', (e) => {
+  try { hostRegions = JSON.parse(e.data) || []; } catch (_) {}
+});
 es.addEventListener('control', (e) => {
   let s = {}; try { s = JSON.parse(e.data); } catch (_) {}
   setBanner(!!s.on, s.target);
@@ -1307,18 +1338,36 @@ term.onData((d) => {
   // the copy is always exactly the on-screen cells in the rectangle.
   let edgeT = null;
   function stopEdge() { if (edgeT) { clearInterval(edgeT); edgeT = null; } }
+  function anchorRegion() {
+    // The host region (cell rect) containing the selection anchor — a drag
+    // inside the claude pane must treat the PANE's rows as its edges, not the
+    // canvas's. (#mirror-regions)
+    const a = selA;
+    if (!a) return null;
+    for (const rg of hostRegions) {
+      if (a.c >= rg.x && a.c < rg.x + rg.w && a.r >= rg.y && a.r < rg.y + rg.h) return rg;
+    }
+    return null;
+  }
   function edgeZone(y) {
-    // The zone is the VISIBLE slice of the terminal: the .xterm-screen box
-    // clamped to #t's padded viewport. On a phone the canvas is BIGGER than
-    // the screen (the host grid renders full-size and #t pans it), so the raw
-    // canvas bottom can sit far below the physical display — the previous
-    // zone was unreachable there. (#mirror-edgezone)
+    // Zone bounds = the anchor's host region (converted cells→pixels) when
+    // published, else the whole canvas — in both cases clamped to #t's padded
+    // viewport (on phones the canvas is BIGGER than the display and #t pans
+    // it, so raw canvas edges can sit off-screen). (#mirror-edgezone)
     const scr = el.querySelector('.xterm-screen') || el;
     const r = scr.getBoundingClientRect();
     const tr = el.getBoundingClientRect();
-    const top = Math.max(r.top, tr.top + (parseFloat(el.style.paddingTop) || 0));
-    const bottom = Math.min(r.bottom, tr.bottom - (parseFloat(el.style.paddingBottom) || 0));
-    return (y < top + 36) ? 'up' : (y > bottom - 36) ? 'down' : null;
+    let top = r.top, bottom = r.bottom;
+    const rg = anchorRegion();
+    if (rg) {
+      const ch = r.height / term.rows;
+      top = r.top + rg.y * ch;
+      bottom = r.top + (rg.y + rg.h) * ch;
+    }
+    top = Math.max(top, tr.top + (parseFloat(el.style.paddingTop) || 0));
+    bottom = Math.min(bottom, tr.bottom - (parseFloat(el.style.paddingBottom) || 0));
+    const band = Math.min(36, Math.max(18, (bottom - top) / 5));
+    return (y < top + band) ? 'up' : (y > bottom - band) ? 'down' : null;
   }
   function edgeScroll(y) {
     const dir = edgeZone(y);
@@ -1350,7 +1399,12 @@ term.onData((d) => {
         return;
       }
       window.__dbg.st2++;
-      const at = selB || {c: scol, r: srow};
+      let at = selB || {c: scol, r: srow};
+      const rg = anchorRegion();
+      if (rg) {
+        at = {c: Math.max(rg.x, Math.min(rg.x + rg.w - 1, at.c)),
+              r: Math.max(rg.y, Math.min(rg.y + rg.h - 1, at.r))};
+      }
       postMouse(at.c, at.r, 0, d === 'down' ? 'scrolldown' : 'scrollup');
     }, 150);
   }
@@ -2005,6 +2059,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send_event("writekey", json.dumps({"key": hub._write_key}))
             self._send_event("control", json.dumps(
                 {"on": hub._control_enabled, "target": hub._control_target}))
+            _rj = getattr(hub, "_regions_json", None)
+            if _rj:
+                self._send_event("regions", _rj)   # current layout for a fresh client
             while True:
                 try:
                     data = cq.get(timeout=30.0)
@@ -2018,6 +2075,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     break
                 if isinstance(data, _Control):   # named control event, not output
                     self._send_event("control", data.json)
+                    continue
+                if isinstance(data, _Regions):   # host-layout event (#mirror-regions)
+                    self._send_event("regions", data.json)
                     continue
                 self._send_frame(data)
         except (BrokenPipeError, ConnectionResetError):

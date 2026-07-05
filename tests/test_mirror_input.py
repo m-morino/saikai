@@ -968,6 +968,14 @@ def test_page_wires_select_mode_and_copy():
     # canvas edge. (#mirror-edgezone)
     assert "scrollTop" in _edge, "stage 1 (local pan) missing"
     assert "lastPY" in _edge, "the tick must re-check the finger position"
+    # Region-aware zones: the host publishes scrollable rects ('regions' SSE);
+    # a selection anchored INSIDE the claude pane must use the PANE's edges
+    # (they sit mid-canvas — the canvas-edge zone never fired there), and the
+    # wheel is posted at a cell clamped INTO that region. (#mirror-regions)
+    assert "hostRegions" in page and "'regions'" in page, "no regions listener"
+    assert "anchorRegion" in page, "zone must follow the anchor's host region"
+    _zone = page[page.index("function anchorRegion"):page.index("function edgeScroll")]
+    assert "rg.y" in _zone and "rg.h" in _zone, "region rows must bound the zone"
     # read-only must SAY why the host won't scroll instead of silently stalling,
     # and &debug=1 exposes live counters for on-machine diagnosis.
     assert "CONTROL ON" in page, "no read-only edge hint"

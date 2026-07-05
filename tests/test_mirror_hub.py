@@ -8,6 +8,33 @@ def _get(url):
     return urllib.request.urlopen(url, timeout=3.0)
 
 
+def test_set_regions_dedups_and_reaches_clients():
+    """set_regions publishes host scrollable rects as a named SSE frame:
+    identical layouts are deduped (it rides hot paths), clients receive a
+    _Regions frame, and a FRESH client gets the current layout on connect
+    (the initial stream sends _regions_json). (#mirror-regions)"""
+    hub = m.MirrorHub(token="t", cols=100, rows=40)
+    import queue as _q
+    cq = _q.Queue(maxsize=8)
+    with hub._clients_lock:
+        hub._clients.add(cq)
+    regs = [{"x": 40, "y": 4, "w": 60, "h": 26, "k": "pane"}]
+    hub.set_regions(regs)
+    frame = cq.get_nowait()
+    assert type(frame).__name__ == "_Regions", frame
+    import json as _json
+    assert _json.loads(frame.json) == regs
+    # dedup: same layout again -> nothing queued
+    hub.set_regions(list(regs))
+    assert cq.empty(), "identical layout must be deduped"
+    # a change flows again
+    hub.set_regions([])
+    assert type(cq.get_nowait()).__name__ == "_Regions"
+    assert hub._regions_json == "[]"
+    with hub._clients_lock:
+        hub._clients.discard(cq)
+
+
 def test_broadcast_is_nonblocking_and_drops_oldest():
     """broadcast() runs on Textual's UI thread; it must NEVER block, even if the
     drain side is stalled. When the bounded ingest queue is full it drops the
@@ -330,6 +357,7 @@ def test_add_client_caps_concurrent_viewers():
 
 
 if __name__ == "__main__":
+    test_set_regions_dedups_and_reaches_clients()
     test_norm_src_collapses_rotatable_identities()
     print("PASS test_norm_src_collapses_rotatable_identities")
     test_read_token_has_its_own_lockout()

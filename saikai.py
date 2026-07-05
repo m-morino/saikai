@@ -7946,6 +7946,39 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
 
+        def _mirror_push_regions(self) -> None:
+            """Publish the scrollable content rectangles (cell coords) to the
+            mirror: the session list and the VISIBLE live pane. The browser's
+            select-mode edge auto-scroll needs the PANE's own edges — they sit
+            mid-canvas, so the canvas-edge zone never fired for a selection
+            inside the claude pane. Hub-side dedup makes this hot-path cheap;
+            called from the list rebuild and the status poll. (#mirror-regions)"""
+            _hub = getattr(self, "_mirror_hub", None)
+            if _hub is None:
+                return
+            regs = []
+            try:
+                r = self.query_one("#table", DataTable).content_region
+                if r.width > 0 and r.height > 0:
+                    regs.append({"x": r.x, "y": r.y, "w": r.width,
+                                 "h": r.height, "k": "list"})
+            except Exception:
+                pass
+            try:
+                if _LIVE_TERM is not None:
+                    for t in self.query(_LIVE_TERM.AgentTerminal):
+                        r = t.content_region
+                        # only the VISIBLE pane (hidden tabs report zero-size)
+                        if r.width > 0 and r.height > 0 and t.display:
+                            regs.append({"x": r.x, "y": r.y, "w": r.width,
+                                         "h": r.height, "k": "pane"})
+            except Exception:
+                pass
+            try:
+                _hub.set_regions(regs)
+            except Exception:
+                pass
+
         def _resync_mirror_target(self) -> None:
             """Keep the mirror CONTROL banner ('typing into: X') honest when focus
             moves or the focused pane closes/dies while control is ON — otherwise
@@ -8485,6 +8518,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             return advanced
 
         def _poll_live_status(self) -> None:
+            self._mirror_push_regions()   # hub dedups; keeps browser zones current (#mirror-regions)
             # Detect background live panes transitioning into "waiting" (needs
             # input) and toast once per transition; keep the list markers live.
             if self._live is None:
