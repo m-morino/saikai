@@ -1268,6 +1268,16 @@ def test_page_pane_view_contracts():
     assert "function paneTracks()" in page   # only a TRACKING child gets synth reports
     assert "if (selectMode && d.match(sgrMouseRe)) return;" not in page, \
         "select mode must NOT swallow pane-view mouse reports anymore"
+    # long-press in the pane = one-shot selection drag, no Select mode
+    # (#longpress-select); quick drags stay scroll; list rows keep the menu
+    assert "function engageLpSel(c, r)" in page
+    assert "if (paneRegionAt(c, r)) engageLpSel(c, r);" in page
+    assert "else openMenu(px, py, c, r);" in page, "list long-press keeps the row menu"
+    assert "function flashHint(msg)" in page and "function copyNote(msg)" in page
+    assert "if (lpSel || paneRegionAt(cc[0], cc[1])) return;" in page, \
+        "contextmenu must not fight the in-pane long-press"
+    assert "cancelLongPress();" in page and "> 10" in page, \
+        "a real move before the hold fires must stay a scroll"
     # cursor calm-down + DEC2026 (#mirror-cursor-flicker #mirror-sync-2026):
     # app view hides the cursor during write bursts (host hid its own cursor
     # before this client connected — xterm's would chase the paint position);

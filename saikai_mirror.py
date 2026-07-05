@@ -1635,6 +1635,26 @@ const ESC = String.fromCharCode(27);
 // blocked, and the select bar's Copy button (a gesture) re-copies the stash.
 // (#pane-native-select)
 let lastOsc52 = '';
+// Small transient toast for gestures that run OUTSIDE the select bar (the
+// long-press selection, its auto-copy confirmation). (#longpress-select)
+const flashEl = document.createElement('div');
+flashEl.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);'+
+  'bottom:35%;z-index:25;display:none;font:bold 14px monospace;color:#dfd;'+
+  'background:#243a24;border:1px solid #4a4;border-radius:8px;padding:6px 14px';
+document.body.appendChild(flashEl);
+let flashT = null;
+function flashHint(msg) {
+  flashEl.textContent = msg;
+  flashEl.style.display = 'block';
+  if (flashT) clearTimeout(flashT);
+  flashT = setTimeout(() => { flashEl.style.display = 'none'; flashT = null; }, 1600);
+}
+function copyNote(msg) {
+  // route to the select bar's hint when it's visible, else the floating toast
+  const hint = document.getElementById('sel-hint');
+  if (hint && selBar.style.display !== 'none') hint.textContent = msg;
+  else flashHint(msg);
+}
 // Pane view, non-tracking child (claude's prompt owns no mouse): xterm does the
 // selection natively — auto-copy it on release so a drag "just copies", the
 // same feel as the app-view pane. Stashed so the Copy button can re-copy inside
@@ -1647,9 +1667,8 @@ try {
     if (!s) return;
     lastOsc52 = s;
     const ok = copyText(s);
-    const hint = document.getElementById('sel-hint');
-    if (hint && selectMode) hint.textContent = ok
-      ? ('copied ' + s.length + ' chars') : (s.length + ' chars — tap Copy');
+    copyNote(ok ? ('copied ' + s.length + ' chars')
+                : (s.length + ' chars selected — tap Copy'));
   });
 } catch (e) {}
 try {
@@ -1665,10 +1684,8 @@ try {
       if (text) {
         lastOsc52 = text;
         const ok = copyText(text);
-        const hint = document.getElementById('sel-hint');
-        if (hint) hint.textContent = ok
-          ? ('claude copied ' + text.length + ' chars to your clipboard')
-          : ('claude copied ' + text.length + ' chars — tap Copy to take it');
+        copyNote(ok ? ('claude copied ' + text.length + ' chars to your clipboard')
+                    : ('claude copied ' + text.length + ' chars — tap Copy to take it'));
       }
     } catch (e) {}
     return true;
@@ -1873,10 +1890,8 @@ es.addEventListener('clip', (e) => {
     if (!text) return;
     lastOsc52 = text;
     const ok = copyText(text);
-    const hint = document.getElementById('sel-hint');
-    if (hint) hint.textContent = ok
-      ? ('claude copied ' + text.length + ' chars to your clipboard')
-      : ('claude copied ' + text.length + ' chars — tap Copy to take it');
+    copyNote(ok ? ('copied ' + text.length + ' chars to your clipboard')
+                : (text.length + ' chars copied — open Select and tap Copy to take it'));
   } catch (_) {}
 });
 
@@ -2308,6 +2323,16 @@ term.onData((d) => {
   }
   function drag(y, x) {                   // returns true once it consumes the move
     if (lastY === null) return false;
+    // a real move before the long-press fires = a scroll gesture, not a hold
+    if (Math.abs(y - pressY) > 10 || Math.abs(x - pressX) > 10) cancelLongPress();
+    if (lpSel) {                          // one-shot long-press selection (#longpress-select)
+      const cc = cellAt(x, y);
+      if (!tSelApp || tSelApp[0] !== cc[0] || tSelApp[1] !== cc[1]) {
+        tSelApp = cc;
+        postMouse(cc[0], cc[1], 1, 'move');
+      }
+      return true;
+    }
     if (selectMode) {
       // Pane view: a MOUSE drag already reaches the child through xterm's own
       // reporting (claude runs its selection) — do nothing here. App view:
@@ -2344,10 +2369,10 @@ term.onData((d) => {
     return moved;
   }
   function end() {
-    if (selPane) {                    // finish the delegated drag with a release
+    if (selPane || lpSel) {           // finish a delegated drag with a release
       const cc = tSelApp || [scol, srow];
       postMouse(cc[0], cc[1], 1, 'up');
-      selPane = false; tSelApp = null;
+      selPane = false; lpSel = false; tSelApp = null;
     }
     lastY = null; cancelLongPress(); stopEdge();
   }
@@ -2359,12 +2384,26 @@ term.onData((d) => {
   let lpTimer = null, menuEl = null;
   function cancelLongPress() { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } }
   function closeMenu() { if (menuEl) { menuEl.remove(); menuEl = null; } }
+  // Long-press INSIDE the claude pane = a one-shot selection drag — no Select
+  // mode needed: hold ~500ms, drag, release → the pane's own selection runs and
+  // auto-copies (the 'clip' relay). Elsewhere (list rows) a long-press keeps
+  // opening the row context menu. (#longpress-select)
+  let lpSel = false;
+  function engageLpSel(c, r) {
+    lpSel = true; tSelApp = [c, r];
+    postMouse(c, r, 1, 'down');
+    flashHint('selecting — drag, release to copy');
+  }
   function armLongPress() {
     if (paneView) return;   // row actions are an app-view concept (#pane-direct)
     if (!controlOn || fatal) return;
     cancelLongPress();
     const c = scol, r = srow, px = pressX, py = pressY;
-    lpTimer = setTimeout(() => { lpTimer = null; openMenu(px, py, c, r); }, 500);
+    lpTimer = setTimeout(() => {
+      lpTimer = null;
+      if (paneRegionAt(c, r)) engageLpSel(c, r);
+      else openMenu(px, py, c, r);
+    }, 500);
   }
   function openMenu(px, py, col, row) {
     if (!controlOn || fatal) return;
@@ -2429,7 +2468,11 @@ term.onData((d) => {
   // on #t in the bubble phase (xterm's own listeners run first, so taps still
   // become SGR press/release); mouseup is on window so a release outside #t ends
   // the drag. Right-click opens the same context menu (the desktop gesture).
-  el.addEventListener('mousedown', (e) => { if (e.button === 0) begin(e.clientX, e.clientY); });
+  el.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    begin(e.clientX, e.clientY);
+    if (!selectMode) armLongPress();   // long-CLICK: hold still ~500ms → in-pane
+  });                                  // selection / row menu (#longpress-select)
   window.addEventListener('mousemove', (e) => {           // window: overlays cover #t
     if (lastY === null || !(e.buttons & 1)) return;        // only while left held
     if (drag(e.clientY, e.clientX)) e.preventDefault();
@@ -2439,6 +2482,10 @@ term.onData((d) => {
     if (!controlOn || fatal || selectMode) return;         // no row-menu while selecting
     e.preventDefault();
     const cc = cellAt(e.clientX, e.clientY);
+    // Inside the claude pane the ROW menu is meaningless, and a mobile
+    // long-press synthesizes contextmenu right when the long-press selection
+    // engages — swallow it there. (#longpress-select)
+    if (lpSel || paneRegionAt(cc[0], cc[1])) return;
     openMenu(e.clientX, e.clientY, cc[0], cc[1]);
   });
 })();
