@@ -973,6 +973,84 @@ def _write_ssh_remote_session() -> str:
     return sid
 
 
+def test_pilot_kill_agent_gated_and_verified():
+    """Ctrl+K terminates a live AGENT process, but ONLY after a confirm and an
+    identity check, and NEVER on a non-agent row. Verifies: (1) a non-bg row
+    refuses with an info toast and pushes no modal; (2) a kind=agent row pushes
+    the KillAgentScreen with the right pid; (3) confirming calls the kill helper
+    with the registry (pid, procStart). The kill helper itself is stubbed so the
+    test signals nothing real. (#agent-kill)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_kill_agent_gated_and_verified (textual unavailable)")
+        return
+    import asyncio, os
+    from textual.app import App
+
+    local_sid = _write_demo_session()
+    agent_sid = _write_demo_session()
+    sdir = _FAKE_HOME / ".claude" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / f"{os.getpid()}.json").write_text(json.dumps(
+        {"pid": os.getpid(), "sessionId": agent_sid, "status": "running",
+         "kind": "agent", "name": "runaway", "procStart": "12345"}), encoding="utf-8")
+    saikai._invalidate_active_sessions()
+    saikai._set_group_by("state")
+    _orig_live = saikai._is_session_pid_live
+    saikai._is_session_pid_live = lambda pid, idx=None: pid == os.getpid()
+    killed = []
+    _orig_kill = saikai._kill_agent_process
+    saikai._kill_agent_process = lambda pid, ps: (killed.append((pid, ps)) or "signalled")
+    facts = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30), notifications=True) as pilot:
+                await pilot.pause(0.4)
+                # (1) non-agent row: focus the local demo, Ctrl+K refuses
+                self._cursor_sid = lambda _s=local_sid: _s
+                self.action_kill_agent()
+                await pilot.pause(0.2)
+                facts["nonbg_no_modal"] = not any(
+                    type(s).__name__ == "KillAgentScreen" for s in self.screen_stack)
+                facts["nonbg_toast"] = any("isn't one" in str(n.message)
+                                           for n in self._notifications)
+                # (2) agent row: Ctrl+K opens the confirm
+                self._cursor_sid = lambda _s=agent_sid: _s
+                self.action_kill_agent()
+                await pilot.pause(0.2)
+                modal = next((s for s in self.screen_stack
+                              if type(s).__name__ == "KillAgentScreen"), None)
+                facts["agent_modal"] = modal is not None
+                # (3) confirm → kill helper called with the registry identity
+                if modal is not None:
+                    modal.dismiss(True)
+                    await pilot.pause(0.2)
+                facts["killed"] = list(killed)
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+        saikai._is_session_pid_live = _orig_live
+        saikai._kill_agent_process = _orig_kill
+        saikai._invalidate_active_sessions()
+        try:
+            (sdir / f"{os.getpid()}.json").unlink()
+        except OSError:
+            pass
+    assert facts.get("nonbg_no_modal") is True and facts.get("nonbg_toast") is True, facts
+    assert facts.get("agent_modal") is True, f"agent row must open the confirm: {facts}"
+    assert facts.get("killed") == [(os.getpid(), "12345")], \
+        f"confirm must kill with the registry (pid, procStart): {facts}"
+
+
 def test_pilot_agents_kind_groups_and_refusal():
     """claude's agents feature registers live sessions with kind="agent": they
     must (1) group under their own "Agents" section — not pollute "Open", which
@@ -2816,6 +2894,7 @@ if __name__ == "__main__":
     test_pilot_mirror_arrow_byte_drives_app()
     print("PASS test_pilot_mirror_arrow_byte_drives_app")
     test_pilot_agents_kind_groups_and_refusal()
+    test_pilot_kill_agent_gated_and_verified()
     test_pilot_remote_origin_badge_and_resume_block()
     test_pilot_autorefresh_gate_catches_transcript_growth()
     test_pilot_mirror_resize_syncs_size()

@@ -25,6 +25,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import stat as _stat
 import subprocess
 import sys
@@ -1768,6 +1769,7 @@ def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
 
 _active_sessions_cache: dict[str, str] | None = None
 _active_kinds_cache: "dict[str, str] | None" = None   # sid -> kind ("interactive" | "bg" | …)
+_active_procinfo_cache: "dict[str, tuple] | None" = None   # sid -> (pid, procStart) for a verified kill (#agent-kill)
 _active_jobids_cache: "dict[str, str] | None" = None   # sid -> jobId (bg sessions → ~/.claude/jobs/<jobId>/)
 _active_remote_cache: set[str] | None = None   # live sids with bridgeSessionId (Remote Control)
 _active_names_cache: "dict[str, str] | None" = None   # sid -> Claude's own session name (the switcher label)
@@ -1781,11 +1783,12 @@ def _load_active_sessions() -> dict[str, str]:
     "bg" (a headless background agent/job) | … — the kind is exposed separately via
     _active_session_kinds (a `bg` session is live but NOT resumable / attachable)."""
     global _active_sessions_cache, _active_kinds_cache, _active_jobids_cache
-    global _active_remote_cache, _active_names_cache
+    global _active_remote_cache, _active_names_cache, _active_procinfo_cache
     if _active_sessions_cache is not None:
         return _active_sessions_cache
     out: dict[str, str] = {}
     kinds: dict[str, str] = {}
+    procinfo: dict[str, tuple] = {}
     jobids: dict[str, str] = {}
     remote: set[str] = set()
     names: dict[str, str] = {}
@@ -1809,6 +1812,9 @@ def _load_active_sessions() -> dict[str, str]:
                     if pid and sid and _is_session_pid_live(int(pid), pid_index):
                         out[sid] = status
                         kinds[sid] = d.get("kind", "")
+                        # (pid, procStart) identifies the process for a verified
+                        # kill — procStart is the pid-reuse guard. (#agent-kill)
+                        procinfo[sid] = (int(pid), str(d.get("procStart", "")))
                         _jid = d.get("jobId")
                         if _jid:
                             jobids[sid] = str(_jid)
@@ -1835,6 +1841,7 @@ def _load_active_sessions() -> dict[str, str]:
     if scanned_ok:
         _active_sessions_cache = out
         _active_kinds_cache = kinds
+        _active_procinfo_cache = procinfo
         _active_jobids_cache = jobids
         _active_remote_cache = remote
         _active_names_cache = names
@@ -1879,6 +1886,84 @@ def _active_session_kinds() -> dict:
     return _active_kinds_cache or {}
 
 
+def _active_procinfo() -> dict:
+    """sid -> (pid, procStart) for the live registry entries. (#agent-kill)"""
+    _load_active_sessions()
+    return _active_procinfo_cache or {}
+
+
+def _proc_start_matches(pid: int, procstart: str) -> bool:
+    """True if `pid` is STILL the process the registry recorded — the pid-reuse
+    guard for a kill. claude stores the OS process-start identity in `procStart`;
+    on Linux that's /proc/<pid>/stat field 22 (start time in clock ticks since
+    boot), compared exactly. Without a recorded procStart, or off Linux where we
+    can't cheaply read it, fall back to the image-name check (weaker but the only
+    cross-platform signal). Never raises. (#agent-kill)"""
+    if pid <= 0:
+        return False
+    ps = (procstart or "").strip()
+    if sys.platform.startswith("linux") and ps.isdigit():
+        try:
+            fields = (_PROC_ROOT / str(pid) / "stat").read_text(
+                encoding="utf-8", errors="replace").rsplit(")", 1)[-1].split()
+            # after "comm)" the fields are state ppid … starttime = overall field
+            # 22 = index 19 in this post-")" slice.
+            return fields[19] == ps
+        except (FileNotFoundError, IndexError):
+            return False
+        except OSError:
+            pass
+    if sys.platform == "win32":
+        idx = _win_pid_index()
+        info = idx.get(pid) if idx else None
+        nm = (info[0] if info else "")
+        return bool(nm) and (nm in _CLAUDE_PROC_NAMES or nm.startswith("claude"))
+    return _linux_pid_is_claude(pid) if sys.platform.startswith("linux") else _is_pid_alive(pid)
+
+
+def _kill_agent_process(pid: int, procstart: str) -> str:
+    """Terminate a live AGENT/bg session's process by pid, off the UI thread.
+    Verifies the (pid, procStart) identity FIRST so a recycled pid is never
+    signalled. POSIX: SIGTERM the PID only (never the group — an external fork
+    may share the parent claude's group; the bare PID can't take the parent
+    down), then SIGKILL after a grace period if it survives. Windows: taskkill
+    /T /F by pid (the agent + its own workers, not its ancestors). Returns a
+    short outcome for the toast. (#agent-kill)"""
+    if not _proc_start_matches(pid, procstart):
+        return "stale"
+    if sys.platform == "win32":
+        import subprocess
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            return "error"
+        return "signalled"
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "gone"
+    except Exception:
+        return "error"
+
+    def _escalate():
+        import time as _t
+        for _ in range(15):                 # ~1.5s grace for a clean SIGTERM exit
+            _t.sleep(0.1)
+            if not _is_pid_alive(pid):
+                return
+        if _proc_start_matches(pid, procstart):   # re-verify before the hard kill
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+    import threading as _thr
+    _thr.Thread(target=_escalate, daemon=True, name="saikai-agent-reap").start()
+    return "signalled"
+
+
 def _active_remote_sessions() -> set[str]:
     """Live session ids whose Claude registry entry has Remote Control enabled."""
     _load_active_sessions()
@@ -1891,7 +1976,7 @@ def _invalidate_active_sessions() -> None:
     stay frozen at the launch-time snapshot for the whole picker lifetime (a
     session that exited elsewhere keeps showing Open/Running)."""
     global _active_sessions_cache, _active_kinds_cache, _active_jobids_cache
-    global _active_remote_cache, _active_names_cache
+    global _active_remote_cache, _active_names_cache, _active_procinfo_cache
     _active_sessions_cache = None
     _active_kinds_cache = None
     _active_jobids_cache = None
@@ -5230,6 +5315,41 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def action_cancel(self) -> None:
             self.dismiss(False)
 
+    class KillAgentScreen(ModalScreen):
+        """Confirm terminating a live AGENT/bg process (kind=agent/bg, the &
+        marker). This signals a process saikai did NOT spawn, so it's gated by an
+        explicit confirm; the parent interactive claude is never affected (only
+        the agent fork's own pid is signalled). Enter kills, Esc cancels.
+        (#agent-kill)"""
+        CSS = """
+        KillAgentScreen { align: center middle; }
+        #ka-box { background: $panel; border: solid $error; padding: 1 2;
+                  width: 78; max-width: 96%; height: auto; }
+        """
+        BINDINGS = [Binding("enter", "proceed", show=False),
+                    Binding("escape", "cancel", show=False)]
+
+        def __init__(self, title: str, pid: int):
+            super().__init__()
+            self._title = title or "this agent"
+            self._pid = pid
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="ka-box"):
+                yield Static("[bold red]Kill agent process[/bold red]")
+                yield Static(f"[dim]Terminate '{_esc_markup(self._title)}' "
+                             f"(pid {self._pid})? This is a background agent owned "
+                             "by its parent claude — the parent and your interactive "
+                             "session keep running; only this agent stops. Unsaved "
+                             "agent work is lost.[/dim]")
+                yield Static("[dim]Enter kills · Esc cancels[/dim]")
+
+        def action_proceed(self) -> None:
+            self.dismiss(True)
+
+        def action_cancel(self) -> None:
+            self.dismiss(False)
+
     class NotificationsScreen(ModalScreen):
         """Recent-notifications recall (F11). Toasts auto-dismiss; this lists the
         ones that already vanished — newest first, with time + severity colour —
@@ -5535,6 +5655,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("f10", "close_live", "Close tab", id="close", show=False, priority=True),
             Binding("f11", "notifications", "Notifs", id="notifs", show=False, priority=True),
             Binding("shift+f10", "close_all_live", "Close all", id="close_all", show=False, priority=True),
+            # Ctrl+K: terminate the focused row's AGENT/bg process (kind=agent/bg —
+            # the & marker). Confirmed, identity-verified; never touches an
+            # interactive claude. (#agent-kill)
+            Binding("ctrl+k", "kill_agent", "Kill agent", id="kill_agent", show=False, priority=True),
             Binding("f2", "prev_tab", "◀Tab", id="prev_tab", show=False, priority=True),
             Binding("f3", "next_tab", "Tab▶", id="next_tab", show=False, priority=True),
             Binding("shift+f3", "next_attention", "Next!", id="attention", show=False, priority=True),
@@ -8413,6 +8537,49 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # meta flips (closed / next pane), and remote input can't fall into
             # the pty-None window until the next poll. (#review-dead-pane-window)
             self._mirror_sync_pane()
+
+        def action_kill_agent(self) -> None:
+            """Ctrl+K: terminate the focused row's live agent/bg process. Only
+            valid on an is_bg session (kind=agent/bg, the & marker) — refuse
+            anything else so a stray Ctrl+K can never signal an interactive
+            claude or a dormant transcript. Confirmed + identity-verified.
+            (#agent-kill)"""
+            if isinstance(self.focused, Select):
+                raise SkipAction()
+            sid = self._cursor_sid()
+            s = self._sid_index.get(sid) if sid else None
+            if not s:
+                return
+            if not s.get("is_bg"):
+                self.notify("Ctrl+K terminates a running AGENT (the & marker); "
+                            "this row isn't one", severity="information",
+                            title="saikai", timeout=5)
+                return
+            info = _active_procinfo().get(sid)
+            if not info:
+                self.notify("agent already ended", timeout=4)
+                self.action_refresh()
+                return
+            pid, procstart = info
+            title = _pane_title(s, sid, None)
+
+            def _do(ok: bool, _pid=pid, _ps=procstart, _sid=sid, _t=title):
+                if not ok:
+                    return
+                res = _kill_agent_process(_pid, _ps)
+                _log(f"kill agent {_sid[:8]} pid={_pid}: {res}")
+                if res in ("signalled",):
+                    self.notify(f"terminating agent '{_t}' (pid {_pid})", timeout=5)
+                elif res in ("gone", "stale"):
+                    self.notify("agent already ended", timeout=4)
+                else:
+                    self.notify(f"could not terminate pid {_pid}",
+                                severity="error", title="saikai", timeout=6)
+                # let the registry entry drop, then refresh so & clears / row
+                # becomes resumable
+                self.set_timer(2.2, self.action_refresh)
+
+            self.push_screen(KillAgentScreen(title, pid), _do)
 
         def action_close_all_live(self) -> None:
             # Shift+F10: close ALL live panes at once (parallel kill) but STAY in
