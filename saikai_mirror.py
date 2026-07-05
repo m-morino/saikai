@@ -30,6 +30,10 @@ _Control = collections.namedtuple("_Control", ["json"])
 # them — the pane's top/bottom edges live mid-canvas, so a canvas-edge zone
 # never fires for a selection INSIDE the pane. (#mirror-regions)
 _Regions = collections.namedtuple("_Regions", ["json"])
+# Size frame: the host terminal was resized. The browser xterm was sized at
+# page load and stays fixed otherwise, so absolute-positioned host ANSI would
+# garble against a stale grid — it must re-size live. (#mirror-resize)
+_Size = collections.namedtuple("_Size", ["json"])
 
 # Brute-force throttle for the SSE write-key: after this many bad attempts,
 # refuse input for a cooldown so a lost/guessed key can't be hammered. (#audit-mirror-ratecap)
@@ -529,8 +533,20 @@ class MirrorHub:
 
     def set_size(self, cols: int, rows: int) -> None:
         with self._mirror_lock:
+            if (cols, rows) == (self._cols, self._rows):
+                return                        # unchanged — no reflow, no broadcast
             self._cols, self._rows = cols, rows
             self._screen.resize(rows, cols)   # pyte: (lines, columns)
+        # Tell every live browser to resize its xterm (fresh clients read the
+        # new size from the page's data-cols/rows on connect). (#mirror-resize)
+        frame = _Size(json.dumps({"cols": cols, "rows": rows}))
+        with self._clients_lock:
+            targets = list(self._clients)
+        for cq in targets:
+            try:
+                cq.put_nowait(frame)
+            except queue.Full:
+                pass
 
     def set_repaint_request(self, fn) -> None:
         # Written from the UI thread (on_mount), read from the HTTP server thread
@@ -1166,6 +1182,12 @@ function setBanner(on, target) {
 
 es.addEventListener('writekey', (e) => {
   try { writeKey = JSON.parse(e.data).key; } catch (_) {}
+});
+es.addEventListener('size', (e) => {          // host terminal resized (#mirror-resize)
+  try {
+    const s = JSON.parse(e.data);
+    if (s.cols > 0 && s.rows > 0) { term.resize(s.cols, s.rows); fitChrome(); }
+  } catch (_) {}
 });
 let hostRegions = [];        // host scrollable areas in CELL coords (#mirror-regions)
 es.addEventListener('regions', (e) => {
@@ -2078,6 +2100,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     continue
                 if isinstance(data, _Regions):   # host-layout event (#mirror-regions)
                     self._send_event("regions", data.json)
+                    continue
+                if isinstance(data, _Size):      # host resized (#mirror-resize)
+                    self._send_event("size", data.json)
                     continue
                 self._send_frame(data)
         except (BrokenPipeError, ConnectionResetError):

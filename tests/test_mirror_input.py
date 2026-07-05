@@ -972,6 +972,8 @@ def test_page_wires_select_mode_and_copy():
     # a selection anchored INSIDE the claude pane must use the PANE's edges
     # (they sit mid-canvas — the canvas-edge zone never fired there), and the
     # wheel is posted at a cell clamped INTO that region. (#mirror-regions)
+    # a host resize must live-resize the browser xterm (fixed-size otherwise).
+    assert "'size'" in page and "term.resize(" in page, "no live-resize listener"
     assert "hostRegions" in page and "'regions'" in page, "no regions listener"
     assert "anchorRegion" in page, "zone must follow the anchor's host region"
     _zone = page[page.index("function anchorRegion"):page.index("function edgeScroll")]

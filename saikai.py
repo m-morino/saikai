@@ -6664,6 +6664,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             return [sid] if sid else []
 
         def _apply_split_ratio(self, ratio: float) -> None:
+            self.call_after_refresh(self._mirror_sync_geometry)  # regions moved (#mirror-regions)
             """Set the list width to `ratio` of #main (the pane is 1fr → it
             absorbs the rest). Inline style beats the CSS width rule."""
             try:
@@ -7946,6 +7947,44 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
 
+        def on_resize(self, event=None) -> None:
+            # The terminal changed size (window/font resize) — the mirror models
+            # the host at a FIXED grid, so it must be told NOW or every frame
+            # garbles until the next poll. Read the size from the EVENT: self.size
+            # may not have committed the new value yet inside this handler.
+            # (#mirror-resize)
+            _hub = getattr(self, "_mirror_hub", None)
+            if _hub is None:
+                return
+            try:
+                sz = getattr(event, "size", None) if event is not None else None
+                w = sz.width if sz is not None else self.size.width
+                h = sz.height if sz is not None else self.size.height
+                _hub.set_size(w, h)
+            except Exception:
+                pass
+            # regions read content_region, which settles after this reflow —
+            # push them once layout is done.
+            try:
+                self.call_after_refresh(self._mirror_push_regions)
+            except Exception:
+                pass
+
+        def _mirror_sync_geometry(self) -> None:
+            """Push the host geometry the mirror can't otherwise know: terminal
+            SIZE (a resize reflows every absolute-positioned frame — a frozen
+            browser grid garbles) AND the scrollable region rects. One sync
+            called from every layout-changing event + the poll backstop; the hub
+            dedups both, so spamming it is cheap. (#mirror-resize #mirror-regions)"""
+            _hub = getattr(self, "_mirror_hub", None)
+            if _hub is None:
+                return
+            try:
+                _hub.set_size(self.size.width, self.size.height)
+            except Exception:
+                pass
+            self._mirror_push_regions()
+
         def _mirror_push_regions(self) -> None:
             """Publish the scrollable content rectangles (cell coords) to the
             mirror: the session list and the VISIBLE live pane. The browser's
@@ -8518,7 +8557,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             return advanced
 
         def _poll_live_status(self) -> None:
-            self._mirror_push_regions()   # hub dedups; keeps browser zones current (#mirror-regions)
+            self._mirror_sync_geometry()  # hub dedups; tracks resize + layout (#mirror-resize)
             # Detect background live panes transitioning into "waiting" (needs
             # input) and toast once per transition; keep the list markers live.
             if self._live is None:

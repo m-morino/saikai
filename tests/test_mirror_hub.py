@@ -8,6 +8,27 @@ def _get(url):
     return urllib.request.urlopen(url, timeout=3.0)
 
 
+def test_set_size_broadcasts_and_dedups():
+    """A host resize must reach live browsers: set_size broadcasts a _Size frame
+    (the xterm is fixed-size otherwise, so absolute host ANSI garbles), deduped
+    on an unchanged size. Fresh clients read the size from the page's data-*
+    attrs on connect. (#mirror-resize)"""
+    hub = m.MirrorHub(token="t", cols=100, rows=40)
+    import queue as _q, json as _json
+    cq = _q.Queue(maxsize=8)
+    with hub._clients_lock:
+        hub._clients.add(cq)
+    hub.set_size(120, 50)
+    frame = cq.get_nowait()
+    assert type(frame).__name__ == "_Size", frame
+    assert _json.loads(frame.json) == {"cols": 120, "rows": 50}
+    assert (hub._cols, hub._rows) == (120, 50)
+    hub.set_size(120, 50)                 # unchanged -> deduped
+    assert cq.empty(), "unchanged size must not rebroadcast"
+    with hub._clients_lock:
+        hub._clients.discard(cq)
+
+
 def test_set_regions_dedups_and_reaches_clients():
     """set_regions publishes host scrollable rects as a named SSE frame:
     identical layouts are deduped (it rides hot paths), clients receive a
@@ -357,6 +378,7 @@ def test_add_client_caps_concurrent_viewers():
 
 
 if __name__ == "__main__":
+    test_set_size_broadcasts_and_dedups()
     test_set_regions_dedups_and_reaches_clients()
     test_norm_src_collapses_rotatable_identities()
     print("PASS test_norm_src_collapses_rotatable_identities")
