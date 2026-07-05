@@ -27,6 +27,10 @@ dependencies = [
     "ptyprocess>=0.7 ; sys_platform != 'win32'",
     "platformdirs>=3.6",
     "segno>=1.6.6",
+    # In-process TLS cert minting for the LAN mirror (TLS is on by default). Bundled
+    # so https works on Windows too, where the openssl CLI usually isn't on PATH —
+    # openssl is only a fallback. (#review-tls-windows)
+    "cryptography>=41",
 ]
 
 [project.scripts]

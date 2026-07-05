@@ -363,11 +363,25 @@ def test_resolve_tls_paths_precedence():
     assert m.resolve_tls_paths(
         {"SAIKAI_MIRROR_TLS_CERT": str(d / "nope.pem"),
          "SAIKAI_MIRROR_TLS_KEY": str(key)}, d) is None
-    # no cert env → self-sign via openssl when present; skip the assert if absent.
+    # no cert env → self-sign in-process. This must work with NO openssl binary
+    # (the Windows case that used to fall back to plain HTTP). (#review-tls-windows)
     import shutil
-    if shutil.which("openssl"):
-        auto = m.resolve_tls_paths({}, d / "auto")
-        assert auto is not None and Path(auto[0]).is_file() and Path(auto[1]).is_file()
+    _real_which = shutil.which
+    shutil.which = lambda n: None if n == "openssl" else _real_which(n)
+    try:
+        auto = m.resolve_tls_paths({}, d / "auto", "192.168.1.50")
+    finally:
+        shutil.which = _real_which
+    assert auto is not None, "self-sign must work without the openssl binary"
+    assert Path(auto[0]).is_file() and Path(auto[1]).is_file()
+    # the minted cert loads into a TLS server, covers the host, and is valid
+    import ssl as _ssl
+    _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER).load_cert_chain(auto[0], auto[1])
+    assert m._cert_covers(auto[0], {"127.0.0.1", "192.168.1.50"})
+    assert m._cert_valid_for(auto[0], 3600)
+    import os as _os
+    if _os.name == "posix":
+        assert (_os.stat(auto[1]).st_mode & 0o077) == 0, "key must be owner-only"
 
 
 def test_add_client_caps_concurrent_viewers():

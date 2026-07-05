@@ -1222,43 +1222,105 @@ def _cert_covers(certf: str, ips: set) -> bool:
     return ips.issubset(san_ips)
 
 
-def _gen_self_signed(cache_dir, host: str = "") -> "tuple[str, str] | None":
-    """A cached self-signed cert/key under cache_dir, generated via openssl (the
-    stdlib can serve TLS but can't MINT a cert). Reused across runs while still
-    valid AND still covering the current host, so the browser isn't asked to
-    re-trust every launch but a network change forces a fresh cert. Returns
-    (cert, key) or None when openssl is absent / generation fails → caller warns
-    and stays HTTP. An EC P-256 key (near-instant keygen, cheap handshake) keeps
-    startup fast on a Pi and blunts TLS-handshake CPU amplification."""
-    import os as _os
-    import shutil
-    from pathlib import Path
+def _cert_valid_for(certf: str, min_secs: float) -> bool:
+    """True if certf is still valid for at least min_secs — WITHOUT openssl (uses
+    only the stdlib ssl module), so a cached cert can be re-validated on a host
+    (Windows) that has no openssl binary. (#review-tls-windows)"""
     try:
-        d = Path(cache_dir)
-        d.mkdir(parents=True, exist_ok=True)
+        import ssl
+        import time as _t
+        txt = ssl._ssl._test_decode_cert(certf)   # dict incl. notAfter
+        na = txt.get("notAfter")
+        if not na:
+            return False
+        return ssl.cert_time_to_seconds(na) - _t.time() > min_secs
+    except Exception:
+        return False
+
+
+def _write_cert_key(certf: str, keyf: str, cert_pem: bytes, key_pem: bytes) -> bool:
+    """Write the key (owner-only, before the world-readable cert) then the cert.
+    The umask narrows the private key's mode for the window before the chmod — a
+    TOCTOU a local user / backup job could otherwise exploit. POSIX-only; umask
+    is effectively a no-op on Windows but harmless."""
+    import os as _os
+    old_umask = None
+    try:
+        old_umask = _os.umask(0o077)
+    except (AttributeError, OSError):
+        old_umask = None
+    try:
+        with open(keyf, "wb") as f:
+            f.write(key_pem)
+        with open(certf, "wb") as f:
+            f.write(cert_pem)
     except OSError:
-        return None
-    certf, keyf = d / "mirror-cert.pem", d / "mirror-key.pem"
-    ips = {"127.0.0.1"}
-    lan = _lan_ip()
-    if lan and lan != "127.0.0.1":
-        ips.add(lan)
-    if host and host not in ("0.0.0.0", "", "::", "127.0.0.1", "localhost"):
-        ips.add(host)
-    if certf.is_file() and keyf.is_file():
-        # Reuse only if it's valid for another hour AND still covers this host.
-        if (_openssl_run(["openssl", "x509", "-checkend", "3600", "-noout",
-                          "-in", str(certf)], 5) == 0
-                and _cert_covers(str(certf), ips)):
-            return (str(certf), str(keyf))
+        return False
+    finally:
+        if old_umask is not None:
+            try:
+                _os.umask(old_umask)
+            except OSError:
+                pass
+    try:
+        _os.chmod(keyf, 0o600)
+    except OSError:
+        pass
+    return True
+
+
+def _gen_self_signed_py(certf: str, keyf: str, ips: set) -> bool:
+    """Mint a P-256 self-signed cert/key IN-PROCESS via `cryptography` — no
+    openssl binary, so TLS-by-default works on Windows (where openssl usually
+    isn't on PATH) with nothing extra to install. Returns True on success, False
+    if cryptography is unavailable or minting fails (caller then tries openssl).
+    (#review-tls-windows)"""
+    try:
+        import datetime
+        import ipaddress as _ip
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+    except Exception:
+        return False
+    try:
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "saikai-mirror")])
+        sans = [x509.DNSName("localhost")]
+        for ip in sorted(ips):
+            try:
+                sans.append(x509.IPAddress(_ip.ip_address(ip)))
+            except ValueError:
+                pass
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (x509.CertificateBuilder()
+                .subject_name(name).issuer_name(name)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now - datetime.timedelta(minutes=5))
+                .not_valid_after(now + datetime.timedelta(days=365))
+                .add_extension(x509.SubjectAlternativeName(sans), critical=False)
+                .sign(key, hashes.SHA256()))
+        key_pem = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption())
+        cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    except Exception:
+        return False
+    return _write_cert_key(certf, keyf, cert_pem, key_pem)
+
+
+def _gen_self_signed_openssl(certf: str, keyf: str, ips: set) -> bool:
+    """Mint the cert/key via the openssl CLI — the fallback when `cryptography`
+    isn't importable. An EC P-256 key keeps keygen near-instant on a Pi."""
+    import shutil
     if not shutil.which("openssl"):
-        return None
+        return False
+    import os as _os
     san = "subjectAltName=" + ",".join(
         ["DNS:localhost"] + [f"IP:{ip}" for ip in sorted(ips)])
-    # Restrict the umask so the private key is NEVER group/world-readable, even in
-    # the window between openssl creating it and the chmod below (a TOCTOU an
-    # unprivileged local user / backup job could otherwise exploit). POSIX-only;
-    # os.umask is a no-op-ish on Windows but harmless.
     old_umask = None
     try:
         old_umask = _os.umask(0o077)
@@ -1268,7 +1330,7 @@ def _gen_self_signed(cache_dir, host: str = "") -> "tuple[str, str] | None":
         rc = _openssl_run(
             ["openssl", "req", "-x509", "-newkey", "ec",
              "-pkeyopt", "ec_paramgen_curve:P-256", "-sha256", "-days", "365",
-             "-nodes", "-keyout", str(keyf), "-out", str(certf),
+             "-nodes", "-keyout", keyf, "-out", certf,
              "-subj", "/CN=saikai-mirror", "-addext", san], 30)
     finally:
         if old_umask is not None:
@@ -1277,12 +1339,41 @@ def _gen_self_signed(cache_dir, host: str = "") -> "tuple[str, str] | None":
             except OSError:
                 pass
     if rc != 0:
-        return None
+        return False
     try:
         _os.chmod(keyf, 0o600)
     except OSError:
         pass
-    return (str(certf), str(keyf))
+    return True
+
+
+def _gen_self_signed(cache_dir, host: str = "") -> "tuple[str, str] | None":
+    """A cached self-signed cert/key under cache_dir. Minted IN-PROCESS via
+    `cryptography` (works on every platform incl. Windows with no openssl binary),
+    falling back to the openssl CLI, then to None (caller warns + stays HTTP).
+    Reused across runs while still valid AND still covering the current host, so
+    the browser isn't re-asked to trust every launch but a network change forces
+    a fresh cert. (#review-tls-windows)"""
+    from pathlib import Path
+    try:
+        d = Path(cache_dir)
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    certf, keyf = str(d / "mirror-cert.pem"), str(d / "mirror-key.pem")
+    ips = {"127.0.0.1"}
+    lan = _lan_ip()
+    if lan and lan != "127.0.0.1":
+        ips.add(lan)
+    if host and host not in ("0.0.0.0", "", "::", "127.0.0.1", "localhost"):
+        ips.add(host)
+    if (Path(certf).is_file() and Path(keyf).is_file()
+            and _cert_valid_for(certf, 3600) and _cert_covers(certf, ips)):
+        return (certf, keyf)      # reuse: still valid for an hour AND covers host
+    if _gen_self_signed_py(certf, keyf, ips) or \
+            _gen_self_signed_openssl(certf, keyf, ips):
+        return (certf, keyf)
+    return None
 
 
 def resolve_tls_paths(env: dict, cache_dir, host: str = "") -> "tuple[str, str] | None":
@@ -1290,8 +1381,8 @@ def resolve_tls_paths(env: dict, cache_dir, host: str = "") -> "tuple[str, str] 
 
     Precedence: an explicit SAIKAI_MIRROR_TLS_CERT + _KEY pair (both must exist —
     a named-but-missing pair returns None rather than silently self-signing) → an
-    openssl-generated self-signed cert cached under cache_dir → None. Only meaningful
-    when mirror_tls_enabled(env)."""
+    in-process self-signed cert cached under cache_dir (cryptography, else the
+    openssl CLI) → None. Only meaningful when mirror_tls_enabled(env)."""
     import os as _os
     cert = str(env.get("SAIKAI_MIRROR_TLS_CERT", "")).strip()
     key = str(env.get("SAIKAI_MIRROR_TLS_KEY", "")).strip()
