@@ -1577,6 +1577,10 @@ const ESC = String.fromCharCode(27);
 // this xterm then IS the claude pane's terminal (exact bytes, native mouse
 // reporting, real alt-screen), not a re-render of the whole saikai app.
 const paneView = new URLSearchParams(location.search).get('view') === 'pane';
+// Fit-to-width state (used by the key bar toggle AND fitChrome's fitFont —
+// declared up here so both are past its TDZ regardless of load order). (#kb-fit)
+let fitOn = true;
+try { fitOn = localStorage.getItem('saikai-fit') !== '0'; } catch (e) {}
 // Turn on mouse tracking (VT200 button + SGR encoding) by writing the DECSET
 // enable into the terminal: xterm's core mouse service then attaches its own
 // DOM listeners and reports taps/scrolls as ESC[<b;col;row(M|m) via onData.
@@ -2332,6 +2336,7 @@ kbBar.innerHTML =
   // list (these work when the list, not a pane, is focused).
   '<div class="kb-row" id="kb2" style="display:none;flex-wrap:wrap">'+
     '<button id="kb-view" data-k="">Pane view</button>'+
+    '<button id="kb-fit" data-k="">Fit</button>'+
     '<button id="kb-hand" data-k="">&#8644; Right</button>'+
     '<button data-k="slash">Find</button>'+
     '<button data-k="f5">Refresh</button>'+
@@ -2368,6 +2373,13 @@ try {
 } catch (e) {}
 const kbCtrl = document.getElementById('kb-ctrl');
 const kbMore = document.getElementById('kb-more');
+function applyFitLabel() {
+  const fb = document.getElementById('kb-fit');
+  if (!fb) return;
+  fb.textContent = fitOn ? 'Fit' : '1:1';
+  fb.style.background = fitOn ? '#3a3' : '';
+}
+applyFitLabel();
 if (paneView) {   // the toggle names the view a press switches TO
   const vb = document.getElementById('kb-view');
   if (vb) { vb.textContent = 'App view'; vb.style.background = '#3a3'; }
@@ -2539,6 +2551,13 @@ kbBar.querySelectorAll('button').forEach((b) => {
       location.href = u.toString();
       return;
     }
+    if (b.id === 'kb-fit') {                  // Fit-to-width <-> 1:1 glyphs (#kb-fit)
+      fitOn = !fitOn;
+      try { localStorage.setItem('saikai-fit', fitOn ? '1' : '0'); } catch (e) {}
+      applyFitLabel();
+      fitChrome();
+      return;
+    }
     if (b.id === 'kb-hand') {                 // mirror the bars for the other thumb
       hand = (hand === 'L') ? 'R' : 'L';
       try { localStorage.setItem('saikai-hand', hand); } catch (e) {}
@@ -2568,9 +2587,38 @@ kbBar.querySelectorAll('button').forEach((b) => {
 // is measured (not assumed) and re-measured on resize/rotate. #t scrolls
 // (overflow:auto), so the reserved padding lets the last rows clear the bar
 // instead of hiding under it.
+// ── Fit-to-width (#kb-fit): scale the FONT so the whole grid fits the window
+//    width — cols/rows never change (the browser is a follower; the HOST owns
+//    the terminal size), only the glyph size does. Clamped to a readability
+//    floor: below it the canvas overflows and pans exactly as before (phones
+//    showing a 140-col host). Toggleable to 1:1 from the More row; persisted
+//    per browser. Re-fit runs on every fitChrome trigger — window resize, the
+//    host 'size' frame, pane-meta resize, bar open/close — so a HOST terminal
+//    resize re-fits too. (fitOn is declared at the top of the script.) ───────
+const FIT_BASE = 15, FIT_MIN = 9, FIT_MAX = 22;
+function fitFont() {
+  const scr = document.querySelector('.xterm-screen');
+  if (!scr || !term.element) return;
+  const cur = term.options.fontSize || FIT_BASE;
+  if (!fitOn) {
+    if (cur !== FIT_BASE) { try { term.options.fontSize = FIT_BASE; } catch (e) {} }
+    return;
+  }
+  const avail = document.documentElement.clientWidth;
+  const w = scr.getBoundingClientRect().width;
+  if (!avail || !w) return;
+  let want = Math.max(FIT_MIN, Math.min(FIT_MAX, Math.floor(cur * avail / w)));
+  if (want !== cur) { try { term.options.fontSize = want; } catch (e) {} }
+  // one correction pass: font metrics aren't perfectly linear in fontSize
+  const w2 = scr.getBoundingClientRect().width;
+  if (w2 > avail && want > FIT_MIN) {
+    try { term.options.fontSize = Math.max(FIT_MIN, Math.floor(want * avail / w2)); } catch (e) {}
+  }
+}
 function fitChrome() {
   const tdiv = document.getElementById('t');
   if (!tdiv) return;
+  fitFont();   // font first — the paddings/hug below measure the scaled canvas
   // The select bar (when active) docks just under the status banner at the top.
   let top = banner.offsetHeight;
   if (selBar.style.display !== 'none') {

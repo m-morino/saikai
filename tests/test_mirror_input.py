@@ -1234,6 +1234,11 @@ def test_page_pane_view_contracts():
     assert "function stashDraft()" in page and "sessionStorage.getItem('saikai-draft')" in page
     # unseeded-but-open pane view retries (bounded)
     assert "saikai-seed-retry" in page and "location.reload();" in page
+    # fit-to-width: font scales to the window (floor 9, cap 22), cols/rows
+    # untouched (the HOST owns the grid); More-row toggle persists 1:1 — #kb-fit
+    assert "const FIT_BASE = 15, FIT_MIN = 9, FIT_MAX = 22;" in page
+    assert "function fitFont()" in page and "kb-fit" in page
+    assert "localStorage.getItem('saikai-fit')" in page
     # key bar hugs the terminal's bottom edge when the canvas fits above it
     # (dead space otherwise separates the keys from the content) — #kb-hug
     assert "r.bottom + kbBar.offsetHeight <= window.innerHeight" in page
