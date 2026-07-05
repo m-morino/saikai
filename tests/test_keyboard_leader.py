@@ -952,6 +952,82 @@ def test_pilot_mirror_arrow_byte_drives_app():
         f"down-arrow byte did not reach on_key to move focus to the list: {facts}"
 
 
+def _write_ssh_remote_session() -> str:
+    """A Desktop-SSH mirror fixture: projects/ssh-<uuid>/ with a foreign (Linux)
+    cwd and a queue-operation FIRST line, per the schema observed on a real
+    Windows Claude Desktop install. (#remote-origin)"""
+    sid = str(uuid.uuid4())
+    pdir = _FAKE_HOME / ".claude" / "projects" / f"ssh-{uuid.uuid4()}"
+    pdir.mkdir(parents=True, exist_ok=True)
+    recs = [
+        {"type": "queue-operation", "operation": "enqueue",
+         "timestamp": "2026-07-01T00:00:00.000Z"},
+        {"type": "user", "timestamp": "2026-07-01T00:01:00.000Z",
+         "cwd": "/home/remoteuser/projects/demo",
+         "message": {"role": "user", "content": "remote task over Desktop SSH"}},
+        {"type": "queue-operation", "operation": "dequeue",
+         "timestamp": "2026-07-01T00:02:00.000Z"},
+    ]
+    (pdir / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+    return sid
+
+
+def test_pilot_remote_origin_badge_and_resume_block():
+    """Claude Desktop's SSH integration mirrors remotely-executed sessions into
+    local projects/ssh-<uuid>/ (foreign cwd, queue-operation records). saikai
+    must (1) LIST them without choking on the schema, (2) flag remote_origin,
+    (3) REFUSE resume with an explanatory toast — a local `claude --resume`
+    against a foreign-cwd transcript cannot work. (#remote-origin)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_remote_origin_badge_and_resume_block (textual unavailable)")
+        return
+    import asyncio
+    from textual.app import App
+
+    local_sid = _write_demo_session()
+    ssh_sid = _write_ssh_remote_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30), notifications=True) as pilot:
+                await pilot.pause(0.4)
+                s = self._sid_index.get(ssh_sid)
+                facts["listed"] = s is not None
+                facts["remote_origin"] = bool(s and s.get("remote_origin"))
+                facts["cwd"] = s.get("cwd") if s else None
+                ls = self._sid_index.get(local_sid)
+                facts["local_flag"] = bool(ls and ls.get("remote_origin"))
+                facts["blocked"] = self._remote_origin_block(ssh_sid)
+                facts["local_not_blocked"] = not self._remote_origin_block(local_sid)
+                # the split-pane opener must return WITHOUT registering an open
+                self._open_or_attach_live(ssh_sid)
+                await pilot.pause(0.2)
+                facts["no_pane"] = not (self._live is not None and self._live.has(ssh_sid))
+                facts["toast"] = any("another host" in str(n.message)
+                                     for n in self._notifications)
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+    assert facts.get("listed") is True, f"ssh-* session must be listed: {facts}"
+    assert facts.get("remote_origin") is True, facts
+    assert facts.get("cwd") == "/home/remoteuser/projects/demo", facts
+    assert facts.get("local_flag") is False, "a normal session must NOT be flagged"
+    assert facts.get("blocked") is True and facts.get("local_not_blocked") is True, facts
+    assert facts.get("no_pane") is True, f"resume must not open a pane: {facts}"
+    assert facts.get("toast") is True, f"the block must explain itself: {facts}"
+
+
 def test_pilot_autorefresh_gate_catches_transcript_growth():
     """The default-on auto-refresh change signal must flip when a LISTED
     session's transcript GROWS (a new turn = a flip to 'needs input') and when a
@@ -2665,6 +2741,7 @@ if __name__ == "__main__":
     print("PASS test_pilot_mirror_text_drives_search")
     test_pilot_mirror_arrow_byte_drives_app()
     print("PASS test_pilot_mirror_arrow_byte_drives_app")
+    test_pilot_remote_origin_badge_and_resume_block()
     test_pilot_autorefresh_gate_catches_transcript_growth()
     test_pilot_mirror_resize_syncs_size()
     test_pilot_mirror_push_regions()

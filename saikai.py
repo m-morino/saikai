@@ -1937,6 +1937,14 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
         "claude_name": _active_session_names().get(sid, ""),   # Claude's own switcher label (live sessions)
         "is_open": sid in active,
         "is_remote_control": sid in _active_remote_sessions(),
+        # Claude Desktop's SSH integration mirrors REMOTELY-executed sessions
+        # into local projects/ssh-<uuid>/ (verified on a real Desktop install:
+        # the remote agent is %APPDATA%/Claude/claude-ssh-remote/*, the cwd is a
+        # path on the REMOTE host). They are listable but not resumable here —
+        # the cwd doesn't exist on this machine and the schema differs.
+        # Detection is by directory name: a real cwd can never slug to "ssh-"
+        # (a Linux cwd slugs to "-…", a Windows one to "C--…"). (#remote-origin)
+        "remote_origin": jsonl_path.parent.name.startswith("ssh-"),
         # Default-DENY unknown live kinds: a session is non-attachable (is_bg) when
         # it is LIVE with a non-empty kind other than "interactive". Only bg + an
         # interactive kind exist today, but a future kind defaults to NOT-resumable
@@ -3136,6 +3144,8 @@ def _activity_marker(s: dict) -> str:
         if _jst in ("failed", "stopped"):
             return _c("&", RED)              # bg job ended abnormally
         return _c("&", DIM)                  # running / done bg agent — calm tier
+    if s.get("remote_origin"):
+        return _c("s", DIM)              # Desktop-SSH mirror of a REMOTE host's session
     if s.get("is_remote_control"):
         return _c("R", DIM)              # Remote Control elsewhere — someone else's session
     if s.get("is_open"):
@@ -3172,6 +3182,9 @@ def _marker_legend(s: dict, favorites: set, hidden: set) -> list:
     out = []
     if s.get("is_bg"):
         out.append("& background agent/job")
+    elif s.get("remote_origin"):
+        out.append("s ssh-remote session (ran on another host via Claude Desktop"
+                    " — not resumable here)")
     elif s.get("is_remote_control"):
         out.append("R Remote Control on in another session")
     elif s.get("is_open"):
@@ -6381,6 +6394,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # but for a not-running session (resume it to get the reply). Ranks
                     # below + (just-touched) and above . (merely recent).
                     marker_a = ("&" if s.get("is_bg")
+                                else "s" if s.get("remote_origin")
                                 else "R" if s.get("is_remote_control")
                                 else "$" if (s.get("is_open") and s.get("session_status") == "shell")
                                 else "@" if s.get("is_open")
@@ -7218,6 +7232,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if _LIVE_TERM is None:
                 sid = self._cursor_sid()
                 if sid:
+                    if self._remote_origin_block(sid):   # Desktop-SSH mirror (#remote-origin)
+                        return
                     # Probe BEFORE tearing down the picker: here resume runs only
                     # AFTER self.exit() leaves the alt-screen, so a "claude not on
                     # PATH" error would print into a half-restored terminal and
@@ -7242,11 +7258,32 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if sid:
                 self._open_or_attach_live(sid)
 
+        def _remote_origin_block(self, sid: str) -> bool:
+            """True (+ an explanatory toast) when sid is a Desktop-SSH mirror of a
+            session that RAN ON ANOTHER HOST: its cwd doesn't exist here, so a
+            local `claude --resume` can't reattach it (and must not try — claude
+            would fail against a foreign-cwd transcript in its own projects dir).
+            Resume it where it ran, or via Claude Desktop's SSH view. (#remote-origin)"""
+            s = self._sid_index.get(sid)
+            if not (s and s.get("remote_origin")):
+                return False
+            try:
+                self.notify(
+                    "this session ran on another host via Claude Desktop's SSH "
+                    f"integration (cwd: {s.get('cwd') or '?'})\n"
+                    "resume it there, or from Claude Desktop",
+                    title="remote session", severity="warning", timeout=8)
+            except Exception:
+                pass
+            return True
+
         def action_resume_detached(self) -> None:
             """Legacy full-takeover: exit the picker and run claude in the bare
             terminal (alternate screen handed off). Kept as an escape hatch for
             users who want a full-screen claude instead of the split pane."""
             sid = self._cursor_sid()
+            if self._remote_origin_block(sid or ""):    # Desktop-SSH mirror (#remote-origin)
+                return
             if sid:
                 # Tear down any live panes first so their PTYs don't outlive the
                 # picker as orphans once we exit into the foreground claude. WAIT
@@ -7403,6 +7440,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             """Resume an existing session as a live pane (or switch to it if it's
             already running)."""
             assert _LIVE_TERM is not None and self._live is not None
+            if self._remote_origin_block(sid):       # Desktop-SSH mirror (#remote-origin)
+                return
             if self._live.has(sid):                  # already running → switch
                 tabs = self.query_one("#right", TabbedContent)
                 tabs.active = self._live.pane_id(sid)
