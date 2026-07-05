@@ -5655,10 +5655,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("f10", "close_live", "Close tab", id="close", show=False, priority=True),
             Binding("f11", "notifications", "Notifs", id="notifs", show=False, priority=True),
             Binding("shift+f10", "close_all_live", "Close all", id="close_all", show=False, priority=True),
-            # Ctrl+K: terminate the focused row's AGENT/bg process (kind=agent/bg —
-            # the & marker). Confirmed, identity-verified; never touches an
-            # interactive claude. (#agent-kill)
-            Binding("ctrl+k", "kill_agent", "Kill agent", id="kill_agent", show=False, priority=True),
+            # Shift+K: terminate the focused row's AGENT/bg process (kind=agent/bg —
+            # the & marker). NOT a Ctrl+letter (those are readline keys); confirmed,
+            # identity-verified; never touches an interactive claude. (#agent-kill)
+            Binding("K", "kill_agent", "Kill agent", id="kill_agent", show=False, priority=True),
             Binding("f2", "prev_tab", "◀Tab", id="prev_tab", show=False, priority=True),
             Binding("f3", "next_tab", "Tab▶", id="next_tab", show=False, priority=True),
             Binding("shift+f3", "next_attention", "Next!", id="attention", show=False, priority=True),
@@ -8539,9 +8539,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._mirror_sync_pane()
 
         def action_kill_agent(self) -> None:
-            """Ctrl+K: terminate the focused row's live agent/bg process. Only
+            """Shift+K: terminate the focused row's live agent/bg process. Only
             valid on an is_bg session (kind=agent/bg, the & marker) — refuse
-            anything else so a stray Ctrl+K can never signal an interactive
+            anything else so a stray K can never signal an interactive
             claude or a dormant transcript. Confirmed + identity-verified.
             (#agent-kill)"""
             if isinstance(self.focused, Select):
@@ -8551,7 +8551,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if not s:
                 return
             if not s.get("is_bg"):
-                self.notify("Ctrl+K terminates a running AGENT (the & marker); "
+                self.notify("K (Shift+K) terminates a running AGENT (the & marker); "
                             "this row isn't one", severity="information",
                             title="saikai", timeout=5)
                 return

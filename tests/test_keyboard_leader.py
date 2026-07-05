@@ -974,7 +974,7 @@ def _write_ssh_remote_session() -> str:
 
 
 def test_pilot_kill_agent_gated_and_verified():
-    """Ctrl+K terminates a live AGENT process, but ONLY after a confirm and an
+    """Shift+K terminates a live AGENT process, but ONLY after a confirm and an
     identity check, and NEVER on a non-agent row. Verifies: (1) a non-bg row
     refuses with an info toast and pushes no modal; (2) a kind=agent row pushes
     the KillAgentScreen with the right pid; (3) confirming calls the kill helper
