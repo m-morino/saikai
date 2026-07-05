@@ -1275,6 +1275,7 @@ def _gen_self_signed_py(certf: str, keyf: str, ips: set) -> bool:
     isn't on PATH) with nothing extra to install. Returns True on success, False
     if cryptography is unavailable or minting fails (caller then tries openssl).
     (#review-tls-windows)"""
+    global _tls_reason
     try:
         import datetime
         import ipaddress as _ip
@@ -1282,7 +1283,8 @@ def _gen_self_signed_py(certf: str, keyf: str, ips: set) -> bool:
         from cryptography.x509.oid import NameOID
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import ec
-    except Exception:
+    except Exception as e:
+        _tls_reason = f"cryptography unavailable ({e.__class__.__name__}: {e})"
         return False
     try:
         key = ec.generate_private_key(ec.SECP256R1())
@@ -1307,16 +1309,23 @@ def _gen_self_signed_py(certf: str, keyf: str, ips: set) -> bool:
             serialization.PrivateFormat.TraditionalOpenSSL,
             serialization.NoEncryption())
         cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-    except Exception:
+    except Exception as e:
+        _tls_reason = f"cryptography mint failed ({e.__class__.__name__}: {e})"
         return False
-    return _write_cert_key(certf, keyf, cert_pem, key_pem)
+    if not _write_cert_key(certf, keyf, cert_pem, key_pem):
+        _tls_reason = f"cannot write cert/key under {certf!r} (permissions/disk?)"
+        return False
+    _tls_reason = "self-signed via cryptography"
+    return True
 
 
 def _gen_self_signed_openssl(certf: str, keyf: str, ips: set) -> bool:
     """Mint the cert/key via the openssl CLI — the fallback when `cryptography`
     isn't importable. An EC P-256 key keeps keygen near-instant on a Pi."""
+    global _tls_reason
     import shutil
     if not shutil.which("openssl"):
+        _tls_reason += "; openssl not on PATH"
         return False
     import os as _os
     san = "subjectAltName=" + ",".join(
@@ -1339,11 +1348,13 @@ def _gen_self_signed_openssl(certf: str, keyf: str, ips: set) -> bool:
             except OSError:
                 pass
     if rc != 0:
+        _tls_reason += f"; openssl req failed (rc={rc})"
         return False
     try:
         _os.chmod(keyf, 0o600)
     except OSError:
         pass
+    _tls_reason += "; self-signed via openssl CLI"
     return True
 
 
@@ -1354,11 +1365,13 @@ def _gen_self_signed(cache_dir, host: str = "") -> "tuple[str, str] | None":
     Reused across runs while still valid AND still covering the current host, so
     the browser isn't re-asked to trust every launch but a network change forces
     a fresh cert. (#review-tls-windows)"""
+    global _tls_reason
     from pathlib import Path
     try:
         d = Path(cache_dir)
         d.mkdir(parents=True, exist_ok=True)
-    except OSError:
+    except OSError as e:
+        _tls_reason = f"cannot create cache dir {cache_dir!r} ({e})"
         return None
     certf, keyf = str(d / "mirror-cert.pem"), str(d / "mirror-key.pem")
     ips = {"127.0.0.1"}
@@ -1369,11 +1382,26 @@ def _gen_self_signed(cache_dir, host: str = "") -> "tuple[str, str] | None":
         ips.add(host)
     if (Path(certf).is_file() and Path(keyf).is_file()
             and _cert_valid_for(certf, 3600) and _cert_covers(certf, ips)):
+        _tls_reason = "reused cached self-signed cert"
         return (certf, keyf)      # reuse: still valid for an hour AND covers host
+    _tls_reason = ""              # minters append their outcomes below
     if _gen_self_signed_py(certf, keyf, ips) or \
             _gen_self_signed_openssl(certf, keyf, ips):
         return (certf, keyf)
     return None
+
+
+# Why the last resolve_tls_paths call fell back to HTTP (or how it succeeded).
+# The mint helpers swallow their exceptions by design (TLS is best-effort and
+# must never break launch), which made an http-only mirror on some host an
+# undiagnosable mystery — the caller now surfaces this string in the startup
+# warning and the log. (#review-tls-reason)
+_tls_reason = ""
+
+
+def tls_reason() -> str:
+    """Human-readable outcome of the LAST resolve_tls_paths call."""
+    return _tls_reason
 
 
 def resolve_tls_paths(env: dict, cache_dir, host: str = "") -> "tuple[str, str] | None":
@@ -1382,13 +1410,19 @@ def resolve_tls_paths(env: dict, cache_dir, host: str = "") -> "tuple[str, str] 
     Precedence: an explicit SAIKAI_MIRROR_TLS_CERT + _KEY pair (both must exist —
     a named-but-missing pair returns None rather than silently self-signing) → an
     in-process self-signed cert cached under cache_dir (cryptography, else the
-    openssl CLI) → None. Only meaningful when mirror_tls_enabled(env)."""
+    openssl CLI) → None. Only meaningful when mirror_tls_enabled(env). The
+    outcome (incl. WHY a fallback happened) is readable via tls_reason()."""
+    global _tls_reason
     import os as _os
     cert = str(env.get("SAIKAI_MIRROR_TLS_CERT", "")).strip()
     key = str(env.get("SAIKAI_MIRROR_TLS_KEY", "")).strip()
     if cert or key:
         if cert and key and _os.path.isfile(cert) and _os.path.isfile(key):
+            _tls_reason = "user-provided cert/key"
             return (cert, key)
+        _tls_reason = ("SAIKAI_MIRROR_TLS_CERT/_KEY set but "
+                       + ("one is missing on disk" if (cert and key)
+                          else "only one of the pair is set"))
         return None
     return _gen_self_signed(cache_dir, host)
 

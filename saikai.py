@@ -10254,12 +10254,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     _tls = None
                     if _mirror.mirror_tls_enabled(os.environ):
                         _tls = _mirror.resolve_tls_paths(os.environ, CACHE_DIR, _mir_host)
+                        # The WHY is recorded either way (#review-tls-reason):
+                        # the stderr warning scrolls behind the alt-screen, so
+                        # saikai.log is the durable place to diagnose an
+                        # http-only mirror on some host after the fact.
+                        _why = _mirror.tls_reason()
+                        _log(f"mirror tls: {'ON — ' if _tls else 'FALLBACK to http — '}{_why}")
                         if _tls is None:
-                            print(_c("  ⚠ mirror TLS is on by default but no cert is "
-                                     "available (install openssl, or set "
-                                     "SAIKAI_MIRROR_TLS_CERT/_KEY, or SAIKAI_MIRROR_TLS=0 "
-                                     "to silence) — mirror staying on HTTP", YELLOW),
+                            print(_c("  ⚠ mirror TLS is on by default but no cert "
+                                     f"could be resolved [{_why}] — staying on "
+                                     "HTTP. Fix the cause, set "
+                                     "SAIKAI_MIRROR_TLS_CERT/_KEY, or silence with "
+                                     "SAIKAI_MIRROR_TLS=0 (details in "
+                                     f"{CACHE_DIR / 'saikai.log'})", YELLOW),
                                   file=sys.stderr)
+                    else:
+                        _log("mirror tls: OFF by SAIKAI_MIRROR_TLS opt-out")
                     _hub = _mirror.MirrorHub(
                         token=_secrets.token_urlsafe(12), host=_mir_host,
                         port=_mirror.mirror_port(os.environ),

@@ -382,6 +382,30 @@ def test_resolve_tls_paths_precedence():
     import os as _os
     if _os.name == "posix":
         assert (_os.stat(auto[1]).st_mode & 0o077) == 0, "key must be owner-only"
+    # the OUTCOME is always inspectable: success names the minter, and a
+    # fallback names the CAUSE (an http-only mirror was undiagnosable — the
+    # helpers swallow their exceptions by design). (#review-tls-reason)
+    assert m.tls_reason(), "resolve must record an outcome"
+    got_named_missing = m.resolve_tls_paths(
+        {"SAIKAI_MIRROR_TLS_CERT": "/nope.pem",
+         "SAIKAI_MIRROR_TLS_KEY": "/nope.key"}, d)
+    assert got_named_missing is None and "missing on disk" in m.tls_reason()
+    import builtins
+    real_import = builtins.__import__
+    def _broken(name, *a, **k):
+        if name.startswith("cryptography"):
+            raise ImportError("simulated absence")
+        return real_import(name, *a, **k)
+    builtins.__import__ = _broken
+    shutil.which = lambda n: None if n == "openssl" else _real_which(n)
+    try:
+        got_none = m.resolve_tls_paths({}, d / "none", "10.9.9.9")
+    finally:
+        builtins.__import__ = real_import
+        shutil.which = _real_which
+    assert got_none is None
+    assert "cryptography unavailable" in m.tls_reason() \
+        and "openssl not on PATH" in m.tls_reason(), m.tls_reason()
 
 
 def test_add_client_caps_concurrent_viewers():
