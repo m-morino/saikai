@@ -1635,6 +1635,23 @@ const ESC = String.fromCharCode(27);
 // blocked, and the select bar's Copy button (a gesture) re-copies the stash.
 // (#pane-native-select)
 let lastOsc52 = '';
+// Pane view, non-tracking child (claude's prompt owns no mouse): xterm does the
+// selection natively — auto-copy it on release so a drag "just copies", the
+// same feel as the app-view pane. Stashed so the Copy button can re-copy inside
+// a user gesture if the async write was blocked. (#pane-native-select)
+try {
+  term.onSelectionChange(() => {
+    if (!paneView) return;
+    let s = '';
+    try { s = term.getSelection() || ''; } catch (e) {}
+    if (!s) return;
+    lastOsc52 = s;
+    const ok = copyText(s);
+    const hint = document.getElementById('sel-hint');
+    if (hint && selectMode) hint.textContent = ok
+      ? ('copied ' + s.length + ' chars') : (s.length + ' chars — tap Copy');
+  });
+} catch (e) {}
 try {
   term.parser.registerOscHandler(52, (data) => {
     try {
@@ -2086,9 +2103,16 @@ term.onData((d) => {
       selA = {c: scol, r: srow}; selB = selA; drawSel();
     }
   }
-  // Touch → the SGR reports a mouse drag would produce, so the child's own
-  // selection machinery runs for a finger too. Motion deduped per cell.
+  // Touch → the SGR reports a mouse drag would produce, so a child that TRACKS
+  // the mouse (a fullscreen TUI) runs its own selection for a finger too. Sent
+  // ONLY when tracking is on — claude's normal prompt does NOT track the mouse
+  // (the terminal owns selection there), so synthesizing reports would just
+  // type garbage into it. Motion deduped per cell. (#pane-native-select)
   let tSel = null;                    // last synthesized cell, null = no drag
+  function paneTracks() {
+    try { return (term.modes.mouseTrackingMode || 'none') !== 'none'; }
+    catch (e) { return false; }
+  }
   function paneSelReport(kind, x, y) {
     let cc = tSel || [0, 0];
     if (kind !== 'up') cc = cellAt(x, y);
@@ -2298,7 +2322,7 @@ term.onData((d) => {
   el.addEventListener('touchstart', (e) => {
     if (e.touches.length !== 1) { lastY = null; cancelLongPress(); return; }  // pinch -> browser
     begin(e.touches[0].clientX, e.touches[0].clientY);
-    if (selectMode && paneView) {         // finger drives the CHILD's selection
+    if (selectMode && paneView && paneTracks()) {   // finger drives a TRACKING child
       paneSelReport('down', e.touches[0].clientX, e.touches[0].clientY);
       return;
     }
@@ -2307,11 +2331,12 @@ term.onData((d) => {
   el.addEventListener('touchmove', (e) => {
     if (e.touches.length !== 1) return;
     const tx = e.touches[0].clientX, ty = e.touches[0].clientY;
-    if (selectMode && paneView) {
+    if (selectMode && paneView && (tSel || paneTracks())) {
       paneSelReport('move', tx, ty);
       e.preventDefault();
       return;
     }
+    if (selectMode && paneView) return;   // non-tracking child: let xterm select
     if (Math.abs(ty - pressY) > 10 || Math.abs(tx - pressX) > 10) cancelLongPress();
     if (drag(ty, tx)) e.preventDefault();  // we consumed this drag (scroll or select)
   }, {passive: false});
@@ -2432,8 +2457,8 @@ function setSelectMode(on) {
     // edge-scrolls its own transcript, copies on release). App view = the
     // local block overlay. (#pane-native-select)
     if (hint) hint.textContent = paneView
-      ? 'drag: claude selects & copies (needs CONTROL ON)'
-      : 'in the claude pane: claude selects (CONTROL ON) — elsewhere: block select';
+      ? 'drag in the pane: selects & auto-copies on release (CONTROL ON)'
+      : 'drag in the claude pane: auto-copies on release (CONTROL ON) — elsewhere: block, tap Copy';
   }
   fitChrome();
 }
@@ -2441,11 +2466,15 @@ document.getElementById('sel-copy').addEventListener('click', (e) => {
   e.preventDefault();
   const hint = document.getElementById('sel-hint');
   if (paneView) {
-    // claude already copied via OSC 52 on release; this button re-copies the
-    // stash inside a USER GESTURE for browsers that blocked the async write.
-    if (!lastOsc52) { hint.textContent = 'drag first — claude copies on release'; return; }
-    hint.textContent = copyText(lastOsc52)
-      ? ('copied ' + lastOsc52.length + ' chars') : 'copy failed';
+    // Non-tracking child (claude's normal prompt): xterm did the selection —
+    // take its text. Tracking child: it copied via OSC 52 on release — take the
+    // stash. Either way inside this user gesture (some browsers block the async
+    // clipboard write the auto-copy attempted). (#pane-native-select)
+    let s = '';
+    try { s = term.getSelection() || ''; } catch (e) {}
+    if (!s) s = lastOsc52;
+    if (!s) { hint.textContent = 'drag to select first'; return; }
+    hint.textContent = copyText(s) ? ('copied ' + s.length + ' chars') : 'copy failed';
     return;
   }
   const s = blockText();

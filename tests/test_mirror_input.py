@@ -1248,7 +1248,7 @@ def test_page_pane_view_contracts():
     # SGR press/motion/release, and the child's OSC 52 copy lands in the page
     assert "function paneSelReport(kind, x, y)" in page
     assert "registerOscHandler(52," in page and "let lastOsc52 = ''" in page
-    assert "claude selects & copies" in page
+    assert "auto-copies on release" in page
     assert "selectTo(x, y);" in page, \
         "app view keeps the local block overlay outside the pane"
     # app view select INSIDE the claude pane delegates to the child's own
@@ -1260,6 +1260,12 @@ def test_page_pane_view_contracts():
     assert "postMouse(cc[0], cc[1], 1, 'up');" in page
     assert "es.addEventListener('clip'" in page
     assert "if (kind === 'move' && last && last.kind === 'move')" in page
+    # copy is AUTOMATIC on release (claude does not track the mouse in its
+    # prompt — the terminal owns selection+copy): the pane's own drag-copy is
+    # relayed to the browser via MIRROR_CLIP -> 'clip', and pane view auto-copies
+    # xterm's native selection. (#app-native-select #pane-native-select)
+    assert "term.onSelectionChange(" in page and "term.getSelection()" in page
+    assert "function paneTracks()" in page   # only a TRACKING child gets synth reports
     assert "if (selectMode && d.match(sgrMouseRe)) return;" not in page, \
         "select mode must NOT swallow pane-view mouse reports anymore"
     # key bar hugs the terminal's bottom edge when the canvas fits above it

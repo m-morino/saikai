@@ -1436,9 +1436,21 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     def _copy_text(self, text: str) -> None:
         """Cross-platform clipboard: native OS clipboard first
         (codepage-safe — clip.exe mangles multibyte text under a mismatched
-        console codepage), then OSC-52 via the app (Linux/remote terminals)."""
+        console codepage), then OSC-52 via the app (Linux/remote terminals).
+
+        Also relays to the MIRROR browsers (#app-native-select): claude itself
+        does NOT track the mouse in its normal prompt, so the terminal owns
+        selection AND copy — this pane's own drag-select copy is the ONLY copy a
+        mirror viewer gets, so it must reach the device they're holding, not just
+        the host. UI-thread only (both call sites already are)."""
         if not text:
             return
+        hook = MIRROR_CLIP
+        if hook is not None:
+            try:
+                hook(text)
+            except Exception:
+                pass
         if sys.platform == "win32":
             if set_clipboard_windows(text):
                 return
@@ -1751,12 +1763,10 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
 
     def _honor_osc52(self, b64: str) -> None:
         """Put an OSC 52 clipboard-write payload from the child onto the HOST
-        clipboard — and, when the mirror is up, relay it to the BROWSERS via
-        MIRROR_CLIP (set by the app at mount): a phone driving claude's own
-        copy-selection must receive the copy on the device it's holding, not
-        just on the host. Ignores a "?"/empty payload (a read query). Runs on
-        the reader thread → marshals both effects onto the UI thread.
-        (#osc52-clipboard #app-native-select)"""
+        clipboard (a fullscreen child that DOES track the mouse copies via
+        OSC 52). Ignores a "?"/empty payload (a read query). Runs on the reader
+        thread → marshals onto the UI thread. _copy_text relays to the mirror
+        browsers too. (#osc52-clipboard)"""
         if not b64 or b64 == "?":
             return
         try:
@@ -1765,15 +1775,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             return
         if text:
-            def _apply(t=text):
-                self._copy_text(t)
-                hook = MIRROR_CLIP
-                if hook is not None:
-                    try:
-                        hook(t)
-                    except Exception:
-                        pass
-            self._marshal(_apply)
+            self._marshal(lambda t=text: self._copy_text(t))
 
     def _send_to_child(self, data: str) -> None:
         """Write bytes to the child PTY (guarded). Called on the UI thread (via

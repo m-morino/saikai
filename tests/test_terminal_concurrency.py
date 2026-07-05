@@ -1460,6 +1460,31 @@ def test_mouse_tracking_is_one_exclusive_protocol_slot():
     assert term._mouse_btn_motion and not term._mouse_click
     assert term._mouse_sgr, "encoding (1006) is independent of the slot"
 
+def test_copy_text_relays_to_mirror_clip():
+    """claude does NOT track the mouse in its normal prompt, so the terminal owns
+    selection AND copy — the pane's own drag-select copy is the ONLY copy a
+    mirror viewer gets. _copy_text must relay to MIRROR_CLIP (the hub's send_clip)
+    so it reaches the device the viewer is holding, not just the host.
+    (#app-native-select)"""
+    term = rt.AgentTerminal(["agent"], status_classifier=rt.classify_pty_status)
+    got = []
+    _prev = rt.MIRROR_CLIP
+    rt.MIRROR_CLIP = lambda t: got.append(t)
+    try:
+        term._copy_text("selected text")
+    finally:
+        rt.MIRROR_CLIP = _prev
+    assert got == ["selected text"], f"copy must relay to the mirror: {got}"
+    got.clear()
+    rt.MIRROR_CLIP = lambda t: got.append(t)
+    try:
+        term._copy_text("")
+    finally:
+        rt.MIRROR_CLIP = _prev
+    assert got == [], "empty copy must not relay"
+
+
+
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
     print("PASS test_osc_notification_parsing_and_notify_host")
@@ -1549,6 +1574,8 @@ if __name__ == "__main__":
     print("PASS test_mirror_seed_and_tee_are_lock_consistent")
     test_mouse_tracking_is_one_exclusive_protocol_slot()
     print("PASS test_mouse_tracking_is_one_exclusive_protocol_slot")
+    test_copy_text_relays_to_mirror_clip()
+    print("PASS test_copy_text_relays_to_mirror_clip")
     test_selection_geometry_in_sel()
     print("PASS test_selection_geometry_in_sel")
     test_extract_selection_slices_and_joins()
