@@ -1171,7 +1171,7 @@ def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
     # instead. Only NON-live pinned sessions (Recent / Idle / Archived) get the
     # Pinned shortcut there. Date / project grouping has no actionability axis, so
     # all favorites form the Pinned section as before.
-    _LIVE_STATES = ("Needs input", "Running", "Open")
+    _LIVE_STATES = ("Needs input", "Running", "Open", "Agents")
     if group_by == "state":
         pinned = [s for s in rest if s["id"] in favorites
                   and (s.get("_state") or "Idle") not in _LIVE_STATES]
@@ -1209,7 +1209,7 @@ def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
         buckets = {}
         for s in rest:
             buckets.setdefault(s.get("_state") or "Idle", []).append(s)
-        for l in ("Needs input", "Running", "Open", "Idle", "Archived"):
+        for l in ("Needs input", "Running", "Open", "Agents", "Idle", "Archived"):
             if buckets.get(l):
                 groups.append((l, buckets[l]))
     else:  # project
@@ -1951,6 +1951,10 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
         # (refusing resume is recoverable; resuming a live session corrupts it).
         # A dormant session (absent from the registry) → kind None → not is_bg. (#recon-unknown-kind)
         "is_bg": (lambda _k: bool(_k) and _k != "interactive")(_active_session_kinds().get(sid)),
+        # the raw registry kind ("agent" = claude's agents/teammates feature,
+        # "bg" = a headless bg job, "" = interactive) — drives kind-aware UX
+        # for non-attachable live sessions (#agents-kind)
+        "live_kind": _active_session_kinds().get(sid) or "",
         "session_status": active.get(sid, ""),
         "is_active": (sid in active) or age_sec < 300,
         "is_recent": age_sec < 1800,
@@ -3181,7 +3185,8 @@ def _marker_legend(s: dict, favorites: set, hidden: set) -> list:
     activity entry + one state entry (the two columns each show one glyph)."""
     out = []
     if s.get("is_bg"):
-        out.append("& background agent/job")
+        out.append("& agents/bg session (owned by another claude — resumable when it ends)"
+                   if s.get("live_kind") == "agent" else "& background agent/job")
     elif s.get("remote_origin"):
         out.append("s ssh-remote session (ran on another host via Claude Desktop"
                     " — not resumable here)")
@@ -6330,6 +6335,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         _s["_state"] = "Running"
                     elif _live == "waiting":
                         _s["_state"] = "Needs input"
+                    elif _s.get("is_bg"):
+                        # claude's agents feature / a bg job: LIVE but owned by
+                        # another claude — not attachable from here. Its own
+                        # section keeps "Open" meaning "windows you can act on".
+                        # (#agents-kind)
+                        _s["_state"] = "Agents"
                     elif _s.get("is_open") or _live == "idle":
                         # Running now (live pane / open elsewhere): state is known
                         # and its JSONL is GROWING — skip the needs-attention
@@ -7484,10 +7495,18 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # owner. Refuse with a clear reason; it becomes resumable once the bg job
             # finishes and its registry entry drops (is_bg → False on the next scan).
             if s and s.get("is_bg"):
-                _log(f"open SKIP {sid[:8]}: is_bg (background agent, not attachable)")
-                self.notify("running background agent — can't resume a live session "
-                            "(resume it after the bg job finishes)",
-                            severity="warning", title="saikai", timeout=8)
+                _k = s.get("live_kind") or "bg"
+                _log(f"open SKIP {sid[:8]}: is_bg kind={_k} (not attachable)")
+                if _k == "agent":
+                    self.notify(
+                        "claude agents session — it belongs to its parent claude; "
+                        "drive it from the agents view there. It becomes resumable "
+                        "here once it finishes.",
+                        severity="warning", title="saikai", timeout=8)
+                else:
+                    self.notify("running background agent — can't resume a live session "
+                                "(resume it after the bg job finishes)",
+                                severity="warning", title="saikai", timeout=8)
                 return
             # Already open in another Claude window/instance (the @ marker): a second
             # `claude --resume` on the same JSONL can interleave/corrupt it. Confirm.

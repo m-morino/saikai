@@ -973,6 +973,80 @@ def _write_ssh_remote_session() -> str:
     return sid
 
 
+def test_pilot_agents_kind_groups_and_refusal():
+    """claude's agents feature registers live sessions with kind="agent": they
+    must (1) group under their own "Agents" section — not pollute "Open", which
+    means windows you can act on; (2) refuse resume with a message that points
+    at the parent claude's agents view (the old text talked about bg jobs);
+    (3) carry live_kind for kind-aware UX. (#agents-kind)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_agents_kind_groups_and_refusal (textual unavailable)")
+        return
+    import asyncio, os
+    from textual.app import App
+
+    sid = _write_demo_session()
+    sdir = _FAKE_HOME / ".claude" / "sessions"
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / f"{os.getpid()}.json").write_text(json.dumps(
+        {"pid": os.getpid(), "sessionId": sid, "status": "running",
+         "kind": "agent", "name": "teammate-1"}), encoding="utf-8")
+    saikai._invalidate_active_sessions()   # earlier pilots memoised an empty registry
+    saikai._set_group_by("state")          # the Agents section is a State-lens concept
+    # the registry guard requires the pid to BE a claude process (PID-reuse
+    # defense) — the test process is python, so stub liveness for this test
+    _orig_live = saikai._is_session_pid_live
+    saikai._is_session_pid_live = lambda pid, idx=None: pid == os.getpid()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30), notifications=True) as pilot:
+                await pilot.pause(0.4)
+                s = self._sid_index.get(sid)
+                facts["is_bg"] = bool(s and s.get("is_bg"))
+                facts["kind"] = s.get("live_kind") if s else None
+                # the row must land under an "Agents" group header (state lens
+                # is the default) — read the actual table rows
+                tbl = self.query_one("#table")
+                labels = []
+                for i in range(tbl.row_count):
+                    try:
+                        labels.append(" ".join(str(c) for c in tbl.get_row_at(i)))
+                    except Exception:
+                        pass
+                facts["has_agents_hdr"] = any("Agents" in l for l in labels)
+                facts["open_hdr_rows"] = [l for l in labels if "Open (" in l]
+                self._open_or_attach_live(sid)
+                await pilot.pause(0.2)
+                facts["no_pane"] = not (self._live is not None and self._live.has(sid))
+                facts["toast"] = any("agents view" in str(n.message)
+                                     for n in self._notifications)
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+        saikai._is_session_pid_live = _orig_live
+        saikai._invalidate_active_sessions()
+        try:
+            (sdir / f"{os.getpid()}.json").unlink()
+        except OSError:
+            pass
+    assert facts.get("is_bg") is True, facts
+    assert facts.get("kind") == "agent", facts
+    assert facts.get("has_agents_hdr") is True, \
+        f"agents must group under their own header, not Open: {facts}"
+    assert facts.get("no_pane") is True and facts.get("toast") is True, facts
+
+
 def test_pilot_remote_origin_badge_and_resume_block():
     """Claude Desktop's SSH integration mirrors remotely-executed sessions into
     local projects/ssh-<uuid>/ (foreign cwd, queue-operation records). saikai
@@ -2741,6 +2815,7 @@ if __name__ == "__main__":
     print("PASS test_pilot_mirror_text_drives_search")
     test_pilot_mirror_arrow_byte_drives_app()
     print("PASS test_pilot_mirror_arrow_byte_drives_app")
+    test_pilot_agents_kind_groups_and_refusal()
     test_pilot_remote_origin_badge_and_resume_block()
     test_pilot_autorefresh_gate_catches_transcript_growth()
     test_pilot_mirror_resize_syncs_size()
