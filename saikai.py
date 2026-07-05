@@ -1210,6 +1210,11 @@ def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
         buckets = {}
         for s in rest:
             buckets.setdefault(s.get("_state") or "Idle", []).append(s)
+        if buckets.get("Agents"):
+            # cluster the agents by PARENT session (stable sort keeps the
+            # recency order within one parent's brood) so one parent's agents
+            # read as a block (#agent-lineage)
+            buckets["Agents"].sort(key=lambda x: x.get("parent_session_id") or x["id"])
         for l in ("Needs input", "Running", "Open", "Agents", "Idle", "Archived"):
             if buckets.get(l):
                 groups.append((l, buckets[l]))
@@ -2030,6 +2035,11 @@ def _enrich_session(sid: str, parsed: dict, jsonl_path: Path, mtime: float) -> d
         # Detection is by directory name: a real cwd can never slug to "ssh-"
         # (a Linux cwd slugs to "-…", a Windows one to "C--…"). (#remote-origin)
         "remote_origin": jsonl_path.parent.name.startswith("ssh-"),
+        # agent lineage (#agent-lineage): who spawned this session (empty for a
+        # user-started one), its agent id, and whether it's a sidechain
+        "parent_session_id": parsed.get("parent_session_id", ""),
+        "agent_id": parsed.get("agent_id", ""),
+        "is_sidechain": bool(parsed.get("is_sidechain")),
         # Default-DENY unknown live kinds: a session is non-attachable (is_bg) when
         # it is LIVE with a non-empty kind other than "interactive". Only bg + an
         # interactive kind exist today, but a future kind defaults to NOT-resumable
@@ -2084,7 +2094,8 @@ def parse_session(jsonl_path: Path) -> dict | None:
     cached = _read_json(cache_file, None)
     if (cached and abs(cached.get("mtime", 0) - mtime) < 0.5
             and cached.get("size") == size
-            and "origin_cwd" in cached):
+            and "origin_cwd" in cached
+            and "parent_session_id" in cached):   # lineage added 2026-07-06 (#agent-lineage)
         if _is_hook_session(cached.get("real_msgs", []), len(cached.get("real_msgs") or [])):
             return None
         return _enrich_session(sid, cached, jsonl_path, mtime)
@@ -2094,6 +2105,8 @@ def parse_session(jsonl_path: Path) -> dict | None:
 
     first_ts = last_ts = ai_title = cwd = origin_cwd = git_branch = None
     worktree_origin_cwd = None    # worktree-state.worktreeSession.originalCwd (resume cwd)
+    parent_session_id = agent_id = None   # agent/subagent lineage (#agent-lineage)
+    is_sidechain = False
     real_msgs: list[str] = []
 
     try:
@@ -2130,6 +2143,18 @@ def parse_session(jsonl_path: Path) -> dict | None:
                     cwd = obj["cwd"]
                 if isinstance(obj.get("gitBranch"), str):
                     git_branch = obj["gitBranch"]
+                # Agent lineage: a session claude's agents feature spawned records
+                # who spawned it — the anchor for grouping/bulk ops on the parent.
+                # First value wins (it's constant per session). (#agent-lineage)
+                if parent_session_id is None \
+                        and isinstance(obj.get("parentSessionId"), str) \
+                        and obj["parentSessionId"]:
+                    parent_session_id = obj["parentSessionId"]
+                if agent_id is None and isinstance(obj.get("agentId"), str) \
+                        and obj["agentId"]:
+                    agent_id = obj["agentId"]
+                if obj.get("isSidechain") is True:
+                    is_sidechain = True
                 if t == "ai-title":
                     ai_title = obj.get("aiTitle", "") or ai_title
                 elif t == "worktree-state":
@@ -2173,6 +2198,9 @@ def parse_session(jsonl_path: Path) -> dict | None:
         "origin_cwd": origin_cwd or cwd or "",
         "worktree_origin_cwd": worktree_origin_cwd or "",
         "git_branch": git_branch or "",
+        "parent_session_id": parent_session_id or "",
+        "agent_id": agent_id or "",
+        "is_sidechain": is_sidechain,
     }
     if prior_topics:
         parsed["topics"] = prior_topics
@@ -2887,6 +2915,11 @@ def _preview_detail_rows(s: dict) -> list[str]:
         marker = _confidence_marker(score)
         rs = "  ·  ".join(reasons) if reasons else ""
         rows.append(f"  parent:   {marker} {pid[:8]}  [score {score:.2f}]  {rs}".rstrip())
+    # AUTHORITATIVE agent lineage (recorded by claude itself in the transcript,
+    # unlike the heuristic `parent:` score above). (#agent-lineage)
+    if s.get("parent_session_id"):
+        rows.append(f"  spawned by: {s['parent_session_id'][:8]}  (claude agents"
+                    + (", sidechain)" if s.get("is_sidechain") else ")"))
     cwd = s.get("cwd", "")
     if cwd:
         rows.append(f"  cwd:      {cwd}")
@@ -6577,6 +6610,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     raw_title = "▣ " + raw_title       # selection (Space-Space)
                 if _b2_sid and s["id"] == _b2_sid:
                     raw_title = "↻ " + raw_title       # b2 checkpoint in progress on this session
+                if s.get("is_bg") and s.get("parent_session_id"):
+                    # agent lineage: name WHO spawned it, so one parent's brood
+                    # reads as a block in the Agents section (#agent-lineage)
+                    _par = getattr(self, "_sid_index", {}).get(s["parent_session_id"])
+                    _pt = _list_title(_par)[:24] if _par else s["parent_session_id"][:8]
+                    raw_title = "↳ " + raw_title + " ⟨" + _pt + "⟩"
                 _tstyle = _title_color.get(_color_key_for(s, _color_by), "")  # [display] color_by
                 if narrow:
                     # marker · relative-Last · title (title tinted per color_by).
@@ -8538,48 +8577,77 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # the pty-None window until the next poll. (#review-dead-pane-window)
             self._mirror_sync_pane()
 
+        def _kill_agents(self, targets: list, label: str) -> None:
+            """Confirm, then terminate each (pid, procStart, title) in `targets`.
+            One confirm for the whole batch; each kill is identity-verified in
+            _kill_agent_process. (#agent-kill #agent-lineage)"""
+            if not targets:
+                return
+            head = targets[0]
+
+            def _do(ok: bool):
+                if not ok:
+                    return
+                done = gone = fail = 0
+                for pid, ps, _t in targets:
+                    res = _kill_agent_process(pid, ps)
+                    _log(f"kill agent pid={pid}: {res}")
+                    if res == "signalled":
+                        done += 1
+                    elif res in ("gone", "stale"):
+                        gone += 1
+                    else:
+                        fail += 1
+                if fail:
+                    self.notify(f"{done} terminating, {fail} failed",
+                                severity="error", title="saikai", timeout=6)
+                elif done:
+                    self.notify(f"terminating {done} agent(s)"
+                                + (f", {gone} already ended" if gone else ""), timeout=5)
+                else:
+                    self.notify("agent(s) already ended", timeout=4)
+                self.set_timer(2.2, self.action_refresh)
+
+            # the modal names the batch (its title line = label, pid of the first)
+            self.push_screen(KillAgentScreen(label, head[0]), _do)
+
         def action_kill_agent(self) -> None:
-            """Shift+K: terminate the focused row's live agent/bg process. Only
-            valid on an is_bg session (kind=agent/bg, the & marker) — refuse
-            anything else so a stray K can never signal an interactive
-            claude or a dormant transcript. Confirmed + identity-verified.
-            (#agent-kill)"""
+            """Shift+K: terminate a live agent process — the focused agent row's
+            own process, OR (on a PARENT row) all of its live child agents at
+            once ("manage them where they belong"). Refuses any row that is
+            neither, so a stray K can never signal an interactive claude or a
+            dormant transcript. Confirmed + identity-verified. (#agent-kill)"""
             if isinstance(self.focused, Select):
                 raise SkipAction()
             sid = self._cursor_sid()
             s = self._sid_index.get(sid) if sid else None
             if not s:
                 return
-            if not s.get("is_bg"):
-                self.notify("K (Shift+K) terminates a running AGENT (the & marker); "
-                            "this row isn't one", severity="information",
-                            title="saikai", timeout=5)
-                return
-            info = _active_procinfo().get(sid)
-            if not info:
-                self.notify("agent already ended", timeout=4)
-                self.action_refresh()
-                return
-            pid, procstart = info
-            title = _pane_title(s, sid, None)
-
-            def _do(ok: bool, _pid=pid, _ps=procstart, _sid=sid, _t=title):
-                if not ok:
-                    return
-                res = _kill_agent_process(_pid, _ps)
-                _log(f"kill agent {_sid[:8]} pid={_pid}: {res}")
-                if res in ("signalled",):
-                    self.notify(f"terminating agent '{_t}' (pid {_pid})", timeout=5)
-                elif res in ("gone", "stale"):
+            if s.get("is_bg"):
+                # a single agent/bg row
+                info = _active_procinfo().get(sid)
+                if not info:
                     self.notify("agent already ended", timeout=4)
-                else:
-                    self.notify(f"could not terminate pid {_pid}",
-                                severity="error", title="saikai", timeout=6)
-                # let the registry entry drop, then refresh so & clears / row
-                # becomes resumable
-                self.set_timer(2.2, self.action_refresh)
-
-            self.push_screen(KillAgentScreen(title, pid), _do)
+                    self.action_refresh()
+                    return
+                pid, procstart = info
+                title = _pane_title(s, sid, None)
+                self._kill_agents([(pid, procstart, title)], f"'{title}' (pid {pid})")
+                return
+            # a non-agent row: bulk-stop its live children, if any (#agent-lineage)
+            kids = [(k, v) for k, v in self._sid_index.items()
+                    if v.get("is_bg") and v.get("parent_session_id") == sid
+                    and _active_procinfo().get(k)]
+            if kids:
+                targets = [(*_active_procinfo()[k], _pane_title(v, k, None))
+                           for k, v in kids]
+                self._kill_agents(
+                    targets, f"{len(targets)} child agent(s) of "
+                             f"'{_pane_title(s, sid, None)}'")
+                return
+            self.notify("K terminates a running AGENT (the & marker), or a "
+                        "parent's child agents; this row is neither",
+                        severity="information", title="saikai", timeout=5)
 
         def action_close_all_live(self) -> None:
             # Shift+F10: close ALL live panes at once (parallel kill) but STAY in

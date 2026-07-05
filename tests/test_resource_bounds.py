@@ -812,6 +812,42 @@ def test_memory_safety_presets_and_override():
                 os.environ[k] = v
 
 
+
+def test_parse_session_extracts_agent_lineage():
+    """Agent lineage (#agent-lineage): parse_session pulls parentSessionId /
+    agentId / isSidechain from the transcript into the session dict, and the
+    disk-cache gate REJECTS an old cache lacking the field so upgrades repopulate."""
+    import json, tempfile
+    from pathlib import Path
+    d = Path(tempfile.mkdtemp())
+    child = d / "agent-abc.jsonl"
+    child.write_text("\n".join(json.dumps(r) for r in [
+        {"type": "user", "timestamp": "2026-07-01T00:00:00.000Z", "cwd": "/w",
+         "parentSessionId": "parent-123", "agentId": "abc", "isSidechain": True,
+         "message": {"role": "user", "content": "subagent task"}},
+        {"type": "user", "timestamp": "2026-07-01T00:01:00.000Z", "cwd": "/w",
+         "message": {"role": "user", "content": "more"}},
+    ]) + "\n", encoding="utf-8")
+    p = saikai.parse_session(child)
+    assert p is not None
+    assert p.get("parent_session_id") == "parent-123", p
+    assert p.get("agent_id") == "abc" and p.get("is_sidechain") is True, p
+    plain = d / "plain.jsonl"
+    plain.write_text(json.dumps(
+        {"type": "user", "timestamp": "2026-07-01T00:00:00.000Z", "cwd": "/w",
+         "message": {"role": "user", "content": "hi"}}) + "\n", encoding="utf-8")
+    pp = saikai.parse_session(plain)
+    assert pp.get("parent_session_id") == "" and pp.get("is_sidechain") is False, pp
+    st = child.stat()
+    stale = {"mtime": st.st_mtime, "size": st.st_size, "origin_cwd": "/w",
+             "real_msgs": ["x"], "first_ts": "t"}
+    cache_file = saikai.PARSED_DIR / (child.stem + ".json")
+    saikai.PARSED_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps(stale), encoding="utf-8")
+    p2 = saikai.parse_session(child)
+    assert p2.get("parent_session_id") == "parent-123", \
+        "old cache without lineage must force a re-parse"
+
 if __name__ == "__main__":
     test_hostile_inputs_degrade_instead_of_raising()
     print("PASS test_hostile_inputs_degrade_instead_of_raising")
@@ -855,6 +891,8 @@ if __name__ == "__main__":
     print("PASS test_last_assistant_text_from_jsonl_reads_tail")
     test_first_cwd_from_jsonl_scans_early_records()
     print("PASS test_first_cwd_from_jsonl_scans_early_records")
+    test_parse_session_extracts_agent_lineage()
+    print("PASS test_parse_session_extracts_agent_lineage")
     test_first_ts_from_jsonl_scans_early_records()
     print("PASS test_first_ts_from_jsonl_scans_early_records")
     test_bind_cleared_child_falsifiable_detection()

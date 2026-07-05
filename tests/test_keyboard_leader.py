@@ -1014,7 +1014,7 @@ def test_pilot_kill_agent_gated_and_verified():
                 await pilot.pause(0.2)
                 facts["nonbg_no_modal"] = not any(
                     type(s).__name__ == "KillAgentScreen" for s in self.screen_stack)
-                facts["nonbg_toast"] = any("isn't one" in str(n.message)
+                facts["nonbg_toast"] = any("is neither" in str(n.message)
                                            for n in self._notifications)
                 # (2) agent row: Ctrl+K opens the confirm
                 self._cursor_sid = lambda _s=agent_sid: _s
