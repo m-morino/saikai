@@ -2646,6 +2646,25 @@ def test_pilot_filter_engaged_window_survives_focus_move():
         f"a filter keystroke in the last beat must read as engaged: {facts}"
 
 
+def test_kill_agent_yields_key_to_a_focused_live_pane():
+    """Shift+K (kill-agent) is a priority=True binding, so it preempts a focused
+    live pane's on_key — verified separately: priority bindings fire before the
+    focused widget's on_key even when that on_key calls event.stop(). Without a
+    guard, pressing Shift+K while typing into claude ran action_kill_agent (a
+    notify) instead of entering a capital 'K'. action_kill_agent must raise
+    SkipAction when a live terminal is focused — the SAME guard action_resume /
+    action_toggle_preview / action_help already use — so Textual forwards the key
+    to the AgentTerminal, whose on_key writes it to the PTY. (#agent-kill)"""
+    src = Path(saikai.__file__).read_text(encoding="utf-8")
+    i = src.find("def action_kill_agent(self)")
+    assert i != -1, "action_kill_agent not found"
+    j = src.find("\n        def ", i + 1)   # next method at the class-body indent
+    body = src[i:j] if j != -1 else src[i:i + 2000]
+    assert ("self._focused_terminal() is not None" in body
+            and "SkipAction" in body), \
+        "action_kill_agent must yield Shift+K to a focused live pane (raise SkipAction)"
+
+
 def test_pilot_cycle_tab_skips_dead_pane():
     """F2/F3 (cycle_tab) must NEVER focus a DEAD ✓ pane. A corpse has no PTY, so
     keys would vanish into it (and a stray printable would bubble to the list as
@@ -2921,6 +2940,8 @@ if __name__ == "__main__":
     print("PASS test_statusbar_markup_escapes_user_search_and_folder")
     test_tab_glyph_updates_via_tab_label_not_pane_label()
     print("PASS test_tab_glyph_updates_via_tab_label_not_pane_label")
+    test_kill_agent_yields_key_to_a_focused_live_pane()
+    print("PASS test_kill_agent_yields_key_to_a_focused_live_pane")
     test_pilot_cycle_tab_skips_dead_pane()
     test_pilot_double_space_does_not_leave_leader_armed()
     print("PASS test_pilot_double_space_does_not_leave_leader_armed")

@@ -8619,6 +8619,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             dormant transcript. Confirmed + identity-verified. (#agent-kill)"""
             if isinstance(self.focused, Select):
                 raise SkipAction()
+            # A focused live pane owns Shift+K as a literal capital "K": the K
+            # binding is priority=True, so it preempts the pane's on_key; raise
+            # SkipAction so Textual forwards the key to the AgentTerminal (its
+            # on_key writes it to the PTY) instead of killing an agent while the
+            # user is typing — mirrors action_resume's Enter guard. (#agent-kill)
+            if self._focused_terminal() is not None:
+                raise SkipAction()
             sid = self._cursor_sid()
             s = self._sid_index.get(sid) if sid else None
             if not s:
