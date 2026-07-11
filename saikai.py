@@ -312,6 +312,10 @@ _CONFIG_TEMPLATE = (
     "split_ratio  = 0.34       # initial list share; dragging / Alt+arrows persists over it\n\n"
     "[launch]\n"
     "auto_permission = false   # true = add --permission-mode auto in frequent workspaces\n\n"
+    "[providers]\n"
+    "# codex = true   # list Codex CLI threads (~/.codex or $CODEX_HOME) alongside\n"
+    "#                # claude's (auto-on when the dir exists; false hides them).\n"
+    "#                # Enter resumes them via `codex resume` in a live pane.\n\n"
     "[limits]                       # live-pane memory safety\n"
     'memory_safety          = "on"  # ONE knob: on (balanced) | off (only refuse at true\n'
     "#                                exhaustion + max_live) | strict (refuse earlier, hard stop)\n"
@@ -1260,6 +1264,10 @@ def _needs_attention(s: dict, cache: dict) -> bool:
     user turn — the assistant didn't get the last word, so the session was
     interrupted / left unanswered and is worth resuming. Cached by mtime so a
     file is tail-read at most once per change."""
+    if (s.get("provider") or "claude") != "claude":
+        # the tail-read below speaks claude's transcript schema; codex rollouts
+        # have no attention signal wired yet (C1) — never flag them (#codex-provider)
+        return False
     sid = s.get("id")
     mt = s.get("mtime", 0)
     hit = cache.get(sid)
@@ -2243,6 +2251,256 @@ def load_sessions_in_dir(project_dir: Path, since: datetime | None) -> list[dict
             s["project_name"] = project_dir.name
             sessions.append(s)
     return sessions
+
+
+# ── Codex history discovery — provider "codex", C1 (#codex-provider) ─────────
+# Facts verified against codex-cli 0.144.1 on real rollouts (2026-07-12):
+# ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl; line 1 is session_meta
+# {id, cwd, timestamp, source, originator, git} — a RESUMED rollout adds
+# session_id (= ROOT thread id) + parent_thread_id. Clean user turns ride
+# event_msg {type:"user_message"} (response_item user messages carry AGENTS.md /
+# instruction preambles and must not feed search/preview). session_index.jsonl
+# maps root ids to thread_name. `codex resume <root-id>` loads the thread's
+# LATEST state across chained rollouts, and skips its "choose working
+# directory" prompt when spawned with cwd = the recorded cwd.
+_CODEX = get_provider("codex")
+
+
+def _codex_sessions_root() -> Path:
+    return _CODEX.history_roots()[0]     # $CODEX_HOME ?? ~/.codex, + "sessions"
+
+
+def _codex_enabled() -> bool:
+    """Codex rows appear when the sessions dir exists; [providers] codex=false /
+    SAIKAI_CODEX=0 opts out. Config-gated so a dormant ~/.codex left by a
+    one-time experiment can be silenced without deleting it."""
+    if not _cfg("providers", "codex", "SAIKAI_CODEX", True, _cfg_bool):
+        return False
+    try:
+        return _codex_sessions_root().is_dir()
+    except Exception:
+        return False
+
+
+def _parse_codex_rollout(path: Path) -> dict | None:
+    """One rollout file → meta + clean user turns, disk-cached by mtime+size
+    (same staleness discipline as parse_session's cache — an append always
+    changes the byte size). None for unreadable files and for INTERNAL
+    sessions (source {"subagent": {"other": …}} — approval assessors etc.,
+    machine-made threads that are noise in a session picker); the skip is
+    cached too so big internal files are read once."""
+    try:
+        _st = path.stat()
+    except OSError:
+        return None
+    mtime, size = _st.st_mtime, _st.st_size
+    cache_file = PARSED_DIR / f"codex-{path.stem[-36:]}.json"
+    cached = _read_json(cache_file, None)
+    if (isinstance(cached, dict) and abs(cached.get("mtime", 0) - mtime) < 0.5
+            and cached.get("size") == size):
+        if cached.get("skip"):
+            return None
+        r = dict(cached)
+        r["path"] = path                  # Path is not JSON-cacheable; rebind
+        return r
+    meta = None
+    first_ts = last_ts = None
+    real_msgs: list[str] = []
+    try:
+        with open(path, "rb") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                ts = obj.get("timestamp", "")
+                if ts:
+                    if first_ts is None:
+                        first_ts = ts
+                    last_ts = ts
+                payload = obj.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                t = obj.get("type", "")
+                if meta is None and t == "session_meta":
+                    meta = payload
+                elif t == "event_msg" and payload.get("type") == "user_message":
+                    txt = payload.get("message")
+                    if isinstance(txt, str) and txt.strip():
+                        real_msgs.append(txt[:800].replace("\n", " "))
+    except Exception:
+        pass                              # keep a partial parse (locked tail)
+    result: "dict | None"
+    if not (isinstance(meta, dict) and isinstance(meta.get("id"), str)):
+        result = None
+    else:
+        src = meta.get("source")
+        kind, parent, agent_label = "cli", "", ""
+        if isinstance(src, str) and src:
+            kind = src
+        elif isinstance(src, dict):
+            sub = src.get("subagent")
+            spawn = sub.get("thread_spawn") if isinstance(sub, dict) else None
+            if isinstance(spawn, dict):
+                # codex's own agents feature — same lineage shape claude rows
+                # carry (parent_session_id / agent_id) (#agent-lineage)
+                kind = "agent"
+                parent = spawn.get("parent_thread_id") or ""
+                agent_label = (spawn.get("agent_nickname")
+                               or spawn.get("agent_role") or "agent")
+            elif isinstance(sub, dict):
+                # internal assessor (guardian …) — cache the skip and bail
+                try:
+                    _write_json(cache_file, {"mtime": mtime, "size": size,
+                                             "skip": True})
+                except Exception:
+                    pass
+                return None
+        result = {
+            "mtime": mtime, "size": size,
+            "rollout_id": meta["id"],
+            # a resumed rollout names its ROOT thread; a fresh one IS the root
+            "root_id": meta.get("session_id") or meta["id"],
+            "first_ts": meta.get("timestamp") or first_ts or "",
+            "last_ts": last_ts or first_ts or "",
+            "cwd": meta.get("cwd") or "",
+            "kind": kind,
+            "parent_thread_id": parent,
+            "agent_label": agent_label,
+            "real_msgs": real_msgs,
+        }
+    if result is None:
+        try:
+            _write_json(cache_file, {"mtime": mtime, "size": size, "skip": True})
+        except Exception:
+            pass
+        return None
+    try:
+        _write_json(cache_file, result)
+    except Exception:
+        pass
+    r = dict(result)
+    r["path"] = path
+    return r
+
+
+def load_codex_sessions(since: "datetime | None") -> list[dict]:
+    """All codex threads as saikai session dicts (provider="codex") — ONE row
+    per THREAD: chained rollouts (resume writes a new file pointing at the
+    root) fold into their root id, which is exactly what `codex resume` takes;
+    the newest rollout supplies jsonl_path / mtime / cwd, and user turns merge
+    across the chain so search and preview see the whole conversation."""
+    root = _codex_sessions_root()
+    try:
+        files = list(root.rglob("rollout-*.jsonl"))
+    except OSError:
+        return []
+    threads: dict[str, list[dict]] = {}
+    for p in files:
+        try:
+            r = _parse_codex_rollout(p)
+        except Exception:
+            continue                      # one bad file must not hide the rest
+        if r:
+            threads.setdefault(r["root_id"], []).append(r)
+    names: dict[str, str] = {}
+    try:
+        with open(root.parent / "session_index.jsonl", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(d, dict) and d.get("id") and d.get("thread_name"):
+                    names[d["id"]] = str(d["thread_name"])
+    except OSError:
+        pass
+    rows: list[dict] = []
+    cutoff = since.timestamp() if since is not None else None
+    for tid, parts in threads.items():
+        parts.sort(key=lambda r: r["first_ts"])
+        latest = max(parts, key=lambda r: r["mtime"])
+        if cutoff is not None and latest["mtime"] < cutoff:
+            continue
+        agent = next((r for r in parts if r["kind"] == "agent"), None)
+        parsed = {
+            "provider": "codex",
+            "first_ts": parts[0]["first_ts"],
+            "last_ts": latest["last_ts"],
+            "ai_title": names.get(tid, ""),
+            "real_msgs": [m for r in parts for m in r["real_msgs"]],
+            "cwd": latest["cwd"],
+            "origin_cwd": parts[0]["cwd"],
+            "worktree_origin_cwd": "",
+            "git_branch": "",
+            "parent_session_id": (agent or {}).get("parent_thread_id", ""),
+            "agent_id": (agent or {}).get("agent_label", ""),
+            "is_sidechain": False,
+        }
+        row = _enrich_session(tid, parsed, latest["path"], latest["mtime"])
+        # claude-style encoded project name so project_short / the Project
+        # column render codex rows exactly like claude ones for the same cwd
+        row["project_name"] = re.sub(r"[:/\\.]", "-", latest["cwd"] or "")
+        rows.append(row)
+    return rows
+
+
+def _codex_rows_in_scope(rows: list[dict], all_projects: bool,
+                         repo, cwd) -> list[dict]:
+    """--here/--project keeps only codex threads whose cwd sits inside the
+    current repo (or cwd); --all shows every thread. Mirrors the claude-side
+    project scoping, which codex's date-sharded layout can't express."""
+    if all_projects:
+        return rows
+    base = _norm_cwd(str(repo or cwd))
+    out = []
+    for s in rows:
+        c = _norm_cwd(s.get("cwd") or s.get("origin_cwd") or "")
+        if c and (c == base or c.startswith(base + os.sep)):
+            out.append(s)
+    return out
+
+
+def _codex_dirs_mtime() -> float:
+    """Change signal for the codex tree: a NEW rollout bumps its DAY dir, and a
+    new day/month/year bumps its parent — so root + the newest year/month/day
+    chain covers file creation in ~4 stats. Appends to already-listed files are
+    covered by the _sid_index jsonl_path stat layer (#audit-attention-freshness)."""
+    m = 0.0
+    d = _codex_sessions_root()
+    try:
+        m = max(m, d.stat().st_mtime)
+    except OSError:
+        return m
+    for _ in range(3):                    # year / month / day
+        try:
+            subs = [p for p in d.iterdir() if p.is_dir()]
+        except OSError:
+            break
+        if not subs:
+            break
+        d = max(subs, key=lambda p: p.name)   # zero-padded names sort lexically
+        try:
+            m = max(m, d.stat().st_mtime)
+        except OSError:
+            break
+    return m
+
+
+def _build_codex_resume_invocation(
+    full_id: str, selected: dict
+) -> tuple[list[str], str | None, dict]:
+    """`codex resume <root-id>` from the thread's recorded cwd. Matching the
+    recorded cwd makes codex skip its own "choose working directory" prompt
+    (verified on 0.144.1); a vanished cwd → None (inherit saikai's), and the
+    prompt appears INSIDE the pane — survivable by design. (#codex-provider)"""
+    cwd = selected.get("cwd") or selected.get("origin_cwd") or None
+    if cwd and not Path(cwd).is_dir():
+        cwd = None
+    spec = _CODEX.build_resume(full_id, cwd=cwd, env=_child_spawn_env())
+    return spec.argv, spec.cwd, spec.env
 
 
 # ── LLM summarization via claude -p ──────────────────────────────────────────
@@ -3302,6 +3560,8 @@ def _marker_legend(s: dict, favorites: set, hidden: set) -> list:
     preview can explain its own +/./*/@/&/… glyphs in context. At most one
     activity entry + one state entry (the two columns each show one glyph)."""
     out = []
+    if s.get("provider") == "codex":
+        out.append("◇ codex thread — Enter resumes it with `codex resume` in a pane")
     if s.get("is_bg"):
         out.append("& agents/bg session (owned by another claude — resumable when it ends)"
                    if s.get("live_kind") == "agent" else "& background agent/job")
@@ -6602,6 +6862,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 raw_title = (raw_title.replace("\n", " ")
                                        .replace("\r", " ")
                                        .replace("\t", " "))
+                if s.get("provider") == "codex":
+                    raw_title = "◇ " + raw_title    # provider badge (#codex-provider)
                 if tree_mode and tree_prefixes.get(s["id"]):
                     # Strip ANSI from the tree prefix so the cell stays a plain
                     # str of consistent width.
@@ -7424,9 +7686,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # Probe BEFORE tearing down the picker: here resume runs only
                     # AFTER self.exit() leaves the alt-screen, so a "claude not on
                     # PATH" error would print into a half-restored terminal and
-                    # scroll away — the user just sees saikai vanish. Surface it now.
-                    if shutil.which("claude") is None:
-                        self.notify("claude not found on PATH — cannot resume",
+                    # scroll away — the user just sees saikai vanish. Surface it
+                    # now. The binary follows the row's provider (#codex-provider).
+                    _bin = get_provider(
+                        (self._sid_index.get(sid) or {}).get("provider")
+                        or "claude").executable_name
+                    if shutil.which(_bin) is None:
+                        self.notify(f"{_bin} not found on PATH — cannot resume",
                                     severity="error", title="saikai", timeout=8)
                         return
                     self.exit(sid)
@@ -7753,11 +8019,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"(~{_per:.0f} MB). Close panes (F10) if it slows. "
                     f"SAIKAI_HARD_RAM_GATE=1 to block instead.",
                     severity="warning", timeout=7)
+            # Status classification follows the ROW's provider (a codex pane
+            # gets the generic classifier), not the global default (#codex-provider)
+            _prov = ((self._sid_index.get(sid) or {}).get("provider")
+                     or _ACTIVE_PROVIDER.id)
             term = _LIVE_TERM.AgentTerminal(
                 argv, cwd=cwd, env=env, sid=sid, title=title,
                 on_status=self._on_live_status, on_exit=self._on_live_exit,
                 status_classifier=_LIVE_TERM.classifier_for_profile(
-                    _ACTIVE_PROVIDER.status_profile),
+                    get_provider(_prov).status_profile),
             )
             pane = TabPane(Content(_LIVE_TERM.tab_label(title, "idle")), term, id=pane_id)  # Content: markup-safe title (rich Text crashes render_str) (#audit-toast-markup)
             # Mount on the UI event loop in a worker so we can AWAIT the removal of
@@ -9376,6 +9646,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     m = max(m, _os.stat(p).st_mtime)   # transcript GROWTH (no glob)
                 except OSError:
                     pass
+            if _codex_enabled():
+                # NEW codex rollouts bump their day dir (appends to known files
+                # are already covered by the jsonl_path stats above) (#codex-provider)
+                m = max(m, _codex_dirs_mtime())
             return m
 
         def _rescan_if_changed(self) -> None:
@@ -9876,6 +10150,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                             severity="warning", timeout=3)
                 return
             s = self._sid_index.get(sid) or {}
+            if (s.get("provider") or "claude") != "claude":
+                # the flow injects claude's /handoff + /clear — foreign slash
+                # commands typed into a codex pane would go to its model (#codex-provider)
+                self.notify("checkpoint drives claude's /handoff + /clear — "
+                            "not available for a codex pane",
+                            severity="warning", timeout=5)
+                return
             jp = s.get("jsonl_path")
             if not jp:
                 self.notify("no transcript for this pane yet", timeout=3)
@@ -10855,7 +11136,11 @@ def _build_resume_invocation(
     full_id: str, sessions: list[dict]
 ) -> tuple[list[str], str | None, dict]:
     """Launch a RESUMED `claude --resume <id>` from its origin cwd. Used by both
-    the legacy full-takeover path (_resume_claude) and the split-live pane."""
+    the legacy full-takeover path (_resume_claude) and the split-live pane.
+    A provider="codex" row resumes via `codex resume` instead (#codex-provider)."""
+    selected = next((s for s in sessions if s["id"] == full_id), None)
+    if selected is not None and selected.get("provider") == "codex":
+        return _build_codex_resume_invocation(full_id, selected)
     target_cwd = _resolve_resume_cwd(full_id, sessions)
     return _build_claude_invocation(["--resume", full_id], target_cwd, sessions)
 
@@ -12187,6 +12472,15 @@ def _main():
                 if extra:
                     sessions.extend(extra)
 
+    # Codex threads ride the same list (provider="codex", ◇ badge) when the
+    # history dir exists; --here scopes them by cwd like claude rows (#codex-provider)
+    if _codex_enabled():
+        try:
+            sessions.extend(_codex_rows_in_scope(
+                load_codex_sessions(since), args.all_projects, repo, cwd))
+        except Exception as e:
+            _log(f"codex scan failed (list continues without it): {e!r}")
+
     # Collapse any sid that surfaced from >1 project dir (case-variant encoded dirs
     # on a case-insensitive FS) BEFORE the table keys rows by sid — else DuplicateKey. (#H2)
     sessions = _dedup_sessions_by_id(sessions)
@@ -12220,7 +12514,10 @@ def _main():
         import threading as _thr
         needs_llm = [s for s in sessions
                      if not s["ai_title"] and not s.get("is_open")
-                     and s.get("_cache_hit") is None]
+                     and s.get("_cache_hit") is None
+                     # don't spend claude credits titling codex threads; they
+                     # fall back to their first user turn (#codex-provider)
+                     and (s.get("provider") or "claude") == "claude"]
         if needs_llm:
             _t = _thr.Thread(target=summarize_all_parallel, args=(sessions,),
                              daemon=True)
@@ -12290,6 +12587,12 @@ def _main():
                                 s["worktree_label"] = wt_label
                             if extra:
                                 fresh.extend(extra)
+            if _codex_enabled():        # keep parity with the initial scan (#codex-provider)
+                try:
+                    fresh.extend(_codex_rows_in_scope(
+                        load_codex_sessions(since), args.all_projects, repo, cwd))
+                except Exception as e:
+                    _log(f"codex rescan failed (list continues without it): {e!r}")
             # Same sid from >1 project dir (case-variant encoded dirs on a
             # case-insensitive FS) must collapse HERE too, not just at initial
             # load — DataTable.add_row(key=sid) raises on a duplicate key, so a

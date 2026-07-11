@@ -260,11 +260,18 @@ resolved location and values — or press **`Space ,`** inside the app: the
 Settings screen edits the list options in place and shows every config knob
 with its resolved value and source (`e` there opens config.toml in your editor).
 
-Claude Code is the currently integrated provider. Agent-specific launch and
-status contracts live in `saikai_provider.py`; a Codex contract validates the
-extension boundary, but Codex is not selectable until its history discovery and
-live-state integration are complete. Claude history discovery respects
-`CLAUDE_CONFIG_DIR`.
+Claude Code is the primary provider; Claude history discovery respects
+`CLAUDE_CONFIG_DIR`. Agent-specific launch and status contracts live in
+`saikai_provider.py`.
+
+**Codex CLI (experimental).** When `~/.codex/sessions` (or `$CODEX_HOME`)
+exists, Codex threads join the same list automatically, marked `◇` — search,
+preview, and `Enter` (which opens `codex resume <id>` in a normal live pane,
+web mirror included) work like any other row. Chained threads (codex's own
+resume) fold into one row; codex's internal assessor sessions are excluded.
+Set `[providers] codex = false` (or `SAIKAI_CODEX=0`) to hide them. Not yet
+wired for codex rows: the `!` attention marker, live/open detection, and
+checkpoint (claude-specific by design).
 
 ## Platform support
 
