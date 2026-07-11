@@ -39,7 +39,10 @@ Resume semantics (PTY-probed):
 
 - `load_codex_sessions` folds rollouts into one row per thread root; rows are
   ordinary session dicts with `provider="codex"`, so favorites, hide, rename,
-  search, preview, panes and the web mirror work unchanged. `◇` title badge.
+  search, preview, panes and the web mirror work unchanged. In a MIXED list
+  every row carries its provider glyph (`✻` claude / `⌬` codex — both
+  East-Asian-width Neutral, so 1 cell even on CJK terminals); an all-claude
+  list stays unbadged.
 - `_build_resume_invocation` dispatches by the row's provider — panes get the
   `generic` status classifier via the provider registry.
 - Freshness: new rollouts bump their day dir → `_codex_dirs_mtime()` stats the

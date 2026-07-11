@@ -253,7 +253,9 @@ def test_pilot_codex_rows_listed_and_enter_resumes():
                         titles.append(str(row[-1]))
                     except Exception:
                         pass
-                facts["codex_badged"] = any("◇" in t for t in titles)
+                # provider glyphs appear because this list MIXES providers
+                facts["codex_badged"] = any("⌬" in t for t in titles)
+                facts["claude_badged"] = any("✻" in t for t in titles)
                 self._open_or_attach_live(B)
                 await pilot.pause(0.2)
         asyncio.run(go())
@@ -271,7 +273,9 @@ def test_pilot_codex_rows_listed_and_enter_resumes():
 
     assert facts.get("has_codex"), facts
     assert facts.get("has_claude"), facts
-    assert facts.get("codex_badged"), f"codex rows must carry the ◇ badge: {facts}"
+    assert facts.get("codex_badged"), f"codex rows must carry the ⌬ badge: {facts}"
+    assert facts.get("claude_badged"), \
+        f"claude rows must carry ✻ when the list mixes providers: {facts}"
     assert len(facts["argvs"]) == 1, facts
     argv = facts["argvs"][0]
     assert argv[1:3] == ["resume", B], argv

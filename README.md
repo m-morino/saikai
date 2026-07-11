@@ -265,7 +265,10 @@ Claude Code is the primary provider; Claude history discovery respects
 `saikai_provider.py`.
 
 **Codex CLI (experimental).** When `~/.codex/sessions` (or `$CODEX_HOME`)
-exists, Codex threads join the same list automatically, marked `◇` — search,
+exists, Codex threads join the same list automatically. A mixed list marks
+every row with its provider's glyph — `✻` claude (its own CLI mark), `⌬`
+codex (OpenAI's hexagonal knot) — while an all-claude list stays unbadged.
+Search,
 preview, and `Enter` (which opens `codex resume <id>` in a normal live pane,
 web mirror included) work like any other row. Chained threads (codex's own
 resume) fold into one row; codex's internal assessor sessions are excluded.
