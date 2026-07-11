@@ -967,6 +967,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._pending_ticks = 0
         self.is_dead = False
         self._spawn_error: Optional[str] = None
+        # monotonic ts of the last USER input written to this pane (keys, paste,
+        # mirror-injected bytes). The host's list-rebuild deferral keys off
+        # "typing recently", not "pane focused": parking focus in a pane while
+        # WATCHING the list froze the State groups on quiet POSIX ptys, where
+        # the final busy→idle tick comes from the UI-thread poll and never the
+        # reader. (#linux-state-regroup)
+        self.last_input_ts = 0.0
 
     # ── geometry helpers ──────────────────────────────────────────────────────
     def _dims(self) -> tuple[int, int]:
@@ -1169,6 +1176,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         data = encode_key(event.key, getattr(event, "character", None))
         if data is None:
             return
+        self.last_input_ts = time.monotonic()   # (#linux-state-regroup)
         self._snap_to_live()   # typing returns the view to the live bottom
         try:
             self._pty.write(data)
@@ -1237,6 +1245,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         text = _normalize_paste_newlines(text)   # CRLF → LF (Windows double-enter)
         if getattr(self, "_bracketed_paste", False):
             text = _wrap_bracketed_paste(text)   # strips embedded markers (breakout)
+        self.last_input_ts = time.monotonic()    # (#linux-state-regroup)
         self._snap_to_live()   # injected input returns the view to the live bottom
         try:
             self._pty.write(text)
