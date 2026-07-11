@@ -2777,6 +2777,13 @@ def load_sessions_in_dir(project_dir: Path, since: datetime | None) -> list[dict
 # directory" prompt when spawned with cwd = the recorded cwd.
 _CODEX = get_provider("codex")
 
+# Provider glyphs for MIXED lists: ✻ (U+273B) is the scattered asterisk claude
+# code itself brands its CLI with; ⌬ (U+232C benzene ring) is the closest
+# single-cell stand-in for OpenAI's hexagonal-knot mark. Both are East-Asian-
+# width Neutral → 1 cell even on CJK-configured terminals (the first-cut ◇ was
+# Ambiguous and could render double-width there). (#codex-provider)
+_PROVIDER_GLYPH = {"claude": "✻", "codex": "⌬"}
+
 
 def _codex_sessions_root() -> Path:
     return _CODEX.history_roots()[0]     # $CODEX_HOME ?? ~/.codex, + "sessions"
@@ -4484,7 +4491,7 @@ def _marker_legend(s: dict, favorites: set, hidden: set) -> list:
     activity entry + one state entry (the two columns each show one glyph)."""
     out = []
     if s.get("provider") == "codex":
-        out.append("◇ codex thread — Enter resumes it with `codex resume` in a pane")
+        out.append("⌬ codex thread — Enter resumes it with `codex resume` in a pane")
     if s.get("is_expired"):
         out.append("- Claude deleted this transcript; saikai kept the record "
                    "(readable and searchable, not resumable)")
@@ -7884,6 +7891,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 visible = [s for s in visible
                            if s["id"] in favorites
                            or (_last_active_dt(s) or datetime.min) >= _cut]
+            # Provider glyphs (✻ claude / ⌬ codex) appear only when the list
+            # MIXES providers; a homogeneous (all-claude) list keeps the classic
+            # unbadged look. (#codex-provider)
+            _mixed_providers = len({(s.get("provider") or "claude")
+                                    for s in visible}) > 1
             view_mode = _get_view_mode()
             tree_mode = _get_tree_mode() and len(_forest_candidates(all_sessions)) <= 1000
             group_by = _get_group_by()
@@ -8122,8 +8134,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 raw_title = (raw_title.replace("\n", " ")
                                        .replace("\r", " ")
                                        .replace("\t", " "))
-                if s.get("provider") == "codex":
-                    raw_title = "◇ " + raw_title    # provider badge (#codex-provider)
+                if _mixed_providers:
+                    raw_title = (_PROVIDER_GLYPH.get(
+                        s.get("provider") or "claude", "·") + " " + raw_title)
                 if tree_mode and tree_prefixes.get(s["id"]):
                     # Strip ANSI from the tree prefix so the cell stays a plain
                     # str of consistent width.
@@ -14291,7 +14304,7 @@ def _main():
                 if extra:
                     sessions.extend(extra)
 
-    # Codex threads ride the same list (provider="codex", ◇ badge) when the
+    # Codex threads ride the same list (provider="codex", provider glyphs in mixed lists) when the
     # history dir exists; --here scopes them by cwd like claude rows (#codex-provider)
     if _codex_enabled():
         try:
