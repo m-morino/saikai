@@ -24,6 +24,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat as _stat
@@ -299,6 +300,64 @@ def _cfg_bool(v, default: bool = False) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+# ── [remotes] host mapping — remote-roots phase 2 (#remote-roots) ────────────
+# ssh_args: extra ssh CLI args (port, identity, jump host …). Host aliases in
+# ~/.ssh/config work too — but OpenSSH resolves ~ via getpwuid, NOT $HOME, so
+# harnesses/services with a redirected HOME need the first-class field.
+_Remote = namedtuple("_Remote", "name host prefixes ssh_args")
+
+
+def _remotes_map() -> "list[_Remote]":
+    """Parsed [remotes] config in declaration order (first match wins — declare
+    more-specific remotes first). Malformed entries are skipped (logged), never
+    fatal: one typo'd remote must not take the other mappings down. Prefixes
+    must be absolute POSIX paths; a trailing slash is normalised away ("/"
+    itself = match any absolute cwd). Config-only — the env-var override
+    convention doesn't extend to TOML tables."""
+    sec = _load_config().get("remotes")
+    out: list[_Remote] = []
+    if not isinstance(sec, dict):
+        return out
+    for name, spec in sec.items():
+        host = spec.get("host") if isinstance(spec, dict) else None
+        raw = spec.get("cwd_prefixes") if isinstance(spec, dict) else None
+        prefixes = [p.rstrip("/") or "/" for p in (raw if isinstance(raw, list) else [])
+                    if isinstance(p, str) and p.startswith("/")]
+        raw_args = spec.get("ssh_args", []) if isinstance(spec, dict) else []
+        ssh_args = ([str(a) for a in raw_args if isinstance(a, (str, int, float))]
+                    if isinstance(raw_args, list) else None)
+        # strictness surfaces typos: a half-usable ssh_args (nested tables …)
+        # rejects the ENTRY, it doesn't silently drop the odd element out.
+        if (isinstance(host, str) and host and prefixes
+                and ssh_args is not None and len(ssh_args) == len(raw_args)):
+            out.append(_Remote(str(name), host, prefixes, ssh_args))
+        else:
+            _log(f"remotes: skipping malformed entry {name!r} "
+                 "(need host + absolute cwd_prefixes; ssh_args = list of strings)")
+    return out
+
+
+def _remote_for_cwd(cwd: "str | None") -> "_Remote | None":
+    """The first [remotes] entry holding a PATH-prefix of cwd ("/home/mm"
+    matches /home/mm and /home/mm/x — not /home/mmx), else None."""
+    if not cwd:
+        return None
+    for r in _remotes_map():
+        for p in r.prefixes:
+            if cwd == p or cwd.startswith(p if p == "/" else p + "/"):
+                return r
+    return None
+
+
+def _remote_resume_target(s: "dict | None") -> "_Remote | None":
+    """The [remotes] entry to resume a Desktop-SSH mirror session WHERE IT RAN,
+    or None. Only remote_origin rows qualify — a LOCAL session whose cwd
+    happens to match a configured prefix must never be re-routed over ssh."""
+    if not (isinstance(s, dict) and s.get("remote_origin")):
+        return None
+    return _remote_for_cwd(s.get("origin_cwd") or s.get("cwd"))
+
+
 _CONFIG_TEMPLATE = (
     "# saikai configuration (TOML). Env vars (SAIKAI_*) override these; CLI flags win.\n\n"
     "[summary]\n"
@@ -312,6 +371,15 @@ _CONFIG_TEMPLATE = (
     "split_ratio  = 0.34       # initial list share; dragging / Alt+arrows persists over it\n\n"
     "[launch]\n"
     "auto_permission = false   # true = add --permission-mode auto in frequent workspaces\n\n"
+    "[remotes]\n"
+    "# Resume Desktop-SSH mirror sessions (the 's' rows) on the host they ran on:\n"
+    "# Enter opens `ssh -t <host> 'cd <cwd> && claude --resume <id>'` in the pane.\n"
+    "# Matched by cwd prefix; first entry wins — declare specific remotes first.\n"
+    "# Needs key-based ssh (a password prompt appears inside the pane otherwise).\n"
+    "# Optional ssh_args (port / identity / jump host); ~/.ssh/config aliases\n"
+    "# work in host too — ssh_args just keeps saikai-only options out of it.\n"
+    '# pi  = { host = "mm@192.168.11.4", cwd_prefixes = ["/home/mm", "/opt"] }\n'
+    '# nuc = { host = "mm@nuc", cwd_prefixes = ["/srv"], ssh_args = ["-p", "2222"] }\n\n'
     "[limits]                       # live-pane memory safety\n"
     'memory_safety          = "on"  # ONE knob: on (balanced) | off (only refuse at true\n'
     "#                                exhaustion + max_live) | strict (refuse earlier, hard stop)\n"
@@ -3306,8 +3374,11 @@ def _marker_legend(s: dict, favorites: set, hidden: set) -> list:
         out.append("& agents/bg session (owned by another claude — resumable when it ends)"
                    if s.get("live_kind") == "agent" else "& background agent/job")
     elif s.get("remote_origin"):
-        out.append("s ssh-remote session (ran on another host via Claude Desktop"
-                    " — not resumable here)")
+        _r = _remote_resume_target(s)
+        out.append(f"s ssh-remote session (ran on another host — Enter resumes "
+                   f"over ssh via [remotes] {_r.name!r})" if _r else
+                   "s ssh-remote session (ran on another host via Claude Desktop"
+                   " — not resumable here; map its host in config.toml [remotes])")
     elif s.get("is_remote_control"):
         out.append("R Remote Control on in another session")
     elif s.get("is_open"):
@@ -7425,8 +7496,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # AFTER self.exit() leaves the alt-screen, so a "claude not on
                     # PATH" error would print into a half-restored terminal and
                     # scroll away — the user just sees saikai vanish. Surface it now.
-                    if shutil.which("claude") is None:
-                        self.notify("claude not found on PATH — cannot resume",
+                    # A [remotes]-mapped mirror needs ssh locally, not claude.
+                    _bin = ("ssh" if _remote_resume_target(self._sid_index.get(sid))
+                            else "claude")
+                    if shutil.which(_bin) is None:
+                        self.notify(f"{_bin} not found on PATH — cannot resume",
                                     severity="error", title="saikai", timeout=8)
                         return
                     self.exit(sid)
@@ -7447,18 +7521,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def _remote_origin_block(self, sid: str) -> bool:
             """True (+ an explanatory toast) when sid is a Desktop-SSH mirror of a
-            session that RAN ON ANOTHER HOST: its cwd doesn't exist here, so a
-            local `claude --resume` can't reattach it (and must not try — claude
-            would fail against a foreign-cwd transcript in its own projects dir).
-            Resume it where it ran, or via Claude Desktop's SSH view. (#remote-origin)"""
+            session that RAN ON ANOTHER HOST and no [remotes] mapping covers its
+            cwd: a local `claude --resume` can't reattach it (and must not try —
+            claude would fail against a foreign-cwd transcript in its own
+            projects dir). Mapped mirrors are NOT blocked: resume rides ssh to
+            the recorded host. (#remote-origin) (#remote-roots)"""
             s = self._sid_index.get(sid)
             if not (s and s.get("remote_origin")):
                 return False
+            if _remote_resume_target(s):
+                return False        # resumable over ssh via config [remotes]
             try:
                 self.notify(
                     "this session ran on another host via Claude Desktop's SSH "
                     f"integration (cwd: {s.get('cwd') or '?'})\n"
-                    "resume it there, or from Claude Desktop",
+                    "map its host under [remotes] in config.toml to resume it "
+                    "here over ssh — or resume it where it ran",
                     title="remote session", severity="warning", timeout=8)
             except Exception:
                 pass
@@ -10875,11 +10953,45 @@ def _build_claude_invocation(
     return spec.argv, spec.cwd, spec.env
 
 
+def _build_remote_resume_invocation(
+    full_id: str, selected: dict, remote: "_Remote"
+) -> tuple[list[str], str | None, dict]:
+    """argv to reattach a remote-origin session ON THE HOST IT RAN ON:
+    ``ssh <ssh_args> -t <host> "exec bash -lc 'cd <cwd> && exec claude
+    --resume <sid>'"``. The pane machinery doesn't care that the child is ssh —
+    pyte, status classification, checkpoint injection and the mirror tee all
+    ride the PTY unchanged (docs/design/remote-roots.md, phase 2).
+
+    bash -lc: a plain ssh command runs NON-interactive, whose shell skips
+    ~/.profile — so ~/.local/bin (where claude usually lives) is off PATH and
+    the resume dies with "command not found". A login shell reads the profile.
+    cwd is LOCAL for the ssh process (None → inherit): the recorded cwd is a
+    foreign path and must not be chdir'd into here. Remote quoting is POSIX
+    shlex — Windows REMOTES are out of scope for phase 2 (a Windows LOCAL side
+    is fine: ssh.exe takes the same argv). No pre-flight `test -d` probe: a
+    wrong remote cwd/sid fails loudly inside the pane (claude's "No
+    conversation found"), which is visible and cheaper than a blocking ssh
+    round-trip before every open. (#remote-roots)"""
+    rcwd = selected.get("origin_cwd") or selected.get("cwd")
+    exe = _ACTIVE_PROVIDER.executable_name   # bare name — resolved on the REMOTE PATH
+    inner = ((f"cd {shlex.quote(rcwd)} && " if rcwd else "")
+             + f"exec {exe} --resume {shlex.quote(full_id)}")
+    cmd = f"exec bash -lc {shlex.quote(inner)}"
+    return (["ssh", *remote.ssh_args, "-t", remote.host, cmd],
+            None, _child_spawn_env())
+
+
 def _build_resume_invocation(
     full_id: str, sessions: list[dict]
 ) -> tuple[list[str], str | None, dict]:
     """Launch a RESUMED `claude --resume <id>` from its origin cwd. Used by both
-    the legacy full-takeover path (_resume_claude) and the split-live pane."""
+    the legacy full-takeover path (_resume_claude) and the split-live pane.
+    A [remotes]-mapped Desktop-SSH mirror resumes over ssh on the host it ran
+    on instead (#remote-roots)."""
+    selected = next((s for s in sessions if s["id"] == full_id), None)
+    target = _remote_resume_target(selected)
+    if target:
+        return _build_remote_resume_invocation(full_id, selected, target)
     target_cwd = _resolve_resume_cwd(full_id, sessions)
     return _build_claude_invocation(["--resume", full_id], target_cwd, sessions)
 

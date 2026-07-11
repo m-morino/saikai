@@ -1,8 +1,9 @@
 # Remote roots — supervise sessions on other hosts (0.6 goal)
 
-Status: **design** (branch `feature/remote-roots`, targeting 0.6).
-Shipped groundwork in 0.5.0: Desktop-SSH mirror sessions (`projects/ssh-*`)
-are badged `s` / `remote_origin` and refuse a local resume (#remote-origin).
+Status: **phase 2 implemented** on this branch (targeting 0.6); phase 3 is
+design. Shipped groundwork in 0.5.0: Desktop-SSH mirror sessions
+(`projects/ssh-*`) are badged `s` / `remote_origin` and refuse a local resume
+(#remote-origin).
 
 ## Problem
 
@@ -57,7 +58,20 @@ written on the REMOTE host's `~/.claude/projects` — the local `ssh-*` mirror
 (written by Desktop) stops updating, so list freshness for that session comes
 only from the open pane itself. Phase 3 fixes this properly.
 
-Prerequisites to start:
+Implementation notes (phase 2, landed):
+
+- `[remotes]` grew an optional `ssh_args` list (port / identity / jump host)
+  — ssh reads the real user's `~/.ssh/config` (getpwuid, not `$HOME`), so
+  aliases work, but saikai-only options deserve a first-class field.
+- The remote command is wrapped `exec bash -lc '…'`: a non-interactive ssh
+  shell skips `~/.profile`, leaving `~/.local/bin` (where claude lives) off
+  PATH — the login shell fixes that. Verified E2E.
+- E2E (tests run on demand, not in CI): an EPHEMERAL sshd on 127.0.0.1 with a
+  throwaway keypair stands in for the remote — `~/.ssh` is never touched. The
+  pass criterion is process ancestry: `claude --resume <sid>` must descend
+  from sshd, proving the resume rode the transport.
+
+Remaining prerequisites for real-fleet use:
 - [ ] key-based ssh (no passphrase prompt) from the saikai host to each remote
       — an interactive prompt inside the pane is survivable but ugly
 - [ ] one real `ssh-*` jsonl sample committed as a test fixture (schema is

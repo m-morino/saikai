@@ -215,6 +215,27 @@ air-gapped network — needs **no claude.ai OAuth**, and mirrors saikai's whole
 Remote Control to drive a session from outside your network; reach for saikai's
 mirror to watch *all* your local sessions from the couch.
 
+## Remote sessions over ssh (experimental)
+
+Sessions mirrored by **Claude Desktop's SSH integration** (`projects/ssh-*`,
+the `s` marker) ran on another machine — a local `claude --resume` can't
+reattach them. Map their host in `config.toml` and **`Enter` resumes them where
+they ran**, inside a normal live pane over `ssh -t`:
+
+```toml
+[remotes]
+# matched by cwd prefix, first entry wins — declare specific remotes first
+pi  = { host = "mm@192.168.11.4", cwd_prefixes = ["/home/mm", "/opt"] }
+nuc = { host = "mm@nuc", cwd_prefixes = ["/srv"], ssh_args = ["-p", "2222"] }
+```
+
+Everything downstream — status classification, the web mirror, checkpoint keys
+— works unchanged, because the pane is just a terminal. Set up **key-based
+ssh** first (a password prompt appears inside the pane otherwise). New turns
+are then written on the remote host, so the local mirror row stops refreshing
+while the pane is your live view; full fleet discovery is the 0.6 roadmap
+(`docs/design/remote-roots.md`).
+
 ## Configuration (environment variables)
 
 | Variable | Default | Meaning |
