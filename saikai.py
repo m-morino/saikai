@@ -300,11 +300,13 @@ def _cfg_bool(v, default: bool = False) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
-# ── [remotes] host mapping — remote-roots phase 2 (#remote-roots) ────────────
+# ── [remotes] host mapping — remote-roots phase 2+3 (#remote-roots) ──────────
 # ssh_args: extra ssh CLI args (port, identity, jump host …). Host aliases in
 # ~/.ssh/config work too — but OpenSSH resolves ~ via getpwuid, NOT $HOME, so
 # harnesses/services with a redirected HOME need the first-class field.
-_Remote = namedtuple("_Remote", "name host prefixes ssh_args")
+# discover: phase-3 fleet discovery — poll this host's sessions into the list.
+# config_root: the remote's CLAUDE_CONFIG_DIR (default ~/.claude).
+_Remote = namedtuple("_Remote", "name host prefixes ssh_args discover config_root")
 
 
 def _remotes_map() -> "list[_Remote]":
@@ -312,15 +314,16 @@ def _remotes_map() -> "list[_Remote]":
     more-specific remotes first). Malformed entries are skipped (logged), never
     fatal: one typo'd remote must not take the other mappings down. Prefixes
     must be absolute POSIX paths; a trailing slash is normalised away ("/"
-    itself = match any absolute cwd). Config-only — the env-var override
-    convention doesn't extend to TOML tables."""
+    itself = match any absolute cwd); they are OPTIONAL since phase 3 — a
+    fleet remote resumes by name, no cwd mapping needed. Config-only — the
+    env-var override convention doesn't extend to TOML tables."""
     sec = _load_config().get("remotes")
     out: list[_Remote] = []
     if not isinstance(sec, dict):
         return out
     for name, spec in sec.items():
         host = spec.get("host") if isinstance(spec, dict) else None
-        raw = spec.get("cwd_prefixes") if isinstance(spec, dict) else None
+        raw = spec.get("cwd_prefixes", []) if isinstance(spec, dict) else []
         prefixes = [p.rstrip("/") or "/" for p in (raw if isinstance(raw, list) else [])
                     if isinstance(p, str) and p.startswith("/")]
         raw_args = spec.get("ssh_args", []) if isinstance(spec, dict) else []
@@ -328,12 +331,15 @@ def _remotes_map() -> "list[_Remote]":
                     if isinstance(raw_args, list) else None)
         # strictness surfaces typos: a half-usable ssh_args (nested tables …)
         # rejects the ENTRY, it doesn't silently drop the odd element out.
-        if (isinstance(host, str) and host and prefixes
+        if (isinstance(host, str) and host and isinstance(raw, list)
                 and ssh_args is not None and len(ssh_args) == len(raw_args)):
-            out.append(_Remote(str(name), host, prefixes, ssh_args))
+            out.append(_Remote(
+                str(name), host, prefixes, ssh_args,
+                _cfg_bool(spec.get("discover"), True),
+                str(spec.get("config_root") or "~/.claude")))
         else:
             _log(f"remotes: skipping malformed entry {name!r} "
-                 "(need host + absolute cwd_prefixes; ssh_args = list of strings)")
+                 "(need host; cwd_prefixes = absolute paths; ssh_args = list of strings)")
     return out
 
 
@@ -350,12 +356,93 @@ def _remote_for_cwd(cwd: "str | None") -> "_Remote | None":
 
 
 def _remote_resume_target(s: "dict | None") -> "_Remote | None":
-    """The [remotes] entry to resume a Desktop-SSH mirror session WHERE IT RAN,
-    or None. Only remote_origin rows qualify — a LOCAL session whose cwd
-    happens to match a configured prefix must never be re-routed over ssh."""
-    if not (isinstance(s, dict) and s.get("remote_origin")):
+    """The [remotes] entry to resume a remote session WHERE IT RAN, or None.
+    A fleet-discovered row (phase 3) carries its remote's NAME — that binding
+    is authoritative, no cwd mapping involved. A Desktop-SSH mirror (phase 2)
+    maps by cwd prefix. A LOCAL session whose cwd happens to match a prefix
+    must never be re-routed over ssh."""
+    if not isinstance(s, dict):
+        return None
+    rn = s.get("remote_name")
+    if rn:
+        return next((r for r in _remotes_map() if r.name == rn), None)
+    if not s.get("remote_origin"):
         return None
     return _remote_for_cwd(s.get("origin_cwd") or s.get("cwd"))
+
+
+# ── fleet discovery — remote-roots phase 3 (#fleet) ──────────────────────────
+def _fleet_remotes() -> "list[_Remote]":
+    return [r for r in _remotes_map() if r.discover]
+
+
+def _fleet_poll_secs() -> float:
+    """Slow remote tick (design: 15–30s). Local freshness keeps its own 2s
+    stat-gate; this only paces the per-host batched ssh."""
+    return max(5.0, _cfg("fleet", "poll", "SAIKAI_FLEET_POLL", 20.0, float))
+
+
+def _fleet_fetchers() -> list:
+    """One RemoteFetcher per discover-enabled remote, cache under
+    CACHE_DIR/remote/<name>/ (constructed fresh — they are stateless beyond
+    the cache dir, so this can never hold a stale config)."""
+    import saikai_remote
+    return [saikai_remote.RemoteFetcher(
+                r.name, r.host, r.ssh_args, CACHE_DIR / "remote",
+                config_root=r.config_root)
+            for r in _fleet_remotes()]
+
+
+def load_fleet_sessions() -> list[dict]:
+    """Rows for every fleet remote from its LOCAL cache snapshot (the poll
+    thread keeps the cache moving; this function never touches the network).
+    Rows are ordinary session dicts plus: remote_name (resume routing + the
+    ⟨name⟩ badge), remote_origin=True (the 's' marker / ssh gate), is_open
+    from the REMOTE live registry, and _fleet_stale when the host has not
+    answered for a few polls (the row shows the cached snapshot then)."""
+    rows: list[dict] = []
+    stale_after = 3.0 * _fleet_poll_secs()
+    for fx in _fleet_fetchers():
+        proj_root = fx.dir / "projects"
+        try:
+            dirs = [d for d in proj_root.iterdir() if d.is_dir()]
+        except OSError:
+            continue
+        reg = fx.registry()
+        stale = fx.stale_after(stale_after)
+        for d in dirs:
+            for s in load_sessions_in_dir(d, None):
+                s["remote_name"] = fx.name
+                s["remote_origin"] = True       # remote session: 's' + ssh resume
+                s["_fleet_stale"] = stale
+                live = reg.get(s["id"])
+                if live and (live.get("kind") or "interactive") == "interactive":
+                    # open ON THAT HOST — resume gets the same confirm gate as
+                    # a locally-open session (design: attach semantics or refuse)
+                    s["is_open"] = True
+                    s["session_status"] = live.get("status", "")
+                rows.append(s)
+    return rows
+
+
+def _fleet_dirs_mtime() -> float:
+    """Change signal for the fleet caches: the fetcher rewrites manifest.json /
+    registry.json ONLY when content changed, so their mtimes move exactly when
+    the list should rebuild (last-ok is deliberately NOT watched — a healthy
+    quiet host must not cause rebuilds)."""
+    m = 0.0
+    root = CACHE_DIR / "remote"
+    try:
+        subs = list(root.iterdir())
+    except OSError:
+        return m
+    for d in subs:
+        for f in ("manifest.json", "registry.json"):
+            try:
+                m = max(m, (d / f).stat().st_mtime)
+            except OSError:
+                pass
+    return m
 
 
 _CONFIG_TEMPLATE = (
@@ -378,8 +465,15 @@ _CONFIG_TEMPLATE = (
     "# Needs key-based ssh (a password prompt appears inside the pane otherwise).\n"
     "# Optional ssh_args (port / identity / jump host); ~/.ssh/config aliases\n"
     "# work in host too — ssh_args just keeps saikai-only options out of it.\n"
+    "# Fleet discovery (phase 3): each remote's sessions are polled into THIS\n"
+    "# list (rows show ⟨name⟩; '?' = host unreachable, cached snapshot shown).\n"
+    "# discover = true by default once a remote is declared; config_root sets\n"
+    "# the remote's CLAUDE_CONFIG_DIR when it isn't ~/.claude.\n"
     '# pi  = { host = "mm@192.168.11.4", cwd_prefixes = ["/home/mm", "/opt"] }\n'
-    '# nuc = { host = "mm@nuc", cwd_prefixes = ["/srv"], ssh_args = ["-p", "2222"] }\n\n'
+    '# nuc = { host = "mm@nuc", cwd_prefixes = ["/srv"], ssh_args = ["-p", "2222"],\n'
+    '#         discover = false, config_root = "~/.claude" }\n\n'
+    "[fleet]\n"
+    "poll = 20   # seconds between remote polls (one batched ssh per host per tick)\n\n"
     "[limits]                       # live-pane memory safety\n"
     'memory_safety          = "on"  # ONE knob: on (balanced) | off (only refuse at true\n'
     "#                                exhaustion + max_live) | strict (refuse earlier, hard stop)\n"
@@ -3379,6 +3473,8 @@ def _marker_legend(s: dict, favorites: set, hidden: set) -> list:
                    f"over ssh via [remotes] {_r.name!r})" if _r else
                    "s ssh-remote session (ran on another host via Claude Desktop"
                    " — not resumable here; map its host in config.toml [remotes])")
+        if s.get("_fleet_stale"):
+            out.append("? its host is unreachable — this row is the cached snapshot")
     elif s.get("is_remote_control"):
         out.append("R Remote Control on in another session")
     elif s.get("is_open"):
@@ -6138,6 +6234,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 self._sessions_mtime = 0.0
             self.set_interval(2.0, self._rescan_if_changed)
+            # Fleet discovery (remote-roots phase 3): a daemon worker that only
+            # WRITES CACHE FILES — the 2s gate above notices manifest/registry
+            # moving and rebuilds; the UI thread never waits on ssh. (#fleet)
+            if _fleet_remotes():
+                self._start_fleet_poller()
             # Poll live-pane status so a backgrounded pane that starts WAITING
             # for input raises a toast, and the list markers stay live.
             if self._live is not None:
@@ -6681,6 +6782,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     raw_title = "▣ " + raw_title       # selection (Space-Space)
                 if _b2_sid and s["id"] == _b2_sid:
                     raw_title = "↻ " + raw_title       # b2 checkpoint in progress on this session
+                if s.get("remote_name"):
+                    # fleet row: name its host; '?' = the host stopped answering
+                    # and this is the cached snapshot (#fleet)
+                    raw_title += (" ⟨" + s["remote_name"]
+                                  + ("?" if s.get("_fleet_stale") else "") + "⟩")
                 if s.get("is_bg") and s.get("parent_session_id"):
                     # agent lineage: name WHO spawned it, so one parent's brood
                     # reads as a block in the Agents section (#agent-lineage)
@@ -9478,7 +9584,36 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     m = max(m, _os.stat(p).st_mtime)   # transcript GROWTH (no glob)
                 except OSError:
                     pass
+            if _fleet_remotes():
+                # fleet caches move only when a remote actually changed (#fleet)
+                m = max(m, _fleet_dirs_mtime())
             return m
+
+        def _start_fleet_poller(self) -> None:
+            """Fleet worker (remote-roots phase 3): one batched BatchMode ssh per
+            discover-remote per tick, writing ONLY cache files. manifest.json /
+            registry.json move exactly when a remote changed, so the 2s stat-
+            gate rebuilds precisely then; a dead host leaves the cached snapshot
+            (rows show ⟨name?⟩). Daemon thread — dies with the app, never
+            touches the UI thread or any Textual object. (#fleet)"""
+            import threading as _thr
+
+            def _loop():
+                prev_ok: dict = {}
+                while True:
+                    for fx in _fleet_fetchers():
+                        try:
+                            ok = fx.tick()
+                        except Exception as e:
+                            ok = False
+                            _log(f"fleet: {fx.name} tick error: {e!r}")
+                        if ok != prev_ok.get(fx.name):
+                            _log(f"fleet: {fx.name} "
+                                 f"{'reachable' if ok else 'UNREACHABLE — serving cached snapshot'}")
+                            prev_ok[fx.name] = ok
+                    time.sleep(_fleet_poll_secs())
+
+            _thr.Thread(target=_loop, daemon=True, name="saikai-fleet").start()
 
         def _rescan_if_changed(self) -> None:
             """Default-on auto-refresh tick: kick the OFF-thread rescan only when the
@@ -11089,11 +11224,23 @@ def _dedup_sessions_by_id(sessions: list[dict]) -> list[dict]:
     in the drive-letter case), each holding the SAME session files; the cross-project
     scan would then list a sid twice and table.add_row(key=sid) raises DuplicateKey,
     breaking the whole list. Dedup by sid (not dir name) so the fix is correct on
-    case-sensitive filesystems too. (#H2)"""
+    case-sensitive filesystems too. (#H2)
+
+    A FLEET row always beats the local Desktop-SSH mirror of the same sid,
+    regardless of mtime: after any non-Desktop turn the mirror stops updating,
+    so its mtime can read fresher while its CONTENT is stale — the polled
+    remote copy is the authoritative one, and it is the resumable row. (#fleet)"""
     by_id: dict = {}
     for s in sessions:
         prev = by_id.get(s["id"])
-        if prev is None or (s.get("mtime") or 0) >= (prev.get("mtime") or 0):
+        if prev is None:
+            by_id[s["id"]] = s
+            continue
+        a_fleet, b_fleet = bool(s.get("remote_name")), bool(prev.get("remote_name"))
+        if a_fleet != b_fleet:
+            if a_fleet:
+                by_id[s["id"]] = s
+        elif (s.get("mtime") or 0) >= (prev.get("mtime") or 0):
             by_id[s["id"]] = s
     return list(by_id.values()) if len(by_id) != len(sessions) else sessions
 
@@ -12323,6 +12470,16 @@ def _main():
                 if extra:
                     sessions.extend(extra)
 
+    # Fleet rows (remote-roots phase 3) ride the same list in --all mode; the
+    # snapshot comes from the local cache only — the poll thread keeps it warm.
+    # A fleet row and its Desktop-SSH mirror share the sid: the dedup below
+    # prefers the fleet row (fresher, resumable). (#fleet)
+    if args.all_projects and _fleet_remotes():
+        try:
+            sessions.extend(load_fleet_sessions())
+        except Exception as e:
+            _log(f"fleet scan failed (list continues without it): {e!r}")
+
     # Collapse any sid that surfaced from >1 project dir (case-variant encoded dirs
     # on a case-insensitive FS) BEFORE the table keys rows by sid — else DuplicateKey. (#H2)
     sessions = _dedup_sessions_by_id(sessions)
@@ -12333,7 +12490,12 @@ def _main():
     _log(f"start: loaded {len(sessions)} sessions "
          f"(all_projects={args.all_projects}, project={args.project}, days={args.days})")
 
-    if not sessions:
+    if not sessions and args.all_projects and _fleet_remotes() and not args.table:
+        # A fleet-viewer machine may have NO local history at all on first run —
+        # the poller (started inside the picker) fills the list on its first
+        # tick, so start empty instead of exiting before it can. (#fleet)
+        _log("start: no local sessions; fleet remotes configured — starting empty")
+    elif not sessions:
         period = "all history" if args.days == 0 else f"last {args.days} days"
         print(f"No sessions in {period}.")
         return
@@ -12426,6 +12588,11 @@ def _main():
                                 s["worktree_label"] = wt_label
                             if extra:
                                 fresh.extend(extra)
+            if args.all_projects and _fleet_remotes():   # parity with the initial scan (#fleet)
+                try:
+                    fresh.extend(load_fleet_sessions())
+                except Exception as e:
+                    _log(f"fleet rescan failed (list continues without it): {e!r}")
             # Same sid from >1 project dir (case-variant encoded dirs on a
             # case-insensitive FS) must collapse HERE too, not just at initial
             # load — DataTable.add_row(key=sid) raises on a duplicate key, so a

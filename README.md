@@ -231,10 +231,19 @@ nuc = { host = "mm@nuc", cwd_prefixes = ["/srv"], ssh_args = ["-p", "2222"] }
 
 Everything downstream — status classification, the web mirror, checkpoint keys
 — works unchanged, because the pane is just a terminal. Set up **key-based
-ssh** first (a password prompt appears inside the pane otherwise). New turns
-are then written on the remote host, so the local mirror row stops refreshing
-while the pane is your live view; full fleet discovery is the 0.6 roadmap
-(`docs/design/remote-roots.md`).
+ssh** first (a password prompt appears inside the pane otherwise).
+
+**Fleet discovery.** Each declared remote is also *polled* (one batched ssh
+per host every `[fleet] poll` seconds, default 20): its sessions join the
+list in `--all` mode, tagged `⟨name⟩`, searchable and previewable from the
+local cache, `@` when open **on that host**, and `Enter` resumes them over
+ssh — no `cwd_prefixes` needed for these rows. A host that stops answering
+degrades gracefully: its rows stay, marked `⟨name?⟩`, serving the cached
+snapshot; nothing ever blocks the local list. Only changed transcripts are
+pulled, size-bounded, into `~/.cache/saikai/remote/`. Set `discover = false`
+on a remote to keep phase-2 resume without polling; `config_root` points at
+a remote `CLAUDE_CONFIG_DIR` if it isn't `~/.claude`
+(`docs/design/remote-roots.md` has the full design).
 
 ## Configuration (environment variables)
 

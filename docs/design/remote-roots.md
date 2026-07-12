@@ -1,9 +1,8 @@
 # Remote roots — supervise sessions on other hosts (0.6 goal)
 
-Status: **phase 2 implemented** on this branch (targeting 0.6); phase 3 is
-design. Shipped groundwork in 0.5.0: Desktop-SSH mirror sessions
-(`projects/ssh-*`) are badged `s` / `remote_origin` and refuse a local resume
-(#remote-origin).
+Status: **phase 2 + phase 3 implemented** on this branch (targeting 0.6).
+Shipped groundwork in 0.5.0: Desktop-SSH mirror sessions (`projects/ssh-*`)
+are badged `s` / `remote_origin` and refuse a local resume (#remote-origin).
 
 ## Problem
 
@@ -84,7 +83,35 @@ Remaining prerequisites for real-fleet use:
 Discovery itself goes over ssh: the configured remotes' `~/.claude/projects`
 are enumerated and merged into the one list, each row tagged with its host.
 
-Design sketch:
+Implementation notes (landed; `saikai_remote.py` holds the pure logic):
+
+- One batched **BatchMode** ssh per host per tick (`[fleet] poll`, default
+  20s): transcript listing (path/size/mtime via GNU find) + the live registry
+  with a REMOTE `/proc/<pid>/comm` liveness check, in one delimited stream. A
+  missing END sentinel = truncated output = the whole scan is discarded
+  (never read as "everything was deleted").
+- Only CHANGED transcripts are pulled, bounded head+tail (192K+64K); the seam
+  merges into one junk line json.loads rejects — parse_session's per-line
+  discipline absorbs it. Cache mirrors the remote layout under
+  `CACHE_DIR/remote/<name>/projects/`, with the REMOTE mtime restored so
+  recency/sorting need no special casing.
+- manifest.json / registry.json are rewritten only on content change — their
+  mtimes are exactly the "something happened" signal the 2s stat-gate
+  watches. `last-ok` (touched every successful tick, NOT watched) is the
+  staleness clock: rows show `⟨name?⟩` + a legend line when the host stops
+  answering, serving the cached snapshot.
+- Rows are ordinary session dicts + remote_name; resume routes through the
+  phase-2 ssh invocation BY NAME (no cwd mapping needed), `is_open` comes
+  from the remote registry (interactive only) and gets the same
+  open-elsewhere confirm. The fleet row beats the Desktop-SSH mirror of the
+  same sid in dedup — the mirror's mtime can lie fresher while its content
+  is stale.
+- A fleet-viewer machine with ZERO local history starts with an empty list
+  instead of exiting, so the poller can fill it (found by the E2E).
+- E2E: ephemeral loopback sshd + a scratch config_root as the "remote"; a
+  session seeded mid-run surfaced in the UI 6s later (poll 6s + 2s gate).
+
+Original design sketch:
 
 - **Two-tier freshness.** Local keeps the 2s stat-gate. Remotes poll on a
   slow tick (15–30s) with ONE batched command per host per tick, e.g.

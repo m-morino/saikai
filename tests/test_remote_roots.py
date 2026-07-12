@@ -66,26 +66,36 @@ def test_remotes_map_parses_in_declaration_order():
         assert m[0].host == "mm@192.168.11.4" and m[0].prefixes == ["/home/mm", "/opt"]
         assert m[1].host == "mm@nuc"
         assert m[0].ssh_args == []            # optional, defaults empty
+        assert m[0].discover is True          # phase 3: fleet by default …
+        assert m[0].config_root == "~/.claude"
     finally:
         _clear_config()
 
 
 def test_remotes_map_skips_malformed_entries():
+    # Since phase 3, cwd_prefixes are OPTIONAL (a fleet remote resumes by
+    # name) — host-only entries are now VALID; relative prefixes are still
+    # dropped from the list. Broken host / ssh_args still reject the entry.
     _with_remotes(
         "[remotes]\n"
         'bad1 = "just-a-string"\n'
         'bad2 = { host = "", cwd_prefixes = ["/x"] }\n'
-        'bad3 = { host = "mm@h" }\n'
-        'bad4 = { host = "mm@h", cwd_prefixes = ["rel/only"] }\n'
+        'ok3  = { host = "mm@h" }\n'
+        'ok4  = { host = "mm@h", cwd_prefixes = ["rel/only"] }\n'
         'bad5 = { host = "mm@h", cwd_prefixes = ["/x"], ssh_args = "not-a-list" }\n'
         'bad6 = { host = "mm@h", cwd_prefixes = ["/x"], ssh_args = [["nested"]] }\n'
-        'good = { host = "mm@h", cwd_prefixes = ["rel/dropped", "/abs/"], ssh_args = ["-p", 2222] }\n')
+        'bad7 = { host = "mm@h", cwd_prefixes = "not-a-list" }\n'
+        'good = { host = "mm@h", cwd_prefixes = ["rel/dropped", "/abs/"], '
+        'ssh_args = ["-p", 2222], discover = false, config_root = "/opt/cc" }\n')
     try:
         m = saikai._remotes_map()
-        assert [e.name for e in m] == ["good"], m
+        assert [e.name for e in m] == ["ok3", "ok4", "good"], m
+        assert m[0].prefixes == [] and m[1].prefixes == []
+        g = m[2]
         # trailing slash normalised away; the relative prefix dropped
-        assert m[0].prefixes == ["/abs"], m
-        assert m[0].ssh_args == ["-p", "2222"]   # TOML int coerced to str
+        assert g.prefixes == ["/abs"], m
+        assert g.ssh_args == ["-p", "2222"]   # TOML int coerced to str
+        assert g.discover is False and g.config_root == "/opt/cc"
     finally:
         _clear_config()
 
