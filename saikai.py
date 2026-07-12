@@ -16,7 +16,7 @@ Usage:
         [--no-summary] [--refresh-summary]
 """
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 import argparse
 import io
