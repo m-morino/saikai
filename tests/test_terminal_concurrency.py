@@ -1530,6 +1530,26 @@ def test_cursor_anchor_gated_to_a_stable_cell():
         "the stable-cursor gate is missing from _sync_terminal_cursor"
 
 
+def test_ime_anchor_default_off_keeps_windows_caret_and_opt_in_parse():
+    """The stable-master default (IME anchor OFF) must not (1) lose the caret on
+    Windows nor (2) silently re-enable via an empty/unknown env value — the two
+    confirmed code-review regressions on the default-OFF flip.
+    (1) render_line draws saikai's OWN cursor unless the native hardware cursor is
+    handling it (Windows AND anchor ON); with the anchor OFF the caret is still drawn
+    on Windows (the old `not _IS_WIN` guard left NO caret there once _show_hw_cursor
+    went inert). (2) SAIKAI_IME_ANCHOR is parsed opt-IN, so unset / empty / unknown
+    all stay OFF instead of flipping the fly-prone anchor back on. (#native-cursor)"""
+    from pathlib import Path
+    src = Path(rt.__file__).read_text(encoding="utf-8")
+    assert "not (_IS_WIN and _IME_ANCHOR)" in src, \
+        "render_line must draw the caret on Windows when the IME anchor is OFF"
+    assert "x == cursor_x and not _IS_WIN:" not in src, \
+        "the old guard that skipped the caret on ALL Windows panes must be gone"
+    assert 'SAIKAI_IME_ANCHOR", "0")).strip().lower() in (' in src, \
+        "the anchor env parse must be opt-IN (default OFF)"
+    assert '"1", "true", "yes", "on"' in src, "opt-in tokens missing"
+
+
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
     print("PASS test_osc_notification_parsing_and_notify_host")
@@ -1651,3 +1671,5 @@ if __name__ == "__main__":
     print("PASS test_busy_storm_throttles_reclassify")
     test_cursor_anchor_gated_to_a_stable_cell()
     print("PASS test_cursor_anchor_gated_to_a_stable_cell")
+    test_ime_anchor_default_off_keeps_windows_caret_and_opt_in_parse()
+    print("PASS test_ime_anchor_default_off_keeps_windows_caret_and_opt_in_parse")

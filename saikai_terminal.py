@@ -94,8 +94,8 @@ def _log(msg: str) -> None:
 # default cursor (the search box) instead of the pane prompt. Set SAIKAI_IME_ANCHOR=1
 # to force it on. NOTE: under claude's fullscreen renderer claude hides the terminal
 # cursor (draws its own), so the anchor is a no-op there anyway. (#ime-anchor-optout)
-_IME_ANCHOR = str(os.environ.get("SAIKAI_IME_ANCHOR", "0")).strip().lower() not in (
-    "0", "false", "no", "off")
+_IME_ANCHOR = str(os.environ.get("SAIKAI_IME_ANCHOR", "0")).strip().lower() in (
+    "1", "true", "yes", "on")   # default OFF: opt-IN only, so an empty/unknown value stays OFF
 
 # Opt-in raw-PTY capture: when SAIKAI_PTY_CAPTURE names a file, every decoded chunk
 # the reader feeds is appended as repr() (escape sequences visible) — for diagnosing
@@ -1140,12 +1140,14 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # the glyph already carries width 2 (real blank cells hold " ").
             if ch.data == "":
                 continue
-            if show_cursor and x == cursor_x and not _IS_WIN:
-                # Non-Windows: draw saikai's own cursor (cell reversed, keeping the
-                # cell's real fg/bg/bold so a themed prompt isn't flattened). On
-                # Windows we instead show the terminal's NATIVE cursor via
-                # _show_hw_cursor — its configured thin bar — and skip this block so
-                # there's no wide reverse-block on top of it. (#native-cursor)
+            if show_cursor and x == cursor_x and not (_IS_WIN and _IME_ANCHOR):
+                # Draw saikai's own cursor (cell reversed, keeping the cell's real
+                # fg/bg/bold so a themed prompt isn't flattened). SKIP only on Windows
+                # WHEN the IME anchor is on: there _show_hw_cursor shows the terminal's
+                # NATIVE cursor (thin bar) instead, and drawing here too would stack a
+                # wide reverse-block on it. With the anchor OFF the native cursor is
+                # never shown, so we MUST draw here — else a Windows classic-renderer
+                # pane has NO caret at all (the default-OFF regression). (#native-cursor)
                 flush(x)
                 run_chars = []
                 segments.append(Segment(ch.data or " ",
