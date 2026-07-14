@@ -104,6 +104,15 @@ _IME_ANCHOR = str(os.environ.get("SAIKAI_IME_ANCHOR", "1")).strip().lower() not 
 # saikai's pyte mirror handle differently). Off by default; debug only.
 _PTY_CAPTURE = os.environ.get("SAIKAI_PTY_CAPTURE", "").strip()
 
+# Reader-side re-classify throttle (#agent-storm-throttle): while a pane is stably
+# 'busy', an agent-mode spinner emits ~170k synchronized frames/session and
+# re-classifying each (a full pyte-grid render ~0.7ms + the classifier regex
+# ~0.2ms) burned ~150s of CPU only to re-confirm 'busy'. Throttle the busy-storm
+# re-classify to this cadence. A flip INTO busy is never throttled (status != busy
+# skips the gate), and the flip OUT of busy is caught by the host refresh_status
+# poll (which fires even with no reader tick), so no state transition is lost.
+_CLASSIFY_MIN_INTERVAL = 0.1
+
 
 def _ime_anchor_xy(cursor_x, cursor_y, rx, ry, rw, rh):
     """Pure geometry for the terminal-cursor / IME anchor: map claude's grid cursor
@@ -2073,8 +2082,17 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # Classify from the CURRENT screen + claude's OSC-0 title (its own state
         # glyph), not a rolling byte tail: a tail keeps stale "esc to interrupt"
         # / answered prompts that scrolled up and would misclassify an idle pane.
-        _txt, _title = self._current_screen()
-        self._update_status(self._classify(_txt, _title))
+        # Throttle while stably busy (#agent-storm-throttle): re-classifying every
+        # spinner frame renders the whole pyte grid + runs the regex for nothing
+        # (status stays 'busy'). A non-busy status is never throttled, so a flip
+        # INTO busy and a prompt (waiting) are still caught promptly; the flip OUT
+        # of busy rides the host refresh_status poll when output stops.
+        _now = time.monotonic()
+        if not (getattr(self, "_status", None) == "busy"
+                and (_now - getattr(self, "_last_classify_ts", 0.0)) < _CLASSIFY_MIN_INTERVAL):
+            self._last_classify_ts = _now
+            _txt, _title = self._current_screen()
+            self._update_status(self._classify(_txt, _title))
         # Answer any terminal queries in this chunk AFTER the feed, so a cursor-
         # position reply reflects the cursor this chunk just moved. (#term-queries)
         if "\x1b[" in chunk or "\x1b]1" in chunk:
@@ -2363,6 +2381,17 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 cy = int(screen.cursor.y)
             except Exception:
                 return
+        # Stable-cursor gate (#agent-storm-throttle): an agent spinner moves the
+        # cursor Home -> … -> prompt on every one of ~170k synchronized frames, and
+        # coalesced repaints catch it MID-frame — anchoring the IME/candidate window
+        # to the live cell made it flicker across the whole screen. Re-anchor only
+        # when the cell HELD across two repaints (settled); a focus sync is exempt —
+        # it must anchor at the current cell immediately.
+        if reason != "focus":
+            _prev = getattr(self, "_prev_sync_cursor", None)
+            self._prev_sync_cursor = (cx, cy)
+            if (cx, cy) != _prev:
+                return   # still moving — keep the anchor at the last settled cell
         try:
             region = self.content_region
             xy = _ime_anchor_xy(cx, cy, region.x, region.y, region.width, region.height)

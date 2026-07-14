@@ -1484,6 +1484,51 @@ def test_copy_text_relays_to_mirror_clip():
     assert got == [], "empty copy must not relay"
 
 
+def test_busy_storm_throttles_reclassify():
+    """An agent-mode spinner emits ~170k synchronized frames/session; re-classifying
+    each (a full pyte-grid render ~0.7ms + the regex ~0.2ms) burned ~150s of CPU only
+    to re-confirm 'busy'. While stably busy, _consume throttles the re-classify to
+    _CLASSIFY_MIN_INTERVAL; a flip INTO busy is never throttled (busy detection stays
+    immediate) and the flip OUT rides the host refresh_status poll. Verified against a
+    real capture: 5,993 frames -> 608 classifies. (#agent-storm-throttle)"""
+    import pyte, time as _t
+    term = rt.AgentTerminal(["agent"], status_classifier=rt.classify_pty_status)
+    try:
+        term._stop.set()                       # stop any reader; we feed _consume by hand
+    except Exception:
+        pass
+    term._marshal = lambda fn: None            # no Textual app in the harness
+    term._screen = rt._HistoryScreenBase(120, 40, history=rt.SCROLLBACK_LINES)
+    term._stream = pyte.Stream(term._screen)
+    calls = []
+    _orig = term._classify
+    term._classify = lambda txt, title: (calls.append(1), _orig(txt, title))[1]
+    busy = "\x1b]0;⠋ working\x1b\\\x1b[H spinning "   # braille title glyph -> busy
+
+    term._consume(busy)                        # status idle -> NOT throttled -> classifies
+    assert term._status == "busy", "a spinner frame must flip the pane to busy"
+    assert len(calls) == 1, calls
+
+    term._last_classify_ts = _t.monotonic()    # pretend we just classified
+    term._consume(busy)
+    assert len(calls) == 1, "a busy frame within the throttle window must be skipped"
+
+    term._last_classify_ts = _t.monotonic() - (rt._CLASSIFY_MIN_INTERVAL + 0.05)
+    term._consume(busy)
+    assert len(calls) == 2, "a busy frame after the interval must re-classify"
+
+
+def test_cursor_anchor_gated_to_a_stable_cell():
+    """The IME/candidate anchor (app.cursor_position) must NOT chase the live pyte
+    cursor on every repaint: an agent spinner moves it Home -> prompt on all ~170k
+    frames and coalesced repaints caught it mid-frame, flickering the anchor across
+    the screen. _sync_terminal_cursor re-anchors only when the cell HELD across two
+    repaints; a focus sync stays exempt. (#agent-storm-throttle)"""
+    import inspect
+    src = inspect.getsource(rt.AgentTerminal._sync_terminal_cursor)
+    assert "_prev_sync_cursor" in src and 'reason != "focus"' in src, \
+        "the stable-cursor gate is missing from _sync_terminal_cursor"
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -1602,3 +1647,7 @@ if __name__ == "__main__":
     print("PASS test_sync_update_defers_repaint_until_close")
     test_input_snaps_scrolled_back_pane_to_live()
     print("PASS test_input_snaps_scrolled_back_pane_to_live")
+    test_busy_storm_throttles_reclassify()
+    print("PASS test_busy_storm_throttles_reclassify")
+    test_cursor_anchor_gated_to_a_stable_cell()
+    print("PASS test_cursor_anchor_gated_to_a_stable_cell")
