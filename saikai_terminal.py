@@ -87,14 +87,14 @@ def _log(msg: str) -> None:
 
 # IME-anchor: re-anchor the (hidden) hardware cursor to claude's prompt cell +
 # show the native hardware cursor there (Windows). This puts the WT IME/composition
-# window AT the claude prompt. DEFAULT ON: without it the IME window sits at
-# Textual's default cursor (wrong place — unusable for CJK input in the classic
-# renderer). Set SAIKAI_IME_ANCHOR=0 to turn it off (cursor handling then matches a
-# stock Textual app). NOTE: this positions the IME in the CLASSIC renderer; under
-# claude's fullscreen renderer claude hides the terminal cursor (draws its own), so
-# the anchor is a no-op there — set CLAUDE_CODE_NATIVE_CURSOR=1 for the child if you
-# want the fullscreen prompt to keep the real cursor. (#ime-anchor-optout)
-_IME_ANCHOR = str(os.environ.get("SAIKAI_IME_ANCHOR", "1")).strip().lower() not in (
+# window AT the claude prompt. DEFAULT OFF (temporary): in agent mode the per-render
+# anchor made the hardware/IME cursor FLY across the screen and flicker on list-hover;
+# the real fix is in progress on branch fix/ime-cursor-anchor. Until it lands, default
+# OFF keeps master stable — the only cost is that the IME window sits at Textual's
+# default cursor (the search box) instead of the pane prompt. Set SAIKAI_IME_ANCHOR=1
+# to force it on. NOTE: under claude's fullscreen renderer claude hides the terminal
+# cursor (draws its own), so the anchor is a no-op there anyway. (#ime-anchor-optout)
+_IME_ANCHOR = str(os.environ.get("SAIKAI_IME_ANCHOR", "0")).strip().lower() not in (
     "0", "false", "no", "off")
 
 # Opt-in raw-PTY capture: when SAIKAI_PTY_CAPTURE names a file, every decoded chunk
