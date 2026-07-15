@@ -85,15 +85,13 @@ def _log(msg: str) -> None:
         pass
 
 
-# IME-anchor: re-anchor the (hidden) hardware cursor to claude's prompt cell +
-# show the native hardware cursor there (Windows). This puts the WT IME/composition
-# window AT the claude prompt. DEFAULT ON: without it the IME window sits at
-# Textual's default cursor (wrong place — unusable for CJK input in the classic
-# renderer). Set SAIKAI_IME_ANCHOR=0 to turn it off (cursor handling then matches a
-# stock Textual app). NOTE: this positions the IME in the CLASSIC renderer; under
-# claude's fullscreen renderer claude hides the terminal cursor (draws its own), so
-# the anchor is a no-op there — set CLAUDE_CODE_NATIVE_CURSOR=1 for the child if you
-# want the fullscreen prompt to keep the real cursor. (#ime-anchor-optout)
+# IME-anchor: re-anchor the hardware cursor to claude's prompt cell + show the
+# native cursor there on Windows. This is a host-side IME anchor, not a child
+# render cursor: main-screen Claude may hide/draw its own cursor while it still
+# needs WT's native cursor at the prompt for CJK composition. Alt-screen UIs own
+# cursor presentation, and repaint-driven cursor moves are debounced so agents
+# redraws don't make WT chase transient positions. Set SAIKAI_IME_ANCHOR=0 to turn
+# it off completely. (#ime-anchor-optout)
 _IME_ANCHOR = str(os.environ.get("SAIKAI_IME_ANCHOR", "1")).strip().lower() not in (
     "0", "false", "no", "off")
 
@@ -116,6 +114,54 @@ def _ime_anchor_xy(cursor_x, cursor_y, rx, ry, rw, rh):
     x = rx + max(0, min(int(cursor_x), rw - 1))
     y = ry + max(0, min(int(cursor_y), rh - 1))
     return (x, y)
+
+
+def _native_cursor_should_show(cursor_hidden: bool, in_alt_screen: bool) -> bool:
+    """Windows native-cursor policy for split-live panes.
+
+    The hardware cursor is an IME anchor for claude's classic prompt. Do not let
+    DECTCEM (?25l) suppress that anchor on the main screen: Claude can hide the
+    terminal cursor while still expecting IME at its prompt. Alt-screen is the
+    reliable boundary where the child owns cursor presentation.
+    """
+    del cursor_hidden
+    return not in_alt_screen
+
+
+_HOST_TERMINAL_ENV_STRIP = {
+    # A pane child renders into saikai's pyte/Textual virtual terminal, not
+    # directly into the outer emulator. If these leak through, Claude Code can
+    # take host-specific paths such as WT full repaint / terminal private
+    # protocols that are correct for direct stdout but wrong behind saikai.
+    "WT_SESSION",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "KITTY_WINDOW_ID",
+    "ALACRITTY_LOG",
+    "KONSOLE_VERSION",
+    "VTE_VERSION",
+    "ZED_TERM",
+    "WEZTERM_EXECUTABLE",
+    "WEZTERM_PANE",
+    # Claude sets this for Windows/WT fleet views; saikai's pane is neither.
+    "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT",
+}
+
+
+def _child_pty_env(base_env) -> dict:
+    """Environment advertised by saikai's PTY renderer to the child.
+
+    The child talks to saikai's virtual terminal. Keep the capability contract
+    explicit and deterministic instead of inheriting the outer terminal's brand
+    probes (WT_SESSION, TERM_PROGRAM, etc.)."""
+    env = dict(base_env)
+    for key in _HOST_TERMINAL_ENV_STRIP:
+        env.pop(key, None)
+    env["TERM"] = "xterm-256color"
+    env["COLORTERM"] = "truecolor"
+    return env
 
 
 # ── global reap-thread registry ───────────────────────────────────────────────
@@ -942,6 +988,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._osc52_carry = ""       # partial OSC 52 clipboard write held across read()s (base64 can span chunks)
         self._app_cursor = False     # ?1 DECCKM — replayed in the mirror seed so a
                                      # pane-view browser encodes arrows correctly (#pane-direct)
+        self._hw_cursor_visible: Optional[bool] = None  # last ?25 visibility we wrote
+        self._cursor_sync_due = 0.0  # debounce WT native-cursor moves during redraw
+        self._cursor_sync_timer_armed = False
         # Mirror pane-direct tee (#pane-direct): tee(str) forwards a scrubbed
         # chunk to the mirror hub's pane channel; reset(str) enqueues a full-
         # state seed; synth(screen, cols, rows, modes) serializes one. All three
@@ -1027,9 +1076,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # deterministic. pyte stores whatever the child emits; Rich/Textual then
         # downsamples to the OUTER terminal as needed. (#audit-term)
         base_env = self._env if self._env is not None else os.environ
-        env = dict(base_env)
-        env["TERM"] = "xterm-256color"
-        env["COLORTERM"] = "truecolor"
+        env = _child_pty_env(base_env)
         kwargs["env"] = env
         # argv MUST be a list (pywinpty spike gotcha #3).
         self._pty = PtyProcess.spawn(self._argv, **kwargs)
@@ -2238,7 +2285,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     def _do_pane_refresh(self) -> None:   # runs on the UI thread
         self._refresh_pending = False
         self.refresh()
-        self._sync_terminal_cursor()
+        self._hide_hw_cursor_if_alt_screen()
+        self._schedule_terminal_cursor_sync()
 
     def snapshot_text(self) -> str:
         """Plain-text dump of the pane's CURRENT visible pyte screen + geometry,
@@ -2295,28 +2343,88 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             return bool(self.has_focus)
 
-    def _show_hw_cursor(self, show: bool) -> None:
-        """Show/hide the REAL terminal cursor (Windows). This makes the user see the
-        terminal's NATIVE cursor — its own configured thin bar/underline — at the
-        prompt, instead of saikai's full-cell reverse block (which reads as too
-        wide). Textual's Windows driver hides the hardware cursor at startup and
-        only *moves* it; we re-show it while a pane is focused — the blink keepalive
-        keeps moving it so WT renders it and keeps the IME enabled — and hide it on
-        blur so the list / unfocused panes don't carry a stray cursor. Windows-only;
-        other platforms keep saikai's drawn cursor cell. (#native-cursor)"""
+    def _show_hw_cursor(self, show: bool, *, force: bool = False) -> None:
+        """Show/hide the REAL terminal cursor (Windows).
+
+        This cursor is an IME anchor for the classic prompt. Repaint-driven moves
+        are debounced separately so it does not chase child full-screen redraw.
+        Repeated identical DEC visibility writes are suppressed; focus/app-focus
+        can force one re-assertion after WT/Textual regained the window.
+        (#native-cursor #agents-cursor)"""
         if not _IS_WIN or not _IME_ANCHOR:
+            return
+        if not force and getattr(self, "_hw_cursor_visible", None) is show:
             return
         try:
             drv = getattr(self.app, "_driver", None)
             if drv is not None:
                 drv.write("\x1b[?25h" if show else "\x1b[?25l")
+                self._hw_cursor_visible = show
         except Exception:
             pass
 
+    def _hide_hw_cursor_if_alt_screen(self) -> None:
+        """Immediately honour alt-screen cursor ownership without moving WT's cursor.
+
+        Repaint-driven cursor *moves* are debounced below because claude's agents
+        view can move pyte's cursor all over the screen while drawing. Hiding is
+        reserved for alt-screen: main-screen DECTCEM hide is not a reliable signal
+        that the IME anchor should disappear from Claude's prompt. (#agents-cursor)"""
+        if not _IS_WIN or not _IME_ANCHOR:
+            return
+        try:
+            if self.is_dead or not self._is_focused_pane():
+                return
+        except Exception:
+            return
+        with self._lock:
+            screen = self._screen
+            if screen is None:
+                return
+            in_alt = bool(getattr(getattr(self, "_alt", None), "in_alt", False))
+        if not _native_cursor_should_show(False, in_alt):
+            self._show_hw_cursor(False)
+
+    def _schedule_terminal_cursor_sync(self, delay: float = 0.12) -> None:
+        """Debounce WT cursor moves until PTY output is briefly quiet.
+
+        The native Windows cursor exists here to anchor IME at the prompt. It is
+        not a render cursor for child full-screen UIs, so repaint-driven syncs
+        should converge after output quiesces instead of chasing every cursor
+        motion in the stream. Focus/app-focus still call _sync_terminal_cursor()
+        immediately because that is when WT otherwise leaves IME at the search
+        box/default cursor. (#ime-race #agents-cursor)"""
+        if not _IS_WIN or not _IME_ANCHOR:
+            return
+        now = time.monotonic()
+        self._cursor_sync_due = now + max(0.0, delay)
+        if getattr(self, "_cursor_sync_timer_armed", False):
+            return
+        self._cursor_sync_timer_armed = True
+        try:
+            self.set_timer(max(0.01, delay), self._cursor_sync_timer_fired)
+        except Exception:
+            self._cursor_sync_timer_armed = False
+            self._sync_terminal_cursor(reason="quiet")
+
+    def _cursor_sync_timer_fired(self) -> None:
+        self._cursor_sync_timer_armed = False
+        due = float(getattr(self, "_cursor_sync_due", 0.0) or 0.0)
+        remaining = due - time.monotonic()
+        if remaining > 0.0:
+            self._cursor_sync_timer_armed = True
+            try:
+                self.set_timer(max(0.01, remaining), self._cursor_sync_timer_fired)
+            except Exception:
+                self._cursor_sync_timer_armed = False
+                self._sync_terminal_cursor(reason="quiet")
+            return
+        self._sync_terminal_cursor(reason="quiet")
+
     def on_focus(self, event=None) -> None:
         # Anchor the IME the moment the pane is focused (don't wait for a repaint).
-        # Show the terminal's native cursor (Windows) — see _show_hw_cursor.
-        self._show_hw_cursor(True)
+        # _sync_terminal_cursor decides whether the native cursor is actually
+        # visible: alt-screen full-screen UIs keep it hidden.
         self._sync_terminal_cursor(reason="focus")
         if getattr(self, "_focus_reporting", False):                # ?1004: tell the child it's focused
             self._send_to_child("\x1b[I")
@@ -2361,13 +2469,20 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             try:
                 cx = int(screen.cursor.x)
                 cy = int(screen.cursor.y)
+                cursor_hidden = bool(getattr(screen.cursor, "hidden", False))
             except Exception:
                 return
+            in_alt = bool(getattr(getattr(self, "_alt", None), "in_alt", False))
+        show_hw_cursor = _native_cursor_should_show(cursor_hidden, in_alt)
+        if not show_hw_cursor:
+            self._show_hw_cursor(False)
+            return
         try:
             region = self.content_region
             xy = _ime_anchor_xy(cx, cy, region.x, region.y, region.width, region.height)
             if xy is not None:
                 app.cursor_position = Offset(*xy)
+                self._show_hw_cursor(True, force=(reason == "focus"))
                 # Textual only EMITS the cursor move/visibility to the real
                 # terminal during a CompositorUpdate (App._display). Setting
                 # cursor_position alone on an *idle* focus return never reaches

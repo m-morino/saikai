@@ -7813,10 +7813,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     cancel()
                 # The OS window regaining focus doesn't fire the pane's own
                 # on_focus, so re-anchor its cursor — otherwise WT leaves the IME
-                # disabled until the next redraw. (#ime-race)
-                show = getattr(w, "_show_hw_cursor", None)
-                if show is not None:
-                    show(True)            # re-show the native cursor on window return
+                # disabled until the next redraw. _sync_terminal_cursor also keeps
+                # alt-screen child UIs from inheriting a stale native cursor.
+                # (#ime-race #agents-cursor)
                 sync(reason="focus")
                 self.call_after_refresh(lambda: sync(reason="focus"))
             except Exception:

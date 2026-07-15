@@ -372,6 +372,172 @@ def test_show_hw_cursor_native_cursor_dec_bytes():
         rt._IME_ANCHOR = _saved
 
 
+def test_native_cursor_respects_alt_screen_but_keeps_main_screen_ime_anchor():
+    """Windows native cursor is an IME anchor for the main-screen prompt.
+
+    Claude may hide the terminal cursor while still accepting input at the normal
+    prompt, so DECTCEM alone must not send IME composition back to Textual's
+    search/default cursor. Alt-screen remains the boundary where the child owns
+    cursor presentation. (#agents-cursor)"""
+    import threading as _th
+
+    class _Cursor:
+        def __init__(self, hidden=False):
+            self.x = 3
+            self.y = 2
+            self.hidden = hidden
+
+    class _Screen:
+        def __init__(self, hidden=False):
+            self.cursor = _Cursor(hidden)
+
+    class _Alt:
+        def __init__(self, in_alt=False):
+            self.in_alt = in_alt
+
+    class _Region:
+        x = 40
+        y = 5
+        width = 80
+        height = 24
+
+    class _Drv:
+        def __init__(self, writes):
+            self._writes = writes
+        def write(self, s):
+            self._writes.append(s)
+
+    class _App:
+        def __init__(self, writes):
+            self._driver = _Drv(writes)
+
+    class _Shim(rt.AgentTerminal):
+        app = property(lambda self: self._app)
+        content_region = property(lambda self: _Region())
+
+    def _term(hidden=False, in_alt=False):
+        writes = []
+        t = _Shim.__new__(_Shim)
+        t.sid = "x"
+        t._app = _App(writes)
+        t._lock = _th.Lock()
+        t._screen = _Screen(hidden)
+        t._alt = _Alt(in_alt)
+        t._scroll = 0
+        t.is_dead = False
+        t._hw_cursor_visible = None
+        t._is_focused_pane = lambda: True
+        t.refresh = lambda *a, **k: None
+        return t, writes
+
+    old_win, old_anchor, old_offset = rt._IS_WIN, rt._IME_ANCHOR, rt.Offset
+    rt._IS_WIN = True
+    rt._IME_ANCHOR = True
+    if rt.Offset is None:
+        rt.Offset = lambda x, y: (x, y)
+    try:
+        assert rt._native_cursor_should_show(False, False) is True
+        assert rt._native_cursor_should_show(True, False) is True
+        assert rt._native_cursor_should_show(False, True) is False
+
+        t, writes = _term(hidden=True)
+        t._sync_terminal_cursor()
+        assert writes == ["\x1b[?25h"], writes
+        assert t._app.cursor_position == rt.Offset(43, 7)
+
+        t, writes = _term(in_alt=True)
+        t._sync_terminal_cursor()
+        assert writes == ["\x1b[?25l"], writes
+
+        t, writes = _term()
+        t._sync_terminal_cursor()
+        t._sync_terminal_cursor()
+        assert writes == ["\x1b[?25h"], writes
+        assert t._app.cursor_position == rt.Offset(43, 7)
+    finally:
+        rt._IS_WIN, rt._IME_ANCHOR, rt.Offset = old_win, old_anchor, old_offset
+
+
+def test_child_pty_env_hides_outer_terminal_identity_from_child():
+    """The pane child renders into saikai, not directly into Windows Terminal.
+
+    Claude Code enables WT/host-specific redraw paths from WT_SESSION and related
+    probes; those are correct for a direct terminal, but wrong behind saikai's
+    pyte renderer. The advertised contract is generic xterm truecolor.
+    (#agents-cursor)"""
+    env = rt._child_pty_env({
+        "PATH": "/bin",
+        "TERM": "xterm-kitty",
+        "COLORTERM": "24bit",
+        "WT_SESSION": "outer-wt",
+        "TERM_PROGRAM": "WezTerm",
+        "TERM_PROGRAM_VERSION": "999",
+        "KITTY_WINDOW_ID": "1",
+        "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT": "1",
+        "CLAUDE_CODE_FORCE_SYNC_OUTPUT": "1",
+    })
+    assert env["PATH"] == "/bin"
+    assert env["TERM"] == "xterm-256color"
+    assert env["COLORTERM"] == "truecolor"
+    assert "WT_SESSION" not in env
+    assert "TERM_PROGRAM" not in env
+    assert "TERM_PROGRAM_VERSION" not in env
+    assert "KITTY_WINDOW_ID" not in env
+    assert "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT" not in env
+    # Explicit user/developer override remains explicit; only host identity leaks
+    # and Claude's derived WT full-repaint flag are scrubbed.
+    assert env["CLAUDE_CODE_FORCE_SYNC_OUTPUT"] == "1"
+
+
+def test_repaint_cursor_sync_debounces_until_output_quiet():
+    """Repaint-driven WT cursor moves wait for quiet output.
+
+    This keeps the IME anchor correct after claude returns to a classic prompt,
+    while avoiding native-cursor chasing during agents/full-screen redraw.
+    Immediate focus sync is covered separately by _sync_terminal_cursor tests.
+    (#agents-cursor)"""
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    timers = []
+    syncs = []
+    now = [1000.0]
+
+    old_win, old_anchor, old_mono = rt._IS_WIN, rt._IME_ANCHOR, rt.time.monotonic
+    rt._IS_WIN = True
+    rt._IME_ANCHOR = True
+    rt.time.monotonic = lambda: now[0]
+    try:
+        t._cursor_sync_due = 0.0
+        t._cursor_sync_timer_armed = False
+        t.set_timer = lambda delay, cb: timers.append((delay, cb))
+        t._sync_terminal_cursor = lambda reason="repaint": syncs.append(reason)
+
+        t._schedule_terminal_cursor_sync(delay=0.12)
+        assert len(timers) == 1, timers
+        assert syncs == []
+
+        # More PTY output before the timer fires moves the due time, but does
+        # not arm a second independent timer.
+        now[0] += 0.05
+        t._schedule_terminal_cursor_sync(delay=0.12)
+        assert len(timers) == 1, timers
+
+        # The original timer fires too early, so it reschedules instead of
+        # moving WT's cursor to a transient draw position.
+        _delay, cb = timers.pop(0)
+        cb()
+        assert syncs == []
+        assert len(timers) == 1, timers
+
+        # Once output has been quiet long enough, one cursor sync lands.
+        now[0] += 0.13
+        _delay, cb = timers.pop(0)
+        cb()
+        assert syncs == ["quiet"], syncs
+        assert t._cursor_sync_timer_armed is False
+    finally:
+        rt._IS_WIN, rt._IME_ANCHOR, rt.time.monotonic = old_win, old_anchor, old_mono
+
+
 def test_autoscroll_tick_pins_anchor_to_content():
     """#drag-autoscroll: while edge-dragging, _autoscroll_tick scrolls one line and
     shifts the anchor by the SAME delta so it stays pinned to its text (the visible
@@ -1542,6 +1708,12 @@ if __name__ == "__main__":
     print("PASS test_classify_pty_status_basics")
     test_show_hw_cursor_native_cursor_dec_bytes()
     print("PASS test_show_hw_cursor_native_cursor_dec_bytes")
+    test_native_cursor_respects_alt_screen_but_keeps_main_screen_ime_anchor()
+    print("PASS test_native_cursor_respects_alt_screen_but_keeps_main_screen_ime_anchor")
+    test_child_pty_env_hides_outer_terminal_identity_from_child()
+    print("PASS test_child_pty_env_hides_outer_terminal_identity_from_child")
+    test_repaint_cursor_sync_debounces_until_output_quiet()
+    print("PASS test_repaint_cursor_sync_debounces_until_output_quiet")
     test_autoscroll_tick_pins_anchor_to_content()
     print("PASS test_autoscroll_tick_pins_anchor_to_content")
     test_alt_screen_suppresses_false_needs_input()
