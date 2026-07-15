@@ -1128,6 +1128,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                                      # pane-view browser encodes arrows correctly (#pane-direct)
         self._hw_cursor_visible: Optional[bool] = None  # last ?25 visibility we wrote
         self._anchored_xy = None  # last IME anchor cell we set (freeze/flush bookkeeping)
+        self._prev_repaint_cell = None  # pyte cursor at the previous repaint sync (stability gate)
         # Mirror pane-direct tee (#pane-direct): tee(str) forwards a scrubbed
         # chunk to the mirror hub's pane channel; reset(str) enqueues a full-
         # state seed; synth(screen, cols, rows, modes) serializes one. All three
@@ -2555,6 +2556,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             if drv is not None:
                 drv.write("\x1b[?25h" if show else "\x1b[?25l")
                 self._hw_cursor_visible = show
+                if _IME_DEBUG:
+                    try:
+                        foc = type(self.screen.focused).__name__
+                    except Exception:
+                        foc = "?"
+                    _ime_dbg(f"hwcursor show={show} force={force} "
+                             f"focused_pane={self._is_focused_pane()} screen.focused={foc}")
         except Exception:
             pass
 
@@ -2651,6 +2659,20 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._show_hw_cursor(True, force=(reason != "repaint"))
             if xy is None:
                 return
+            # Anti-fly (position stability): on a per-repaint sync, only MOVE the
+            # anchor once the cursor CELL has settled — i.e. it is the SAME cell we saw
+            # on the previous repaint. A child redrawing its input box sweeps the pyte
+            # cursor across a row 2-3 lines above the prompt on every repaint (drawing
+            # the box border), and this can happen while the pane is NOT 'busy'; the
+            # earlier busy-only freeze let those transient cells through and the native
+            # cursor / IME flickered along that row. Freezing the MOVE (while still
+            # keeping the cursor shown) keeps the anchor on the last settled cell.
+            # "focus"/"settle" are definitive and skip the gate. (#agents-cursor)
+            if reason == "repaint":
+                prev = getattr(self, "_prev_repaint_cell", None)
+                self._prev_repaint_cell = (cx, cy)
+                if (cx, cy) != prev:
+                    return   # cursor still moving this frame — keep the settled anchor
             moved = xy != getattr(self, "_anchored_xy", None)
             app.cursor_position = Offset(*xy)   # cross-platform IME anchor
             self._anchored_xy = xy

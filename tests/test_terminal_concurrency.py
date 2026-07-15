@@ -477,7 +477,9 @@ def test_native_cursor_follows_dectcem_regardless_of_screen():
         assert writes == ["\x1b[?25l"], writes
 
         # alt-screen but cursor visible (claude agent mode) -> anchors at the prompt.
+        # Two repaints at the SAME cell so the position-stability gate lets it move.
         t, writes = _term(in_alt=True)
+        t._sync_terminal_cursor()
         t._sync_terminal_cursor()
         assert writes == ["\x1b[?25h"], writes
         assert t._app.cursor_position == rt.Offset(43, 7)
@@ -592,10 +594,20 @@ def test_cursor_sync_freezes_while_busy_and_settles_on_transition():
         assert True in refreshes, refreshes          # moved -> forced repaint to flush
         assert writes == ["\x1b[?25h"], writes
 
-        # 3) a repaint sync now (still idle, unchanged cell): no extra flush (no loop).
+        # 3) repaint syncs at the SAME idle cell: anchor stays, no extra flush (no loop).
         refreshes.clear()
-        t._sync_terminal_cursor(reason="repaint")
+        t._sync_terminal_cursor(reason="repaint")   # 1st obs -> stability freeze
+        t._sync_terminal_cursor(reason="repaint")   # 2nd obs (stable) -> move, unchanged
+        assert t._app.cursor_position == rt.Offset(43, 7)
         assert refreshes == [], refreshes
+
+        # 3b) idle cursor SWEEP (input-box redraw): a moved cell is frozen for one
+        #     repaint, then anchored once it settles for a second repaint.
+        t._screen.cursor.x = 9
+        t._sync_terminal_cursor(reason="repaint")   # cell changed -> freeze
+        assert t._app.cursor_position == rt.Offset(43, 7), "swept cell must not anchor"
+        t._sync_terminal_cursor(reason="repaint")   # same cell twice -> settle
+        assert t._app.cursor_position == rt.Offset(49, 7)
 
         # 4) _update_status leaving 'busy' marshals a 'settle' sync.
         marshalled, reasons = [], []
@@ -1892,9 +1904,10 @@ def test_cursor_anchor_does_not_chase_every_repaint():
     assert "_schedule_terminal_cursor_sync" not in refresh_src, \
         "the debounce timer indirection must be gone (it starved + never flushed)"
     sync_src = inspect.getsource(rt.AgentTerminal._sync_terminal_cursor)
-    assert "_prev_sync_cursor" not in sync_src, "the old two-repaint gate must be gone"
+    assert "_prev_repaint_cell" in sync_src, \
+        "the anti-fly must be a position-stability gate (only move on a settled cell)"
     assert 'reason == "repaint"' in sync_src and '"busy"' in sync_src, \
-        "the anti-fly must be a status=='busy' freeze on the repaint sync"
+        "the repaint sync must freeze while busy and gate the move on cell stability"
     assert not hasattr(rt.AgentTerminal, "_schedule_terminal_cursor_sync"), \
         "the debounce timer machinery must be removed"
 
