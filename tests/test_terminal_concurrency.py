@@ -283,19 +283,45 @@ def test_classify_pty_status_basics():
 
 def test_alt_screen_suppresses_false_needs_input():
     """claude's alt-screen full-screen UIs (agent switcher, /help) render menu-like
-    text that _WAITING_RE / _MENU_RE misfire on — flipping the pane to a false
-    'needs input', and back as the TUI redraws on scroll. _classify suppresses a
-    body-only 'waiting' while in alt-screen (real task prompts use the normal
-    buffer); the title-spinner 'busy' still wins. (#alt-waiting)"""
+    text that _MENU_RE misfires on — and a user navigating them types into the
+    pane. _classify demotes those two cases; the title-spinner 'busy' still wins.
+    (#alt-waiting)"""
+    import time as _t
     term = rt.AgentTerminal(["agent"], status_classifier=rt.classify_pty_status)
     menu = "1. one\n2. two\n3. three\n"
     term._alt.in_alt = False
     assert term._classify(menu, "") == "waiting"        # normal buffer → menu reads as waiting
     term._alt.in_alt = True
-    assert term._classify(menu, "") == "idle"           # alt-screen TUI menu → NOT needs-input
+    assert term._classify(menu, "") == "idle"           # bare list on alt → an ANSWER, not a gate
     assert term._classify(menu, "⠋ working") == "busy"  # spinner wins even in alt-screen
     # a non-menu idle screen stays idle regardless of alt-screen
     assert term._classify("just output", "✳ ready") == "idle"
+    # the user is DRIVING a TUI (recent keys into the pane): even a ❯-pointed
+    # menu must not flag while they navigate it
+    term.last_input_ts = _t.monotonic()
+    assert term._classify("❯ 1. session-a\n  2. session-b\n", "") == "idle"
+
+
+def test_real_gates_on_alt_screen_stay_waiting():
+    """Current claude (≥2.1) runs its WHOLE session UI on the alt screen, so the
+    old blanket alt-demotion silenced every real gate. A ❯-pointed forced choice
+    (the resume-from-summary gate — layout captured from a live 2.1.201 probe,
+    2026-07-16) and a permission prompt must classify 'waiting' on the alt screen
+    when the user has NOT been typing into the pane. (#resume-gate-waiting)"""
+    term = rt.AgentTerminal(["agent"], status_classifier=rt.classify_pty_status)
+    term._alt.in_alt = True
+    term.last_input_ts = 0.0
+    resume_gate = (
+        "  This session is 13d 1h old and 273k tokens.\n\n"
+        "  Resuming the full session will consume a substantial portion of your"
+        " usage limits. We recommend\n  resuming from a summary.\n\n"
+        "  ❯ 1. Resume from summary (recommended)\n"
+        "    2. Resume full session as-is\n"
+        "    3. Don't ask me again\n\n"
+        "  Enter to confirm · Esc to cancel\n")
+    assert term._classify(resume_gate, "✳ title") == "waiting"
+    perm = "Do you want to proceed? (y/n)\n"
+    assert term._classify(perm, "") == "waiting"
 
 
 def test_classify_trust_folder_dialog_is_waiting():
@@ -1843,6 +1869,8 @@ if __name__ == "__main__":
     print("PASS test_autoscroll_tick_pins_anchor_to_content")
     test_alt_screen_suppresses_false_needs_input()
     print("PASS test_alt_screen_suppresses_false_needs_input")
+    test_real_gates_on_alt_screen_stay_waiting()
+    print("PASS test_real_gates_on_alt_screen_stay_waiting")
     test_classify_trust_folder_dialog_is_waiting()
     print("PASS test_classify_trust_folder_dialog_is_waiting")
     test_status_classifier_profiles_and_injection()

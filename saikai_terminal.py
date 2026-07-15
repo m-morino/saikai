@@ -2209,20 +2209,32 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return txt, title
 
     def _classify(self, txt: str, title: str) -> str:
-        """Run the status classifier, then suppress a body-text 'waiting' while on
-        the ALT screen. claude's full-screen TUIs (the agent switcher, /help, …)
-        render numbered-menu / choose-one text that _WAITING_RE / _MENU_RE misfire
-        on, flipping the pane to a false 'needs input' — and back, as the TUI
-        redraws on scroll/selection (the reported bug). claude's REAL task prompts
-        (permission / forced choice) render in the NORMAL buffer, so a 'waiting'
-        reached only through the alt-screen body isn't real → treat it as idle. The
-        title-spinner 'busy' path is unaffected (it returns before the waiting
-        check), so a genuinely working alt-screen UI still reads busy. (#alt-waiting)"""
+        """Run the status classifier, then tame a body-text 'waiting' on the ALT
+        screen. The blanket "alt ⇒ never waiting" rule assumed claude's REAL task
+        prompts render in the NORMAL buffer — current claude (≥2.1) enters the
+        alt screen at boot and never leaves, so that rule silenced every genuine
+        gate: probe-verified 2026-07-16 on the resume-from-summary forced choice
+        (classify said waiting, the demotion said idle), and by construction the
+        same held for mid-turn permission prompts. What the demotion actually
+        protects against is (#alt-waiting):
+          (a) the user DRIVING a full-screen TUI (agent switcher, /help) whose
+              menus redraw under their keys → discriminate by exactly that:
+              recent input INTO this pane (keys/paste/mirror all stamp
+              last_input_ts), not by which buffer painted;
+          (b) a finished ANSWER that merely ends in a numbered list (_MENU_RE
+              alone) → still demoted: a real gate carries a ❯ choice pointer or
+              an explicit question/y-n (_WAITING_RE), a list does not.
+        The title-spinner 'busy' path is unaffected (it returns before the
+        waiting check). (#resume-gate-waiting)"""
         classifier = getattr(self, "_status_classifier", classify_pty_status)
         st = classifier(txt, title)
         alt = getattr(self, "_alt", None)
         if st == "waiting" and alt is not None and alt.in_alt:
-            return "idle"
+            if (time.monotonic() - getattr(self, "last_input_ts", 0.0)) < 4.0:
+                return "idle"                      # (a) user navigating a TUI
+            tail = _ANSI_RE.sub("", (txt or "")[-2000:])
+            if not (_WAITING_RE.search(tail) or _TRUST_RE.search(txt or "")):
+                return "idle"                      # (b) bare numbered list
         return st
 
     def refresh_status(self) -> None:
