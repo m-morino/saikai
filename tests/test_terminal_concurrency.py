@@ -372,13 +372,16 @@ def test_show_hw_cursor_native_cursor_dec_bytes():
         rt._IME_ANCHOR = _saved
 
 
-def test_native_cursor_respects_alt_screen_but_keeps_main_screen_ime_anchor():
-    """Windows native cursor is an IME anchor for the main-screen prompt.
+def test_native_cursor_follows_dectcem_regardless_of_screen():
+    """The native cursor / IME anchor follows the child's DECTCEM state, screen-
+    agnostic: SHOW when the child shows its cursor (?25h), HIDE when it hides it (?25l).
 
-    Claude may hide the terminal cursor while still accepting input at the normal
-    prompt, so DECTCEM alone must not send IME composition back to Textual's
-    search/default cursor. Alt-screen remains the boundary where the child owns
-    cursor presentation. (#agents-cursor)"""
+    claude's agent / fullscreen renderer runs on the ALT screen while keeping its
+    prompt cursor VISIBLE, and still needs the IME there — so alt+visible must anchor
+    (gating on alt-screen alone, the old policy, sent composition to the pane top-left).
+    Conversely a main-screen program that hides its cursor for a progress spinner must
+    NOT have saikai force a cursor back on. cursor_hidden is the signal for both.
+    (#agents-cursor)"""
     import threading as _th
 
     class _Cursor:
@@ -436,16 +439,25 @@ def test_native_cursor_respects_alt_screen_but_keeps_main_screen_ime_anchor():
     if rt.Offset is None:
         rt.Offset = lambda x, y: (x, y)
     try:
-        assert rt._native_cursor_should_show(False, False) is True
-        assert rt._native_cursor_should_show(True, False) is True
-        assert rt._native_cursor_should_show(False, True) is False
+        # (cursor_hidden, in_alt_screen): follow cursor_hidden, ignore the screen.
+        assert rt._native_cursor_should_show(False, False) is True   # main, cursor shown
+        assert rt._native_cursor_should_show(True, False) is False   # main, cursor hidden (spinner) -> respect ?25l
+        assert rt._native_cursor_should_show(False, True) is True    # claude agent mode: alt + cursor shown
+        assert rt._native_cursor_should_show(True, True) is False    # fullscreen TUI, no insertion point
 
+        # main-screen program that hid its cursor -> saikai must NOT force it back on.
         t, writes = _term(hidden=True)
+        t._sync_terminal_cursor()
+        assert writes == ["\x1b[?25l"], writes
+
+        # alt-screen but cursor visible (claude agent mode) -> anchors at the prompt.
+        t, writes = _term(in_alt=True)
         t._sync_terminal_cursor()
         assert writes == ["\x1b[?25h"], writes
         assert t._app.cursor_position == rt.Offset(43, 7)
 
-        t, writes = _term(in_alt=True)
+        # alt-screen AND cursor hidden (real fullscreen UI) -> hand the cursor back.
+        t, writes = _term(hidden=True, in_alt=True)
         t._sync_terminal_cursor()
         assert writes == ["\x1b[?25l"], writes
 
@@ -489,53 +501,92 @@ def test_child_pty_env_hides_outer_terminal_identity_from_child():
     assert env["CLAUDE_CODE_FORCE_SYNC_OUTPUT"] == "1"
 
 
-def test_repaint_cursor_sync_debounces_until_output_quiet():
-    """Repaint-driven WT cursor moves wait for quiet output.
+def test_cursor_sync_freezes_while_busy_and_settles_on_transition():
+    """Anti-fly WITHOUT a timer: a per-repaint sync FREEZES the anchor while the pane
+    is 'busy' (an agent storm moves the pyte cursor every frame, so moving the anchor
+    then makes the IME window fly); leaving 'busy' marshals a 'settle' sync that lands
+    the anchor on the resting prompt and forces one repaint to flush it. (#agents-cursor)"""
+    import threading as _th
 
-    This keeps the IME anchor correct after claude returns to a classic prompt,
-    while avoiding native-cursor chasing during agents/full-screen redraw.
-    Immediate focus sync is covered separately by _sync_terminal_cursor tests.
-    (#agents-cursor)"""
-    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
-    timers = []
-    syncs = []
-    now = [1000.0]
+    class _Cursor:
+        x = 3; y = 2; hidden = False
 
-    old_win, old_anchor, old_mono = rt._IS_WIN, rt._IME_ANCHOR, rt.time.monotonic
+    class _Screen:
+        def __init__(self):
+            self.cursor = _Cursor(); self.columns = 80; self.lines = 24
+
+    class _Alt:
+        in_alt = False
+
+    class _Region:
+        x = 40; y = 5; width = 80; height = 24
+
+    class _Drv:
+        def __init__(self, w): self._w = w
+        def write(self, s): self._w.append(s)
+
+    class _App:
+        def __init__(self, w): self._driver = _Drv(w)
+
+    class _Shim(rt.AgentTerminal):
+        app = property(lambda self: self._app)
+        content_region = property(lambda self: _Region())
+
+    old_win, old_anchor, old_offset = rt._IS_WIN, rt._IME_ANCHOR, rt.Offset
     rt._IS_WIN = True
     rt._IME_ANCHOR = True
-    rt.time.monotonic = lambda: now[0]
+    if rt.Offset is None:
+        rt.Offset = lambda x, y: (x, y)
     try:
-        t._cursor_sync_due = 0.0
-        t._cursor_sync_timer_armed = False
-        t.set_timer = lambda delay, cb: timers.append((delay, cb))
-        t._sync_terminal_cursor = lambda reason="repaint": syncs.append(reason)
+        writes, refreshes = [], []
+        t = _Shim.__new__(_Shim)
+        t.sid = "x"
+        t._app = _App(writes)
+        t._lock = _th.Lock()
+        t._screen = _Screen()
+        t._alt = _Alt()
+        t._scroll = 0
+        t.is_dead = False
+        t._hw_cursor_visible = None
+        t._anchored_xy = None
+        t._is_focused_pane = lambda: True
+        t.refresh = lambda *a, **k: refreshes.append(k.get("repaint", False))
 
-        t._schedule_terminal_cursor_sync(delay=0.12)
-        assert len(timers) == 1, timers
-        assert syncs == []
+        # 1) repaint sync while BUSY: anchor frozen (never moved).
+        t._status = "busy"
+        t._sync_terminal_cursor(reason="repaint")
+        assert getattr(t._app, "cursor_position", None) is None
+        assert t._anchored_xy is None
 
-        # More PTY output before the timer fires moves the due time, but does
-        # not arm a second independent timer.
-        now[0] += 0.05
-        t._schedule_terminal_cursor_sync(delay=0.12)
-        assert len(timers) == 1, timers
+        # 2) settle sync (busy just ended): anchors at the prompt + forces a flush.
+        t._status = "idle"
+        t._sync_terminal_cursor(reason="settle")
+        assert t._app.cursor_position == rt.Offset(43, 7)
+        assert t._anchored_xy == (43, 7)
+        assert True in refreshes, refreshes          # moved -> forced repaint to flush
+        assert writes == ["\x1b[?25h"], writes
 
-        # The original timer fires too early, so it reschedules instead of
-        # moving WT's cursor to a transient draw position.
-        _delay, cb = timers.pop(0)
-        cb()
-        assert syncs == []
-        assert len(timers) == 1, timers
+        # 3) a repaint sync now (still idle, unchanged cell): no extra flush (no loop).
+        refreshes.clear()
+        t._sync_terminal_cursor(reason="repaint")
+        assert refreshes == [], refreshes
 
-        # Once output has been quiet long enough, one cursor sync lands.
-        now[0] += 0.13
-        _delay, cb = timers.pop(0)
-        cb()
-        assert syncs == ["quiet"], syncs
-        assert t._cursor_sync_timer_armed is False
+        # 4) _update_status leaving 'busy' marshals a 'settle' sync.
+        marshalled, reasons = [], []
+        t._marshal = lambda fn: marshalled.append(fn)
+        t._on_status = lambda sid, st: None
+        t._status = "busy"; t._pending_status = None; t._pending_ticks = 0
+        t._update_status("idle")   # 1st tick: pending
+        t._update_status("idle")   # 2nd tick: flips out of busy -> fire
+        t._sync_terminal_cursor = lambda reason="repaint": reasons.append(reason)
+        for fn in marshalled:
+            try:
+                fn()
+            except Exception:
+                pass
+        assert "settle" in reasons, reasons
     finally:
-        rt._IS_WIN, rt._IME_ANCHOR, rt.time.monotonic = old_win, old_anchor, old_mono
+        rt._IS_WIN, rt._IME_ANCHOR, rt.Offset = old_win, old_anchor, old_offset
 
 
 def test_autoscroll_tick_pins_anchor_to_content():
@@ -1687,19 +1738,22 @@ def test_busy_storm_throttles_reclassify():
 def test_cursor_anchor_does_not_chase_every_repaint():
     """The IME/candidate anchor must NOT chase the live pyte cursor on every repaint:
     an agent spinner moves it Home -> prompt on all ~170k frames and coalesced repaints
-    caught it mid-frame, flickering the anchor across the screen. The fix routes
-    repaint-driven syncs through a debounce (_schedule_terminal_cursor_sync) that only
-    fires once PTY output goes quiet, so the old per-repaint `_prev_sync_cursor`
-    two-frame gate is gone. A focus sync still anchors immediately. (#agents-cursor)"""
+    caught it mid-frame, flickering the anchor across the screen. The fix keeps the sync
+    INLINE on the repaint (so it always rides a CompositorUpdate and flushes) but FREEZES
+    the anchor position while status=='busy'; the debounce timer machinery is gone and no
+    longer starves. A focus/settle sync anchors immediately. (#agents-cursor)"""
     import inspect
     refresh_src = inspect.getsource(rt.AgentTerminal._do_pane_refresh)
-    assert "_schedule_terminal_cursor_sync" in refresh_src, \
-        "_do_pane_refresh must debounce the cursor sync, not call it inline per repaint"
+    assert "_sync_terminal_cursor" in refresh_src, \
+        "_do_pane_refresh must sync the cursor inline (rides the repaint = flushes)"
+    assert "_schedule_terminal_cursor_sync" not in refresh_src, \
+        "the debounce timer indirection must be gone (it starved + never flushed)"
     sync_src = inspect.getsource(rt.AgentTerminal._sync_terminal_cursor)
-    assert "_prev_sync_cursor" not in sync_src, \
-        "the old two-repaint gate must be gone (debounce supersedes it)"
-    assert hasattr(rt.AgentTerminal, "_schedule_terminal_cursor_sync"), \
-        "the debounce entry point must exist"
+    assert "_prev_sync_cursor" not in sync_src, "the old two-repaint gate must be gone"
+    assert 'reason == "repaint"' in sync_src and '"busy"' in sync_src, \
+        "the anti-fly must be a status=='busy' freeze on the repaint sync"
+    assert not hasattr(rt.AgentTerminal, "_schedule_terminal_cursor_sync"), \
+        "the debounce timer machinery must be removed"
 
 
 def test_ime_anchor_default_on_keeps_windows_caret_render_guard():
@@ -1779,12 +1833,12 @@ if __name__ == "__main__":
     print("PASS test_classify_pty_status_basics")
     test_show_hw_cursor_native_cursor_dec_bytes()
     print("PASS test_show_hw_cursor_native_cursor_dec_bytes")
-    test_native_cursor_respects_alt_screen_but_keeps_main_screen_ime_anchor()
-    print("PASS test_native_cursor_respects_alt_screen_but_keeps_main_screen_ime_anchor")
+    test_native_cursor_follows_dectcem_regardless_of_screen()
+    print("PASS test_native_cursor_follows_dectcem_regardless_of_screen")
     test_child_pty_env_hides_outer_terminal_identity_from_child()
     print("PASS test_child_pty_env_hides_outer_terminal_identity_from_child")
-    test_repaint_cursor_sync_debounces_until_output_quiet()
-    print("PASS test_repaint_cursor_sync_debounces_until_output_quiet")
+    test_cursor_sync_freezes_while_busy_and_settles_on_transition()
+    print("PASS test_cursor_sync_freezes_while_busy_and_settles_on_transition")
     test_autoscroll_tick_pins_anchor_to_content()
     print("PASS test_autoscroll_tick_pins_anchor_to_content")
     test_alt_screen_suppresses_false_needs_input()

@@ -102,6 +102,28 @@ _IME_ANCHOR = str(os.environ.get("SAIKAI_IME_ANCHOR", "1")).strip().lower() not 
 # saikai's pyte mirror handle differently). Off by default; debug only.
 _PTY_CAPTURE = os.environ.get("SAIKAI_PTY_CAPTURE", "").strip()
 
+# Opt-in IME-anchor tracing: when SAIKAI_IME_DEBUG names a file (or is "1"), every
+# _sync_terminal_cursor writes one line with the pyte cursor cell, the pyte screen
+# size, the widget content_region, the computed anchor xy, the sync reason, and
+# whether the anchor actually moved since the last flush. For diagnosing candidate-
+# window misplacement (geometry mismatch vs a stale, never-flushed anchor) on a real
+# WT + IME without guessing. Off by default; debug only.
+_IME_DEBUG = os.environ.get("SAIKAI_IME_DEBUG", "").strip()
+if _IME_DEBUG == "1":
+    _IME_DEBUG = os.path.join(
+        os.environ.get("TEMP") or os.environ.get("TMP") or ".", "saikai_ime_debug.txt")
+
+
+def _ime_dbg(line: str) -> None:
+    """Append one IME-anchor trace line (no-op unless SAIKAI_IME_DEBUG is set)."""
+    if not _IME_DEBUG:
+        return
+    try:
+        with open(_IME_DEBUG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
 # Reader-side re-classify throttle (#agent-storm-throttle): while a pane is stably
 # 'busy', an agent-mode spinner emits ~170k synchronized frames/session and
 # re-classifying each (a full pyte-grid render ~0.7ms + the classifier regex
@@ -126,15 +148,25 @@ def _ime_anchor_xy(cursor_x, cursor_y, rx, ry, rw, rh):
 
 
 def _native_cursor_should_show(cursor_hidden: bool, in_alt_screen: bool) -> bool:
-    """Windows native-cursor policy for split-live panes.
+    """Native-cursor / IME-anchor policy: follow the child's DECTCEM state faithfully.
 
-    The hardware cursor is an IME anchor for claude's classic prompt. Do not let
-    DECTCEM (?25l) suppress that anchor on the main screen: Claude can hide the
-    terminal cursor while still expecting IME at its prompt. Alt-screen is the
-    reliable boundary where the child owns cursor presentation.
+    The hardware cursor is the IME anchor — the host terminal parks its composition
+    window wherever this cursor sits. Anchor it at the child's cursor cell whenever the
+    child SHOWS its cursor (?25h), and refuse it only when the child HIDES it (?25l),
+    on EITHER screen. A visible cursor is the text insertion point (that is exactly
+    where composition belongs); a hidden cursor means the child owns presentation and
+    has no insertion point (a pager / spinner / no-cursor TUI mode).
+
+    This is screen-agnostic on purpose. claude's agent / fullscreen renderer runs on
+    the ALT screen while KEEPING its prompt cursor VISIBLE — it still needs the IME
+    there — so gating on alt-screen (the old policy) wrongly refused to anchor and the
+    composition fell back to the pane top-left. Conversely a main-screen program that
+    hides its cursor for a progress spinner must NOT have saikai force a cursor back
+    on. cursor_hidden is the correct signal for both. in_alt_screen is retained in the
+    signature for callers/tests but is not needed for the decision. (#agents-cursor)
     """
-    del cursor_hidden
-    return not in_alt_screen
+    del in_alt_screen
+    return not cursor_hidden
 
 
 _HOST_TERMINAL_ENV_STRIP = {
@@ -998,8 +1030,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._app_cursor = False     # ?1 DECCKM — replayed in the mirror seed so a
                                      # pane-view browser encodes arrows correctly (#pane-direct)
         self._hw_cursor_visible: Optional[bool] = None  # last ?25 visibility we wrote
-        self._cursor_sync_due = 0.0  # debounce WT native-cursor moves during redraw
-        self._cursor_sync_timer_armed = False
+        self._anchored_xy = None  # last IME anchor cell we set (freeze/flush bookkeeping)
         # Mirror pane-direct tee (#pane-direct): tee(str) forwards a scrubbed
         # chunk to the mirror hub's pane channel; reset(str) enqueues a full-
         # state seed; synth(screen, cols, rows, modes) serializes one. All three
@@ -2248,6 +2279,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                     fire = new
         if fire is not None and self._on_status and self.sid:
             self._marshal(lambda: self._safe_status_cb(fire))   # marshal OUTSIDE the lock
+        # Leaving 'busy' = the agent storm ended and the prompt is stable. The
+        # per-repaint anchor sync FROZE while busy (anti-fly), so settle it now onto
+        # the resting prompt and flush. Marshalled to the UI thread (this runs on the
+        # reader thread or the host poll); the sync no-ops off the focused/live pane.
+        # (#agents-cursor)
+        if fire is not None and fire not in ("busy", "dead"):
+            self._marshal(lambda: self._sync_terminal_cursor(reason="settle"))
 
     def _set_status(self, status: str) -> None:
         self._status = status
@@ -2305,8 +2343,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     def _do_pane_refresh(self) -> None:   # runs on the UI thread
         self._refresh_pending = False
         self.refresh()
-        self._hide_hw_cursor_if_alt_screen()
-        self._schedule_terminal_cursor_sync()
+        # Sync the IME anchor INLINE on the repaint: it rides this CompositorUpdate
+        # (so app.cursor_position actually reaches WT — no separate flush needed),
+        # updates cross-platform, and can't be starved by a timer. The anti-fly is a
+        # POSITION freeze inside _sync_terminal_cursor (frozen while status=='busy'),
+        # not a deferral of the whole sync. (#agents-cursor)
+        self._sync_terminal_cursor()
 
     def snapshot_text(self) -> str:
         """Plain-text dump of the pane's CURRENT visible pyte screen + geometry,
@@ -2383,64 +2425,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             pass
 
-    def _hide_hw_cursor_if_alt_screen(self) -> None:
-        """Immediately honour alt-screen cursor ownership without moving WT's cursor.
-
-        Repaint-driven cursor *moves* are debounced below because claude's agents
-        view can move pyte's cursor all over the screen while drawing. Hiding is
-        reserved for alt-screen: main-screen DECTCEM hide is not a reliable signal
-        that the IME anchor should disappear from Claude's prompt. (#agents-cursor)"""
-        if not _IS_WIN or not _IME_ANCHOR:
-            return
-        try:
-            if self.is_dead or not self._is_focused_pane():
-                return
-        except Exception:
-            return
-        with self._lock:
-            screen = self._screen
-            if screen is None:
-                return
-            in_alt = bool(getattr(getattr(self, "_alt", None), "in_alt", False))
-        if not _native_cursor_should_show(False, in_alt):
-            self._show_hw_cursor(False)
-
-    def _schedule_terminal_cursor_sync(self, delay: float = 0.12) -> None:
-        """Debounce WT cursor moves until PTY output is briefly quiet.
-
-        The native Windows cursor exists here to anchor IME at the prompt. It is
-        not a render cursor for child full-screen UIs, so repaint-driven syncs
-        should converge after output quiesces instead of chasing every cursor
-        motion in the stream. Focus/app-focus still call _sync_terminal_cursor()
-        immediately because that is when WT otherwise leaves IME at the search
-        box/default cursor. (#ime-race #agents-cursor)"""
-        if not _IS_WIN or not _IME_ANCHOR:
-            return
-        now = time.monotonic()
-        self._cursor_sync_due = now + max(0.0, delay)
-        if getattr(self, "_cursor_sync_timer_armed", False):
-            return
-        self._cursor_sync_timer_armed = True
-        try:
-            self.set_timer(max(0.01, delay), self._cursor_sync_timer_fired)
-        except Exception:
-            self._cursor_sync_timer_armed = False
-            self._sync_terminal_cursor(reason="quiet")
-
-    def _cursor_sync_timer_fired(self) -> None:
-        self._cursor_sync_timer_armed = False
-        due = float(getattr(self, "_cursor_sync_due", 0.0) or 0.0)
-        remaining = due - time.monotonic()
-        if remaining > 0.0:
-            self._cursor_sync_timer_armed = True
-            try:
-                self.set_timer(max(0.01, remaining), self._cursor_sync_timer_fired)
-            except Exception:
-                self._cursor_sync_timer_armed = False
-                self._sync_terminal_cursor(reason="quiet")
-            return
-        self._sync_terminal_cursor(reason="quiet")
-
     def on_focus(self, event=None) -> None:
         # Anchor the IME the moment the pane is focused (don't wait for a repaint).
         # _sync_terminal_cursor decides whether the native cursor is actually
@@ -2468,13 +2452,30 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         hardware cursor hidden but still `move_to`s it every repaint, and WezTerm
         (and other IMEs) anchor the candidate window to that position.
 
-        UI-thread only (called from _do_pane_refresh / on_focus). No-op unless THIS
-        pane is focused and live (scroll at the bottom). Reads the pyte cursor under
-        the lock, then sets app.cursor_position OUTSIDE the lock (per the concurrency
-        invariant — never marshal/block while holding self._lock)."""
+        UI-thread only. Callers pass a `reason`:
+          - "repaint" (default, from _do_pane_refresh): rides the paint. FROZEN while
+            status=='busy' — an agent spinner moves the pyte cursor Home->…->prompt on
+            every one of ~170k frames and a coalesced repaint catches it mid-frame, so
+            moving the anchor then makes the IME/candidate window fly. Freezing keeps
+            it at the last settled cell.
+          - "settle" (from _update_status when the pane leaves 'busy'): the storm ended
+            and the prompt is now stable, so re-anchor at it and force one repaint to
+            flush (a settle fires outside the paint path).
+          - "focus" (from on_focus / OS-window regain): always re-anchor + flush so the
+            IME isn't left at Textual's default/search cursor.
+
+        No-op unless THIS pane is focused and live (scroll at the bottom). Reads the
+        pyte cursor under the lock, then touches app.cursor_position / writes the driver
+        OUTSIDE the lock (per the concurrency invariant — never marshal/block while
+        holding self._lock)."""
         if not _IME_ANCHOR:
             return
         if Offset is None or self.is_dead or not self._is_focused_pane() or self._scroll != 0:
+            return
+        # Anti-fly: freeze the anchor POSITION during an agent-mode storm. Only the
+        # per-repaint sync is frozen; a "settle"/"focus" sync always runs so the anchor
+        # lands on the settled prompt and is flushed. (#agents-cursor)
+        if reason == "repaint" and getattr(self, "_status", None) == "busy":
             return
         try:
             app = self.app
@@ -2492,31 +2493,43 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 cursor_hidden = bool(getattr(screen.cursor, "hidden", False))
             except Exception:
                 return
+            scols = int(getattr(screen, "columns", 0) or 0)
+            slines = int(getattr(screen, "lines", 0) or 0)
             in_alt = bool(getattr(getattr(self, "_alt", None), "in_alt", False))
-        show_hw_cursor = _native_cursor_should_show(cursor_hidden, in_alt)
-        if not show_hw_cursor:
+        if not _native_cursor_should_show(cursor_hidden, in_alt):
             self._show_hw_cursor(False)
+            self._anchored_xy = None
+            if _IME_DEBUG:
+                _ime_dbg(f"sync reason={reason} HIDE (alt={in_alt} hidden={cursor_hidden})")
             return
         try:
             region = self.content_region
             xy = _ime_anchor_xy(cx, cy, region.x, region.y, region.width, region.height)
-            if xy is not None:
-                app.cursor_position = Offset(*xy)
-                self._show_hw_cursor(True, force=(reason == "focus"))
-                # Textual only EMITS the cursor move/visibility to the real
-                # terminal during a CompositorUpdate (App._display). Setting
-                # cursor_position alone on an *idle* focus return never reaches
-                # the terminal, so WT keeps the IME disabled (×) until claude's
-                # next redraw pushes it — exactly the busy-OK / idle-× symptom.
-                # On a focus-triggered sync, force one repaint so the cursor is
-                # pushed to WT now. (Repaint-triggered syncs already ride a
-                # render, so we skip the refresh there to avoid a paint loop.)
-                # (#ime-race)
-                if reason == "focus":
-                    try:
-                        self.refresh(repaint=True)
-                    except Exception:
-                        pass
+            if _IME_DEBUG:
+                _ime_dbg(
+                    f"sync reason={reason} pyte_cur=({cx},{cy}) pyte_size=({scols}x{slines}) "
+                    f"region=(x={region.x},y={region.y},w={region.width},h={region.height}) "
+                    f"anchor_xy={xy} moved={xy != getattr(self, '_anchored_xy', None)}")
+            # Keep the native cursor SHOWN whenever the child shows its own — even if
+            # geometry isn't settled yet (xy is None on an early focus event). Gating
+            # the show behind a successful anchor left the IME disabled (×) on focus
+            # into a scrolled/unsettled pane. force= on the non-repaint syncs so a
+            # blur→refocus re-asserts ?25h even if visibility looked unchanged.
+            self._show_hw_cursor(True, force=(reason != "repaint"))
+            if xy is None:
+                return
+            moved = xy != getattr(self, "_anchored_xy", None)
+            app.cursor_position = Offset(*xy)   # cross-platform IME anchor
+            self._anchored_xy = xy
+            # app.cursor_position only reaches the terminal during a CompositorUpdate.
+            # A "repaint" sync already rides one. A "settle"/"focus" sync fires outside
+            # the paint path, so force ONE repaint to flush the moved anchor — but only
+            # when it actually MOVED, so an idle re-assert can't spin a repaint loop.
+            if moved and reason != "repaint":
+                try:
+                    self.refresh(repaint=True)
+                except Exception:
+                    pass
         except Exception:
             pass
 
