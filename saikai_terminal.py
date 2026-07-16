@@ -790,12 +790,10 @@ _MIRROR_QUERY_STRIP_RE = re.compile("|".join(
 _OSC9_NOTIFY_RE = re.compile(r"\x1b\]9;(?!4;)([^\x07\x1b]*)\x07")       # iTerm2 (not 9;4 progress)
 _OSC777_RE = re.compile(r"\x1b\]777;notify;([^\x07]*)\x07")            # ghostty: title;body
 _OSC99_RE = re.compile(r"\x1b\]99;[^;]*;([^\x1b\x07]*)(?:\x07|\x1b\\)") # kitty: metadata;payload
-# Synchronized output (DEC mode 2026, BSU/ESU): a TUI brackets a full frame's writes
-# in ?2026h … ?2026l so the terminal presents the COMPLETE frame, not the half-drawn
-# intermediate. saikai feeds pyte continuously but DEFERS the pane repaint until the
-# block closes (or a safety timeout), so an agent UI's redraw doesn't tear ("layout
-# looks broken"). pyte ignores ?2026, so it's tracked here purely for repaint timing.
-_SYNC_RE = re.compile(r"\x1b\[\?2026([hl])")
+# Synchronized output (DEC mode 2026, BSU/ESU): retain a bracketed frame before
+# pyte so neither Textual nor the IME anchor can observe its cursor-hidden/Home
+# intermediate state. pyte ignores ?2026; the private stager below supplies the
+# presentation boundary and fails open on bounded exceptional paths.
 _SYNC_BUFFER_MAX_CHARS = 4 * 1024 * 1024
 _SYNC_BUFFER_MAX_AGE = 0.2
 
@@ -1914,6 +1912,19 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self.refresh()
 
     # ── (4) background reader -> feed pyte -> repaint on the UI thread ─────────
+    def _flush_sync_output(self, reason: str) -> bool:
+        """Release one retained frame on the reader thread, at most once."""
+        changed = False
+        sync_output = getattr(self, "_sync_output", None)
+        if sync_output is None:
+            return False
+        for text, fail_reason in sync_output.flush(reason):
+            if fail_reason:
+                _log(f"sync-output fail-open: reason={fail_reason} chars={len(text)}")
+            self._consume_ready(text)
+            changed = True
+        return changed
+
     def _read_loop(self) -> None:
         pty = self._pty
         assert pty is not None
@@ -1946,6 +1957,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 if changed and self._scroll == 0 and not self._frozen:
                     self._schedule_pane_refresh()
         finally:
+            self._flush_sync_output("eof")
             self._finalize()
 
     def _honor_osc52(self, b64: str) -> None:
@@ -2093,8 +2105,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._answer_cursor_queries(chunk)
 
     def _consume(self, chunk: str) -> bool:
-        """Feed a decoded chunk to pyte (handling alt-screen resets) and update
-        the rolling tail + status. Runs on the reader thread."""
+        """Stage decoded output and feed only complete units to pyte."""
         if _PTY_CAPTURE:
             try:
                 with open(_PTY_CAPTURE, "a", encoding="utf-8") as _cf:
@@ -2153,11 +2164,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._mouse_reporting = (getattr(self, "_mouse_click", False)
                                      or getattr(self, "_mouse_btn_motion", False)
                                      or getattr(self, "_mouse_any_motion", False))
-        _su = _SYNC_RE.findall(chunk)            # synchronized-update block open/close
-        if _su:
-            self._in_sync_update = (_su[-1] == "h")
-            if self._in_sync_update:
-                self._sync_started = time.monotonic()
         # Honor the child's OSC 52 clipboard writes (e.g. claude's fullscreen 'copy
         # selection'): saikai consumes the child's output and pyte ignores OSC 52, so
         # decode + set the HOST clipboard ourselves. Reassemble across reads — a large

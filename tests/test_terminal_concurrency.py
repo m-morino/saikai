@@ -1315,6 +1315,38 @@ def test_cursor_query_fail_opens_sync_block_then_reports_new_cursor():
     assert t._sync_output.active is False
 
 
+def test_sync_output_eof_flushes_retained_frame_once():
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(20, 5, history=20)
+    t._stream = pyte.Stream(t._screen)
+    t._sync_output = rt._SynchronizedOutputStager()
+    t._marshal = lambda fn: None
+
+    assert t._consume("\x1b[?2026hEOF-TEXT") is False
+    assert t._flush_sync_output("eof") is True
+    assert "EOF-TEXT" in "\n".join(rt._pyte_grid_lines(t._screen))
+    assert t._flush_sync_output("eof") is False
+
+
+def test_sync_output_mirror_gets_closed_block_once_in_order():
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(20, 5, history=20)
+    t._stream = pyte.Stream(t._screen)
+    t._sync_output = rt._SynchronizedOutputStager()
+    t._marshal = lambda fn: None
+    mirrored = []
+    t._mirror_tee = lambda chunk: mirrored.append(chunk)
+
+    assert t._consume("pre\x1b[?2026hA") is True
+    assert mirrored == ["pre"]
+    assert t._consume("B\x1b[?2026lpost") is True
+    assert mirrored == ["pre", "\x1b[?2026hAB\x1b[?2026l", "post"]
+
+
 def test_input_snaps_scrolled_back_pane_to_live():
     """A scrolled-back pane (_scroll > 0) pins its view to history, and the reader
     repaints ONLY at _scroll == 0 (bumping _scroll to keep the pin as output streams
@@ -1385,8 +1417,6 @@ def test_consume_collapses_alt_screen_reset_amplification():
     t._bracketed_paste = False
     t._mouse_reporting = False
     t._mouse_sgr = False
-    t._in_sync_update = False
-    t._sync_started = 0.0
     t._current_screen = lambda: ("", "")
     t._update_status = lambda s: None
     t._status_classifier = lambda txt, title: "idle"
@@ -2022,6 +2052,10 @@ if __name__ == "__main__":
     print("PASS test_static_query_answers_before_sync_block_closes")
     test_cursor_query_fail_opens_sync_block_then_reports_new_cursor()
     print("PASS test_cursor_query_fail_opens_sync_block_then_reports_new_cursor")
+    test_sync_output_eof_flushes_retained_frame_once()
+    print("PASS test_sync_output_eof_flushes_retained_frame_once")
+    test_sync_output_mirror_gets_closed_block_once_in_order()
+    print("PASS test_sync_output_mirror_gets_closed_block_once_in_order")
     test_input_snaps_scrolled_back_pane_to_live()
     print("PASS test_input_snaps_scrolled_back_pane_to_live")
     test_busy_storm_throttles_reclassify()
