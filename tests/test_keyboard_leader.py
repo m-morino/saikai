@@ -1806,6 +1806,8 @@ def test_pilot_context_refresh_idle_and_busy():
                         pass          # _b1_tick refreshes the target's status
                     def all_terms(self):
                         return []     # _poll_live_status iterates this each tick
+                    def pane_id(self, sid: str) -> str:
+                        return f"tab-live-{sid}"
 
                 fake_term = _FakeTerm()
 
@@ -1814,6 +1816,11 @@ def test_pilot_context_refresh_idle_and_busy():
                 # a palette settle, and success requires the pane to go busy)
                 self._live = _FakeLive("idle")
                 self._focused_terminal = lambda: fake_term
+                # Drive the same poll that the 1.5s Textual timer runs. Fast
+                # machines used to finish this test before the timer fired,
+                # hiding an incomplete _FakeLive contract that crashed on
+                # slower Windows hosts.
+                self._poll_live_status()
                 await pilot.app.run_action("context_refresh")
                 await pilot.pause(0.05)
                 facts["idle_paste"] = list(fake_term.paste_calls)
