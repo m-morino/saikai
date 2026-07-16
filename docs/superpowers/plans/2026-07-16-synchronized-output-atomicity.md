@@ -566,7 +566,7 @@ $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $env:SAIKAI_IME_ANCHOR = '1'
 $env:SAIKAI_IME_DEBUG = "$env:TEMP\saikai_ime_debug_atomic_$stamp.txt"
 $env:SAIKAI_PTY_CAPTURE = "$env:TEMP\saikai_pty_capture_atomic_$stamp.txt"
-wt.exe -w new -d 'C:\Users\masay\CLI\saikai' pwsh.exe -NoExit -Command 'uv run saikai.py'
+wt.exe -w new -d (Get-Location).Path pwsh.exe -NoExit -Command 'uv run saikai.py'
 ```
 
 Verify the `pwsh -> uv -> python -> saikai.py` process chain before asking for input.
