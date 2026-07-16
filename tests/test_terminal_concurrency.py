@@ -1258,6 +1258,63 @@ def test_sync_output_stager_bounds_and_flushes_once():
     assert s.flush("eof") == []
 
 
+def test_sync_output_next_open_frame_cannot_mutate_queued_complete_frame():
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(30, 6, history=20)
+    t._stream = pyte.Stream(t._screen)
+    t._sync_output = rt._SynchronizedOutputStager()
+    t._marshal = lambda fn: None
+
+    frame_a = "\x1b[?2026h\x1b[5;10HREADY\x1b[?25h\x1b[?2026l"
+    assert t._consume(frame_a) is True
+    with t._lock:
+        stable = (t._screen.cursor.x, t._screen.cursor.y,
+                  bool(t._screen.cursor.hidden))
+
+    frame_b_open = "\x1b[?2026h\x1b[?25l\x1b[Hpartial"
+    assert t._consume(frame_b_open) is False
+    with t._lock:
+        observed = (t._screen.cursor.x, t._screen.cursor.y,
+                    bool(t._screen.cursor.hidden))
+
+    assert observed == stable
+    assert observed[2] is False
+    assert observed[:2] != (0, 0)
+
+
+def test_static_query_answers_before_sync_block_closes():
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(20, 5, history=20)
+    t._stream = pyte.Stream(t._screen)
+    t._sync_output = rt._SynchronizedOutputStager()
+    sent = []
+    t._send_to_child = lambda data: sent.append(data)
+    t._marshal = lambda fn: fn()
+
+    assert t._consume("\x1b[?2026h\x1b[c") is False
+    assert sent == ["\x1b[?6c"]
+
+
+def test_cursor_query_fail_opens_sync_block_then_reports_new_cursor():
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(20, 5, history=20)
+    t._stream = pyte.Stream(t._screen)
+    t._sync_output = rt._SynchronizedOutputStager()
+    sent = []
+    t._send_to_child = lambda data: sent.append(data)
+    t._marshal = lambda fn: fn()
+
+    assert t._consume("\x1b[?2026h\x1b[3;7H\x1b[6n") is True
+    assert sent == ["\x1b[3;7R"]
+    assert t._sync_output.active is False
+
+
 def test_input_snaps_scrolled_back_pane_to_live():
     """A scrolled-back pane (_scroll > 0) pins its view to history, and the reader
     repaints ONLY at _scroll == 0 (bumping _scroll to keep the pin as output streams
@@ -1959,6 +2016,12 @@ if __name__ == "__main__":
     print("PASS test_sync_output_stager_orders_back_to_back_and_combined_markers")
     test_sync_output_stager_bounds_and_flushes_once()
     print("PASS test_sync_output_stager_bounds_and_flushes_once")
+    test_sync_output_next_open_frame_cannot_mutate_queued_complete_frame()
+    print("PASS test_sync_output_next_open_frame_cannot_mutate_queued_complete_frame")
+    test_static_query_answers_before_sync_block_closes()
+    print("PASS test_static_query_answers_before_sync_block_closes")
+    test_cursor_query_fail_opens_sync_block_then_reports_new_cursor()
+    print("PASS test_cursor_query_fail_opens_sync_block_then_reports_new_cursor")
     test_input_snaps_scrolled_back_pane_to_live()
     print("PASS test_input_snaps_scrolled_back_pane_to_live")
     test_busy_storm_throttles_reclassify()

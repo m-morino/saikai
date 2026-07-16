@@ -1124,6 +1124,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                                      # (the reader keeps mutating screen.buffer, so
                                      # render + copy must read the FROZEN frame)
         self._esc_carry = ""         # trailing partial escape held across read()s
+        self._sync_output = _SynchronizedOutputStager()
         self._osc52_carry = ""       # partial OSC 52 clipboard write held across read()s (base64 can span chunks)
         self._app_cursor = False     # ?1 DECCKM — replayed in the mirror seed so a
                                      # pane-view browser encodes arrows correctly (#pane-direct)
@@ -1913,15 +1914,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self.refresh()
 
     # ── (4) background reader -> feed pyte -> repaint on the UI thread ─────────
-    def _sync_deferring(self) -> bool:
-        """True while honouring a synchronized-update block (?2026h…?2026l): the
-        pane repaint is held so a half-drawn frame isn't shown (the tearing the user
-        saw as "layout looks broken"). A safety timeout forces the repaint if the
-        block never closes, so a buggy/stuck child can't freeze the pane."""
-        if not getattr(self, "_in_sync_update", False):
-            return False
-        return (time.monotonic() - getattr(self, "_sync_started", 0.0)) <= 0.2
-
     def _read_loop(self) -> None:
         pty = self._pty
         assert pty is not None
@@ -1940,7 +1932,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                         break
                     time.sleep(0.01)
                     continue
-                self._consume(chunk)
+                changed = self._consume(chunk)
                 # NEVER touch the UI from this thread — marshal a COALESCED
                 # repaint so a fast stream of small chunks can't flood the UI.
                 # While scrolled back (copy mode) the pinned view shows the SAME
@@ -1949,10 +1941,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 # for nothing AND clear a WezTerm Shift+drag selection. Skip it —
                 # scrolling up thus "freezes" the pane so the user can select/copy;
                 # scrolling back to the bottom (_scroll == 0) resumes live repaint.
-                # Defer the repaint inside a synchronized-update block (?2026) so a
-                # half-drawn agent-UI frame isn't shown; the closing ?2026l (or the
-                # safety timeout) lets the next chunk paint the COMPLETE frame.
-                if self._scroll == 0 and not self._frozen and not self._sync_deferring():
+                # A retained synchronized-output block returns False and has not
+                # mutated pyte. Its close releases one complete presentation unit.
+                if changed and self._scroll == 0 and not self._frozen:
                     self._schedule_pane_refresh()
         finally:
             self._finalize()
@@ -2062,24 +2053,14 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             except Exception:
                 return 1, 1
 
-    def _answer_queries(self, chunk: str) -> None:
-        """Reply to terminal queries the child emitted in this chunk. saikai — not
-        the real terminal — receives them, and pyte never writes replies back, so
-        without this claude's capability handshake degrades and its private-?6n
-        redraw probe can block. Reads run here (reader thread); the actual PTY write
-        is marshalled to the UI thread so it can't interleave a keystroke. Answers:
-        Primary DA, DSR (status / cursor position, honouring the private ?6n form),
-        DECRQM ?2026 (we honour synchronized output), XTVERSION, OSC 10/11 color.
-        (#term-queries)"""
+    def _answer_static_queries(self, chunk: str) -> None:
+        """Answer terminal queries that do not depend on pyte's cursor state."""
         out = []
         if _DA_RE.search(chunk):
             out.append("\x1b[?6c")                       # Primary DA → a VT102-class terminal
         for _priv, _kind in _DSR_RE.findall(chunk):
             if _kind == "5":
                 out.append("\x1b[0n")                    # device status: OK
-            else:                                        # 6 = cursor position report
-                r, c = self._cursor_rowcol()
-                out.append(f"\x1b[{_priv}{r};{c}R")      # keep the private '?' if queried
         for _mode in _DECRQM_RE.findall(chunk):
             # saikai honours synchronized output (?2026) → "reset but recognised" (2);
             # any other mode → "not recognised" (0).
@@ -2095,7 +2076,23 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             resp = "".join(out)
             self._marshal(lambda r=resp: self._send_to_child(r))
 
-    def _consume(self, chunk: str) -> None:
+    def _answer_cursor_queries(self, chunk: str) -> None:
+        """Answer cursor-position DSR after the relevant output reached pyte."""
+        out = []
+        for private, kind in _DSR_RE.findall(chunk):
+            if kind == "6":
+                row, col = self._cursor_rowcol()
+                out.append(f"\x1b[{private}{row};{col}R")
+        if out:
+            response = "".join(out)
+            self._marshal(lambda r=response: self._send_to_child(r))
+
+    def _answer_queries(self, chunk: str) -> None:
+        """Compatibility wrapper for callers that already fed *chunk* to pyte."""
+        self._answer_static_queries(chunk)
+        self._answer_cursor_queries(chunk)
+
+    def _consume(self, chunk: str) -> bool:
         """Feed a decoded chunk to pyte (handling alt-screen resets) and update
         the rolling tail + status. Runs on the reader thread."""
         if _PTY_CAPTURE:
@@ -2184,6 +2181,30 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 self._notify_host(_msg.replace(";", ": ", 1))
             for _msg in _OSC99_RE.findall(chunk):
                 self._notify_host(_msg)
+        # Query side channels must stay live while a synchronized-output frame is
+        # retained. In particular, a child can wait for a capability response
+        # before it emits ?2026l.
+        self._answer_static_queries(chunk)
+        sync_output = getattr(self, "_sync_output", None)
+        if sync_output is None:                 # compatibility with minimal test objects
+            sync_output = self._sync_output = _SynchronizedOutputStager()
+        units = sync_output.push(chunk)
+        cursor_query = any(kind == "6" for _private, kind in _DSR_RE.findall(chunk))
+        if cursor_query and sync_output.active:
+            units.extend(sync_output.flush("cursor-query"))
+
+        changed = False
+        for text, fail_reason in units:
+            if fail_reason:
+                _log(f"sync-output fail-open: reason={fail_reason} chars={len(text)}")
+            self._consume_ready(text)
+            changed = True
+        if cursor_query:
+            self._answer_cursor_queries(chunk)
+        return changed
+
+    def _consume_ready(self, chunk: str) -> None:
+        """Feed one complete presentation unit to pyte and its mirror."""
         if not chunk:
             return
         with self._lock:
@@ -2271,10 +2292,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._last_classify_ts = _now
             _txt, _title = self._current_screen()
             self._update_status(self._classify(_txt, _title))
-        # Answer any terminal queries in this chunk AFTER the feed, so a cursor-
-        # position reply reflects the cursor this chunk just moved. (#term-queries)
-        if "\x1b[" in chunk or "\x1b]1" in chunk:
-            self._answer_queries(chunk)
         # A real BEL from the child (pyte distinguishes it from an OSC terminator):
         # ring the host bell — claude's attention signal / notification fallback.
         # Gated by SAIKAI_NO_BELL. (#bell)
