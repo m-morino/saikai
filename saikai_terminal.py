@@ -796,6 +796,104 @@ _OSC99_RE = re.compile(r"\x1b\]99;[^;]*;([^\x1b\x07]*)(?:\x07|\x1b\\)") # kitty:
 # block closes (or a safety timeout), so an agent UI's redraw doesn't tear ("layout
 # looks broken"). pyte ignores ?2026, so it's tracked here purely for repaint timing.
 _SYNC_RE = re.compile(r"\x1b\[\?2026([hl])")
+_SYNC_BUFFER_MAX_CHARS = 4 * 1024 * 1024
+_SYNC_BUFFER_MAX_AGE = 0.2
+
+
+class _SynchronizedOutputStager:
+    """Hold DEC 2026 output until a complete frame is available."""
+
+    def __init__(self, max_chars=_SYNC_BUFFER_MAX_CHARS,
+                 max_age=_SYNC_BUFFER_MAX_AGE):
+        self.max_chars = int(max_chars)
+        self.max_age = float(max_age)
+        self._state = "outside"
+        self._parts = []
+        self._chars = 0
+        self._opened_at = 0.0
+
+    @property
+    def active(self):
+        return self._state == "staging"
+
+    @staticmethod
+    def _is_sync(match):
+        return "2026" in match.group(1).split(";")
+
+    def _start(self, marker, now):
+        self._state = "staging"
+        self._parts = [marker]
+        self._chars = len(marker)
+        self._opened_at = now
+
+    def _append(self, text):
+        if text:
+            self._parts.append(text)
+            self._chars += len(text)
+
+    def _release(self, reason=None, bypass=False):
+        text = "".join(self._parts)
+        self._parts = []
+        self._chars = 0
+        self._opened_at = 0.0
+        self._state = "bypass" if bypass else "outside"
+        return (text, reason) if text else None
+
+    def flush(self, reason):
+        if not self.active:
+            return []
+        unit = self._release(reason, bypass=True)
+        return [unit] if unit else []
+
+    def push(self, chunk, now=None):
+        now = time.monotonic() if now is None else float(now)
+        out = []
+        if self.active and now - self._opened_at > self.max_age:
+            out.extend(self.flush("timeout"))
+
+        pos = 0
+        plain = []
+
+        def emit_plain():
+            if plain:
+                text = "".join(plain)
+                if text:
+                    out.append((text, None))
+                plain.clear()
+
+        for match in _DEC_PRIVATE_RE.finditer(chunk):
+            if not self._is_sync(match):
+                continue
+            before = chunk[pos:match.start()]
+            marker = match.group(0)
+            mode = match.group(2)
+            if self._state == "staging":
+                self._append(before + marker)
+                if mode == "l":
+                    unit = self._release()
+                    if unit:
+                        out.append(unit)
+            else:
+                plain.append(before)
+                plain.append(marker if self._state == "bypass" or mode == "l" else "")
+                if self._state == "bypass":
+                    if mode == "l":
+                        self._state = "outside"
+                elif mode == "h":
+                    plain.pop()
+                    emit_plain()
+                    self._start(marker, now)
+            pos = match.end()
+
+        tail = chunk[pos:]
+        if self._state == "staging":
+            self._append(tail)
+            if self._chars > self.max_chars:
+                out.extend(self.flush("overflow"))
+        else:
+            plain.append(tail)
+        emit_plain()
+        return out
 # Embedded paste markers in text we are about to wrap in bracketed paste: an
 # embedded ESC[201~ would END paste mode early so the bytes after it run as
 # typed-and-submitted input (the classic bracketed-paste breakout). Strip both

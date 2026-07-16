@@ -1213,19 +1213,49 @@ def test_forward_wheel_only_when_mouse_reporting():
     assert t._forward_wheel(ev, up=True) is False and writes == []
 
 
-def test_sync_update_defers_repaint_until_close():
-    """A synchronized-update block (?2026h…?2026l) defers the pane repaint so a
-    half-drawn frame isn't shown; not-in-sync or a timed-out block repaints. (#2026)"""
-    import time as _t
-    assert rt._SYNC_RE.findall("\x1b[?2026hXY\x1b[?2026l") == ["h", "l"]
-    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
-    t._in_sync_update = False
-    assert t._sync_deferring() is False                  # not in sync → repaint
-    t._in_sync_update = True
-    t._sync_started = _t.monotonic()
-    assert t._sync_deferring() is True                   # mid-frame → defer the repaint
-    t._sync_started = _t.monotonic() - 1.0               # block held open too long
-    assert t._sync_deferring() is False                  # safety timeout → repaint anyway
+def test_sync_output_stager_holds_split_frame_until_close():
+    s = rt._SynchronizedOutputStager(max_chars=1024, max_age=0.2)
+    assert s.push("plain", now=1.0) == [("plain", None)]
+    assert s.push("\x1b[?2026h\x1b[?25l\x1b[Hhalf", now=1.1) == []
+    assert s.active is True
+    assert s.push("done\x1b[?25h\x1b[?2026l", now=1.15) == [
+        ("\x1b[?2026h\x1b[?25l\x1b[Hhalfdone\x1b[?25h\x1b[?2026l", None)
+    ]
+    assert s.active is False
+
+
+def test_sync_output_stager_orders_back_to_back_and_combined_markers():
+    s = rt._SynchronizedOutputStager(max_chars=1024, max_age=0.2)
+    units = s.push(
+        "A\x1b[?25;2026hF1\x1b[?2026lB"
+        "\x1b[?2026hF2\x1b[?25;2026lC",
+        now=2.0,
+    )
+    assert units == [
+        ("A", None),
+        ("\x1b[?25;2026hF1\x1b[?2026l", None),
+        ("B", None),
+        ("\x1b[?2026hF2\x1b[?25;2026l", None),
+        ("C", None),
+    ]
+
+
+def test_sync_output_stager_bounds_and_flushes_once():
+    s = rt._SynchronizedOutputStager(max_chars=12, max_age=0.2)
+    assert s.push("\x1b[?2026hab", now=3.0) == []
+    timeout = s.push("c", now=3.3)
+    assert timeout == [("\x1b[?2026hab", "timeout"), ("c", None)]
+    assert s.flush("eof") == []
+
+    s = rt._SynchronizedOutputStager(max_chars=12, max_age=1.0)
+    overflow = s.push("\x1b[?2026habcdef", now=4.0)
+    assert overflow == [("\x1b[?2026habcdef", "overflow")]
+    assert s.flush("eof") == []
+
+    s = rt._SynchronizedOutputStager(max_chars=1024, max_age=1.0)
+    assert s.push("\x1b[?2026hlast", now=5.0) == []
+    assert s.flush("eof") == [("\x1b[?2026hlast", "eof")]
+    assert s.flush("eof") == []
 
 
 def test_input_snaps_scrolled_back_pane_to_live():
@@ -1923,8 +1953,12 @@ if __name__ == "__main__":
     print("PASS test_paste_text_wraps_and_submits")
     test_forward_wheel_only_when_mouse_reporting()
     print("PASS test_forward_wheel_only_when_mouse_reporting")
-    test_sync_update_defers_repaint_until_close()
-    print("PASS test_sync_update_defers_repaint_until_close")
+    test_sync_output_stager_holds_split_frame_until_close()
+    print("PASS test_sync_output_stager_holds_split_frame_until_close")
+    test_sync_output_stager_orders_back_to_back_and_combined_markers()
+    print("PASS test_sync_output_stager_orders_back_to_back_and_combined_markers")
+    test_sync_output_stager_bounds_and_flushes_once()
+    print("PASS test_sync_output_stager_bounds_and_flushes_once")
     test_input_snaps_scrolled_back_pane_to_live()
     print("PASS test_input_snaps_scrolled_back_pane_to_live")
     test_busy_storm_throttles_reclassify()
