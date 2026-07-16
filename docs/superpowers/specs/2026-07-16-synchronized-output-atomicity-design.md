@@ -36,9 +36,12 @@ block is open. A repaint queued for frame N can therefore execute after the read
 has already fed the opening chunks of frame N+1. Textual and the IME cursor sync
 then observe an intermediate screen such as `cursor hidden, cursor=(0,0)`.
 
-This queued-repaint race is the single root cause of both the visible half-frame
-and the IME/native-cursor instability. Agent `busy` classification cannot be the
-boundary because the same full repaint happens while idle and while typing.
+This queued-repaint race is the underlying boundary failure behind both the
+visible half-frame and the IME/native-cursor instability. Two existing details
+amplify it: synchronization state is currently derived from only the last marker
+in a ConPTY chunk, and the 200 ms repaint fail-open deliberately exposes a partial
+screen. Agent `busy` classification cannot be the boundary because the same full
+repaint happens while idle and while typing.
 
 ## Goals
 
@@ -98,6 +101,12 @@ feed units:
 - a stray reset marker outside a block is passed through normally;
 - several complete blocks in one ConPTY chunk are returned separately and in order.
 
+The parser scans DEC private-mode sequences in order; it must not reduce a chunk
+to its last marker. It recognizes `2026` both alone and within a combined private
+mode sequence. The retained representation is `list[str]` plus a final join, not
+repeated string concatenation, so the bounded worst case is linear rather than
+quadratic.
+
 The existing short escape-sequence carry remains before this helper, so a marker
 split at a ConPTY read boundary is reassembled before parsing.
 
@@ -106,9 +115,10 @@ split at a ConPTY read boundary is reassembled before parsing.
 Split the current `_consume` responsibilities into:
 
 1. raw capture and escape reassembly/scrubbing;
-2. synchronized-output staging;
-3. the existing pyte feed, terminal-mode tracking, query handling, classification,
-   and mirror tee for each completed feed unit.
+2. immediate terminal side-channel handling;
+3. synchronized-output staging;
+4. the existing pyte feed, classification, and mirror tee for each completed feed
+   unit.
 
 `_consume` reports whether it actually fed any unit. `_read_loop` schedules a
 coalesced repaint only when the screen changed. An opening/continuation chunk
@@ -119,18 +129,54 @@ complete previous frame.
 
 The staging buffer, not agent status, becomes the presentation boundary.
 
+Status classification therefore changes at most once per completed feed unit and
+may lag by one frame. The existing `busy` repaint freeze remains for children that
+do not use synchronized output.
+
+### Side channels and query progress
+
+Staging presentation must not stage transport progress. After escape reassembly
+and the existing scrubs, saikai immediately processes host-owned side channels
+from the ordered raw stream:
+
+- bracketed paste, mouse, focus-reporting, and other tracked DEC private modes;
+- OSC 52 clipboard writes and OSC notifications;
+- static terminal queries: primary DA, DSR status (`5n`), DECRQM, XTVERSION, and
+  OSC foreground/background color queries.
+
+Those operations do not require the presented pyte cursor and therefore must not
+wait for `?2026l`. This prevents a child from opening a synchronized block, asking
+a capability question, waiting for the answer, and deadlocking against saikai's
+staging buffer.
+
+Cursor-position DSR (`6n` / `?6n`) is stateful. If it arrives while a synchronized
+block is retained, the reader performs a controlled fail-open: it releases the
+retained bytes through the normal pyte feed, answers DSR from the resulting cursor,
+logs the reason, and resets staging. This preserves forward progress and an honest
+cursor reply at the cost of exposing a partial frame only for that exceptional
+protocol interaction.
+
+The pane-direct mirror tee remains ordered with the pyte seed under `self._lock`.
+It receives completed staged units rather than moving to the raw side, so the
+existing seed-before-stream invariant is preserved. A browser xterm sees the same
+complete byte order, only delayed until block close.
+
 ### Failure bounds
 
 The staging buffer is bounded to 4 MiB of decoded text. It also records the open
 time and uses the existing 200 ms synchronized-update threshold as a fail-open
-deadline. On the next received chunk after either limit is exceeded, the retained
-text is released as one unit and synchronized staging resets. On EOF/finalization,
-any retained text is released once before the final repaint.
+deadline. A size breach releases immediately in the reader call that crosses the
+limit. An age breach is evaluated when the next chunk arrives. A stateful cursor
+query also releases immediately as described above. On EOF/finalization, any
+retained text is released once before the final repaint.
 
 If a child opens a block and becomes permanently quiet, saikai deliberately keeps
 the last completed frame rather than displaying a known half-frame. The next byte,
-EOF, or size breach releases the buffer. This avoids a new timer thread and keeps
-pyte feeding single-threaded.
+EOF, size breach, or stateful query releases the buffer. Until one occurs, focus
+and resize continue to present/anchor the last completed pyte state. A resize that
+lands mid-block can make the retained frame use old coordinates when it eventually
+closes; the child's resize-driven redraw corrects the following frame. This is an
+accepted transient risk and avoids a second pyte writer or timer thread.
 
 Timeout/overflow fail-open events are written to the existing bounded saikai log.
 
@@ -160,9 +206,18 @@ Write failing tests before production changes for these observable behaviors:
 3. A queued repaint for a completed frame remains valid when the next synchronized
    frame has opened, because pyte still contains the prior completed frame.
 4. Plain prefix/suffix text and multiple blocks preserve byte order.
-5. A marker split at the ConPTY boundary is reassembled correctly.
-6. Timeout, size-bound, and EOF paths release buffered text once and reset state.
-7. Existing mirror tee and child query behavior remain ordered.
+5. Back-to-back `?2026l ... ?2026h` markers in one chunk commit the first frame
+   while retaining the second; combined DEC private parameters are recognized.
+6. A marker split at the ConPTY boundary is reassembled correctly.
+7. Static terminal queries inside an open block receive an immediate response.
+8. Cursor-position DSR inside an open block fail-opens once, then reports the
+   resulting pyte cursor without deadlock.
+9. Timeout, size-bound, and EOF paths release buffered text once and reset state.
+10. Existing mirror tee seed ordering remains intact with staged units.
+11. Replace `test_sync_update_defers_repaint_until_close`; it asserts the old
+    scheduling-only design. Remove or repurpose `_sync_deferring`,
+    `_in_sync_update`, and `_sync_started` consistently with the new staging
+    contract, and update their comments.
 
 After the focused tests pass, run every `tests/test_*.py` file exactly as CI does.
 Because this changes terminal/threading behavior, the mandatory evidence includes
