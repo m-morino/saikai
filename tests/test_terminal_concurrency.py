@@ -471,29 +471,38 @@ def test_native_cursor_follows_dectcem_regardless_of_screen():
         assert rt._native_cursor_should_show(False, True) is True    # claude agent mode: alt + cursor shown
         assert rt._native_cursor_should_show(True, True) is False    # fullscreen TUI, no insertion point
 
-        # main-screen program that hid its cursor -> saikai must NOT force it back on.
-        t, writes = _term(hidden=True)
-        t._sync_terminal_cursor()
-        assert writes == ["\x1b[?25l"], writes
-
-        # alt-screen but cursor visible (claude agent mode) -> anchors at the prompt.
-        # Two repaints at the SAME cell so the position-stability gate lets it move.
-        t, writes = _term(in_alt=True)
-        t._sync_terminal_cursor()
-        t._sync_terminal_cursor()
-        assert writes == ["\x1b[?25h"], writes
-        assert t._app.cursor_position == rt.Offset(43, 7)
-
-        # alt-screen AND cursor hidden (real fullscreen UI) -> hand the cursor back.
-        t, writes = _term(hidden=True, in_alt=True)
-        t._sync_terminal_cursor()
-        assert writes == ["\x1b[?25l"], writes
-
+        # visible cursor on a repaint -> FOLLOW it (show + anchor), single sync.
         t, writes = _term()
         t._sync_terminal_cursor()
+        assert writes == ["\x1b[?25h"], writes
+        assert t._app.cursor_position == rt.Offset(43, 7)
+
+        # claude agent mode: alt-screen + cursor VISIBLE -> still follow (track).
+        t, writes = _term(in_alt=True)
         t._sync_terminal_cursor()
         assert writes == ["\x1b[?25h"], writes
         assert t._app.cursor_position == rt.Offset(43, 7)
+
+        # cursor HIDDEN on a repaint (mid-redraw / no-cursor) -> FREEZE: touch neither
+        # visibility nor position, so the child's ?25l/?25h redraw can't flicker it.
+        t, writes = _term(hidden=True)
+        t._sync_terminal_cursor()
+        assert writes == [], writes
+        assert getattr(t._app, "cursor_position", None) is None
+
+        # a definitive focus sync on a hidden cursor DOES hide (real no-cursor state).
+        t, writes = _term(hidden=True)
+        t._sync_terminal_cursor(reason="focus")
+        assert writes == ["\x1b[?25l"], writes
+
+        # tracking: a visible cursor moving cell-to-cell -> the anchor FOLLOWS each
+        # repaint (claude moves the terminal cursor to the caret; +2 cols per CJK char).
+        t, writes = _term()
+        t._sync_terminal_cursor()
+        assert t._app.cursor_position == rt.Offset(43, 7)
+        t._screen.cursor.x = 9
+        t._sync_terminal_cursor()
+        assert t._app.cursor_position == rt.Offset(49, 7), "anchor must follow the caret"
     finally:
         rt._IS_WIN, rt._IME_ANCHOR, rt.Offset = old_win, old_anchor, old_offset
 
@@ -519,7 +528,9 @@ def test_child_pty_env_hides_outer_terminal_identity_from_child():
     assert env["PATH"] == "/bin"
     assert env["TERM"] == "xterm-256color"
     assert env["COLORTERM"] == "truecolor"
-    assert "WT_SESSION" not in env
+    # WT_SESSION is PRESERVED so Claude detects Windows Terminal and uses the cursor
+    # path that tracks the caret (stripping it parked the cursor and broke IME tracking).
+    assert env["WT_SESSION"] == "outer-wt"
     assert "TERM_PROGRAM" not in env
     assert "TERM_PROGRAM_VERSION" not in env
     assert "KITTY_WINDOW_ID" not in env
@@ -594,20 +605,24 @@ def test_cursor_sync_freezes_while_busy_and_settles_on_transition():
         assert True in refreshes, refreshes          # moved -> forced repaint to flush
         assert writes == ["\x1b[?25h"], writes
 
-        # 3) repaint syncs at the SAME idle cell: anchor stays, no extra flush (no loop).
+        # 3) repaint at the SAME idle visible cell: anchor unchanged, no extra flush.
         refreshes.clear()
-        t._sync_terminal_cursor(reason="repaint")   # 1st obs -> stability freeze
-        t._sync_terminal_cursor(reason="repaint")   # 2nd obs (stable) -> move, unchanged
+        t._sync_terminal_cursor(reason="repaint")
         assert t._app.cursor_position == rt.Offset(43, 7)
         assert refreshes == [], refreshes
 
-        # 3b) idle cursor SWEEP (input-box redraw): a moved cell is frozen for one
-        #     repaint, then anchored once it settles for a second repaint.
+        # 3b) idle VISIBLE cursor moves cell-to-cell (typing) -> anchor FOLLOWS every
+        #     repaint (this is the tracking that a cell-stability freeze used to break).
         t._screen.cursor.x = 9
-        t._sync_terminal_cursor(reason="repaint")   # cell changed -> freeze
-        assert t._app.cursor_position == rt.Offset(43, 7), "swept cell must not anchor"
-        t._sync_terminal_cursor(reason="repaint")   # same cell twice -> settle
-        assert t._app.cursor_position == rt.Offset(49, 7)
+        t._sync_terminal_cursor(reason="repaint")
+        assert t._app.cursor_position == rt.Offset(49, 7), "anchor must follow the caret"
+
+        # 3c) cursor HIDDEN on a repaint (mid-redraw) -> FREEZE: anchor stays put.
+        t._screen.cursor.x = 20
+        t._screen.cursor.hidden = True
+        t._sync_terminal_cursor(reason="repaint")
+        assert t._app.cursor_position == rt.Offset(49, 7), "hidden cursor must not move the anchor"
+        t._screen.cursor.hidden = False
 
         # 4) _update_status leaving 'busy' marshals a 'settle' sync.
         marshalled, reasons = [], []
@@ -1308,7 +1323,7 @@ def test_static_query_answers_before_sync_block_closes():
     t._marshal = lambda fn: fn()
 
     assert t._consume("\x1b[?2026h\x1b[c") is False
-    assert sent == ["\x1b[?6c"]
+    assert sent == ["\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c"]
 
 
 def test_cursor_query_fail_opens_sync_block_then_reports_new_cursor():
@@ -1678,14 +1693,17 @@ def test_answer_queries_responds_to_terminal_probes():
     t._cursor_rowcol = lambda: (3, 7)
     def _one(q):
         sent.clear(); t._answer_queries(q); return sent[-1] if sent else None
-    assert _one("\x1b[c") == "\x1b[?6c"
-    assert _one("\x1b[0c") == "\x1b[?6c"
+    # Primary DA: reply byte-identical to the outer Windows Terminal (VT500-class),
+    # so Claude Code sees the same terminal it does when run directly and uses its
+    # cursor-tracking path instead of parking the cursor. (#agents-cursor #wt-da)
+    assert _one("\x1b[c") == "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c"
+    assert _one("\x1b[0c") == "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c"
     assert _one("\x1b[?6n") == "\x1b[?3;7R"       # private cursor-position reply
     assert _one("\x1b[6n") == "\x1b[3;7R"         # standard cursor-position reply
     assert _one("\x1b[5n") == "\x1b[0n"           # device status OK
     assert _one("\x1b[?2026$p") == "\x1b[?2026;2$y"    # synchronized output supported
     assert _one("\x1b[?1000$p") == "\x1b[?1000;0$y"    # other mode: not recognised
-    assert _one("\x1b[>0q") == "\x1bP>|saikai\x1b\\"   # XTVERSION
+    assert _one("\x1b[>0q") is None               # XTVERSION: silent, exactly like WT
     assert _one("\x1b]11;?\x07") == "\x1b]11;rgb:1e1e/1e1e/1e1e\x07"  # bg (dark)
     assert _one("\x1b]10;?\x07") == "\x1b]10;rgb:c0c0/c0c0/c0c0\x07"  # fg (light)
     sent.clear(); t._answer_queries("plain \x1b[1m bold \x1b[0m"); assert sent == []
@@ -1890,13 +1908,14 @@ def test_busy_storm_throttles_reclassify():
     assert len(calls) == 2, "a busy frame after the interval must re-classify"
 
 
-def test_cursor_anchor_does_not_chase_every_repaint():
-    """The IME/candidate anchor must NOT chase the live pyte cursor on every repaint:
-    an agent spinner moves it Home -> prompt on all ~170k frames and coalesced repaints
-    caught it mid-frame, flickering the anchor across the screen. The fix keeps the sync
-    INLINE on the repaint (so it always rides a CompositorUpdate and flushes) but FREEZES
-    the anchor position while status=='busy'; the debounce timer machinery is gone and no
-    longer starves. A focus/settle sync anchors immediately. (#agents-cursor)"""
+def test_cursor_anchor_freezes_on_busy_or_hidden_follows_visible():
+    """Anti-fly WITHOUT breaking tracking: a per-repaint sync FREEZES while the pane is
+    'busy' (an agent-mode storm sweeps the pyte cursor Home->prompt across ~170k frames)
+    or while the child HID its cursor (?25l mid-redraw). Otherwise it FOLLOWS the visible
+    cursor every repaint, because claude moves the terminal cursor to the real input
+    caret and the IME anchor must track it. The sync stays INLINE on the repaint (rides a
+    CompositorUpdate = flushes); the debounce timer and the cell-stability gate (which
+    also froze legitimate tracking) are gone. (#agents-cursor)"""
     import inspect
     refresh_src = inspect.getsource(rt.AgentTerminal._do_pane_refresh)
     assert "_sync_terminal_cursor" in refresh_src, \
@@ -1904,10 +1923,10 @@ def test_cursor_anchor_does_not_chase_every_repaint():
     assert "_schedule_terminal_cursor_sync" not in refresh_src, \
         "the debounce timer indirection must be gone (it starved + never flushed)"
     sync_src = inspect.getsource(rt.AgentTerminal._sync_terminal_cursor)
-    assert "_prev_repaint_cell" in sync_src, \
-        "the anti-fly must be a position-stability gate (only move on a settled cell)"
-    assert 'reason == "repaint"' in sync_src and '"busy"' in sync_src, \
-        "the repaint sync must freeze while busy and gate the move on cell stability"
+    assert '"busy"' in sync_src and "cursor_hidden" in sync_src, \
+        "the repaint freeze must gate on busy OR cursor_hidden, not cell-stability"
+    assert "_prev_repaint_cell" not in sync_src, \
+        "the cell-stability gate (which froze legitimate input tracking) must be gone"
     assert not hasattr(rt.AgentTerminal, "_schedule_terminal_cursor_sync"), \
         "the debounce timer machinery must be removed"
 
@@ -2073,7 +2092,7 @@ if __name__ == "__main__":
     print("PASS test_input_snaps_scrolled_back_pane_to_live")
     test_busy_storm_throttles_reclassify()
     print("PASS test_busy_storm_throttles_reclassify")
-    test_cursor_anchor_does_not_chase_every_repaint()
-    print("PASS test_cursor_anchor_does_not_chase_every_repaint")
+    test_cursor_anchor_freezes_on_busy_or_hidden_follows_visible()
+    print("PASS test_cursor_anchor_freezes_on_busy_or_hidden_follows_visible")
     test_ime_anchor_default_on_keeps_windows_caret_render_guard()
     print("PASS test_ime_anchor_default_on_keeps_windows_caret_render_guard")

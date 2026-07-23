@@ -174,7 +174,15 @@ _HOST_TERMINAL_ENV_STRIP = {
     # directly into the outer emulator. If these leak through, Claude Code can
     # take host-specific paths such as WT full repaint / terminal private
     # protocols that are correct for direct stdout but wrong behind saikai.
-    "WT_SESSION",
+    #
+    # NOTE: WT_SESSION is deliberately NOT stripped. MEASURED on-device: with WT_SESSION
+    # present (real WT, direct claude) the input cursor tracks the caret correctly; with
+    # it stripped (behind saikai) Claude falls back to a renderer that PARKS the terminal
+    # cursor at a fixed base cell (row33/col3) and never moves it to the caret, so the
+    # IME/native cursor can't follow typing. Keeping WT_SESSION lets Claude use the WT
+    # cursor path that tracks. The WT full-repaint hazard is handled separately by
+    # stripping CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT + CLAUDE_CODE_FORCE_SYNC_OUTPUT.
+    # (#agents-cursor #wt-session)
     "TERM_PROGRAM",
     "TERM_PROGRAM_VERSION",
     "LC_TERMINAL",
@@ -1128,7 +1136,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                                      # pane-view browser encodes arrows correctly (#pane-direct)
         self._hw_cursor_visible: Optional[bool] = None  # last ?25 visibility we wrote
         self._anchored_xy = None  # last IME anchor cell we set (freeze/flush bookkeeping)
-        self._prev_repaint_cell = None  # pyte cursor at the previous repaint sync (stability gate)
         # Mirror pane-direct tee (#pane-direct): tee(str) forwards a scrubbed
         # chunk to the mirror hub's pane channel; reset(str) enqueues a full-
         # state seed; synth(screen, cols, rows, modes) serializes one. All three
@@ -2070,7 +2077,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         """Answer terminal queries that do not depend on pyte's cursor state."""
         out = []
         if _DA_RE.search(chunk):
-            out.append("\x1b[?6c")                       # Primary DA → a VT102-class terminal
+            # Primary DA — reply BYTE-IDENTICAL to the outer Windows Terminal (probed
+            # on-device: ESC[?61;...c, a VT500-class terminal with feature extensions).
+            # The old minimal "?6c" (VT102) made Claude Code treat the pane as a basic
+            # terminal and fall back to a renderer that parks the cursor at a base cell
+            # instead of tracking the input caret. Looking exactly like WT (which Claude
+            # tracks correctly when run directly) is the fix. (#agents-cursor #wt-da)
+            out.append("\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c")
         for _priv, _kind in _DSR_RE.findall(chunk):
             if _kind == "5":
                 out.append("\x1b[0n")                    # device status: OK
@@ -2078,8 +2091,10 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # saikai honours synchronized output (?2026) → "reset but recognised" (2);
             # any other mode → "not recognised" (0).
             out.append(f"\x1b[?{_mode};{'2' if _mode == '2026' else '0'}$y")
-        if _XTVERSION_RE.search(chunk):
-            out.append("\x1bP>|saikai\x1b\\")
+        # XTVERSION (ESC[>q): the outer Windows Terminal sends NO reply (probed on-
+        # device). Answering with a name ("saikai") made Claude Code see an unknown
+        # terminal and skip its WT cursor-tracking path. Stay silent, exactly like WT.
+        # (#agents-cursor #wt-da)
         for _code in _OSC_COLOR_Q_RE.findall(chunk):
             # Report a dark background (11) / light foreground (10) so the child picks
             # a dark theme, matching a typical terminal.
@@ -2613,11 +2628,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         if Offset is None or self.is_dead or not self._is_focused_pane() or self._scroll != 0:
             return
-        # Anti-fly: freeze the anchor POSITION during an agent-mode storm. Only the
-        # per-repaint sync is frozen; a "settle"/"focus" sync always runs so the anchor
-        # lands on the settled prompt and is flushed. (#agents-cursor)
-        if reason == "repaint" and getattr(self, "_status", None) == "busy":
-            return
         try:
             app = self.app
         except Exception:
@@ -2637,6 +2647,20 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             scols = int(getattr(screen, "columns", 0) or 0)
             slines = int(getattr(screen, "lines", 0) or 0)
             in_alt = bool(getattr(getattr(self, "_alt", None), "in_alt", False))
+        # Freeze a per-repaint sync only while the pane is 'busy' (an agent-mode storm
+        # moves the pyte cursor across the whole screen every frame → the anchor would
+        # fly) or while the child HID its cursor (?25l — mid-redraw / no-cursor state,
+        # not a real caret). OTHERWISE FOLLOW the cursor: claude moves the terminal
+        # cursor to the real input caret (e.g. +2 columns per CJK char), and following it
+        # every repaint is exactly what makes the IME anchor TRACK typing. An earlier
+        # cell-stability freeze here also froze that legitimate tracking, so the cursor
+        # "didn't follow input". "focus"/"settle" are definitive and skip the gate.
+        # (#agents-cursor)
+        if reason == "repaint" and (getattr(self, "_status", None) == "busy" or cursor_hidden):
+            if _IME_DEBUG:
+                _ime_dbg(f"sync reason=repaint FREEZE cur=({cx},{cy}) "
+                         f"busy={getattr(self, '_status', None) == 'busy'} hidden={cursor_hidden}")
+            return
         if not _native_cursor_should_show(cursor_hidden, in_alt):
             self._show_hw_cursor(False)
             self._anchored_xy = None
@@ -2659,20 +2683,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._show_hw_cursor(True, force=(reason != "repaint"))
             if xy is None:
                 return
-            # Anti-fly (position stability): on a per-repaint sync, only MOVE the
-            # anchor once the cursor CELL has settled — i.e. it is the SAME cell we saw
-            # on the previous repaint. A child redrawing its input box sweeps the pyte
-            # cursor across a row 2-3 lines above the prompt on every repaint (drawing
-            # the box border), and this can happen while the pane is NOT 'busy'; the
-            # earlier busy-only freeze let those transient cells through and the native
-            # cursor / IME flickered along that row. Freezing the MOVE (while still
-            # keeping the cursor shown) keeps the anchor on the last settled cell.
-            # "focus"/"settle" are definitive and skip the gate. (#agents-cursor)
-            if reason == "repaint":
-                prev = getattr(self, "_prev_repaint_cell", None)
-                self._prev_repaint_cell = (cx, cy)
-                if (cx, cy) != prev:
-                    return   # cursor still moving this frame — keep the settled anchor
             moved = xy != getattr(self, "_anchored_xy", None)
             app.cursor_position = Offset(*xy)   # cross-platform IME anchor
             self._anchored_xy = xy
