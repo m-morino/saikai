@@ -859,6 +859,10 @@ _SYNC_BYPASS_TTL = 2.0
 # the UI thread, where a full pty input queue would freeze the event loop. Keystrokes,
 # mouse reports and query replies are far below it and stay inline. (#paste-block)
 _PTY_INLINE_WRITE_MAX = 4096
+# Ceiling on writes waiting for that thread. A child that stops reading stdin for
+# good would otherwise turn the queue into an unbounded buffer that also swallows
+# every later keystroke. Far above any real typing or paste. (#paste-block)
+_PTY_WRITE_QUEUE_MAX = 4 * 1024 * 1024
 # Reader buffer. ptyprocess defaults read() to 1024 bytes, which turns a big turn
 # into ~1000 wakeups per MB, each paying the whole per-chunk pipeline. winpty
 # accepts the same argument. (#linux-read-size)
@@ -917,9 +921,21 @@ def _strip_dcs(text: str, inside: bool = False, dropped: int = 0):
     return "".join(out), inside, dropped
 
 
-def _has_cursor_query(text: str) -> bool:
-    """True if *text* contains a cursor-position report request (DSR 6)."""
-    return any(kind == "6" for _priv, kind in _DSR_RE.findall(text))
+# Queries whose answer depends on state the SAME chunk may still change, so they are
+# answered at their own stream position rather than up front: cursor position (DSR 6)
+# and mode state (DECRQM). Groups: 1-2 = DSR privacy/kind, 3 = DECRQM mode.
+_POSITIONAL_QUERY_RE = re.compile("|".join((_DSR_RE.pattern, _DECRQM_RE.pattern)))
+
+
+def _has_positional_query(text: str) -> bool:
+    """True if *text* holds a query that must be answered at its stream position.
+
+    A child can block on one of these before it emits ?2026l, so a retained frame
+    holding one has to fail open rather than deadlock."""
+    for match in _POSITIONAL_QUERY_RE.finditer(text):
+        if match.group(3) is not None or match.group(2) == "6":
+            return True
+    return False
 
 
 class _SynchronizedOutputStager:
@@ -967,12 +983,20 @@ class _SynchronizedOutputStager:
         return bool(self._last_frame_at) and (now - self._last_frame_at) <= _SYNC_ATOMIC_TTL
 
     @property
-    def pending_cursor_query(self):
-        """True when the RETAINED text holds a DSR-6. The child may be waiting for
-        that reply before it emits ?2026l, so the frame has to fail open — but only
-        for a query we are actually holding: a ?6n that arrived before the block
-        opened is answerable from the plain prefix and must not tear the frame."""
+    def pending_query(self):
+        """True when the RETAINED text holds a position-dependent query (DSR-6 or
+        DECRQM). The child may be waiting for that reply before it emits ?2026l, so
+        the frame has to fail open — but only for a query we are actually holding: one
+        that arrived before the block opened is answerable from the plain prefix and
+        must not tear the frame."""
         return self._cursor_query
+
+    @property
+    def in_block(self):
+        """True while the child is inside a BSU/ESU pair, whether we are still
+        holding the frame or streaming it through after a fail-open. This is what
+        DECRQM ?2026 must report — the child set the mode either way."""
+        return self._state in ("staging", "bypass")
 
     @staticmethod
     def _is_sync(match):
@@ -989,7 +1013,7 @@ class _SynchronizedOutputStager:
         if text:
             self._parts.append(text)
             self._chars += len(text)
-            if not self._cursor_query and _has_cursor_query(text):
+            if not self._cursor_query and _has_positional_query(text):
                 self._cursor_query = True
 
     def _release(self, reason=None, bypass=False):
@@ -2217,6 +2241,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 # the child first.
                 if (queue or getattr(self, "_writer", None) is not None
                         or len(data) > _PTY_INLINE_WRITE_MAX):
+                    if sum(len(part) for part in queue) + len(data) > _PTY_WRITE_QUEUE_MAX:
+                        # The child has stopped reading stdin for good. Refuse rather
+                        # than buffer without limit; the pane is already unusable and
+                        # the queue would just grow until memory ran out.
+                        _log(f"pty write dropped: queue full ({len(data)} chars)")
+                        return
                     queue.append(data)
                     if getattr(self, "_writer", None) is None:
                         self._writer = threading.Thread(
@@ -2361,7 +2391,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         line) or SGR mouse encoding, even though saikai tracks both. (#term-queries)"""
         if mode == "2026":
             stager = getattr(self, "_sync_output", None)
-            return 1 if (stager is not None and stager.active) else 2
+            return 1 if (stager is not None and stager.in_block) else 2
         if mode in _DECRQM_ALT_SCREEN:
             return 1 if getattr(getattr(self, "_alt", None), "in_alt", False) else 2
         if mode == "25":                                    # DECTCEM
@@ -2397,8 +2427,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         for _priv, _kind in _DSR_RE.findall(chunk):
             if _kind == "5":
                 out.append("\x1b[0n")                    # device status: OK
-        for _mode in _DECRQM_RE.findall(chunk):
-            out.append(f"\x1b[?{_mode};{self._decrqm_report(_mode)}$y")
+        # DECRQM is NOT answered here: it reports live mode state, so it has to be
+        # answered at its own stream position once the bytes before it reached pyte
+        # (see _feed_presentation_unit). Everything above is state-free.
         # XTVERSION (ESC[>q): the outer Windows Terminal sends NO reply (probed on-
         # device). Answering with a name ("saikai") made Claude Code see an unknown
         # terminal and skip its WT cursor-tracking path. Stay silent, exactly like WT.
@@ -2425,9 +2456,22 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             response = "".join(out)
             self._marshal(lambda r=response: self._send_to_child(r))
 
+    def _answer_mode_queries(self, chunk: str) -> None:
+        """Answer DECRQM for a chunk that already reached pyte."""
+        out = [f"\x1b[?{mode};{self._decrqm_report(mode)}$y"
+               for mode in _DECRQM_RE.findall(chunk)]
+        if out:
+            response = "".join(out)
+            self._marshal(lambda r=response: self._send_to_child(r))
+
     def _answer_queries(self, chunk: str) -> None:
-        """Compatibility wrapper for callers that already fed *chunk* to pyte."""
+        """Answer every query in *chunk* for a caller that already fed it to pyte.
+
+        _consume does not use this: it answers the state-free queries up front (a
+        child can block on them mid-frame) and the state-dependent ones at their own
+        stream position."""
         self._answer_static_queries(chunk)
+        self._answer_mode_queries(chunk)
         self._answer_cursor_queries(chunk)
 
     def _consume(self, chunk: str) -> bool:
@@ -2529,8 +2573,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if sync_output is None:                 # compatibility with minimal test objects
             sync_output = self._sync_output = _SynchronizedOutputStager()
         units = sync_output.push(chunk)
-        if sync_output.active and sync_output.pending_cursor_query:
-            units.extend(sync_output.flush("cursor-query"))
+        if sync_output.active and sync_output.pending_query:
+            units.extend(sync_output.flush("pending-query"))
 
         changed = False
         for text, fail_reason in units:
@@ -2552,12 +2596,16 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         (#term-queries)"""
         replies = []
         pos = 0
-        for _m in _DSR_RE.finditer(chunk):
-            if _m.group(2) != "6":
-                continue
+        for _m in _POSITIONAL_QUERY_RE.finditer(chunk):
+            _mode = _m.group(3)
+            if _mode is None and _m.group(2) != "6":
+                continue                       # DSR-5 is state-free, answered early
             self._consume_ready(chunk[pos:_m.end()])
-            row, col = self._cursor_rowcol()
-            replies.append(f"\x1b[{_m.group(1)}{row};{col}R")
+            if _mode is None:
+                row, col = self._cursor_rowcol()
+                replies.append(f"\x1b[{_m.group(1)}{row};{col}R")
+            else:
+                replies.append(f"\x1b[?{_mode};{self._decrqm_report(_mode)}$y")
             pos = _m.end()
         self._consume_ready(chunk[pos:])
         if replies:
@@ -2720,6 +2768,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         second tick on the timer cadence."""
         if self._screen is None or self.is_dead:
             return
+        # This poll is also the only tick a QUIET pane gets. The IME anchor's
+        # hidden-cursor settle and its mid-frame freeze are both re-evaluated by a
+        # sync, and syncs otherwise ride repaints — which the reader schedules only
+        # for new output. A child that hid its cursor and then stopped emitting
+        # would keep a stale native cursor on screen forever. (#ime-midframe)
+        self._sync_terminal_cursor(reason="repaint")
         # Skip the screen-join + classify for a STABLE pane that produced no
         # output since the last poll — UNLESS it is still 'busy' (must keep being
         # re-checked so it can flip to idle on the debounce's 2nd tick when claude
@@ -3192,6 +3246,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         thread below escalates to SIGKILL if needed and closes the pty safely
         off-thread."""
         self._stop.set()
+        # Drop anything still queued for the writer: the pane is going away, and a
+        # writer blocked on a dying pty should retire instead of draining. (#paste-block)
+        lock = getattr(self, "_write_lock", None)
+        if lock is not None:
+            with lock:
+                if getattr(self, "_write_q", None):
+                    self._write_q.clear()
         pty, pid = self._pty, self._pid
         self._pty = None
         self._pid = None        # idempotent: a 2nd kill() must not re-kill a (recycled) PID

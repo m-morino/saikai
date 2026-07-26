@@ -1658,6 +1658,25 @@ def test_large_paste_never_blocks_the_ui_thread_and_keeps_order():
         _time.sleep(0.01)
     assert t._writer is None and t._write_q == []
 
+    # A child that never drains must not turn the queue into an unbounded buffer:
+    # every later keystroke would be swallowed AND retained forever.
+    wedge = _th.Event()
+    stuck = _th.Event()
+
+    class _Wedged:
+        def write(self, data):
+            stuck.set()
+            wedge.wait(5.0)
+
+    t._pty = _Wedged()
+    t._write_child("z" * 5000)
+    assert stuck.wait(3.0)
+    for _ in range(200):
+        t._write_child("k" * 100000)
+    queued = sum(len(x) for x in t._write_q)
+    assert queued <= rt._PTY_WRITE_QUEUE_MAX, queued
+    wedge.set()
+
 
 def test_dcs_payloads_never_reach_the_grid():
     """A DCS string (sixel image, DECRQSS, XTGETTCAP) must not print as text.
@@ -1719,7 +1738,7 @@ def test_decrqm_reports_the_modes_saikai_actually_implements():
 
     def _reply(query):
         sent.clear()
-        t._answer_static_queries(query)
+        t._answer_queries(query)          # already-fed-chunk path: mode state included
         return sent[-1] if sent else None
 
     assert _reply("\x1b[?2004$p") == "\x1b[?2004;2$y"      # implemented, reset
@@ -1741,6 +1760,17 @@ def test_decrqm_reports_the_modes_saikai_actually_implements():
     t._consume("\x1b[?2026hmid-frame")
     assert t._sync_output.active is True
     assert _reply("\x1b[?2026$p") == "\x1b[?2026;1$y"
+    t._consume("\x1b[?2026l")
+
+    # A mode set and verified in the SAME write must report the state AFTER the set:
+    # the query is answered at its own stream position, like DSR-6, not from the
+    # state the chunk started with. (#term-queries)
+    sent.clear()
+    t._consume("\x1b[?1003h\x1b[?1003$p")
+    assert sent == ["\x1b[?1003;1$y"], sent
+    sent.clear()
+    t._consume("\x1b[?2026hframe-body\x1b[?2026$p")
+    assert sent == ["\x1b[?2026;1$y"], sent   # a child verifying its own BSU took effect
 
 
 def test_cursor_report_clamps_pending_wrap_and_honours_origin_mode():
@@ -2513,6 +2543,23 @@ def test_cursor_anchor_settles_hidden_and_tracks_atomic_frames():
         assert writes == ["\x1b[?25h"], writes
         assert t._anchored_xy == (43, 7)
 
+        # (5) a child that hides its cursor and then goes QUIET still settles: the
+        # settle can only be reached from a sync, and repaints are driven by output,
+        # so the host's periodic poll has to reconcile it. (#ime-midframe)
+        t, writes = _term()
+        t._sync_terminal_cursor(now=400.0)
+        writes.clear()
+        t._screen.cursor.hidden = True
+        t._sync_terminal_cursor(now=400.05)           # transient hold, then silence
+        assert writes == [], writes
+        t._cursor_hidden_since = time.monotonic() - (rt._NATIVE_CURSOR_HIDE_SETTLE + 0.5)
+        t._scr_ver = t._last_poll_ver = 7             # nothing new to classify
+        t._pending_status = None
+        t.refresh_status()
+        assert writes == ["\x1b[?25l"], writes
+        assert t._anchored_xy is None
+
+        t, writes = _term()
         writes.clear()                                # wheeling back down, no input
         t._scroll = 3
         t._sync_terminal_cursor(now=300.2)
