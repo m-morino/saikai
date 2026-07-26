@@ -1502,6 +1502,56 @@ def test_cursor_report_uses_the_cursor_at_the_querys_stream_position():
     assert sent == ["\x1b[1;2R\x1b[5;6R"], sent  # each query at its own position
 
 
+def test_reader_asks_for_large_reads_and_guards_the_eof_flush():
+    """Two properties of the reader loop.
+
+    (1) ptyprocess defaults read() to 1024 bytes, so on POSIX a multi-megabyte turn
+        woke the reader ~1000 times per MB, each wakeup paying the whole per-chunk
+        pipeline (esc carry, query scans, DEC-private scan, stager push, a coalesced
+        refresh marshal). Ask for a real buffer.
+    (2) The EOF flush runs before _finalize in the same finally. It feeds pyte and
+        then the status classifier — a user-supplied callable — so an exception
+        there used to skip _finalize entirely and leave the pane never marked dead.
+    (#linux-read-size #eof-flush)"""
+    import threading as _th
+
+    reads = []
+
+    class _P:
+        def __init__(self):
+            self.n = 0
+        def read(self, *args, **kwargs):
+            reads.append((args, kwargs))
+            self.n += 1
+            if self.n > 1:
+                raise EOFError
+            return "out"
+
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t._pty = _P()
+    t._stop = _th.Event()
+    t._scroll = 0
+    t._frozen = False
+    t._consume = lambda _c: False
+    t._flush_sync_output = lambda _r: False
+    finalized = []
+    t._finalize = lambda: finalized.append(True)
+    t._read_loop()
+    assert reads and reads[0][0], "read() must be given an explicit size"
+    assert reads[0][0][0] >= 65536, reads[0]
+    assert finalized == [True]
+
+    # a raising EOF flush must not cost us _finalize
+    finalized.clear()
+    t._pty = _P()
+    t._stop = _th.Event()
+    def _boom(_reason):
+        raise ValueError("classifier blew up during teardown")
+    t._flush_sync_output = _boom
+    t._read_loop()
+    assert finalized == [True], "a failing eof flush must still finalize the pane"
+
+
 def test_large_paste_never_blocks_the_ui_thread_and_keeps_order():
     """A big paste must not freeze the whole TUI.
 
@@ -2600,6 +2650,8 @@ if __name__ == "__main__":
     print("PASS test_dcs_payloads_never_reach_the_grid")
     test_large_paste_never_blocks_the_ui_thread_and_keeps_order()
     print("PASS test_large_paste_never_blocks_the_ui_thread_and_keeps_order")
+    test_reader_asks_for_large_reads_and_guards_the_eof_flush()
+    print("PASS test_reader_asks_for_large_reads_and_guards_the_eof_flush")
     test_cursor_query_fail_open_only_for_a_RETAINED_query()
     print("PASS test_cursor_query_fail_open_only_for_a_RETAINED_query")
     test_sync_output_eof_flushes_retained_frame_once()

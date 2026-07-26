@@ -854,6 +854,10 @@ _NATIVE_CURSOR_HIDE_SETTLE = 0.5
 # the UI thread, where a full pty input queue would freeze the event loop. Keystrokes,
 # mouse reports and query replies are far below it and stay inline. (#paste-block)
 _PTY_INLINE_WRITE_MAX = 4096
+# Reader buffer. ptyprocess defaults read() to 1024 bytes, which turns a big turn
+# into ~1000 wakeups per MB, each paying the whole per-chunk pipeline. winpty
+# accepts the same argument. (#linux-read-size)
+_PTY_READ_SIZE = 65536
 
 
 # Private modes saikai tracks, mapped to the attribute holding their current state,
@@ -2095,7 +2099,10 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         try:
             while not self._stop.is_set():
                 try:
-                    chunk = pty.read()              # blocking; str on winpty
+                    # Ask for a real buffer: ptyprocess defaults to 1024 bytes, so a
+                    # multi-megabyte turn woke this loop ~1000 times per MB and paid
+                    # the whole per-chunk pipeline each time. (#linux-read-size)
+                    chunk = pty.read(_PTY_READ_SIZE)   # blocking; str on winpty
                 except EOFError:                     # child closed the pty
                     break
                 except Exception:
@@ -2121,7 +2128,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 if changed and self._scroll == 0 and not self._frozen:
                     self._schedule_pane_refresh()
         finally:
-            self._flush_sync_output("eof")
+            # Guarded: the flush feeds pyte and then the status classifier — a
+            # caller-supplied callable — so a raise here must not cost us
+            # _finalize, which is what marks the pane dead. (#eof-flush)
+            try:
+                self._flush_sync_output("eof")
+            except Exception:
+                pass
             self._finalize()
 
     def _honor_osc52(self, b64: str) -> None:
