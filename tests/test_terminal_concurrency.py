@@ -2206,6 +2206,12 @@ def test_answer_queries_responds_to_terminal_probes():
     # out and it then mis-detects version-gated features. (#wt-da2)
     assert _one("\x1b[>c") == "\x1b[>0;10;1c"
     assert _one("\x1b[>0c") == "\x1b[>0;10;1c"
+    # Replies follow the order the child ASKED in. Primary DA used to be emitted
+    # first unconditionally, so a probe batch that ends with CSI c — the common
+    # "answer everything you know, then this sentinel" shape — got the sentinel
+    # first and a strict parser mismatched every reply after it. (#term-queries)
+    assert _one("\x1b]11;?\x07\x1b[>c\x1b[c") == (
+        "\x1b]11;rgb:1e1e/1e1e/1e1e\x07" "\x1b[>0;10;1c" "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c")
     sent.clear(); t._answer_queries("plain \x1b[1m bold \x1b[0m"); assert sent == []
 
 

@@ -2408,25 +2408,31 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         return 1 if getattr(self, attr, False) else 2
 
     def _answer_static_queries(self, chunk: str) -> None:
-        """Answer terminal queries that do not depend on pyte's cursor state."""
-        out = []
-        if _DA_RE.search(chunk):
+        """Answer terminal queries whose reply does not depend on live state.
+
+        Replies go out in the order the child ASKED, not in the order this method
+        happens to check: a probe batch that ends with CSI c — "answer what you know,
+        then this sentinel" — must not get the sentinel first. (#term-queries)"""
+        out = []                      # (position in chunk, reply) — sorted before send
+        _m = _DA_RE.search(chunk)
+        if _m is not None:
             # Primary DA — reply BYTE-IDENTICAL to the outer Windows Terminal (probed
             # on-device: ESC[?61;...c, a VT500-class terminal with feature extensions).
             # The old minimal "?6c" (VT102) made Claude Code treat the pane as a basic
             # terminal and fall back to a renderer that parks the cursor at a base cell
             # instead of tracking the input caret. Looking exactly like WT (which Claude
             # tracks correctly when run directly) is the fix. (#agents-cursor #wt-da)
-            out.append("\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c")
-        if _DA2_RE.search(chunk):
+            out.append((_m.start(), "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c"))
+        _m = _DA2_RE.search(chunk)
+        if _m is not None:
             # Secondary DA. A terminal that answers DA1 as WT must answer this too:
             # vim's t_RV and tmux's handshake serialize DA1 then DA2, and silence
             # stalls them for a probe timeout and then mis-detects version-gated
             # features. WT's reply is "VT100, firmware 10, no cartridge". (#wt-da2)
-            out.append("\x1b[>0;10;1c")
-        for _priv, _kind in _DSR_RE.findall(chunk):
-            if _kind == "5":
-                out.append("\x1b[0n")                    # device status: OK
+            out.append((_m.start(), "\x1b[>0;10;1c"))
+        for _m in _DSR_RE.finditer(chunk):
+            if _m.group(2) == "5":
+                out.append((_m.start(), "\x1b[0n"))      # device status: OK
         # DECRQM is NOT answered here: it reports live mode state, so it has to be
         # answered at its own stream position once the bytes before it reached pyte
         # (see _feed_presentation_unit). Everything above is state-free.
@@ -2434,15 +2440,17 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # device). Answering with a name ("saikai") made Claude Code see an unknown
         # terminal and skip its WT cursor-tracking path. Stay silent, exactly like WT.
         # (#agents-cursor #wt-da)
-        for _code, _term in _OSC_COLOR_Q_RE.findall(chunk):
+        for _m in _OSC_COLOR_Q_RE.finditer(chunk):
             # Report a dark background (11) / light foreground (10) so the child picks
             # a dark theme, matching a typical terminal. Answer with the terminator the
             # child ASKED with: an ST-terminated query answered with BEL leaves a strict
             # parser waiting for its ST, and the stray BEL rings the bell.
+            _code = _m.group(1)
             _rgb = "1e1e/1e1e/1e1e" if _code == "11" else "c0c0/c0c0/c0c0"
-            out.append(f"\x1b]{_code};rgb:{_rgb}{_term}")
+            out.append((_m.start(), f"\x1b]{_code};rgb:{_rgb}{_m.group(2)}"))
         if out:
-            resp = "".join(out)
+            out.sort(key=lambda pair: pair[0])
+            resp = "".join(reply for _pos, reply in out)
             self._marshal(lambda r=resp: self._send_to_child(r))
 
     def _answer_cursor_queries(self, chunk: str) -> None:
