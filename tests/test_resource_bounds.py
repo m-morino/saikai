@@ -816,12 +816,264 @@ def test_vt_tokenizer_string_carry_is_bounded():
     """Malformed OSC/DCS streams fail open under a cap instead of retaining a
     whole unbounded PTY stream in tokenizer carry state."""
     import saikai_terminal as _terminal
-    for opener in ("\x1b]", "\x1bP", "\x9d", "\x90"):
+    for opener in ("\x1b]", "\x1bP", "\x1b_", "\x1b^", "\x1bX",
+                   "\x9d", "\x90", "\x9f", "\x9e", "\x98"):
         tokenizer = _terminal.VTTokenizer(max_carry=32, max_dropped_string=48)
         emitted = tokenizer.feed(opener + "x" * 1_000)
         assert emitted, f"{opener!r} remained wholly buffered"
         assert len(tokenizer.carry) <= 32
         assert tokenizer.dropped_string_chars <= 48
+
+
+def test_terminal_color_cache_is_bounded_and_skips_arbitrary_truecolor():
+    import saikai_terminal as _terminal
+
+    _terminal._COLOR_CACHE.clear()
+    for value in range(_terminal._COLOR_CACHE_MAX * 4):
+        assert _terminal._pyte_color(f"unknown-color-{value}") is None
+    assert len(_terminal._COLOR_CACHE) <= _terminal._COLOR_CACHE_MAX
+
+    before = len(_terminal._COLOR_CACHE)
+    for value in range(1000):
+        color = f"{value:06x}"
+        assert _terminal._pyte_color(color) == "#" + color
+    assert len(_terminal._COLOR_CACHE) == before, \
+        "arbitrary truecolor values must not occupy the global palette cache"
+
+
+def test_incremental_grapheme_candidate_is_bounded():
+    import pyte
+    import saikai_terminal as _terminal
+
+    screen = _terminal._HistoryScreenBase(20, 2, history=2)
+    stream = pyte.Stream(screen)
+    stream.feed("e")
+    for _ in range(_terminal._EGC_MAX_CODEPOINTS * 20):
+        stream.feed("\u0301")
+
+    candidate = screen._egc_candidate
+    assert candidate is not None
+    assert len(candidate[0]) <= _terminal._EGC_MAX_CODEPOINTS
+    assert len(screen.buffer[0][0].data) <= _terminal._EGC_MAX_CODEPOINTS
+
+
+def test_overwritten_osc8_cell_metadata_is_bounded():
+    """A hyperlink repaint storm cannot retain every historical pyte Char."""
+    import pyte
+    import saikai_terminal as _terminal
+
+    screen = _terminal._HistoryScreenBase(8, 2, history=2)
+    stream = pyte.Stream(screen)
+    for index in range(5000):
+        screen._saikai_active_hyperlink = (
+            f"id={index}", f"https://example.test/{index}")
+        stream.feed("\rX")
+
+    assert len(screen._saikai_hyperlink_refs) <= 1024
+    links = screen._refresh_saikai_hyperlinks()
+    assert links[(0, 0)] == (
+        "id=4999", "https://example.test/4999")
+
+
+def test_terminal_saved_cursor_slot_is_bounded():
+    import pyte
+    import saikai_terminal as _terminal
+
+    screen = _terminal._HistoryScreenBase(20, 2, history=2)
+    stream = pyte.Stream(screen)
+    for _ in range(10_000):
+        stream.feed("\x1b7")
+    assert len(screen.savepoints) <= 1
+
+
+def test_pty_writer_worker_count_and_shutdown_are_bounded():
+    """Repeated panes keep one writer each and retire it without retained bytes."""
+    import threading
+    import time
+    import saikai_terminal as _terminal
+
+    baseline = {
+        thread.ident for thread in threading.enumerate()
+        if thread.name.startswith("saikai-pty-write-")
+    }
+    workers = []
+    for index in range(24):
+        pane = _terminal.AgentTerminal(
+            ["agent"], status_classifier=lambda _text, _title: "idle")
+        pane._pty = type("P", (), {"write": lambda self, data: None})()
+        pane.is_dead = False
+        pane.sid = f"resource-{index}"
+        pane._start_writer()
+        first = pane._writer
+        pane._start_writer()
+        assert pane._writer is first
+        assert pane._writer_workers_started == 1
+        assert pane.write("界" * 2000) is True
+        deadline = time.monotonic() + 3.0
+        while pane._write_pending_bytes and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert pane._write_pending_bytes == 0
+        worker = pane._stop_writer()
+        if worker is not None:
+            workers.append(worker)
+
+    for worker in workers:
+        worker.join(timeout=3.0)
+        assert not worker.is_alive()
+    _terminal.join_all_pty_writers(timeout=1.0)
+    leaked = [
+        thread for thread in threading.enumerate()
+        if thread.name.startswith("saikai-pty-write-")
+        and thread.ident not in baseline
+    ]
+    assert leaked == [], [thread.name for thread in leaked]
+
+
+def test_agent_kill_escalation_is_tracked_and_bounded():
+    """A SIGTERM-ignoring registered agent cannot leave an untracked helper."""
+    import signal
+
+    original_platform = saikai.sys.platform
+    original_match = saikai._proc_start_matches
+    original_alive = saikai._is_pid_alive
+    original_kill = saikai.os.kill
+    original_grace = saikai._AGENT_REAP_GRACE
+    original_poll = saikai._AGENT_REAP_POLL
+    sent = []
+    try:
+        saikai.sys.platform = "linux"
+        saikai._proc_start_matches = lambda pid, procstart: True
+        saikai._is_pid_alive = lambda pid: True
+        saikai.os.kill = lambda pid, sig: sent.append((pid, sig))
+        saikai._AGENT_REAP_GRACE = 0.0
+        saikai._AGENT_REAP_POLL = 0.0
+        with saikai._AGENT_REAP_LOCK:
+            saikai._AGENT_REAP_THREADS.clear()
+
+        assert saikai._kill_agent_process(7171, "stable-start") == "signalled"
+        with saikai._AGENT_REAP_LOCK:
+            workers = list(saikai._AGENT_REAP_THREADS)
+        assert len(workers) == 1
+        saikai.join_agent_reaps(timeout=3.0)
+        assert (7171, signal.SIGTERM) in sent
+        assert (7171, getattr(signal, "SIGKILL", 9)) in sent
+        assert not workers[0].is_alive()
+        with saikai._AGENT_REAP_LOCK:
+            assert saikai._AGENT_REAP_THREADS == []
+    finally:
+        saikai._AGENT_REAP_GRACE = original_grace
+        saikai._AGENT_REAP_POLL = original_poll
+        saikai.os.kill = original_kill
+        saikai._is_pid_alive = original_alive
+        saikai._proc_start_matches = original_match
+        saikai.sys.platform = original_platform
+
+
+def test_agent_kill_batch_runs_in_a_tracked_worker():
+    """A slow Windows taskkill batch must not block the Textual/UI caller."""
+    import threading
+    import time
+
+    original_kill = saikai._kill_agent_process
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    caller_ident = threading.get_ident()
+    calls = []
+    results = []
+
+    def slow_kill(pid, procstart):
+        calls.append((pid, procstart, threading.get_ident()))
+        entered.set()
+        assert release.wait(timeout=3.0)
+        return "signalled" if pid == 41 else "stale"
+
+    try:
+        saikai._kill_agent_process = slow_kill
+        with saikai._AGENT_REAP_LOCK:
+            saikai._AGENT_REAP_THREADS.clear()
+
+        started = time.monotonic()
+        worker = saikai._start_agent_kill_batch(
+            [(41, "start-41", "one"), (42, "start-42", "two")],
+            lambda counts: (results.append(
+                (counts, threading.get_ident())), completed.set()))
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.5
+        assert entered.wait(timeout=1.0)
+        assert completed.is_set() is False
+        with saikai._AGENT_REAP_LOCK:
+            assert worker in saikai._AGENT_REAP_THREADS
+        assert calls[0][:2] == (41, "start-41")
+        assert calls[0][2] != caller_ident
+
+        release.set()
+        saikai.join_agent_reaps(timeout=3.0)
+        assert completed.wait(timeout=1.0)
+        assert [call[:2] for call in calls] == [
+            (41, "start-41"), (42, "start-42")]
+        assert results == [((1, 1, 0), worker.ident)]
+        assert not worker.is_alive()
+        with saikai._AGENT_REAP_LOCK:
+            assert saikai._AGENT_REAP_THREADS == []
+    finally:
+        release.set()
+        saikai.join_agent_reaps(timeout=3.0)
+        saikai._kill_agent_process = original_kill
+
+
+def test_join_agent_reaps_reaches_workers_registered_while_joining():
+    """Shutdown must include escalators registered by an in-flight kill batch."""
+    import threading
+
+    parent_release = threading.Event()
+    nested_release = threading.Event()
+    nested_joined = threading.Event()
+    nested_holder = []
+
+    class _Nested(threading.Thread):
+        def join(self, timeout=None):
+            nested_joined.set()
+            nested_release.set()
+            return super().join(timeout)
+
+        def run(self):
+            nested_release.wait(3.0)
+
+    class _Parent(threading.Thread):
+        def join(self, timeout=None):
+            parent_release.set()
+            return super().join(timeout)
+
+        def run(self):
+            parent_release.wait(3.0)
+            nested = _Nested(name="saikai-agent-reap-nested")
+            nested_holder.append(nested)
+            nested.start()
+            saikai._track_agent_reap(nested)
+
+    with saikai._AGENT_REAP_LOCK:
+        saikai._AGENT_REAP_THREADS.clear()
+    parent = _Parent(name="saikai-agent-kill-batch-parent")
+    parent.start()
+    saikai._track_agent_reap(parent)
+    try:
+        saikai.join_agent_reaps(timeout=2.0)
+        assert nested_holder
+        assert nested_joined.is_set(), \
+            "join_agent_reaps missed a worker registered during its first join"
+        assert not nested_holder[0].is_alive()
+        with saikai._AGENT_REAP_LOCK:
+            assert not any(t.is_alive() for t in saikai._AGENT_REAP_THREADS)
+    finally:
+        parent_release.set()
+        nested_release.set()
+        parent.join(timeout=3.0)
+        for nested in nested_holder:
+            nested.join(timeout=3.0)
+        with saikai._AGENT_REAP_LOCK:
+            saikai._AGENT_REAP_THREADS.clear()
 
 
 
@@ -877,6 +1129,22 @@ if __name__ == "__main__":
     print("PASS test_memory_safety_presets_and_override")
     test_vt_tokenizer_string_carry_is_bounded()
     print("PASS test_vt_tokenizer_string_carry_is_bounded")
+    test_terminal_color_cache_is_bounded_and_skips_arbitrary_truecolor()
+    print("PASS test_terminal_color_cache_is_bounded_and_skips_arbitrary_truecolor")
+    test_incremental_grapheme_candidate_is_bounded()
+    print("PASS test_incremental_grapheme_candidate_is_bounded")
+    test_overwritten_osc8_cell_metadata_is_bounded()
+    print("PASS test_overwritten_osc8_cell_metadata_is_bounded")
+    test_terminal_saved_cursor_slot_is_bounded()
+    print("PASS test_terminal_saved_cursor_slot_is_bounded")
+    test_pty_writer_worker_count_and_shutdown_are_bounded()
+    print("PASS test_pty_writer_worker_count_and_shutdown_are_bounded")
+    test_agent_kill_escalation_is_tracked_and_bounded()
+    print("PASS test_agent_kill_escalation_is_tracked_and_bounded")
+    test_agent_kill_batch_runs_in_a_tracked_worker()
+    print("PASS test_agent_kill_batch_runs_in_a_tracked_worker")
+    test_join_agent_reaps_reaches_workers_registered_while_joining()
+    print("PASS test_join_agent_reaps_reaches_workers_registered_while_joining")
     test_na_cache_is_bounded()
     print("PASS test_na_cache_is_bounded")
     test_load_severity_bands()

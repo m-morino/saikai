@@ -9,9 +9,10 @@ def test_snapshot_reproduces_fed_text_and_color():
     hub._feed("hello")
     hub._feed("\x1b[31mHI\x1b[0m")
     frame = hub._snapshot()
-    # Full repaint clears + homes the cursor, contains the visible text and a
-    # red SGR for the colored cells.
-    assert frame.startswith("\x1b[2J\x1b[H")
+    # Full repaint first closes any browser-side OSC 8 link, then clears +
+    # homes the cursor. It contains the visible text and a red SGR for the
+    # colored cells.
+    assert frame.startswith("\x1b]8;;\x1b\\\x1b[2J\x1b[H")
     assert "hello" in frame
     assert "HI" in frame
     assert "\x1b[31m" in frame   # red foreground re-emitted
@@ -24,7 +25,10 @@ def test_snapshot_skips_wide_char_continuation():
     import re
     hub = m.MirrorHub(token="t", cols=12, rows=1)
     hub._feed("あいうA")
-    plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", hub._snapshot())
+    frame = hub._snapshot()
+    frame = re.sub(
+        r"\x1b\]8;[^\x1b\x07]*(?:\x07|\x1b\\)", "", frame)
+    plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", frame)
     assert plain.startswith("あいうA")   # adjacent — no per-wide-char shift
 
 

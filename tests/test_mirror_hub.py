@@ -164,14 +164,477 @@ def test_static_assets_served_locally_without_token():
     hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0)
     port = hub.serve()
     try:
-        for asset in ("/xterm.min.js", "/addon-canvas.js", "/xterm.min.css"):
+        for asset in (
+                "/xterm.min.js", "/addon-canvas.js",
+                "/addon-saikai-rich-graphemes.js", "/xterm.min.css"):
             r = _get(f"http://127.0.0.1:{port}{asset}")     # no token needed
             assert r.status == 200 and len(r.read(64)) > 0
+            assert "no-cache" in r.headers.get("Cache-Control", "")
         page = _get(f"http://127.0.0.1:{port}/?token=secret").read().decode("utf-8")
         assert "/xterm.min.js" in page and "cdn.jsdelivr" not in page
         assert "/addon-canvas.js" in page and "loadAddon" in page   # crisp borders
+        assert "/addon-unicode-graphemes.js" not in page
+        versioned = re.search(
+            r'/addon-saikai-rich-graphemes\.js\?v=([0-9a-f]{12})', page)
+        assert versioned is not None
+        assert versioned.group(1) == m._static_asset_version(
+            "addon-saikai-rich-graphemes.js")
+        assert "allowProposedApi:true" in page
+        assert "new _RG(richWidthData)" in page
+        assert "__RICH_WIDTH_DATA__" not in page
+        import html as _html
+        import json as _json
+        import re as _re
+        encoded = _re.search(r"data-rich-width='([^']+)'", page)
+        assert encoded is not None
+        width_data = _json.loads(_html.unescape(encoded.group(1)))
+        assert width_data == m._rich_width_payload()
     finally:
         hub.stop()
+
+
+def test_rich_width_payload_scans_unicode_in_bounded_blocks():
+    """Building browser Unicode tables must not materialize one 1.1M-char
+    subject (which peaked above 80 MiB and duplicated under concurrent misses)."""
+    import regex
+
+    seen_lengths = []
+    original_finditer = regex.finditer
+
+    def recording_finditer(pattern, subject, *args, **kwargs):
+        seen_lengths.append(len(subject))
+        return original_finditer(pattern, subject, *args, **kwargs)
+
+    m._rich_width_payload.cache_clear()
+    regex.finditer = recording_finditer
+    try:
+        payload = m._rich_width_payload()
+    finally:
+        regex.finditer = original_finditer
+        m._rich_width_payload.cache_clear()
+
+    assert payload["graphemeBreak"]
+    for key in (
+            "graphemeBreak", "indicConjunctBreak",
+            "extendedPictographic"):
+        ranges = payload[key]
+        assert all(
+            left[1] < right[0] for left, right in zip(ranges, ranges[1:])), key
+    assert seen_lengths
+    assert max(seen_lengths) <= 65536, max(seen_lengths)
+
+
+def test_rich_width_payload_cold_build_is_single_flight():
+    """Concurrent first pages must share one Unicode-table construction."""
+    import regex
+    import threading
+    import time as _time
+
+    callers = set()
+    callers_lock = threading.Lock()
+    original_finditer = regex.finditer
+
+    def recording_finditer(pattern, subject, *args, **kwargs):
+        with callers_lock:
+            callers.add(threading.get_ident())
+        _time.sleep(0.0005)
+        return original_finditer(pattern, subject, *args, **kwargs)
+
+    m._rich_width_payload.cache_clear()
+    regex.finditer = recording_finditer
+    start = threading.Barrier(5)
+    failures = []
+
+    def build():
+        try:
+            start.wait()
+            m._rich_width_payload()
+        except Exception as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=build) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join(30)
+    regex.finditer = original_finditer
+    m._rich_width_payload.cache_clear()
+
+    assert not failures
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(callers) == 1, callers
+
+
+def test_page_resets_pane_sync_state_at_every_stream_boundary():
+    """A partial old-generation DEC 2026 frame must not flush after a reseed."""
+    page = m._PAGE_HTML
+    assert "function resetPaneSyncState()" in page
+    pane_reset = page.split(
+        "es.addEventListener('pane-reset'", 1)[1].split("});", 1)[0]
+    assert pane_reset.index("resetPaneSyncState();") < pane_reset.index(
+        "term.reset();")
+    generation = page.split(
+        "if (m.gen !== undefined && m.gen !== paneGen)", 1)[1].split(
+            "}", 1)[0]
+    assert "resetPaneSyncState();" in generation
+
+
+def test_page_encodes_kitty_flag1_pane_keyboard_input():
+    """Pane input must honor the child's active-buffer Kitty keyboard mode."""
+    import json
+    import shutil
+    import subprocess
+
+    page = m._PAGE_HTML
+    assert "m.kitty_keyboard" in page
+    assert "term.attachCustomKeyEventHandler" in page
+    assert "sendRaw(encodeKittyFlag1Data(d, paneKittyKeyboard));" in page
+
+    begin = "// kitty input helpers begin"
+    end = "// kitty input helpers end"
+    assert begin in page and end in page
+    helpers = page.split(begin, 1)[1].split(end, 1)[0]
+
+    node = shutil.which("node")
+    if node is None:
+        return
+    script = r"""
+const fs = require('fs');
+const ESC = String.fromCharCode(27);
+eval(fs.readFileSync(0, 'utf8'));
+function ev(key, code, mods = {}) {
+  return Object.assign({
+    type: 'keydown', key, code, shiftKey: false, altKey: false,
+    ctrlKey: false, metaKey: false, isComposing: false, keyCode: 0,
+    getModifierState: () => false
+  }, mods);
+}
+const out = [
+  kittySequenceForKeyboardEvent(ev('Escape', 'Escape'), 1),
+  kittySequenceForKeyboardEvent(
+    ev('Escape', 'Escape', {ctrlKey: true}), 1),
+  kittySequenceForKeyboardEvent(ev('ArrowUp', 'ArrowUp'), 1),
+  kittySequenceForKeyboardEvent(
+    ev('ArrowUp', 'ArrowUp', {ctrlKey: true}), 1),
+  kittySequenceForKeyboardEvent(
+    ev('Home', 'Home', {shiftKey: true}), 1),
+  kittySequenceForKeyboardEvent(ev('Delete', 'Delete'), 1),
+  kittySequenceForKeyboardEvent(
+    ev('PageDown', 'PageDown', {altKey: true}), 1),
+  kittySequenceForKeyboardEvent(ev('F1', 'F1'), 1),
+  kittySequenceForKeyboardEvent(
+    ev('F2', 'F2', {shiftKey: true}), 1),
+  kittySequenceForKeyboardEvent(ev('F3', 'F3'), 1),
+  kittySequenceForKeyboardEvent(
+    ev('F5', 'F5', {ctrlKey: true}), 1),
+  kittySequenceForKeyboardEvent(ev('F12', 'F12'), 1),
+  kittySequenceForKeyboardEvent(ev('c', 'KeyC', {ctrlKey: true}), 1),
+  kittySequenceForKeyboardEvent(
+    ev('C', 'KeyC', {ctrlKey: true, shiftKey: true}), 1),
+  kittySequenceForKeyboardEvent(ev('[', 'BracketLeft', {altKey: true}), 1),
+  kittySequenceForKeyboardEvent(
+    ev('Enter', 'Enter', {ctrlKey: true}), 1),
+  kittySequenceForKeyboardEvent(ev('A', 'KeyA', {shiftKey: true}), 1),
+  kittySequenceForKeyboardEvent(
+    ev('c', 'KeyC', {ctrlKey: true, isComposing: true}), 1),
+  kittySequenceForKeyboardEvent(ev('@', 'KeyQ', {
+    ctrlKey: true, altKey: true,
+    getModifierState: name => name === 'AltGraph'
+  }), 1),
+  kittySequenceForKeyboardEvent(ev('c', 'KeyC', {ctrlKey: true}), 0),
+  kittySequenceForKeyboardEvent(ev('ArrowUp', 'ArrowUp'), 0),
+  encodeKittyFlag1Data(String.fromCharCode(3), 1),
+  encodeKittyFlag1Data(String.fromCharCode(3), 0)
+];
+process.stdout.write(JSON.stringify(out));
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        input=helpers, check=True, capture_output=True, text=True,
+        encoding="utf-8",
+    )
+    observed = json.loads(result.stdout)
+    assert observed == [
+        "\x1b[27u",
+        "\x1b[27;5u",
+        "\x1b[A",
+        "\x1b[1;5A",
+        "\x1b[1;2H",
+        "\x1b[3~",
+        "\x1b[6;3~",
+        "\x1b[P",
+        "\x1b[1;2Q",
+        "\x1b[13~",
+        "\x1b[15;5~",
+        "\x1b[24~",
+        "\x1b[99;5u",
+        "\x1b[99;6u",
+        "\x1b[91;3u",
+        "\x1b[13;5u",
+        None,
+        None,
+        None,
+        None,
+        None,
+        "\x1b[99;5u",
+        "\x03",
+    ]
+    import saikai_terminal as terminal
+    local_functional = [
+        terminal.encode_key(key, None, kitty_flags=1)
+        for key in (
+            "escape", "ctrl+escape", "up", "ctrl+up", "shift+home",
+            "delete", "alt+pagedown", "f1", "shift+f2", "f3",
+            "ctrl+f5", "f12",
+        )
+    ]
+    assert observed[:len(local_functional)] == local_functional
+
+
+def test_pane_seed_carries_and_strips_ordered_kitty_keyboard_mode():
+    """A mode-changing reseed must set browser input flags before it is live."""
+    import json
+    import shutil
+    import subprocess
+    import pyte
+
+    screen = pyte.Screen(8, 2)
+    seed = m._synth_pane_seed(
+        screen, 8, 2,
+        {
+            "alt": False,
+            "cursor_hidden": False,
+            "cursor_style": 0,
+            "kitty_keyboard": 1,
+        },
+    )
+    marker = "\x1b]777;saikai-kitty-keyboard=1\x1b\\"
+    assert seed.startswith(marker)
+
+    page = m._PAGE_HTML
+    begin = "// pane seed mode helper begin"
+    end = "// pane seed mode helper end"
+    assert begin in page and end in page
+    helper = page.split(begin, 1)[1].split(end, 1)[0]
+    pane_reset = page.split(
+        "es.addEventListener('pane-reset'", 1)[1].split("});", 1)[0]
+    assert pane_reset.index("decodePaneSeedModes") < pane_reset.index(
+        "term.reset();")
+    generation = page.split(
+        "if (m.gen !== undefined && m.gen !== paneGen)", 1)[1].split(
+            "}", 1)[0]
+    assert "paneKittyKeyboard = 0;" in generation
+    assert "hasOwnProperty.call(m, 'kitty_keyboard')" in page
+
+    node = shutil.which("node")
+    if node is None:
+        return
+    script = r"""
+const fs = require('fs');
+const ESC = String.fromCharCode(27);
+eval(fs.readFileSync(0, 'utf8'));
+const prefix = ESC + ']777;saikai-kitty-keyboard=';
+const st = ESC + String.fromCharCode(92);
+const values = [
+  prefix + '1' + st + 'PAYLOAD',
+  prefix + '0' + st + 'PAYLOAD',
+  prefix + '2' + st + 'PAYLOAD',
+  prefix + 'x' + st + 'PAYLOAD',
+  'PAYLOAD',
+  prefix + '1BROKEN'
+].map(decodePaneSeedModes);
+process.stdout.write(JSON.stringify(values));
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        input=helper, check=True, capture_output=True, text=True,
+        encoding="utf-8",
+    )
+    assert json.loads(result.stdout) == [
+        {"data": "PAYLOAD", "kittyKeyboard": 1},
+        {"data": "PAYLOAD", "kittyKeyboard": 0},
+        {"data": "PAYLOAD", "kittyKeyboard": 0},
+        {"data": "PAYLOAD", "kittyKeyboard": 0},
+        {"data": "PAYLOAD", "kittyKeyboard": 0},
+        {"data": "", "kittyKeyboard": 0},
+    ]
+
+
+def test_vendored_xterm_grapheme_width_matches_rich_when_node_available():
+    """Exercise the exact browser parser and Rich-width adapter assets."""
+    import json
+    import pathlib
+    import regex
+    import shutil
+    import subprocess
+    from rich.cells import cell_len
+
+    node = shutil.which("node")
+    if node is None:
+        return
+    root = pathlib.Path(__file__).resolve().parent.parent
+    xterm = root / "saikai_mirror_static" / "xterm.min.js"
+    addon = root / "saikai_mirror_static" / "addon-saikai-rich-graphemes.js"
+    samples = (
+        "\U0001fae0",            # Rich 2, stock xterm grapheme provider 1
+        "\u2764\u200d\U0001f525",  # Rich 1, stock provider 2
+        "\U0001f590\U0001f3fd",  # Rich 1, stock provider 2
+        "a\u200dY",              # ZWJ + non-EP must break before Y
+        "e\u0301", "\u2764\ufe0f", "1\ufe0f\u20e3",
+        "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466",
+        "\U0001f1ef\U0001f1f5", "\U0001f44d\U0001f3fd",
+        "\u2764\u200d\u200d\ufe0f",  # skipped ZWJ must not skip following VS16
+        "\u200d\u0e33", "\u200d\u200d\u0e33",  # leading-ZWJ skip parity
+        "\u0915\u094d\u0924\u094d\u092f",  # one regex EGC, three Rich cells
+        "\u1100\u1100",          # one regex EGC, four Rich cells
+    )
+    width_data = m._rich_width_payload()
+    script = r"""
+const fs = require('fs');
+const { Terminal } = require(process.argv[1]);
+const { SaikaiRichGraphemesAddon } = require(process.argv[2]);
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const samples = input.samples;
+const widthData = input.widthData;
+(async () => {
+  const out = [];
+  for (const sample of samples) {
+    async function observe(writes) {
+      const term = new Terminal({
+        cols: 40, rows: 2, allowProposedApi: true
+      });
+      term.loadAddon(new SaikaiRichGraphemesAddon(widthData));
+      for (const write of writes) {
+        await new Promise(resolve => term.write(write, resolve));
+      }
+      const line = term.buffer.active.getLine(0);
+      let text = '';
+      for (let x = 0; x < term.buffer.active.cursorX; ++x) {
+        const cell = line.getCell(x);
+        if (cell) text += cell.getChars();
+      }
+      return {
+        cursorX: term.buffer.active.cursorX,
+        text,
+        version: term.unicode.activeVersion
+      };
+    }
+    const input = 'A' + sample + 'B';
+    const whole = await observe([input]);
+    // SSE frames originate as already-decoded Python str values and each is
+    // UTF-8 encoded/base64'd whole, so a frame cannot split inside a Unicode
+    // codepoint. One-codepoint writes cover every reachable frame boundary.
+    const chunked = await observe(Array.from(input));
+    const probe = new Terminal({allowProposedApi: true});
+    probe.loadAddon(new SaikaiRichGraphemesAddon(widthData));
+    out.push({
+      cursorX: whole.cursorX,
+      text: whole.text,
+      chunkedCursorX: chunked.cursorX,
+      chunkedText: chunked.text,
+      isolatedWidth: probe._core.unicodeService.getStringCellWidth(sample),
+      version: whole.version
+    });
+  }
+  process.stdout.write(JSON.stringify(out));
+})().catch(error => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+    result = subprocess.run(
+        [node, "-e", script, str(xterm), str(addon)],
+        input=json.dumps(
+            {"samples": samples, "widthData": width_data},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    )
+    observed = json.loads(result.stdout)
+    for sample, row in zip(samples, observed):
+        width = sum(cell_len(cluster) for cluster in regex.findall(r"\X", sample))
+        assert row == {
+            "cursorX": 1 + width + 1,
+            "text": "A" + sample + "B",
+            "chunkedCursorX": 1 + width + 1,
+            "chunkedText": "A" + sample + "B",
+            "isolatedWidth": width,
+            "version": "saikai-rich-" + width_data["version"],
+        }
+
+
+def test_seed_sgr_preserves_blink_and_strikethrough():
+    """A late joiner must receive pyte blink/strike rendition bits as SGR."""
+    import pyte
+
+    screen = pyte.Screen(4, 1)
+    pyte.Stream(screen).feed("\x1b[5;9mX")
+    attrs = m._cell_attrs(screen.buffer[0][0])
+    sgr = m._attrs_to_sgr(attrs)
+    assert "\x1b[5m" in sgr
+    assert "\x1b[9m" in sgr
+
+
+def test_seed_serializes_osc8_cell_links_and_active_link_state():
+    """Late join must preserve both painted OSC8 cells and a still-open link."""
+    import json
+    import pathlib
+    import shutil
+    import subprocess
+    import pyte
+
+    screen = pyte.Screen(10, 2)
+    pyte.Stream(screen).feed("LINK")
+    screen._saikai_hyperlinks = {
+        (0, column): ("id=painted", "https://example.test/painted")
+        for column in range(4)
+    }
+    screen._saikai_active_hyperlink = (
+        "id=active", "https://example.test/active")
+    seed = m._synth_pane_seed(
+        screen, 10, 2,
+        {"alt": False, "cursor_hidden": False, "cursor_style": 0},
+    )
+
+    assert "\x1b]8;id=painted;https://example.test/painted\x1b\\" in seed
+    assert seed.endswith(
+        "\x1b]8;id=active;https://example.test/active\x1b\\")
+
+    node = shutil.which("node")
+    if node is None:
+        return
+    root = pathlib.Path(__file__).resolve().parent.parent
+    script = r"""
+const fs = require('fs');
+const { Terminal } = require(process.argv[1]);
+const { SaikaiRichGraphemesAddon } = require(process.argv[2]);
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const term = new Terminal({cols: 10, rows: 2, allowProposedApi: true});
+term.loadAddon(new SaikaiRichGraphemesAddon(input.widthData));
+term.write(input.seed, () => term.write('Z', () => {
+  const line = term.buffer.active.getLine(0);
+  process.stdout.write(JSON.stringify(
+    [0, 1, 2, 3, 4].map(x => line.getCell(x).extended._urlId)));
+}));
+"""
+    result = subprocess.run(
+        [
+            node, "-e", script,
+            str(root / "saikai_mirror_static" / "xterm.min.js"),
+            str(root / "saikai_mirror_static"
+                / "addon-saikai-rich-graphemes.js"),
+        ],
+        input=json.dumps(
+            {"seed": seed, "widthData": m._rich_width_payload()},
+            ensure_ascii=True, separators=(",", ":"),
+        ),
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    )
+    url_ids = json.loads(result.stdout)
+    assert url_ids[0] and len(set(url_ids[:4])) == 1
+    assert url_ids[4] and url_ids[4] != url_ids[0]
 
 
 def test_page_injects_terminal_size():
@@ -440,12 +903,13 @@ def test_pane_seed_roundtrip_restores_grid_and_modes():
     modes = {"alt": True, "app_cursor": True, "mouse_click": True,
              "mouse_btn_motion": False, "mouse_any_motion": False,
              "mouse_sgr": True, "focus_reporting": False,
-             "bracketed_paste": True, "cursor_hidden": False}
+             "bracketed_paste": True, "cursor_hidden": False,
+             "cursor_style": 5}
     seed = m._synth_pane_seed(src, 20, 5, modes)
     # mode replay: every tracked mode appears explicitly, h or l per the flag
     for want in ("\x1b[?1049h", "\x1b[?1h", "\x1b[?1000h", "\x1b[?1002l",
                  "\x1b[?1003l", "\x1b[?1004l", "\x1b[?1006h",
-                 "\x1b[?2004h", "\x1b[?25h"):
+                 "\x1b[?2004h", "\x1b[5 q", "\x1b[?25h"):
         assert want in seed, f"seed must replay {want!r}"
     assert seed.index("\x1b[?1049h") < seed.index("\x1b[2J"), \
         "alt-screen enter must precede the paint (it targets the alt buffer)"
@@ -469,6 +933,157 @@ def test_pane_seed_roundtrip_restores_grid_and_modes():
                 f"attrs {y},{x}: {a} vs {b}"
     assert (dst.cursor.y, dst.cursor.x) == (src.cursor.y, src.cursor.x)
     print("PASS test_pane_seed_roundtrip_restores_grid_and_modes")
+
+
+def test_pane_seed_preserves_pending_autowrap_and_current_rendition():
+    """A reseed at x==columns must not overwrite the edge on the next byte."""
+    import pyte
+
+    for edge_text in ("ABCD", "AB\u754c"):
+        src = pyte.Screen(4, 2)
+        src_stream = pyte.Stream(src)
+        src_stream.feed("\x1b[31m" + edge_text)
+        assert src.cursor.x == 4
+
+        modes = {
+            "alt": False,
+            "cursor_hidden": False,
+            "cursor_style": 0,
+        }
+        seed = m._synth_pane_seed(src, 4, 2, modes)
+        dst = pyte.Screen(4, 2)
+        dst_stream = pyte.Stream(dst)
+        dst_stream.feed(seed)
+        assert dst.cursor.x == 4, (edge_text, dst.cursor.x)
+        assert dst.cursor.attrs.fg == src.cursor.attrs.fg
+
+        src_stream.feed("Z")
+        dst_stream.feed("Z")
+        assert dst.display == src.display
+        assert (dst.cursor.y, dst.cursor.x) == (src.cursor.y, src.cursor.x)
+        assert dst.buffer[1][0].fg == src.buffer[1][0].fg == "red"
+
+
+def test_pane_seed_restores_modes_that_change_future_presentation():
+    """Late joiners must process the next PTY bytes exactly like the source."""
+    import pyte
+    import saikai_terminal as terminal
+
+    cases = (
+        (2, 5, "\x1b[?7lABCDE", "Z"),          # DECAWM
+        (2, 5, "ABCDE\x1b[1;3H\x1b[4h", "Z"), # IRM
+        (4, 5, "\x1b[2;3r\x1b[?6h", "A\r\nB\r\nC"),  # margins + DECOM
+    )
+    for rows, cols, setup, future in cases:
+        src = terminal._HistoryScreenBase(cols, rows, history=10)
+        src_stream = pyte.Stream(src)
+        src_stream.feed(setup)
+        modes = {
+            "alt": False,
+            "cursor_hidden": False,
+            "cursor_style": 0,
+        }
+        seed = m._synth_pane_seed(src, cols, rows, modes)
+        dst = terminal._HistoryScreenBase(cols, rows, history=10)
+        dst_stream = pyte.Stream(dst)
+        dst_stream.feed(seed)
+
+        src_stream.feed(future)
+        dst_stream.feed(future)
+        assert terminal._pyte_grid_lines(dst) == terminal._pyte_grid_lines(src), \
+            (repr(setup), terminal._pyte_grid_lines(src),
+             terminal._pyte_grid_lines(dst))
+        assert (dst.cursor.y, dst.cursor.x) == (src.cursor.y, src.cursor.x)
+
+
+def test_pane_seed_restores_decsc_savepoint_for_future_decrc():
+    """DECRC after attach must resume the child's saved cursor and rendition."""
+    import pyte
+
+    src = pyte.Screen(12, 4)
+    src_stream = pyte.Stream(src)
+    src_stream.feed(
+        "\x1b[?7l\x1b[2;6H\x1b[31m\x1b(0\x0f\x1b7"
+        "\x1b[?7h\x1b[32m\x1b(B\x0f\x1b[HNOW")
+    modes = {"alt": False, "cursor_hidden": False, "cursor_style": 0}
+    seed = m._synth_pane_seed(src, 12, 4, modes)
+
+    dst = pyte.Screen(12, 4)
+    dst_stream = pyte.Stream(dst)
+    dst_stream.feed(seed)
+    # Current parser state must also survive the temporary state used to create
+    # the savepoint. Exercise it before restoring the saved slot.
+    for stream in (src_stream, dst_stream):
+        stream.feed("q")
+    assert dst.display == src.display
+    assert dst.cursor.attrs.fg == src.cursor.attrs.fg == "green"
+    assert pyte.modes.DECAWM in dst.mode
+
+    for stream in (src_stream, dst_stream):
+        stream.feed("\x1b8q")
+
+    assert dst.display == src.display
+    assert (dst.cursor.y, dst.cursor.x) == (src.cursor.y, src.cursor.x)
+    assert dst.buffer[1][5].fg == "red"
+
+
+def test_pane_seed_restores_buffer_local_tabstops_for_future_tabs():
+    """A custom HTS layout must survive attach for later tab navigation."""
+    import pyte
+
+    src = pyte.Screen(12, 4)
+    src_stream = pyte.Stream(src)
+    src_stream.feed("\x1b[3g\x1b[1;4H\x1bH\x1b[2;1H")
+    modes = {"alt": False, "cursor_hidden": False, "cursor_style": 0}
+    seed = m._synth_pane_seed(src, 12, 4, modes)
+
+    dst = pyte.Screen(12, 4)
+    dst_stream = pyte.Stream(dst)
+    dst_stream.feed(seed)
+    for stream in (src_stream, dst_stream):
+        stream.feed("\tX")
+
+    assert dst.display == src.display
+    assert (dst.cursor.y, dst.cursor.x) == (src.cursor.y, src.cursor.x)
+
+
+def test_pane_seed_restores_active_charset_for_future_text():
+    """The current G0/G1 designation is terminal state, not painted text."""
+    import pyte
+
+    src = pyte.Screen(12, 4)
+    src_stream = pyte.Stream(src)
+    src_stream.feed("\x1b(0\x0f")
+    modes = {"alt": False, "cursor_hidden": False, "cursor_style": 0}
+    seed = m._synth_pane_seed(src, 12, 4, modes)
+
+    dst = pyte.Screen(12, 4)
+    dst_stream = pyte.Stream(dst)
+    dst_stream.feed(seed)
+    for stream in (src_stream, dst_stream):
+        stream.feed("q")
+
+    assert dst.display == src.display
+
+
+def test_pane_seed_restores_lnm_for_future_linefeeds():
+    """LNM changes the column where the next LF writes after attach."""
+    import pyte
+
+    src = pyte.Screen(12, 4)
+    src_stream = pyte.Stream(src)
+    src_stream.feed("\x1b[20hABC")
+    modes = {"alt": False, "cursor_hidden": False, "cursor_style": 0}
+    seed = m._synth_pane_seed(src, 12, 4, modes)
+
+    dst = pyte.Screen(12, 4)
+    dst_stream = pyte.Stream(dst)
+    dst_stream.feed(seed)
+    for stream in (src_stream, dst_stream):
+        stream.feed("\nZ")
+
+    assert dst.display == src.display
+    assert (dst.cursor.y, dst.cursor.x) == (src.cursor.y, src.cursor.x)
 
 
 def test_pane_channel_routes_by_view_and_reseeds_on_fallbehind():
@@ -546,6 +1161,46 @@ def test_pane_channel_routes_by_view_and_reseeds_on_fallbehind():
     finally:
         hub.stop()
     print("PASS test_pane_channel_routes_by_view_and_reseeds_on_fallbehind")
+
+
+def test_raw_xterm_divergence_requests_canonical_reseed():
+    """Representational gaps are healed from AgentTerminal's canonical screen.
+
+    xterm advances a detached zero-width EGC that the local screen drops, and
+    stores a 3+ cell EGC in multiple cells whose later edits are not atomic.
+    Detection belongs on the mirror drain thread, never the pane reader lock.
+    """
+    import queue as _q
+
+    def observed_hub():
+        hub = m.MirrorHub(token="t", cols=12, rows=2)
+        cq = _q.Queue(32)
+        with hub._clients_lock:
+            hub._pane_clients.add(cq)
+        requests = []
+        hub.set_pane_reseed_request(lambda: requests.append("reseed"))
+        return hub, requests
+
+    plain, plain_requests = observed_hub()
+    plain._drain_pane_frame(m._PaneData("ordinary ASCII"))
+    assert plain_requests == []
+
+    detached, detached_requests = observed_hub()
+    detached._drain_pane_frame(
+        m._PaneData("A\x1b[31m\u0301"))
+    assert detached_requests == ["reseed"]
+
+    split, split_requests = observed_hub()
+    split._drain_pane_frame(m._PaneData("\u1100"))
+    assert split_requests == []
+    split._drain_pane_frame(m._PaneData("\u1100"))
+    assert split_requests == ["reseed"]
+
+    seeded, seeded_requests = observed_hub()
+    seeded._drain_pane_frame(m._PaneReset(
+        "\x1b[2J\x1b[H\u1100\u1100", '{"open": true, "gen": 7}'))
+    seeded._drain_pane_frame(m._PaneData("next"))
+    assert seeded_requests == ["reseed"]
 
 
 def test_raw_endpoint_gates_and_dispatches():
@@ -817,9 +1472,24 @@ if __name__ == "__main__":
     test_url_includes_token_and_resolves_wildcard_host()
     test_mirror_port_parsing()
     test_static_assets_served_locally_without_token()
+    test_rich_width_payload_scans_unicode_in_bounded_blocks()
+    test_rich_width_payload_cold_build_is_single_flight()
+    test_page_resets_pane_sync_state_at_every_stream_boundary()
+    test_page_encodes_kitty_flag1_pane_keyboard_input()
+    test_pane_seed_carries_and_strips_ordered_kitty_keyboard_mode()
+    test_vendored_xterm_grapheme_width_matches_rich_when_node_available()
+    test_seed_sgr_preserves_blink_and_strikethrough()
+    test_seed_serializes_osc8_cell_links_and_active_link_state()
     test_page_injects_terminal_size()
     test_pane_seed_roundtrip_restores_grid_and_modes()
+    test_pane_seed_preserves_pending_autowrap_and_current_rendition()
+    test_pane_seed_restores_modes_that_change_future_presentation()
+    test_pane_seed_restores_decsc_savepoint_for_future_decrc()
+    test_pane_seed_restores_buffer_local_tabstops_for_future_tabs()
+    test_pane_seed_restores_active_charset_for_future_text()
+    test_pane_seed_restores_lnm_for_future_linefeeds()
     test_pane_channel_routes_by_view_and_reseeds_on_fallbehind()
+    test_raw_xterm_divergence_requests_canonical_reseed()
     test_raw_endpoint_gates_and_dispatches()
     test_pane_stream_sends_meta_and_reset_seed()
     test_pane_flush_preserves_control_meta_and_sentinel()

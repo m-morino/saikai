@@ -20,6 +20,29 @@ import saikai_terminal as rt
 import saikai
 
 
+def _wait_pty_writer(term, timeout=3.0):
+    """Wait only in tests; production callers never wait for PTY writes."""
+    condition = getattr(term, "_write_condition", None)
+    if condition is None:
+        return
+    deadline = time.monotonic() + timeout
+    with condition:
+        while getattr(term, "_write_pending_bytes", 0):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            condition.wait(timeout=remaining)
+        assert term._write_pending_bytes == 0, "PTY writer did not drain"
+
+
+def _retire_pty_writer(term):
+    _wait_pty_writer(term)
+    worker = term._stop_writer()
+    if worker is not None:
+        worker.join(timeout=3.0)
+        assert not worker.is_alive(), "PTY writer did not retire"
+
+
 def test_update_status_marshals_outside_lock():
     """_update_status must NOT hold self._lock while marshalling the status
     callback. call_from_thread blocks until the UI thread runs the callback, and
@@ -86,6 +109,64 @@ def test_kill_tracks_reap_for_atexit_join():
     # The point under test is that the reap is TRACKED + joinable, not its speed.
     rt.join_all_reaps(timeout=30)
     assert not t.is_alive(), "reap not joined by join_all_reaps"
+
+
+def test_join_all_reaps_reaches_helpers_registered_while_joining():
+    """A reaper may register its bounded PTY-close helper just before exit.
+
+    join_all_reaps must keep taking snapshots to a fixed point; a single
+    snapshot returns while that helper is still alive and violates the
+    join-every-tracked-reap shutdown contract.
+    """
+    parent_release = threading.Event()
+    nested_release = threading.Event()
+    nested_joined = threading.Event()
+    nested_holder = []
+
+    class _Nested(threading.Thread):
+        def join(self, timeout=None):
+            nested_joined.set()
+            nested_release.set()
+            return super().join(timeout)
+
+        def run(self):
+            nested_release.wait(3.0)
+
+    class _Parent(threading.Thread):
+        def join(self, timeout=None):
+            # Deterministically let the child register only after this parent
+            # was captured in join_all_reaps' first snapshot.
+            parent_release.set()
+            return super().join(timeout)
+
+        def run(self):
+            parent_release.wait(3.0)
+            nested = _Nested(name="nested-close-helper")
+            nested_holder.append(nested)
+            nested.start()
+            rt._track_reap(nested)
+
+    with rt._REAP_LOCK:
+        rt._REAP_THREADS.clear()
+    parent = _Parent(name="parent-reaper")
+    parent.start()
+    rt._track_reap(parent)
+    try:
+        rt.join_all_reaps(timeout=2.0)
+        assert nested_holder, "parent did not register its close helper"
+        assert nested_joined.is_set(), \
+            "join_all_reaps never joined the helper added during its first join"
+        assert not nested_holder[0].is_alive()
+        with rt._REAP_LOCK:
+            assert not any(t.is_alive() for t in rt._REAP_THREADS)
+    finally:
+        parent_release.set()
+        nested_release.set()
+        parent.join(timeout=3.0)
+        for nested in nested_holder:
+            nested.join(timeout=3.0)
+        with rt._REAP_LOCK:
+            rt._REAP_THREADS.clear()
 
 
 def test_posix_kill_signals_only_and_closes_off_thread():
@@ -159,6 +240,456 @@ def test_posix_reap_escalates_to_sigkill():
     assert closed, "pty.close() skipped after the escalation"
 
 
+def test_natural_eof_detaches_before_callbacks_preserves_tail_and_reaps_once():
+    """EOF owns one generation, exposes the final tail, then announces death."""
+    reads = ["FINAL\x1b["]
+    closed_on = []
+    callback_state = []
+    signals = []
+
+    class _Pty:
+        pid = 4242
+
+        def read(self, _size):
+            if reads:
+                return reads.pop(0)
+            raise EOFError
+
+        def write(self, _data):
+            pass
+
+        def isalive(self):
+            return False
+
+        def close(self, force=True):
+            closed_on.append(threading.current_thread())
+
+    pane = rt.AgentTerminal(
+        ["agent"], sid="natural-eof",
+        status_classifier=lambda _text, _title: "idle",
+    )
+    pane._create_screen_pair(3, 40)
+    pane._marshal = lambda callback: callback()
+    pane._schedule_pane_refresh = lambda: None
+    pane._show_hw_cursor = lambda *args, **kwargs: None
+    pane.refresh = lambda *args, **kwargs: None
+    pane._on_exit = lambda _sid: callback_state.append(
+        (pane._pty, pane._pid, rt._pyte_grid_lines(pane._screen)[0]))
+    pty = _Pty()
+    generation = pane._attach_pty(pty, pty.pid)
+    pane._start_writer()
+
+    old_win = rt._IS_WIN
+    old_post = rt._post_signal
+    old_group_alive = rt._process_group_alive
+    rt._IS_WIN = False
+    rt._post_signal = lambda pid, name: signals.append((pid, name))
+    rt._process_group_alive = lambda pid: False
+    caller = threading.current_thread()
+    try:
+        pane._read_loop(pty, generation)
+        rt.join_all_reaps(timeout=3.0)
+        assert pane._pty is None and pane._pid is None
+        assert callback_state and callback_state[0][0:2] == (None, None)
+        assert callback_state[0][2].startswith("FINAL\u241b[")
+        assert len(closed_on) == 1 and closed_on[0] is not caller
+        assert signals == [], "natural EOF must not signal an already-dead group"
+
+        tracked_before = len(rt._REAP_THREADS)
+        assert pane.kill() is None
+        assert len(rt._REAP_THREADS) == tracked_before
+        assert len(closed_on) == 1
+    finally:
+        rt._IS_WIN = old_win
+        rt._post_signal = old_post
+        rt._process_group_alive = old_group_alive
+
+
+def test_lifecycle_generation_allows_exactly_one_detach_and_rejects_stale_eof():
+    """kill/EOF races cannot both own cleanup or detach a replacement PTY."""
+    for _ in range(50):
+        pane = rt.AgentTerminal(
+            ["agent"], status_classifier=lambda _text, _title: "idle")
+        first = object()
+        generation = pane._attach_pty(first, 101)
+        gate = threading.Barrier(3)
+        results = []
+
+        def detach():
+            gate.wait()
+            results.append(pane._detach_owned_pty(first, generation))
+
+        left = threading.Thread(target=detach)
+        right = threading.Thread(target=detach)
+        left.start()
+        right.start()
+        gate.wait()
+        left.join(timeout=3.0)
+        right.join(timeout=3.0)
+        assert sum(result is not None for result in results) == 1
+        assert pane._pty is None and pane._pid is None
+
+        replacement = object()
+        pane._finish_pty_retirement(generation)
+        replacement_generation = pane._attach_pty(replacement, 202)
+        assert replacement_generation > generation
+        assert pane._detach_owned_pty(first, generation) is None
+        assert pane._pty is replacement and pane._pid == 202
+
+
+def test_stale_reader_cannot_stop_flush_or_finalize_a_replacement_generation():
+    """Late EOF from an old backend is completely inert toward its replacement."""
+    finalized = []
+    closed = []
+
+    class _OldPty:
+        def read(self, _size):
+            raise EOFError
+
+        def close(self, force=True):
+            closed.append(True)
+
+    pane = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    old = _OldPty()
+    old_generation = pane._attach_pty(old, 303)
+    assert pane._detach_owned_pty(old, old_generation) is not None
+    pane._finish_pty_retirement(old_generation)
+    replacement = object()
+    replacement_generation = pane._attach_pty(replacement, 404)
+    pane._finalize = lambda: finalized.append(True)
+
+    pane._read_loop(old, old_generation)
+
+    assert pane._stop.is_set() is False
+    assert pane._lifecycle_snapshot() == (
+        replacement, 404, replacement_generation)
+    assert finalized == []
+    assert closed == []
+
+
+def test_retiring_generation_fences_attach_until_reader_cleanup_finishes():
+    """An old reader cannot finalize shared state after replacement attach."""
+    cleanup_entered = threading.Event()
+    cleanup_release = threading.Event()
+
+    class _OldPty:
+        def read(self, _size):
+            raise EOFError
+
+        def close(self, force=True):
+            pass
+
+    pane = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    pane._create_screen_pair(2, 10)
+    pane._marshal = lambda callback: callback()
+    pane._schedule_pane_refresh = lambda: None
+    pane.refresh = lambda *args, **kwargs: None
+    pane._show_hw_cursor = lambda *args, **kwargs: None
+    pane._finalize = lambda: None
+    old = _OldPty()
+    generation = pane._attach_pty(old, 707)
+
+    original_stop_writer = pane._stop_writer
+
+    def blocking_stop_writer():
+        cleanup_entered.set()
+        cleanup_release.wait(3.0)
+        return original_stop_writer()
+
+    pane._stop_writer = blocking_stop_writer
+    reader = threading.Thread(target=pane._read_loop, args=(old, generation))
+    reader.start()
+    assert cleanup_entered.wait(3.0)
+
+    try:
+        pane._attach_pty(object(), 808)
+        raise AssertionError("replacement attached during old-reader cleanup")
+    except RuntimeError as exc:
+        assert "retires" in str(exc)
+
+    cleanup_release.set()
+    reader.join(timeout=3.0)
+    assert not reader.is_alive()
+    replacement = object()
+    replacement_generation = pane._attach_pty(replacement, 808)
+    assert pane._lifecycle_snapshot() == (
+        replacement, 808, replacement_generation)
+
+
+def test_windows_kill_closes_and_taskkills_only_on_tracked_reaper():
+    """The Textual/UI caller only detaches; all Win32 teardown stays off it."""
+    calls = []
+
+    class _Pty:
+        pid = 5151
+
+        def write(self, _data):
+            pass
+
+        def isalive(self):
+            return True
+
+        def close(self, force=True):
+            calls.append(("close", threading.current_thread()))
+
+    pane = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    pty = _Pty()
+    pane._attach_pty(pty, pty.pid)
+    pane._start_writer()
+    caller = threading.current_thread()
+    old_win = rt._IS_WIN
+    old_reap_tree = rt.AgentTerminal._reap_tree
+    rt._IS_WIN = True
+    rt.AgentTerminal._reap_tree = staticmethod(
+        lambda pid: calls.append((f"taskkill:{pid}", threading.current_thread())))
+    try:
+        with rt._REAP_LOCK:
+            rt._REAP_THREADS.clear()
+        reaper = pane.kill()
+        assert reaper is not None
+        assert pane._pty is None and pane._pid is None
+        with rt._REAP_LOCK:
+            assert any(thread is reaper for thread in rt._REAP_THREADS)
+        reaper.join(timeout=3.0)
+        assert not reaper.is_alive()
+        assert [kind for kind, _thread in calls] == ["taskkill:5151", "close"]
+        assert all(thread is not caller for _kind, thread in calls)
+    finally:
+        rt.AgentTerminal._reap_tree = old_reap_tree
+        rt._IS_WIN = old_win
+
+
+def test_windows_natural_eof_closes_without_taskkilling_a_recycled_pid():
+    """EOF proves the direct child ended; close ConPTY but never taskkill its PID."""
+    calls = []
+
+    class _Pty:
+        pid = 5252
+
+        def read(self, _size):
+            raise EOFError
+
+        def close(self, force=True):
+            calls.append(("close", threading.current_thread()))
+
+    pane = rt.AgentTerminal(
+        ["agent"], sid="windows-natural-eof",
+        status_classifier=lambda _text, _title: "idle",
+    )
+    pane._create_screen_pair(3, 20)
+    pane._marshal = lambda callback: callback()
+    pane._schedule_pane_refresh = lambda: None
+    pane._show_hw_cursor = lambda *args, **kwargs: None
+    pane.refresh = lambda *args, **kwargs: None
+    pty = _Pty()
+    generation = pane._attach_pty(pty, pty.pid)
+    old_win = rt._IS_WIN
+    old_reap_tree = rt.AgentTerminal._reap_tree
+    rt._IS_WIN = True
+    rt.AgentTerminal._reap_tree = staticmethod(
+        lambda pid: calls.append((f"taskkill:{pid}", threading.current_thread())))
+    caller = threading.current_thread()
+    try:
+        pane._read_loop(pty, generation)
+        rt.join_all_reaps(timeout=3.0)
+        assert [kind for kind, _thread in calls] == ["close"], calls
+        assert calls[0][1] is not caller
+        assert pane.kill() is None
+    finally:
+        rt.AgentTerminal._reap_tree = old_reap_tree
+        rt._IS_WIN = old_win
+
+
+def test_windows_kill_race_checks_backend_identity_before_taskkill():
+    """A dead ConPTY child is not taskkilled while its reader publishes EOF."""
+    read_entered = threading.Event()
+    close_release = threading.Event()
+    calls = []
+
+    class _Pty:
+        pid = 5303
+
+        def read(self, _size):
+            read_entered.set()
+            close_release.wait(3.0)
+            raise EOFError
+
+        def isalive(self):
+            return False
+
+        def close(self, force=True):
+            calls.append(("close", threading.current_thread()))
+            close_release.set()
+
+    pane = rt.AgentTerminal(
+        ["agent"], sid="windows-eof-kill-race",
+        status_classifier=lambda _text, _title: "idle",
+    )
+    pane._create_screen_pair(2, 20)
+    pane._marshal = lambda callback: callback()
+    pane._schedule_pane_refresh = lambda: None
+    pane._show_hw_cursor = lambda *args, **kwargs: None
+    pane.refresh = lambda *args, **kwargs: None
+    pty = _Pty()
+    generation = pane._attach_pty(pty, pty.pid)
+    reader = threading.Thread(
+        target=pane._read_loop, args=(pty, generation))
+    reader.start()
+    assert read_entered.wait(3.0)
+
+    old_win = rt._IS_WIN
+    old_reap_tree = rt.AgentTerminal._reap_tree
+    rt._IS_WIN = True
+    rt.AgentTerminal._reap_tree = staticmethod(
+        lambda pid: calls.append((f"taskkill:{pid}", threading.current_thread())))
+    try:
+        reaper = pane.kill()
+        assert reaper is not None
+        reaper.join(timeout=3.0)
+        reader.join(timeout=3.0)
+        assert not reaper.is_alive() and not reader.is_alive()
+        assert [kind for kind, _thread in calls] == ["close"], calls
+    finally:
+        close_release.set()
+        rt.AgentTerminal._reap_tree = old_reap_tree
+        rt._IS_WIN = old_win
+
+
+def test_windows_reap_fails_closed_when_handle_liveness_is_unreadable():
+    """An isalive failure cannot authorize taskkill against a recycled PID."""
+    calls = []
+
+    class _Pty:
+        def isalive(self):
+            raise OSError("ConPTY handle state unavailable")
+
+        def close(self, force=True):
+            calls.append(("close", force))
+
+    old_reap_tree = rt.AgentTerminal._reap_tree
+    rt.AgentTerminal._reap_tree = staticmethod(
+        lambda pid: calls.append(("taskkill", pid)))
+    try:
+        rt.AgentTerminal._reap_windows(_Pty(), 424242)
+    finally:
+        rt.AgentTerminal._reap_tree = old_reap_tree
+    assert calls == [("close", True)], calls
+
+
+def test_windows_reader_failure_reaps_tree_before_closing_conpty():
+    """A backend error is not proof of child exit; reap its live tree safely."""
+    calls = []
+
+    class _Pty:
+        pid = 5353
+
+        def read(self, _size):
+            raise OSError("ConPTY read failed")
+
+        def isalive(self):
+            return True
+
+        def close(self, force=True):
+            calls.append(("close", threading.current_thread()))
+
+    pane = rt.AgentTerminal(
+        ["agent"], sid="windows-reader-failure",
+        status_classifier=lambda _text, _title: "idle",
+    )
+    pane._create_screen_pair(3, 20)
+    pane._marshal = lambda callback: callback()
+    pane._schedule_pane_refresh = lambda: None
+    pane._show_hw_cursor = lambda *args, **kwargs: None
+    pane.refresh = lambda *args, **kwargs: None
+    pty = _Pty()
+    generation = pane._attach_pty(pty, pty.pid)
+    old_win = rt._IS_WIN
+    old_reap_tree = rt.AgentTerminal._reap_tree
+    rt._IS_WIN = True
+    rt.AgentTerminal._reap_tree = staticmethod(
+        lambda pid: calls.append((f"taskkill:{pid}", threading.current_thread())))
+    try:
+        pane._read_loop(pty, generation)
+        rt.join_all_reaps(timeout=3.0)
+        assert [kind for kind, _thread in calls] == ["taskkill:5353", "close"]
+    finally:
+        rt.AgentTerminal._reap_tree = old_reap_tree
+        rt._IS_WIN = old_win
+
+
+def test_posix_reap_kills_a_surviving_group_after_direct_child_exit():
+    """A dead direct child does not prove that slave-holding descendants died."""
+    signals = []
+    closed = []
+
+    class _Pty:
+        def isalive(self):
+            return False
+
+        def close(self, force=True):
+            closed.append(threading.current_thread())
+
+    old_post = rt._post_signal
+    old_group_alive = rt._process_group_alive
+    rt._post_signal = lambda pid, name: signals.append((pid, name))
+    rt._process_group_alive = lambda pid: True
+    try:
+        rt.AgentTerminal._reap_posix(
+            _Pty(), 6161, deadline_s=0.0, writer=None)
+    finally:
+        rt._post_signal = old_post
+        rt._process_group_alive = old_group_alive
+    assert (6161, "SIGKILL") in signals
+    assert closed
+
+
+def test_posix_reader_failure_posts_graceful_signals_then_reaps():
+    """A read backend failure owns cleanup but still offers HUP/TERM grace."""
+    signals = []
+    closed = []
+
+    class _Pty:
+        pid = 6262
+
+        def read(self, _size):
+            raise OSError("master read failed")
+
+        def isalive(self):
+            return False
+
+        def close(self, force=True):
+            closed.append(threading.current_thread())
+
+    pane = rt.AgentTerminal(
+        ["agent"], sid="posix-reader-failure",
+        status_classifier=lambda _text, _title: "idle",
+    )
+    pane._create_screen_pair(3, 20)
+    pane._marshal = lambda callback: callback()
+    pane._show_hw_cursor = lambda *args, **kwargs: None
+    pane.refresh = lambda *args, **kwargs: None
+    pty = _Pty()
+    generation = pane._attach_pty(pty, pty.pid)
+    old_win = rt._IS_WIN
+    old_post = rt._post_signal
+    old_group_alive = rt._process_group_alive
+    rt._IS_WIN = False
+    rt._post_signal = lambda pid, name: signals.append((pid, name))
+    rt._process_group_alive = lambda pid: False
+    try:
+        pane._read_loop(pty, generation)
+        rt.join_all_reaps(timeout=3.0)
+        assert signals == [(6262, "SIGHUP"), (6262, "SIGTERM")]
+        assert closed
+    finally:
+        rt._IS_WIN = old_win
+        rt._post_signal = old_post
+        rt._process_group_alive = old_group_alive
+
+
 def test_post_signal_never_raises():
     """_post_signal resolves the signal by NAME (so the POSIX branch stays
     importable/testable on Windows, where SIGHUP doesn't exist) and swallows
@@ -166,6 +697,31 @@ def test_post_signal_never_raises():
     rt._post_signal(None, "SIGHUP")           # no pid → no-op
     rt._post_signal(999999999, "SIGHUP")      # pid > pid_max → ESRCH swallowed
     rt._post_signal(999999999, "NO_SUCH_SIG") # unknown name → no-op
+
+
+def test_post_signal_never_falls_back_from_a_disappeared_process_group():
+    """ESRCH on the group cannot authorize signalling a recycled bare PID."""
+    bare = []
+    had_killpg = hasattr(rt.os, "killpg")
+    old_killpg = getattr(rt.os, "killpg", None)
+    old_kill = rt.os.kill
+    try:
+        rt.os.killpg = lambda _pid, _sig: (_ for _ in ()).throw(
+            ProcessLookupError())
+        rt.os.kill = lambda pid, sig: bare.append((pid, sig))
+        rt._post_signal(9191, "SIGTERM")
+        assert bare == []
+
+        rt.os.killpg = lambda _pid, _sig: (_ for _ in ()).throw(
+            NotImplementedError())
+        rt._post_signal(9292, "SIGTERM")
+        assert bare and bare[-1][0] == 9292
+    finally:
+        rt.os.kill = old_kill
+        if had_killpg:
+            rt.os.killpg = old_killpg
+        else:
+            delattr(rt.os, "killpg")
 
 
 def test_pane_refresh_coalesces():
@@ -609,7 +1165,7 @@ def test_child_pty_env_hides_outer_terminal_identity_from_child():
     # WT_SESSION is PRESERVED so Claude detects Windows Terminal and uses the cursor
     # path that tracks the caret (stripping it parked the cursor and broke IME tracking).
     assert env["WT_SESSION"] == "outer-wt"
-    assert "TERM_PROGRAM" not in env
+    assert env["TERM_PROGRAM"] == "saikai"
     assert "TERM_PROGRAM_VERSION" not in env
     assert "KITTY_WINDOW_ID" not in env
     assert "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT" not in env
@@ -655,6 +1211,115 @@ def test_child_pty_env_presents_one_windows_terminal_identity_per_platform():
         "WEZTERM_EXECUTABLE_DIR": "/usr/bin",
     }, is_win=False)
     assert [k for k in wez if k.startswith("WEZTERM")] == [], wez
+
+
+def test_child_pty_env_scrubs_nested_terminals_and_normalizes_utf8():
+    """A pane is a new terminal boundary, not a child of the outer mux/emulator.
+
+    Live IPC sockets and outer-window identifiers must not let a pane command
+    control WezTerm/tmux/Kitty/Alacritty/Konsole/GNOME Terminal.  Locale
+    normalization changes only the codeset, preserving language/territory and
+    modifiers while making the PTY's decoded-stream contract UTF-8."""
+    outer = {
+        "PATH": "/bin",
+        "UNRELATED": "keep-me",
+        "WEZTERM_UNIX_SOCKET": "/tmp/wezterm.sock",
+        "WEZTERM_PANE": "7",
+        "TMUX": "/tmp/tmux,1,0",
+        "TMUX_PANE": "%4",
+        "STY": "123.screen",
+        "KITTY_WINDOW_ID": "9",
+        "KITTY_LISTEN_ON": "unix:/tmp/kitty.sock",
+        "KITTY_PID": "101",
+        "ALACRITTY_SOCKET": "/tmp/alacritty.sock",
+        "ALACRITTY_WINDOW_ID": "22",
+        "KONSOLE_DBUS_SERVICE": ":1.77",
+        "KONSOLE_DBUS_SESSION": "/Sessions/1",
+        "GNOME_TERMINAL_SCREEN": "/org/gnome/Terminal/screen/1",
+        "VTE_VERSION": "7600",
+        "TERMINFO": "/host/terminfo",
+        "TERMINFO_DIRS": "/host/a:/host/b",
+        "LANG": "ja_JP.SJIS",
+        "LC_MESSAGES": "de_DE.ISO-8859-1@euro",
+        "LANGUAGE": "ja:en",
+        "PYTHONUTF8": "0",
+        "PYTHONIOENCODING": "cp932",
+        "WT_SESSION": "outer-wt",
+    }
+
+    posix = rt._child_pty_env(outer, is_win=False)
+    stripped = {
+        "WEZTERM_UNIX_SOCKET", "WEZTERM_PANE", "TMUX", "TMUX_PANE", "STY",
+        "KITTY_WINDOW_ID", "KITTY_LISTEN_ON", "KITTY_PID",
+        "ALACRITTY_SOCKET", "ALACRITTY_WINDOW_ID",
+        "KONSOLE_DBUS_SERVICE", "KONSOLE_DBUS_SESSION",
+        "GNOME_TERMINAL_SCREEN", "VTE_VERSION", "TERMINFO", "TERMINFO_DIRS",
+        "WT_SESSION",
+    }
+    assert not (stripped & posix.keys()), sorted(stripped & posix.keys())
+    assert posix["UNRELATED"] == "keep-me"
+    assert posix["TERM"] == "xterm-256color"
+    assert posix["COLORTERM"] == "truecolor"
+    assert posix["TERM_PROGRAM"] == "saikai"
+    assert posix["LANG"] == "ja_JP.UTF-8"
+    assert posix["LC_MESSAGES"] == "de_DE.UTF-8@euro"
+    assert posix["LANGUAGE"] == "ja:en"
+    assert posix["PYTHONUTF8"] == "1"
+    assert posix["PYTHONIOENCODING"] == "utf-8"
+
+    # With no inherited locale, use a language-neutral UTF-8 locale.
+    bare = rt._child_pty_env({"PATH": "/bin"}, is_win=False)
+    assert bare["LC_CTYPE"] == "C.UTF-8"
+
+    # Windows environment names are case-insensitive even when a plain dict is
+    # supplied by a caller, so mixed/lowercase host probes must be scrubbed too.
+    windows = rt._child_pty_env({
+        "Path": r"C:\bin",
+        "wezterm_pane": "8",
+        "tmux": "outer",
+        "kitty_listen_on": "tcp:127.0.0.1:9999",
+        "alacritty_socket": r"\\.\pipe\alacritty",
+        "terminfo_dirs": r"C:\outer\terminfo",
+        "lang": "en_US.cp1252",
+    }, is_win=True)
+    assert not any(
+        key.upper() == "TMUX"
+        or key.upper().startswith((
+            "WEZTERM_", "KITTY_", "ALACRITTY_", "TERMINFO"))
+        for key in windows
+    ), windows
+    assert windows["lang"] == "en_US.UTF-8"
+    assert windows["TERM_PROGRAM"] == "saikai"
+    assert windows["WT_SESSION"]
+
+    # WT opt-out is a Windows compatibility switch, never permission to leak a
+    # Windows Terminal host identity into POSIX/WSL.
+    old_identity = rt._WT_IDENTITY
+    rt._WT_IDENTITY = False
+    try:
+        assert "WT_SESSION" not in rt._child_pty_env(
+            {"WT_SESSION": "outer-wt"}, is_win=False)
+        assert rt._child_pty_env(
+            {"WT_SESSION": "outer-wt"}, is_win=True)["WT_SESSION"] == "outer-wt"
+    finally:
+        rt._WT_IDENTITY = old_identity
+
+
+def test_windows_keepalive_text_inside_normal_output_is_preserved():
+    """pywinpty consumes its exact sentinel; ordinary matching text is data."""
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    terminal._create_screen_pair(2, 40)
+    terminal._marshal = lambda callback: callback()
+    terminal._update_status = lambda _status: None
+    old_is_win = rt._IS_WIN
+    rt._IS_WIN = True
+    try:
+        terminal._consume("before0011Ignoreafter")
+    finally:
+        rt._IS_WIN = old_is_win
+    assert terminal._current_screen()[0].splitlines()[0].startswith(
+        "before0011Ignoreafter")
 
 
 def test_cursor_sync_freezes_while_busy_and_settles_on_transition():
@@ -868,6 +1533,46 @@ def test_kitty_disambiguate_encodes_supported_key_classes_canonically():
     assert rt.encode_key("ctrl+a", None, **disambiguate) == "\x1b[97;5u"
     assert rt.encode_key(
         "alt+exclamation_mark", "!", **disambiguate) == "\x1b[33;3u"
+    # Textual's Kitty parser preserves these modifiers on Linux/WezTerm.
+    assert rt.encode_key("super+x", None, **disambiguate) == "\x1b[120;9u"
+    assert rt.encode_key("hyper+x", None, **disambiguate) == "\x1b[120;17u"
+    assert rt.encode_key("meta+x", None, **disambiguate) == "\x1b[120;33u"
+    assert rt.encode_key(
+        "ctrl+shift+super+x", None,
+        **disambiguate) == "\x1b[120;14u"
+
+
+def test_kitty_disambiguate_recovers_named_ascii_and_reserves_release_key():
+    """Textual drops `character` for modified ASCII; its key name must round-trip."""
+    disambiguate = {"kitty_flags": 1}
+    old_release = rt.RELEASE_FOCUS_KEY
+    try:
+        rt.configure_release_focus_key("ctrl+right_square_bracket")
+        expected = {
+            "ctrl+left_square_bracket": "\x1b[91;5u",
+            "ctrl+space": "\x1b[32;5u",
+            "ctrl+backslash": "\x1b[92;5u",
+            "alt+slash": "\x1b[47;3u",
+            "ctrl+at": "\x1b[64;5u",
+            "ctrl+underscore": "\x1b[95;5u",
+            "ctrl+vertical_line": "\x1b[124;5u",
+            # These may be unshifted keys on European layouts. Their Textual
+            # names omit the hyphen present in the Unicode character name.
+            "ctrl+less_than_sign": "\x1b[60;5u",
+            "ctrl+greater_than_sign": "\x1b[62;5u",
+        }
+        for key, encoded in expected.items():
+            assert rt.encode_key(key, None, **disambiguate) == encoded, key
+        assert rt.encode_key(
+            "ctrl+right_square_bracket", None, **disambiguate) is None
+
+        rt.configure_release_focus_key("ctrl+g")
+        assert rt.encode_key("ctrl+g", None, **disambiguate) is None
+        assert rt.encode_key(
+            "ctrl+right_square_bracket", None,
+            **disambiguate) == "\x1b[93;5u"
+    finally:
+        rt.configure_release_focus_key(old_release)
 
 
 def test_configure_release_focus_key_restores_old_key():
@@ -1078,6 +1783,26 @@ def test_extract_selection_slices_and_joins():
     assert ct._extract_selection() == "world"
 
 
+def test_wide_cell_selection_expands_stub_to_the_complete_grapheme():
+    """Selecting either display half of a wide EGC highlights and copies it once."""
+    import pyte
+
+    class _Focused(rt.AgentTerminal):
+        @property
+        def has_focus(self):
+            return True
+
+    t = _Focused(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._create_screen_pair(1, 5)
+    t._stream.feed("A界B\x1b[?25l")
+    t._sel_anchor = t._sel_head = (0, 2)  # the empty stub, not the leader
+
+    strip = t.render_line(0)
+    wide = [segment for segment in strip if segment.text == "界"]
+    assert len(wide) == 1 and bool(wide[0].style.reverse), list(strip)
+    assert t._extract_selection() == "界"
+
+
 def test_frozen_pane_copy_uses_snapshot_not_live_buffer():
     """Regression: copying from a FROZEN streaming pane must return the displayed
     frame, not whatever the reader scrolled into screen.buffer afterwards. Freeze
@@ -1234,12 +1959,14 @@ def test_agent_terminal_on_key_release_encode_and_dead():
     # A normal printable key -> encoded bytes to the child PTY (claude).
     posted.clear()
     t.on_key(_Ev("a", "a"))
+    _wait_pty_writer(t)
     assert writes == ["a"], writes
 
     # Ctrl-C -> encoded to the PTY (interrupts claude), NOT bubbled to the host.
     writes.clear()
     ev = _Ev("ctrl+c", "\x03")
     t.on_key(ev)
+    _wait_pty_writer(t)
     assert writes == ["\x03"] and ev.stopped, (writes, ev.stopped)
 
     # Dead pane -> nothing written; the key bubbles so host bindings still work.
@@ -1247,6 +1974,7 @@ def test_agent_terminal_on_key_release_encode_and_dead():
     t.is_dead = True
     t.on_key(_Ev("b", "b"))
     assert writes == [], writes
+    _retire_pty_writer(t)
 
 
 def test_mirror_inject_input_parses_full_terminal_keys():
@@ -1364,22 +2092,27 @@ def test_paste_text_wraps_and_submits():
     t._lock = threading.Lock()
     t._scroll = 0
     t.paste_text("/handoff")
+    _wait_pty_writer(t)
     assert writes == ["\x1b[200~/handoff\x1b[201~"], writes
     writes.clear(); t._bracketed_paste = False
     t.paste_text("/compact")
+    _wait_pty_writer(t)
     assert writes == ["/compact"], writes
     # Bracketed-paste breakout: an embedded ESC[201~ in the pasted text must be
     # STRIPPED before wrapping, else it ends paste mode early and the bytes after
     # it run as typed-and-submitted input. (#H3)
     writes.clear(); t._bracketed_paste = True
     t.paste_text("safe\x1b[201~\rmalicious")
+    _wait_pty_writer(t)
     assert writes == ["\x1b[200~safe\rmalicious\x1b[201~"], writes
     writes.clear(); t.submit()
+    _wait_pty_writer(t)
     assert writes == ["\r"], writes
     # dead pane: no write
     writes.clear(); t.is_dead = True
     t.paste_text("x"); t.submit()
     assert writes == [], writes
+    _retire_pty_writer(t)
 
 
 def test_paste_marker_strip_is_linear_not_quadratic():
@@ -1433,12 +2166,43 @@ def test_forward_wheel_only_when_mouse_reporting():
     assert t._forward_wheel(ev, up=True) is False and writes == []
     t._mouse_reporting = True; t._mouse_sgr = True     # ON + SGR → forwarded
     assert t._forward_wheel(ev, up=True) is True
+    _wait_pty_writer(t)
     assert writes == ["\x1b[<64;5;3M"], writes
     writes.clear()
     assert t._forward_wheel(ev, up=False) is True
+    _wait_pty_writer(t)
     assert writes == ["\x1b[<65;5;3M"], writes
     writes.clear(); t.is_dead = True                   # dead pane → never writes
     assert t._forward_wheel(ev, up=True) is False and writes == []
+    _retire_pty_writer(t)
+
+
+def test_forwarded_user_mouse_stamps_input_but_synthetic_release_does_not():
+    t = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._pty = _FakePtyWrites()
+    t.is_dead = False
+    t._mouse_reporting = True
+    t._mouse_sgr = True
+    t._mouse_click = True
+    t._mouse_btn_motion = False
+    t._mouse_any_motion = False
+    stamps = []
+    t._note_input = lambda: stamps.append("input")
+    event = _MouseEv(1, 1, button=1)
+
+    assert t._forward_wheel(event, up=True) is True
+    t._forward_mouse("down", event)
+    assert stamps == ["input", "input"]
+
+    t._fwd_buttons = {1}
+    t._fwd_captured = False
+    t._fwd_last = (2, 2)
+    t.release_mouse = lambda: None
+    t._cancel_forwarded_drag()
+    assert stamps == ["input", "input"], \
+        "host-generated cleanup must not extend the recent-user-input window"
+    _retire_pty_writer(t)
 
 
 def test_sync_output_stager_holds_split_frame_until_close():
@@ -1932,7 +2696,7 @@ def test_cursor_report_uses_the_cursor_at_the_querys_stream_position():
 
     sent.clear()
     t._consume("\x1b[1;1HX\x1b[6n\x1b[5;5HY\x1b[6n")
-    assert sent == ["\x1b[1;2R\x1b[5;6R"], sent  # each query at its own position
+    assert sent == ["\x1b[1;2R", "\x1b[5;6R"], sent  # each query at its own position
 
 
 def test_reader_asks_for_large_reads_and_guards_the_eof_flush():
@@ -1985,15 +2749,13 @@ def test_reader_asks_for_large_reads_and_guards_the_eof_flush():
     assert finalized == [True], "a failing eof flush must still finalize the pane"
 
 
-def test_large_paste_never_blocks_the_ui_thread_and_keeps_order():
-    """A big paste must not freeze the whole TUI.
+def test_all_pty_write_paths_are_nonblocking_fifo_and_utf8_accounted():
+    """Every producer uses one FIFO worker, even for a one-byte key/query reply.
 
-    on_paste/paste_text write to the PTY synchronously on the UI thread, and a POSIX
-    pty input queue is a few KiB — so pasting tens of KiB into a pane whose child is
-    momentarily not reading stdin blocks write() and with it the Textual event loop:
-    no keys, no repaints, no other pane, until the child drains. Hand oversized
-    writes to a daemon writer, and queue everything behind it while it drains so the
-    child still receives the bytes in order. Small writes stay inline. (#paste-block)"""
+    A child can stop reading stdin while its PTY input buffer is full.  No UI or
+    reader-thread path may then enter ``pty.write`` itself.  The accepted writes
+    must retain producer order, and the cap/accounting are UTF-8 bytes rather than
+    Python code points."""
     import threading as _th
     import time as _time
 
@@ -2003,59 +2765,346 @@ def test_large_paste_never_blocks_the_ui_thread_and_keeps_order():
 
     class _P:
         def write(self, data):
-            if len(data) > 100:
-                blocking.set()
-                release.wait(3.0)
+            blocking.set()
+            release.wait(3.0)
             order.append(data)
 
-    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    class _Key:
+        key = "a"
+        character = "a"
+        stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _t, _title: "idle")
     t._pty = _P()
     t.is_dead = False
-    t._write_lock = _th.Lock()
-    t._write_q = []
-    t._writer = None
+    t._snap_to_live = lambda: None
+    t._note_input = lambda *a, **k: None
+    t._bracketed_paste = False
+    t._mouse_sgr = True
+    t._marshal = lambda fn: fn()
+    t._cursor_rowcol = lambda: (1, 1)
+    t._start_writer()
 
-    # small write: straight out, no thread, observable immediately
-    t._write_child("a")
-    assert order == ["a"], order
-
-    big = "x" * 20000
     t0 = _time.monotonic()
-    t._write_child(big)
-    assert _time.monotonic() - t0 < 0.5, "an oversized write must not block the caller"
-    assert blocking.wait(3.0), "the writer thread must be draining the queue"
+    t.on_key(_Key())                              # one byte
+    assert _time.monotonic() - t0 < 1.0
+    assert blocking.wait(3.0), "writer did not begin the blocking first write"
 
-    t._write_child("\r")          # arrives while the big write is stuck
+    t0 = _time.monotonic()
+    t.paste_text("p" * 4096)                      # exact old inline threshold
+    reply_thread = _th.Thread(
+        target=lambda: t._answer_queries("\x1b[5n"))  # reader producer
+    reply_thread.start()
+    reply_thread.join(timeout=1.0)
+    assert not reply_thread.is_alive(), "query producer blocked"
+    t._write_child(t._mouse_seq(0, 2, 3, "M"))   # UI mouse producer
+    before_multibyte = t._write_pending_bytes
+    raw_result = []
+    raw_thread = _th.Thread(
+        target=lambda: raw_result.append(t.write("界" * 2000)))
+    raw_thread.start()
+    raw_thread.join(timeout=1.0)
+    assert raw_result == [True], "mirror/raw producer blocked or rejected"
+    assert t._write_pending_bytes - before_multibyte == 6000
+    assert _time.monotonic() - t0 < 1.0, "enqueue paths blocked behind pty.write"
+
     release.set()
     deadline = _time.monotonic() + 3.0
-    while len(order) < 3 and _time.monotonic() < deadline:
+    while len(order) < 5 and _time.monotonic() < deadline:
         _time.sleep(0.01)
-    assert order == ["a", big, "\r"], [len(x) for x in order]
-
-    # queue drained -> the writer retires and small writes are inline again
-    deadline = _time.monotonic() + 3.0
-    while t._writer is not None and _time.monotonic() < deadline:
+    assert order == [
+        "a",
+        "p" * 4096,
+        "\x1b[0n",
+        t._mouse_seq(0, 2, 3, "M"),
+        "界" * 2000,
+    ], [repr(x[:20]) for x in order]
+    while t._write_pending_bytes and _time.monotonic() < deadline:
         _time.sleep(0.01)
-    assert t._writer is None and t._write_q == []
+    assert t._write_pending_bytes == 0
+    writer = t._stop_writer()
+    if writer is not None:
+        writer.join(timeout=3.0)
+        assert not writer.is_alive()
 
-    # A child that never drains must not turn the queue into an unbounded buffer:
-    # every later keystroke would be swallowed AND retained forever.
-    wedge = _th.Event()
-    stuck = _th.Event()
 
-    class _Wedged:
+def test_writer_queue_items_cannot_cross_pty_generations():
+    """Accepted old input is bound to the old backend, never a replacement."""
+    first_entered = threading.Event()
+    first_release = threading.Event()
+    old_writes = []
+    new_writes = []
+
+    class _OldPty:
         def write(self, data):
-            stuck.set()
-            wedge.wait(5.0)
+            first_entered.set()
+            first_release.wait(3.0)
+            old_writes.append(data)
 
-    t._pty = _Wedged()
-    t._write_child("z" * 5000)
-    assert stuck.wait(3.0)
-    for _ in range(200):
-        t._write_child("k" * 100000)
-    queued = sum(len(x) for x in t._write_q)
-    assert queued <= rt._PTY_WRITE_QUEUE_MAX, queued
-    wedge.set()
+    class _NewPty:
+        def write(self, data):
+            new_writes.append(data)
+
+    pane = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    old = _OldPty()
+    old_generation = pane._attach_pty(old, 1001)
+    pane._start_writer()
+    assert pane.write("OLD-INFLIGHT")
+    assert first_entered.wait(3.0)
+    assert pane.write("OLD-QUEUED")
+
+    assert pane._detach_owned_pty(old, old_generation) is not None
+    pane._finish_pty_retirement(old_generation)
+    new = _NewPty()
+    pane._attach_pty(new, 1002)
+    pane._start_writer(reopen=True)
+    assert pane.write("NEW")
+
+    deadline = time.monotonic() + 3.0
+    while new_writes != ["NEW"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    first_release.set()
+    rt.join_all_pty_writers(timeout=3.0)
+
+    assert old_writes == ["OLD-INFLIGHT"]
+    assert new_writes == ["NEW"]
+
+
+def test_query_replies_enter_the_writer_fifo_at_their_stream_position():
+    """A UI key parsed between two child queries must not overtake query one."""
+    import threading as _th
+    import time as _time
+
+    backend_entered = _th.Event()
+    backend_release = _th.Event()
+    second_query_entered = _th.Event()
+    second_query_release = _th.Event()
+    writes = []
+
+    class _Pty:
+        def write(self, data):
+            backend_entered.set()
+            backend_release.wait(3.0)
+            writes.append(data)
+
+    pane = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    pane._pty = _Pty()
+    pane.is_dead = False
+    pane._create_screen_pair(4, 20)
+    pane._marshal = lambda callback: callback()
+    pane._update_status = lambda _status: None
+    pane._start_writer()
+    assert pane.write("BLOCK") is True
+    assert backend_entered.wait(3.0)
+
+    original_reply = pane._csi_query_reply
+
+    def gated_reply(token):
+        if token.final == "c":
+            second_query_entered.set()
+            assert second_query_release.wait(3.0)
+        return original_reply(token)
+
+    pane._csi_query_reply = gated_reply
+    reader = _th.Thread(target=lambda: pane._consume("\x1b[5n\x1b[c"))
+    reader.start()
+    assert second_query_entered.wait(3.0)
+    assert pane.write("KEY") is True
+    second_query_release.set()
+    reader.join(timeout=3.0)
+    assert not reader.is_alive()
+
+    backend_release.set()
+    deadline = _time.monotonic() + 3.0
+    while pane._write_pending_bytes and _time.monotonic() < deadline:
+        _time.sleep(0.005)
+    assert writes == [
+        "BLOCK",
+        "\x1b[0n",
+        "KEY",
+        "\x1b[?62;22c",
+    ], writes
+    pane._retire_sync_deadline()
+    worker = pane._stop_writer()
+    if worker is not None:
+        worker.join(timeout=3.0)
+        assert not worker.is_alive()
+
+
+def test_pty_writer_rejects_byte_overflow_and_stops_bounded():
+    """Saturation rejects without corrupting FIFO/accounting; teardown never waits
+    inline for a currently-blocked backend write and wakes the sole worker."""
+    import threading as _th
+    import time as _time
+
+    entered = _th.Event()
+    release = _th.Event()
+    writes = []
+
+    class _P:
+        def write(self, data):
+            entered.set()
+            release.wait(3.0)
+            writes.append(data)
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _t, _title: "idle")
+    t._pty = _P()
+    t.is_dead = False
+    t._start_writer()
+    first = t._writer
+    t._start_writer()
+    assert t._writer is first and t._writer_workers_started == 1
+    with rt._PTY_WRITER_THREADS_LOCK:
+        assert any(worker is first for worker in rt._PTY_WRITER_THREADS)
+
+    old_cap = rt._PTY_WRITE_QUEUE_MAX
+    old_log = rt._log
+    caller = _th.current_thread()
+    logged = []
+    rt._PTY_WRITE_QUEUE_MAX = 8
+    rt._log = lambda message: logged.append((_th.current_thread(), message))
+    worker = None
+    try:
+        assert t.write("x") is True
+        assert entered.wait(3.0)
+        # In-flight "x" already consumes one byte. Nine UTF-8 bytes cannot fit.
+        assert t.write("界" * 3) is False
+        assert logged == [], "rejection performed filesystem logging on caller"
+        assert t._write_pending_bytes == 1
+        # A later fitting item remains acceptable and follows the first.
+        assert t.write("ab") is True
+        assert t._write_pending_bytes == 3
+
+        started = _time.monotonic()
+        worker = t._stop_writer()
+        assert _time.monotonic() - started < 1.0
+        assert t._write_accepting is False
+        assert t._write_queued_bytes == 0
+        assert list(t._write_q) == []
+        assert t.write("late") is False
+        release.set()
+        assert worker is first
+        worker.join(timeout=3.0)
+        assert not worker.is_alive()
+        assert logged and all(thread is not caller for thread, _message in logged)
+        assert any("9 UTF-8 bytes" in message for _thread, message in logged)
+        assert t._write_pending_bytes == 0
+        assert t._writer is None
+        assert writes == ["x"], writes
+    finally:
+        rt._PTY_WRITE_QUEUE_MAX = old_cap
+        rt._log = old_log
+        release.set()
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=3.0)
+    rt.join_all_pty_writers(timeout=1.0)
+
+
+def test_mirror_raw_input_uses_public_pane_writer():
+    """Pane-direct browser bytes must enter the same bounded FIFO as local input."""
+    written = []
+
+    class _Pane:
+        is_dead = False
+        _pty = object()
+
+        def _note_input(self):
+            pass
+
+        def write(self, data):
+            written.append(data)
+            return True
+
+        def _send_to_child(self, _data):
+            raise AssertionError("mirror used private writer")
+
+    app = saikai._MirrorControl.__new__(saikai._MirrorControl)
+    app._control_enabled = True
+    app._mirror_pane_term = _Pane()
+    app._mirror_inject_raw("\x1b[A")
+    assert written == ["\x1b[A"]
+
+
+def test_natural_eof_and_kill_stop_the_persistent_writer():
+    """Both lifecycle exits stop acceptance and wake an idle pane writer."""
+    class _Pty:
+        def write(self, _data):
+            pass
+
+        def close(self, force=True):
+            pass
+
+    def _pane():
+        pane = rt.AgentTerminal(
+            ["agent"], status_classifier=lambda _text, _title: "idle")
+        pane._pty = _Pty()
+        pane.is_dead = False
+        pane.sid = "writer-lifecycle"
+        pane._start_writer()
+        return pane, pane._writer
+
+    eof_pane, eof_writer = _pane()
+    eof_pane._marshal = lambda callback: callback()
+    eof_pane._show_hw_cursor = lambda *args, **kwargs: None
+    eof_pane.refresh = lambda: None
+    eof_pane._finalize()
+    eof_writer.join(timeout=3.0)
+    assert not eof_writer.is_alive()
+    assert eof_pane._write_accepting is False
+    assert eof_pane.write("late") is False
+
+    killed_pane, killed_writer = _pane()
+    old_win = rt._IS_WIN
+    rt._IS_WIN = True
+    try:
+        reaper = killed_pane.kill()
+        assert reaper is not None
+        reaper.join(timeout=3.0)
+        assert not reaper.is_alive()
+    finally:
+        rt._IS_WIN = old_win
+    killed_writer.join(timeout=3.0)
+    assert not killed_writer.is_alive()
+    assert killed_pane._write_accepting is False
+    assert killed_pane._pty is None
+
+
+def test_spawn_starts_the_persistent_writer():
+    """The spawn boundary arms input before the reader can produce a query."""
+    spawned = []
+
+    class _Pty:
+        pid = 123
+
+        def write(self, _data):
+            pass
+
+    class _Backend:
+        @staticmethod
+        def spawn(argv, **kwargs):
+            spawned.append((argv, kwargs))
+            return _Pty()
+
+    pane = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    old_backend = rt.PtyProcess
+    rt.PtyProcess = _Backend
+    try:
+        pane._spawn(5, 20)
+        assert spawned and spawned[0][0] == ["agent"]
+        assert pane._writer is not None and pane._writer.is_alive()
+        assert pane._write_accepting is True
+    finally:
+        rt.PtyProcess = old_backend
+        worker = pane._stop_writer()
+        if worker is not None:
+            worker.join(timeout=3.0)
+            assert not worker.is_alive()
 
 
 def test_dcs_payloads_never_reach_the_grid():
@@ -2181,6 +3230,28 @@ def test_cursor_report_clamps_pending_wrap_and_honours_origin_mode():
     assert t._cursor_rowcol() == (2, 3)
 
 
+def test_split_emoji_width_drives_cpr_and_ime_anchor_cell():
+    """CPR and the outer native cursor must observe the committed EGC width."""
+    t = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._create_screen_pair(2, 10)
+    t._marshal = lambda callback: callback()
+    t._update_status = lambda _status: None
+    replies = []
+    t._send_to_child = replies.append
+
+    t._consume("A\u2764")
+    t._consume("\ufe0f")
+    t._consume("\x1b[6n")
+
+    assert replies[-1] == "\x1b[1;4R"
+    assert t._screen.cursor.x == 3
+    assert rt._ime_anchor_xy(
+        t._screen.cursor.x, t._screen.cursor.y,
+        40, 5, t._screen.columns, t._screen.lines,
+    ) == (43, 5)
+
+
 def test_cursor_query_fail_open_only_for_a_RETAINED_query():
     """The fail-open that releases a staged frame early must fire only when the query
     is inside the RETAINED text. A ?6n that arrives BEFORE the ?2026h in the same PTY
@@ -2276,8 +3347,10 @@ def test_input_snaps_scrolled_back_pane_to_live():
     # Typing snaps to the live bottom AND still sends the key to the agent.
     t = _mk()
     t.on_key(_Ev("a", "a"))
+    _wait_pty_writer(t)
     assert writes == ["a"], writes
     assert t._scroll == 0, f"typing must snap to live, got _scroll={t._scroll}"
+    _retire_pty_writer(t)
 
     # Ctrl+] (release focus) is not input: scrollback preserved, nothing written.
     writes.clear()
@@ -2285,22 +3358,25 @@ def test_input_snaps_scrolled_back_pane_to_live():
     t.on_key(_Ev(rt.RELEASE_FOCUS_KEY))
     assert writes == [], writes
     assert t._scroll == 7, f"Ctrl+] must not disturb scrollback, got {t._scroll}"
+    _retire_pty_writer(t)
 
     # paste_text and submit are input too -> snap.
     writes.clear()
     t = _mk()
     t.paste_text("hi")
+    _wait_pty_writer(t)
     assert t._scroll == 0 and writes == ["hi"], (t._scroll, writes)
+    _retire_pty_writer(t)
     writes.clear()
     t = _mk()
     t.submit()
+    _wait_pty_writer(t)
     assert t._scroll == 0 and writes == ["\r"], (t._scroll, writes)
+    _retire_pty_writer(t)
 
 
-def test_consume_collapses_alt_screen_reset_amplification():
-    """A chunk that ALTERNATES alt-screen enter/leave must end on the LAST
-    context's content with the correct in_alt — identical to the per-transition
-    reset loop, but without N buffer reallocations under the lock. (#audit-altscreen-reset)"""
+def test_consume_orders_multiple_alt_screen_transitions_without_reset_amplification():
+    """Several transitions in one chunk preserve each real buffer in order."""
     import pyte
     t = rt.AgentTerminal.__new__(rt.AgentTerminal)
     t._lock = threading.Lock()
@@ -2309,22 +3385,689 @@ def test_consume_collapses_alt_screen_reset_amplification():
     t._alt = rt.AltScreenTracker()
     t._scroll = 0
     t._scr_ver = 0
-    t._esc_carry = ""
     t._bracketed_paste = False
     t._mouse_reporting = False
     t._mouse_sgr = False
     t._current_screen = lambda: ("", "")
     t._update_status = lambda s: None
     t._status_classifier = lambda txt, title: "idle"
-    # AAA(normal) → [enter]BBB → [leave]CCC → [enter]DDD : 3 transitions in one chunk.
+    # AAA(main) → [enter]BBB → [leave]CCC → [enter]DDD.
     t._consume("AAA\x1b[?1049hBBB\x1b[?1049lCCC\x1b[?1049hDDD")
     line0 = "".join(t._screen.buffer[0][x].data for x in range(20)).rstrip()
-    assert t._alt.in_alt is True, t._alt.in_alt        # last toggle entered alt
-    assert line0 == "DDD", repr(line0)                 # only the final context is visible
-    # A single transition still works (the unchanged common path).
+    assert t._alt.in_alt is True, t._alt.in_alt
+    assert line0 == "      DDD", repr(line0)           # clean alt, inherited cursor
     t._consume("\x1b[?1049lZZZ")
     line0b = "".join(t._screen.buffer[0][x].data for x in range(20)).rstrip()
-    assert t._alt.in_alt is False and line0b == "ZZZ", (t._alt.in_alt, repr(line0b))
+    assert t._alt.in_alt is False
+    assert line0b == "AAACCCZZZ", (t._alt.in_alt, repr(line0b))
+
+
+def test_main_and_alternate_buffers_preserve_content_history_and_cursor():
+    """47/1047/1049 use two real buffers; repeated toggles are idempotent."""
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(12, 3, history=3)
+    t._stream = pyte.Stream(t._screen)
+    t._marshal = lambda fn: fn()
+    t._update_status = lambda _status: None
+
+    t._consume("MAIN\x1b[3;6H")
+    main = t._screen
+    main_cursor = (main.cursor.y, main.cursor.x)
+    main_lines = rt._pyte_grid_lines(main)
+    main_history = list(main.history.top)
+
+    t._consume("\x1b[?25;1049hALT")
+    alternate = t._screen
+    assert alternate is not main
+    assert (alternate.cursor.y, alternate.cursor.x) == (
+        main_cursor[0], main_cursor[1] + 3)
+    assert "".join(
+        alternate.buffer[main_cursor[0]][x].data
+        for x in range(alternate.columns)
+        if alternate.buffer[main_cursor[0]][x].data != ""
+    ).rstrip().endswith("ALT")
+    assert t._alt.in_alt is True
+
+    t._consume("\x1b[?1049h+")  # repeated SET must not clear the live alt buffer
+    assert rt._pyte_grid_lines(alternate)[main_cursor[0]].rstrip().endswith("ALT+")
+
+    t._consume("\x1b[?1049l")
+    assert t._screen is main
+    assert rt._pyte_grid_lines(main) == main_lines
+    assert list(main.history.top) == main_history
+    assert (main.cursor.y, main.cursor.x) == main_cursor
+    assert t._alt.in_alt is False
+
+    t._consume("\x1b[?25l\x1b[?1049h")
+    assert t._screen.cursor.hidden is True
+    t._consume("\x1b[?25h\x1b[?1049l")
+    assert t._screen is main and main.cursor.hidden is False
+
+    t._consume("\x1b[?47hONE\x1b[?47l\x1b[?1047hTWO\x1b[?1047l")
+    assert t._screen is main
+    assert rt._pyte_grid_lines(main) == main_lines
+
+
+def test_decsc_is_one_persistent_buffer_local_slot_like_xterm():
+    """ESC 7 overwrites one slot and repeated ESC 8 restores it without popping."""
+    import pyte
+
+    screen = rt._HistoryScreenBase(10, 3, history=2)
+    stream = pyte.Stream(screen)
+    stream.feed(
+        "\x1b[1;2H\x1b7"
+        "\x1b[1;5H\x1b7"
+        "\x1b[1;8H\x1b8")
+    assert (screen.cursor.y, screen.cursor.x) == (0, 4)
+    assert len(screen.savepoints) == 1
+
+    stream.feed("\x1b[1;9H\x1b8")
+    assert (screen.cursor.y, screen.cursor.x) == (0, 4)
+    assert len(screen.savepoints) == 1
+
+
+def test_1049_entry_overwrites_main_decsc_slot_once_like_xterm():
+    """1049h saves its entry cursor in MAIN's DECSC slot; repeated h is inert."""
+    import json
+    import pathlib
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is not None:
+        xterm = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "saikai_mirror_static" / "xterm.min.js"
+        )
+        script = r"""
+const { Terminal } = require(process.argv[1]);
+const terminal = new Terminal({ cols: 10, rows: 4 });
+new Promise(resolve => terminal.write(
+  '\x1b[4;9H\x1b7\x1b[2;6H\x1b[?1049hALT' +
+  '\x1b[3;4H+\x1b[?1049h\x1b[?1049l\x1b[H\x1b8',
+  resolve
+)).then(() => process.stdout.write(JSON.stringify([
+  terminal.buffer.active.cursorY,
+  terminal.buffer.active.cursorX
+])));
+"""
+        result = subprocess.run(
+            [node, "-e", script, str(xterm)],
+            check=True, capture_output=True, text=True, encoding="utf-8",
+        )
+        assert json.loads(result.stdout) == [1, 5]
+
+    for mode in ("47", "1047", "1049"):
+        t = rt.AgentTerminal(
+            ["agent"], status_classifier=lambda _txt, _title: "idle")
+        t._create_screen_pair(4, 10)
+        t._marshal = lambda callback: callback()
+        t._update_status = lambda _status: None
+
+        # The user's older ESC7 slot must be replaced by the cursor at entry.
+        t._consume(
+            f"\x1b[4;9H\x1b7\x1b[2;6H\x1b[?{mode}hALT")
+        main = t._main_screen
+        assert len(main.savepoints) == 1
+        saved = main.savepoints[-1]
+        assert (saved.cursor.y, saved.cursor.x) == (1, 5), mode
+
+        # An idempotent SET neither clears ALT nor overwrites MAIN's slot.
+        t._consume("\x1b[3;4H+")
+        alt_expected = rt._pyte_grid_lines(t._alt_screen)
+        t._consume(f"\x1b[?{mode}h")
+        assert rt._pyte_grid_lines(t._alt_screen) == alt_expected, mode
+        assert main.savepoints[-1] is saved, mode
+
+        # This matches vendored xterm's 1049 contract: future DECRC restores
+        # the entry point, not the older explicit ESC7 point. Saikai
+        # intentionally normalizes legacy 47/1047 to that same contract.
+        t._consume(f"\x1b[?{mode}l\x1b[H\x1b8")
+        assert (main.cursor.y, main.cursor.x) == (1, 5), mode
+        assert len(main.savepoints) == 1
+
+
+def test_alternate_buffer_inherits_rendition_and_keeps_global_modes_in_sync():
+    """1049 saves buffer-local cursor/rendition but not terminal-global modes."""
+    from pyte import modes
+
+    t = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._create_screen_pair(5, 10)
+    t._marshal = lambda callback: callback()
+    t._update_status = lambda _status: None
+
+    t._consume(
+        "\x1b[31m\x1b[?7l\x1b[4h"
+        "\x1b[2;4r\x1b[?6h\x1b[3;5H")
+    main = t._main_screen
+    saved_cursor = (main.cursor.y, main.cursor.x)
+    saved_attrs = main.cursor.attrs
+    saved_margins = main.margins
+
+    t._consume("\x1b[?1049h")
+    alternate = t._alt_screen
+    assert t._screen is alternate
+    assert (alternate.cursor.y, alternate.cursor.x) == saved_cursor
+    assert alternate.cursor.attrs == saved_attrs
+    assert modes.DECAWM not in alternate.mode
+    assert modes.IRM in alternate.mode
+    assert modes.DECOM in alternate.mode
+    assert alternate.margins is None
+
+    # Modes are terminal-global even while MAIN is inactive. DECSTBM margins
+    # and SGR are buffer-local; 1049 restores MAIN's exact state.
+    t._consume("\x1b[?7h\x1b[4l\x1b[1;3r\x1b[?6l\x1b[32m")
+    assert alternate.margins != saved_margins
+    t._consume("\x1b[?1049l")
+    assert t._screen is main
+    assert (main.cursor.y, main.cursor.x) == saved_cursor
+    assert main.cursor.attrs == saved_attrs
+    assert modes.DECAWM in main.mode
+    assert modes.IRM not in main.mode
+    assert modes.DECOM not in main.mode
+    assert main.margins == saved_margins
+
+
+def test_mirror_normalizes_47_and_1047_to_the_local_1049_contract():
+    """The pane mirror must reproduce saikai's save/restore semantics exactly."""
+    import json
+    import pathlib
+    import shutil
+    import subprocess
+
+    t = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._create_screen_pair(3, 12)
+    t._marshal = lambda callback: callback()
+    t._update_status = lambda _status: None
+    mirrored = []
+    t._mirror_tee = mirrored.append
+
+    source = (
+        "MAIN\x1b[2;3H"
+        "\x1b[?25;47hALT\x1b[?47;1004lZ"
+        "\x1b[?1047hQ\x1b[?1047l")
+    t._consume(source)
+    mirrored_text = "".join(mirrored)
+    assert "\x1b[?25;1049h" in mirrored_text
+    assert "\x1b[?1049;1004l" in mirrored_text
+    assert "\x1b[?47h" not in mirrored_text
+    assert "\x1b[?1047h" not in mirrored_text
+
+    node = shutil.which("node")
+    if node is None:
+        return
+    asset = pathlib.Path(rt.__file__).with_name(
+        "saikai_mirror_static") / "xterm.min.js"
+    script = r"""
+const { Terminal } = require(process.argv[1]);
+const source = JSON.parse(process.argv[2]);
+const term = new Terminal({cols: 12, rows: 3});
+term.write(source, () => {
+  const normal = term.buffer.normal;
+  const rows = [];
+  for (let y = 0; y < 3; y++) {
+    rows.push(normal.getLine(y).translateToString(true));
+  }
+  process.stdout.write(JSON.stringify({
+    rows, cursor: [normal.cursorY, normal.cursorX]
+  }));
+});
+"""
+    result = subprocess.run(
+        [node, "-e", script, str(asset),
+         json.dumps(mirrored_text, ensure_ascii=False)],
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    )
+    browser = json.loads(result.stdout)
+    assert browser["rows"] == [line.rstrip() for line in rt._pyte_grid_lines(
+        t._main_screen)]
+    assert tuple(browser["cursor"]) == (
+        t._main_screen.cursor.y, t._main_screen.cursor.x)
+
+
+def test_software_cursor_on_a_wide_stub_is_rendered_on_its_leader():
+    """Linux/IME-off must not lose the caret when the child addresses a stub."""
+    class _Focused(rt.AgentTerminal):
+        @property
+        def has_focus(self):
+            return True
+
+    t = _Focused(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._create_screen_pair(1, 4)
+    t._stream.feed("界\x1b[1D")  # cursor x=1, the wide glyph's empty stub
+    old_win, old_anchor = rt._IS_WIN, rt._IME_ANCHOR
+    rt._IS_WIN, rt._IME_ANCHOR = False, False
+    try:
+        strip = t.render_line(0)
+    finally:
+        rt._IS_WIN, rt._IME_ANCHOR = old_win, old_anchor
+    wide = [segment for segment in strip if segment.text == "界"]
+    assert len(wide) == 1 and bool(wide[0].style.reverse), list(strip)
+
+
+def test_render_line_selects_active_buffer_under_the_screen_lock():
+    t = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._create_screen_pair(1, 4)
+    t._main_stream.feed("MAIN")
+    t._alt_stream.feed("ALTT")
+    t._screen = t._main_screen
+    t._stream = t._main_stream
+
+    class _SwitchOnAcquire:
+        def __enter__(self):
+            t._screen = t._alt_screen
+            t._stream = t._alt_stream
+
+        def __exit__(self, *_args):
+            return False
+
+    t._lock = _SwitchOnAcquire()
+    assert t.render_line(0).text == "ALTT"
+
+
+def test_dead_pane_preserves_and_allows_copying_the_final_output():
+    """Exit UI never replaces the last diagnostic and dead text stays selectable."""
+    t = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._create_screen_pair(2, 30)
+    t._stream.feed("\x1b[2;1HFATAL: final diagnostic")
+    t.is_dead = True
+    t.refresh = lambda *args, **kwargs: None
+    t.capture_mouse = lambda: None
+    t.release_mouse = lambda: None
+    t._autoscroll_timer = type(
+        "_StoppedTimer", (), {"stop": lambda self: None})()
+    copied = []
+    t._copy_text = copied.append
+
+    rendered = t.render_line(1).text
+    assert rendered.startswith("FATAL: final diagnostic")
+    assert "agent exited" not in rendered
+
+    t.on_mouse_down(_MouseEv(0, 1, button=1))
+    t.on_mouse_move(_MouseEv(4, 1, button=1))
+    t.on_mouse_up(_MouseEv(4, 1, button=1))
+    assert copied == ["FATAL"]
+
+
+def test_snapshot_and_copy_select_active_buffer_under_the_screen_lock():
+    t = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._create_screen_pair(1, 4)
+    t._main_stream.feed("MAIN")
+    t._alt_stream.feed("ALTT")
+
+    class _SwitchOnAcquire:
+        def __enter__(self):
+            t._screen = t._alt_screen
+            t._stream = t._alt_stream
+
+        def __exit__(self, *_args):
+            return False
+
+    t._screen = t._main_screen
+    t._stream = t._main_stream
+    t._lock = _SwitchOnAcquire()
+    t._snapshot_frozen()
+    assert "".join(ch.data for ch in t._frozen_buf[0]) == "ALTT"
+
+    t._screen = t._main_screen
+    t._stream = t._main_stream
+    t._frozen = False
+    t._frozen_buf = None
+    t._sel_anchor = (0, 0)
+    t._sel_head = (0, 3)
+    t._lock = _SwitchOnAcquire()
+    assert t._extract_selection() == "ALTT"
+
+
+def test_resize_updates_both_buffers_versions_cpr_ime_and_mirror():
+    """Resize has one lock phase, then synchronizes host-facing state outside it."""
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(10, 4, history=3)
+    t._stream = pyte.Stream(t._screen)
+    t._marshal = lambda fn: fn()
+    t._update_status = lambda _status: None
+    t._consume("\x1b[?1049hALT\x1b[?1049l")
+    main = t._screen
+    alternate = t._alt_screen
+    main.cursor.x = alternate.cursor.x = 9
+    main.cursor.y = alternate.cursor.y = 3
+    t._scroll = 2
+    t._scr_ver = 7
+    t._cached_ver = 7
+    t._cached_screen = ("stale", "stale")
+    t._last_poll_ver = 7
+    t._dims = lambda: (2, 4)
+    winsizes = []
+    t._pty = type("P", (), {"setwinsize": lambda self, r, c: winsizes.append((r, c))})()
+    t.is_dead = False
+    t.refresh = lambda *a, **k: None
+    syncs = []
+    reseeds = []
+    t._sync_terminal_cursor = lambda reason="repaint": syncs.append(reason)
+    t.mirror_reseed = lambda: reseeds.append(True)
+
+    t.on_resize(None)
+
+    assert (main.lines, main.columns) == (2, 4)
+    assert (alternate.lines, alternate.columns) == (2, 4)
+    for screen in (main, alternate):
+        assert 0 <= screen.cursor.y < 2
+        assert 0 <= screen.cursor.x <= 4
+    assert t._scroll == 0
+    assert t._scr_ver == 8 and t._cached_ver == -1 and t._last_poll_ver == -1
+    assert t._cursor_rowcol() == (
+        min(main.cursor.y + 1, main.lines),
+        min(main.cursor.x + 1, main.columns),
+    )
+    assert winsizes == [(2, 4)]
+    assert syncs == ["focus"]
+    assert reseeds == [True]
+
+
+def test_resize_rebuilds_frozen_snapshot_and_clamps_selection_geometry():
+    """Resize must not leave a frozen pane reading live through a missing snapshot."""
+    t = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._create_screen_pair(2, 6)
+    t._marshal = lambda fn: fn()
+    t._update_status = lambda _status: None
+    t.refresh = lambda *a, **k: None
+    t._sync_terminal_cursor = lambda **_kw: None
+    t.mirror_reseed = lambda: None
+    t._consume("OLD123")
+    t._frozen = True
+    t._snapshot_frozen()
+    t._sel_anchor = (9, 9)
+    t._sel_head = (8, 8)
+    t._pending_anchor = (7, 7)
+    t._dims = lambda: (2, 4)
+
+    # The child keeps mutating the live grid while the displayed frame is frozen.
+    # Resize must reshape OLD123, not silently jump to this unseen live frame.
+    t._consume("\x1b[HNEW456")
+    assert rt._pyte_grid_lines(t._screen)[0].startswith("NEW456")
+    t.on_resize(None)
+
+    assert t._frozen is True
+    assert t._frozen_buf is not None
+    assert all(len(row) == 4 for row in t._frozen_buf.values())
+    assert t._sel_anchor == (1, 3)
+    assert t._sel_head == (1, 3)
+    assert t._pending_anchor == (1, 3)
+    frozen = [
+        "".join(t._buf_for_row(t._screen, 0, y)[x].data
+                for x in range(t._screen.columns))
+        for y in range(t._screen.lines)
+    ]
+    assert frozen[0] == "OLD1", frozen
+
+    t._consume("\x1b[HLIVE")
+    assert [
+        "".join(t._buf_for_row(t._screen, 0, y)[x].data
+                for x in range(t._screen.columns))
+        for y in range(t._screen.lines)
+    ] == frozen
+    assert rt._pyte_grid_lines(t._screen)[0].startswith("LIVE")
+
+
+def test_resize_crops_frozen_wide_graphemes_without_orphans():
+    from rich.cells import cell_len
+
+    t = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._create_screen_pair(2, 5)
+    t._stream.feed("ABC界")
+    t._frozen = True
+    t._snapshot_frozen()
+    t._dims = lambda: (2, 4)
+    t._sync_terminal_cursor = lambda **_kw: None
+    t.mirror_reseed = lambda: None
+    t.refresh = lambda *a, **_kw: None
+
+    t.on_resize(None)
+
+    row = t._frozen_buf[0]
+    assert [cell.data for cell in row] == ["A", "B", "C", " "]
+    assert cell_len("".join(cell.data for cell in row if cell.data != "")) == 4
+
+
+def test_scrollback_snapshot_survives_full_deque_eviction_for_render_and_copy():
+    """A pinned view must not drift when deque(maxlen) evicts at constant length."""
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(8, 2, history=3)
+    t._stream = pyte.Stream(t._screen)
+    t._marshal = lambda fn: fn()
+    t._update_status = lambda _status: None
+    t.refresh = lambda *a, **k: None
+    t._consume("L0\r\nL1\r\nL2\r\nL3\r\nL4")
+    assert len(t._screen.history.top) == 3
+
+    event = type("E", (), {"stop": lambda self: None})()
+    t.on_mouse_scroll_up(event)
+
+    def visible():
+        with t._lock:
+            return [
+                "".join(
+                    t._buf_for_row(t._screen, t._scroll, row)[column].data
+                    for column in range(t._screen.columns)
+                    if t._buf_for_row(t._screen, t._scroll, row)[column].data != ""
+                )
+                for row in range(t._screen.lines)
+            ]
+
+    before = visible()
+    t._sel_anchor = (0, 0)
+    t._sel_head = (1, 7)
+    copied_before = t._extract_selection()
+
+    t._consume("\r\nN5\r\nN6\r\nN7")
+    assert len(t._screen.history.top) == 3
+    assert visible() == before
+    assert t._extract_selection() == copied_before
+
+
+def test_decscusr_tracks_shape_and_restores_textual_default_on_hide():
+    """DECSCUSR reaches the outer native cursor only while the pane owns it."""
+    tokens = rt.VTTokenizer().feed("\x1b[5 q")
+    assert len(tokens) == 1
+
+    writes = []
+
+    class _Drv:
+        def write(self, data):
+            writes.append(data)
+
+    class _Shim(rt.AgentTerminal):
+        app = property(lambda self: type("A", (), {"_driver": _Drv()})())
+
+    t = _Shim.__new__(_Shim)
+    t.sid = "shape"
+    t._hw_cursor_visible = None
+    t._hw_cursor_shape = 0
+    t._cursor_style = 0
+    t._apply_cursor_style(tokens[0])
+    assert t._cursor_style == 5
+
+    old_anchor = rt._IME_ANCHOR
+    rt._IME_ANCHOR = True
+    try:
+        t._show_hw_cursor(True)
+        t._show_hw_cursor(False)
+    finally:
+        rt._IME_ANCHOR = old_anchor
+
+    assert "\x1b[5 q" in writes
+    assert "\x1b[0 q" in writes
+    assert writes.index("\x1b[5 q") < writes.index("\x1b[0 q")
+
+
+def test_decscusr_is_presented_atomically_with_synchronized_output():
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(10, 2, history=2)
+    t._stream = pyte.Stream(t._screen)
+    t._marshal = lambda fn: fn()
+    t._update_status = lambda _status: None
+
+    t._consume("\x1b[?2026h\x1b[5 q")
+    assert t._cursor_style == 0
+    t._consume("\x1b[?2026l")
+    assert t._cursor_style == 5
+
+
+def test_cursor_shape_resets_on_hands_off_blur_and_widget_hide():
+    from textual.widgets import Input
+
+    writes = []
+
+    class _Drv:
+        def write(self, data):
+            writes.append(data)
+
+    class _Screen:
+        focused = Input()
+
+    class _Shim(rt.AgentTerminal):
+        app = property(lambda self: type("A", (), {"_driver": _Drv()})())
+        screen = property(lambda self: _Screen())
+
+    t = _Shim.__new__(_Shim)
+    t._cursor_style = 5
+    t._hw_cursor_shape = 0
+    t._hw_cursor_visible = True
+    t._focus_reporting = False
+    t._fwd_buttons = set()
+
+    old_anchor = rt._IME_ANCHOR
+    rt._IME_ANCHOR = True
+    try:
+        t._show_hw_cursor(True)
+        writes.clear()
+        t.on_blur()
+        assert writes == ["\x1b[0 q"], writes
+
+        t._cursor_style = 3
+        t._show_hw_cursor(True)
+        writes.clear()
+        t.on_hide()
+    finally:
+        rt._IME_ANCHOR = old_anchor
+
+    assert "\x1b[0 q" in writes
+    if rt._IS_WIN:
+        assert "\x1b[?25l" in writes
+
+
+def test_background_pane_cleanup_cannot_clobber_outer_cursor_owner():
+    """Cursor visibility/shape belong to the shared driver, not each pane."""
+    writes = []
+
+    class _Drv:
+        def write(self, data):
+            writes.append(data)
+
+    driver = _Drv()
+    app = type("A", (), {"_driver": driver})()
+
+    class _Shim(rt.AgentTerminal):
+        @property
+        def app(self):
+            return app
+
+    def pane(style):
+        t = _Shim.__new__(_Shim)
+        t._cursor_style = style
+        t._hw_cursor_shape = 0
+        t._hw_cursor_visible = None
+        return t
+
+    focused = pane(5)
+    background = pane(3)
+    old_anchor, old_win = rt._IME_ANCHOR, rt._IS_WIN
+    rt._IME_ANCHOR, rt._IS_WIN = True, True
+    try:
+        focused._show_hw_cursor(True)
+        before_cleanup = list(writes)
+        background._show_hw_cursor(False, force=True)
+    finally:
+        rt._IME_ANCHOR, rt._IS_WIN = old_anchor, old_win
+
+    assert writes == before_cleanup, writes
+    assert getattr(driver, "_saikai_cursor_owner", None) is focused
+    assert getattr(driver, "_saikai_cursor_shape", None) == 5
+    assert getattr(driver, "_saikai_cursor_visible", None) is True
+
+
+def test_all_local_input_paths_share_one_recent_input_deadline():
+    writes = []
+
+    class _Event:
+        text = "paste"
+
+        def stop(self):
+            pass
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._pty = type("P", (), {"write": lambda self, data: writes.append(data)})()
+    t.is_dead = False
+    t._write_child = lambda data: writes.append(data)
+    t._snap_to_live = lambda: None
+    t._bracketed_paste = False
+
+    ticks = iter((100.0, 101.0, 102.0))
+    note_input = t._note_input
+    t._note_input = lambda: note_input(now=next(ticks))
+    t.on_paste(_Event())
+    first = (t.last_input_ts, t._input_status_deadline)
+    t.paste_text("two")
+    second = (t.last_input_ts, t._input_status_deadline)
+    t.submit()
+    third = (t.last_input_ts, t._input_status_deadline)
+
+    assert first == (100.0, 104.0)
+    assert second == (101.0, 105.0)
+    assert third == (102.0, 106.0)
+
+
+def test_recent_input_status_reclassifies_after_four_seconds_without_output():
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=rt.classify_pty_status)
+    t._screen = rt._HistoryScreenBase(40, 3, history=3)
+    t._stream = pyte.Stream(t._screen)
+    t._stream.feed("Do you want to continue? (y/n)")
+    t._alt.in_alt = True
+    t._alt_screen_mode = True
+    t._status = "idle"
+    t._pending_status = None
+    t._scr_ver = t._last_poll_ver = 4
+    t._sync_terminal_cursor = lambda *a, **k: None
+    observed = []
+    t._update_status = lambda status: observed.append(status)
+
+    now = time.monotonic()
+    t._note_input(now=now)
+    t.refresh_status()
+    assert observed == []
+    t.last_input_ts = now - 4.1
+    t._input_status_deadline = now - 0.1
+    t._input_status_deadline_seen = False
+    t.refresh_status()
+
+    assert observed == ["waiting"]
 
 
 def test_finalize_preserves_active_drag_snapshot():
@@ -2349,6 +4092,42 @@ def test_finalize_preserves_active_drag_snapshot():
     t = _mk(); t._sel_anchor = None            # no drag
     t._finalize()
     assert t._frozen is False and t._frozen_buf is None
+
+
+def test_reader_finalize_stops_textual_timer_only_after_ui_marshal():
+    """Textual Timer.stop touches asyncio state and is therefore UI-thread-only."""
+    ui_thread = threading.get_ident()
+    stopped_on = []
+    callbacks = []
+
+    class _Timer:
+        def stop(self):
+            stopped_on.append(threading.get_ident())
+
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t.is_dead = False
+    t._status = "busy"
+    t._on_status = None
+    t._on_exit = None
+    t.sid = "s"
+    t._input_status_generation = 0
+    t._input_status_timer = _Timer()
+    t._marshal = callbacks.append
+    t.refresh = lambda: None
+    t._retire_sync_deadline = lambda: None
+    t._sel_anchor = None
+    t._frozen = False
+    t._frozen_buf = None
+
+    worker = threading.Thread(target=t._finalize)
+    worker.start()
+    worker.join(timeout=3)
+    assert not worker.is_alive()
+    assert stopped_on == [], "reader thread called Timer.stop directly"
+
+    for callback in callbacks:
+        callback()
+    assert stopped_on == [ui_thread]
 
 
 class _FakePtyWrites:
@@ -2399,16 +4178,22 @@ def test_forward_mouse_sgr_encoding():
     t = _mk_mouse_term(sgr=True)
     w = t._pty.writes
     t._forward_mouse("down", _MouseEv(4, 2, button=1))     # left @ x4,y2 -> col5,row3
+    _wait_pty_writer(t)
     assert w[-1] == "\x1b[<0;5;3M", w[-1]
     t._forward_mouse("down", _MouseEv(0, 0, button=3))     # right -> base (3-1)&3 = 2
+    _wait_pty_writer(t)
     assert w[-1] == "\x1b[<2;1;1M", w[-1]
     t._forward_mouse("up", _MouseEv(4, 2, button=1))       # release terminates 'm'
+    _wait_pty_writer(t)
     assert w[-1] == "\x1b[<0;5;3m", w[-1]
     # motion during a left drag: Textual carries button=1 on the MouseMove
     t._forward_mouse("move", _MouseEv(9, 9, button=1))     # base 0 + motion 32
+    _wait_pty_writer(t)
     assert w[-1] == "\x1b[<32;10;10M", w[-1]
     t._forward_mouse("down", _MouseEv(0, 0, button=1, shift=True, ctrl=True))  # +4+16
+    _wait_pty_writer(t)
     assert w[-1] == "\x1b[<20;1;1M", w[-1]
+    _retire_pty_writer(t)
 
 
 def test_forward_mouse_legacy_x10():
@@ -2417,13 +4202,17 @@ def test_forward_mouse_legacy_x10():
     t = _mk_mouse_term(sgr=False)
     w = t._pty.writes
     t._forward_mouse("down", _MouseEv(4, 2, button=1))     # cb 0, col5, row3
+    _wait_pty_writer(t)
     assert w[-1] == "\x1b[M" + chr(32) + chr(37) + chr(35), repr(w[-1])
     t._forward_mouse("up", _MouseEv(4, 2, button=1))       # release -> cb 3
+    _wait_pty_writer(t)
     assert w[-1] == "\x1b[M" + chr(35) + chr(37) + chr(35), repr(w[-1])
     # col/row past 95 CAP at 95 (chr(127)) — never emit chr(>=128), which pty.write
     # would expand to multi-byte UTF-8 and corrupt the fixed 6-byte X10 packet.
     t._forward_mouse("down", _MouseEv(120, 200, button=1))
+    _wait_pty_writer(t)
     assert w[-1] == "\x1b[M" + chr(32) + chr(127) + chr(127), repr(w[-1])
+    _retire_pty_writer(t)
 
 
 def test_dec_private_re_parses_combined_params():
@@ -2442,12 +4231,14 @@ def test_on_mouse_down_forwards_all_when_child_tracks_else_selects():
     t = _mk_mouse_term(sgr=True)    # (reading self.has_focus raises on a __new__ inst;
                                     #  on_mouse_down's guard try/except swallows it)
     t.on_mouse_down(_MouseEv(3, 1, button=1, shift=False))
+    _wait_pty_writer(t)
     assert t._pty.writes and t._pty.writes[-1].startswith("\x1b[<0;4;2"), t._pty.writes
     assert 1 in t._fwd_buttons
     # Shift+press ALSO forwards now (shift modifier bit +4 → cb 4)
     t._fwd_buttons = set()
     t._pty.writes.clear()
     t.on_mouse_down(_MouseEv(3, 1, button=1, shift=True))
+    _wait_pty_writer(t)
     assert t._pty.writes and t._pty.writes[-1] == "\x1b[<4;4;2M", t._pty.writes
     assert 1 in t._fwd_buttons
     # classic child (no mouse tracking): bare press → saikai's OWN selection anchor
@@ -2457,6 +4248,7 @@ def test_on_mouse_down_forwards_all_when_child_tracks_else_selects():
     t._mouse_click = t._mouse_btn_motion = t._mouse_any_motion = False
     t.on_mouse_down(_MouseEv(3, 1, button=1, shift=False))
     assert t._pty.writes == [] and t._pending_anchor == (1, 3)
+    _retire_pty_writer(t)
 
 
 def test_on_mouse_move_forwards_motion_only_when_tracked():
@@ -2466,6 +4258,7 @@ def test_on_mouse_move_forwards_motion_only_when_tracked():
     t._fwd_captured = True                       # already capturing (skip capture_mouse)
     t._mouse_btn_motion = True
     t.on_mouse_move(_MouseEv(9, 9, button=1))
+    _wait_pty_writer(t)
     assert t._pty.writes and t._pty.writes[-1] == "\x1b[<32;10;10M"
     # click-only child (no motion modes): a forwarded drag must NOT relay motion
     t._pty.writes.clear()
@@ -2473,6 +4266,7 @@ def test_on_mouse_move_forwards_motion_only_when_tracked():
     t._mouse_any_motion = False
     t.on_mouse_move(_MouseEv(5, 5, button=1))
     assert t._pty.writes == []
+    _retire_pty_writer(t)
 
 
 def test_on_mouse_move_forwards_hover_when_any_motion():
@@ -2480,12 +4274,14 @@ def test_on_mouse_move_forwards_hover_when_any_motion():
     t = _mk_mouse_term(sgr=True)
     t._mouse_any_motion = True                 # ?1003 hover tracking on (no button held)
     t.on_mouse_move(_MouseEv(2, 2, button=0))  # no button
+    _wait_pty_writer(t)
     assert t._pty.writes and t._pty.writes[-1] == "\x1b[<35;3;3M"   # no-button motion: base 3 + 32
     # without any-motion, a hover (no held button) is NOT forwarded
     t._pty.writes.clear()
     t._mouse_any_motion = False
     t.on_mouse_move(_MouseEv(2, 2, button=0))
     assert t._pty.writes == []
+    _retire_pty_writer(t)
 
 
 def test_on_mouse_up_skips_release_when_child_stopped_tracking():
@@ -2497,6 +4293,7 @@ def test_on_mouse_up_skips_release_when_child_stopped_tracking():
     t._mouse_click = t._mouse_btn_motion = t._mouse_any_motion = False
     t.on_mouse_up(_MouseEv(4, 2, button=1))
     assert t._pty.writes == [] and not t._fwd_buttons
+    _retire_pty_writer(t)
 
 
 def test_on_mouse_up_multi_button_releases_correct_button():
@@ -2506,14 +4303,18 @@ def test_on_mouse_up_multi_button_releases_correct_button():
     t = _mk_mouse_term(sgr=True)
     t.on_mouse_down(_MouseEv(0, 0, button=1))   # left down
     t.on_mouse_down(_MouseEv(0, 0, button=3))   # right down (left still held)
+    _wait_pty_writer(t)
     assert t._fwd_buttons == {1, 3}
     t._pty.writes.clear()
     t.on_mouse_up(_MouseEv(0, 0, button=1))     # left up → left release, right still held
+    _wait_pty_writer(t)
     assert t._pty.writes[-1] == "\x1b[<0;1;1m", t._pty.writes
     assert t._fwd_buttons == {3}
     t.on_mouse_up(_MouseEv(0, 0, button=3))     # right up → right release, gesture ends
+    _wait_pty_writer(t)
     assert t._pty.writes[-1] == "\x1b[<2;1;1m", t._pty.writes
     assert t._fwd_buttons == set()
+    _retire_pty_writer(t)
 
 
 def test_cancel_forwarded_drag_sends_release():
@@ -2523,8 +4324,10 @@ def test_cancel_forwarded_drag_sends_release():
     t._fwd_buttons = {1}
     t._fwd_last = (3, 2)
     t._cancel_forwarded_drag()
+    _wait_pty_writer(t)
     assert t._pty.writes and t._pty.writes[-1] == "\x1b[<0;3;2m", t._pty.writes
     assert not t._fwd_buttons and t._fwd_captured is False
+    _retire_pty_writer(t)
 
 
 def test_honor_osc52_decodes_and_copies():
@@ -2630,7 +4433,7 @@ def test_answer_queries_responds_to_terminal_probes():
     t._marshal = lambda fn: fn()                 # run the marshalled write inline
     t._cursor_rowcol = lambda: (3, 7)
     def _one(q):
-        sent.clear(); t._answer_queries(q); return sent[-1] if sent else None
+        sent.clear(); t._answer_queries(q); return "".join(sent) if sent else None
     # Primary DA advertises only capabilities saikai actually implements.
     assert _one("\x1b[c") == "\x1b[?62;22c"
     assert _one("\x1b[0c") == "\x1b[?62;22c"
@@ -2744,6 +4547,154 @@ def test_mirror_tee_orders_seed_before_stream_verbatim():
     term.detach_mirror()
     term._consume("after-detach")
     assert events == [], "detach must stop the tee"
+
+
+def test_mirror_seed_restores_saved_main_buffer_while_alt_is_active():
+    """A late pane viewer must not lose MAIN when the child currently uses ALT."""
+    import saikai_mirror as mirror
+
+    source = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _txt, _title: "idle")
+    source._create_screen_pair(3, 8)
+    source._marshal = lambda fn: fn()
+    source._update_status = lambda _status: None
+    source._consume("MAIN\x1b[2;4H")
+    main_lines = rt._pyte_grid_lines(source._main_screen)
+    main_cursor = (
+        source._main_screen.cursor.y, source._main_screen.cursor.x)
+    source._consume("\x1b[?1049hALT\x1b[3;6H\x1b[5 q")
+    alt_lines = rt._pyte_grid_lines(source._alt_screen)
+    alt_cursor = (
+        source._alt_screen.cursor.y, source._alt_screen.cursor.x)
+
+    seeds = []
+    source.attach_mirror(lambda _data: None, seeds.append,
+                         mirror._synth_pane_seed)
+    assert len(seeds) == 1
+
+    target = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _txt, _title: "idle")
+    target._create_screen_pair(3, 8)
+    target._marshal = lambda fn: fn()
+    target._update_status = lambda _status: None
+    target._consume(seeds[0])
+
+    assert target._alt.in_alt is True
+    assert rt._pyte_grid_lines(target._screen) == alt_lines
+    assert (target._screen.cursor.y, target._screen.cursor.x) == alt_cursor
+    assert target._cursor_style == 5
+
+    target._consume("\x1b[?1049l")
+    assert target._alt.in_alt is False
+    assert rt._pyte_grid_lines(target._screen) == main_lines
+    assert (target._screen.cursor.y, target._screen.cursor.x) == main_cursor
+
+
+def test_osc8_metadata_tracks_painted_cells_overwrites_and_active_state():
+    """Late mirror seeds can reconstruct both existing and still-open links."""
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    terminal._create_screen_pair(2, 20)
+    terminal._marshal = lambda callback: callback()
+    terminal._update_status = lambda _status: None
+
+    terminal._consume(
+        "\x1b]8;id=painted;https://example.test/painted\x1b\\"
+        "LINK"
+        "\x1b]8;;\x1b\\")
+    screen = terminal._screen
+    links = screen._refresh_saikai_hyperlinks()
+    assert {
+        position: link for position, link in links.items()
+        if position[0] == 0
+    } == {
+        (0, column): (
+            "id=painted", "https://example.test/painted")
+        for column in range(4)
+    }
+
+    terminal._consume("\x1b[1;2HX")
+    links = screen._refresh_saikai_hyperlinks()
+    assert (0, 1) not in links
+    assert all((0, column) in links for column in (0, 2, 3))
+
+    terminal._consume(
+        "\x1b]8;id=active;https://example.test/active\x1b\\")
+    assert terminal._osc8_active == (
+        "id=active", "https://example.test/active")
+    assert screen._saikai_active_hyperlink == terminal._osc8_active
+
+
+def test_mirror_reseeds_for_rich_width_edit_and_dropped_grapheme_semantics():
+    """xterm's two-cell storage cannot be trusted for these final grid states."""
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    terminal._create_screen_pair(2, 12)
+    terminal._marshal = lambda callback: callback()
+    terminal._update_status = lambda _status: None
+    events = []
+
+    def synth(screen, _cols, _rows, _modes):
+        return "SEED:" + "|".join(rt._pyte_grid_lines(screen))
+
+    terminal.attach_mirror(
+        lambda data: events.append(("tee", data)),
+        lambda seed: events.append(("seed", seed)),
+        synth,
+    )
+    events.clear()
+
+    width_three = "\u0915\u094d\u0924\u094d\u092f"
+    terminal._consume(width_three)
+    assert [kind for kind, _value in events] == ["seed"], events
+    assert width_three in events[0][1]
+
+    # An xterm cell erase can otherwise leave one physical fragment behind.
+    events.clear()
+    terminal._consume("\x1b[1;1H\x1b[X")
+    assert [kind for kind, _value in events] == ["seed"], events
+    assert width_three not in events[0][1]
+
+    # A format control is an EGC boundary locally. A following leading mark is
+    # dropped; xterm would otherwise retain it as an independent width-zero cell.
+    events.clear()
+    terminal._consume("\x1b[31m\u0301")
+    assert [kind for kind, _value in events] == ["seed"], events
+
+    events.clear()
+    terminal._consume("A")
+    assert events == [("tee", "A")]
+
+
+def test_mirror_reseeds_when_active_kitty_keyboard_contract_changes():
+    """Browser input uses the active buffer's exact Kitty flag-1 contract."""
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    terminal._create_screen_pair(2, 12)
+    terminal._marshal = lambda callback: callback()
+    terminal._update_status = lambda _status: None
+    events = []
+
+    def synth(_screen, _cols, _rows, modes):
+        return f"kitty={modes['kitty_keyboard']};alt={modes['alt']}"
+
+    terminal.attach_mirror(
+        lambda data: events.append(("tee", data)),
+        lambda seed: events.append(("seed", seed)),
+        synth,
+    )
+    events.clear()
+
+    terminal._consume("\x1b[>1u")
+    assert events == [("seed", "kitty=1;alt=False")]
+
+    events.clear()
+    terminal._consume("\x1b[?1049h")
+    assert events == [("seed", "kitty=0;alt=True")]
+
+    events.clear()
+    terminal._consume("\x1b[?1049l")
+    assert events == [("seed", "kitty=1;alt=False")]
 
 
 def test_c1_queries_reply_once_and_never_reach_mirror_presentation():
@@ -3141,10 +5092,50 @@ if __name__ == "__main__":
     print("PASS test_osc52_split_write_is_gated_by_live_visible_active_focus")
     test_osc52_re_extracts_payload_and_needs_terminator()
     print("PASS test_osc52_re_extracts_payload_and_needs_terminator")
-    test_consume_collapses_alt_screen_reset_amplification()
-    print("PASS test_consume_collapses_alt_screen_reset_amplification")
+    test_consume_orders_multiple_alt_screen_transitions_without_reset_amplification()
+    print("PASS test_consume_orders_multiple_alt_screen_transitions_without_reset_amplification")
+    test_main_and_alternate_buffers_preserve_content_history_and_cursor()
+    print("PASS test_main_and_alternate_buffers_preserve_content_history_and_cursor")
+    test_decsc_is_one_persistent_buffer_local_slot_like_xterm()
+    print("PASS test_decsc_is_one_persistent_buffer_local_slot_like_xterm")
+    test_1049_entry_overwrites_main_decsc_slot_once_like_xterm()
+    print("PASS test_1049_entry_overwrites_main_decsc_slot_once_like_xterm")
+    test_alternate_buffer_inherits_rendition_and_keeps_global_modes_in_sync()
+    print("PASS test_alternate_buffer_inherits_rendition_and_keeps_global_modes_in_sync")
+    test_mirror_normalizes_47_and_1047_to_the_local_1049_contract()
+    print("PASS test_mirror_normalizes_47_and_1047_to_the_local_1049_contract")
+    test_software_cursor_on_a_wide_stub_is_rendered_on_its_leader()
+    print("PASS test_software_cursor_on_a_wide_stub_is_rendered_on_its_leader")
+    test_render_line_selects_active_buffer_under_the_screen_lock()
+    print("PASS test_render_line_selects_active_buffer_under_the_screen_lock")
+    test_dead_pane_preserves_and_allows_copying_the_final_output()
+    print("PASS test_dead_pane_preserves_and_allows_copying_the_final_output")
+    test_snapshot_and_copy_select_active_buffer_under_the_screen_lock()
+    print("PASS test_snapshot_and_copy_select_active_buffer_under_the_screen_lock")
+    test_resize_updates_both_buffers_versions_cpr_ime_and_mirror()
+    print("PASS test_resize_updates_both_buffers_versions_cpr_ime_and_mirror")
+    test_resize_rebuilds_frozen_snapshot_and_clamps_selection_geometry()
+    print("PASS test_resize_rebuilds_frozen_snapshot_and_clamps_selection_geometry")
+    test_resize_crops_frozen_wide_graphemes_without_orphans()
+    print("PASS test_resize_crops_frozen_wide_graphemes_without_orphans")
+    test_scrollback_snapshot_survives_full_deque_eviction_for_render_and_copy()
+    print("PASS test_scrollback_snapshot_survives_full_deque_eviction_for_render_and_copy")
+    test_decscusr_tracks_shape_and_restores_textual_default_on_hide()
+    print("PASS test_decscusr_tracks_shape_and_restores_textual_default_on_hide")
+    test_decscusr_is_presented_atomically_with_synchronized_output()
+    print("PASS test_decscusr_is_presented_atomically_with_synchronized_output")
+    test_cursor_shape_resets_on_hands_off_blur_and_widget_hide()
+    print("PASS test_cursor_shape_resets_on_hands_off_blur_and_widget_hide")
+    test_background_pane_cleanup_cannot_clobber_outer_cursor_owner()
+    print("PASS test_background_pane_cleanup_cannot_clobber_outer_cursor_owner")
+    test_all_local_input_paths_share_one_recent_input_deadline()
+    print("PASS test_all_local_input_paths_share_one_recent_input_deadline")
+    test_recent_input_status_reclassifies_after_four_seconds_without_output()
+    print("PASS test_recent_input_status_reclassifies_after_four_seconds_without_output")
     test_finalize_preserves_active_drag_snapshot()
     print("PASS test_finalize_preserves_active_drag_snapshot")
+    test_reader_finalize_stops_textual_timer_only_after_ui_marshal()
+    print("PASS test_reader_finalize_stops_textual_timer_only_after_ui_marshal")
     test_update_status_marshals_outside_lock()
     print("PASS test_update_status_marshals_outside_lock")
     test_ime_anchor_xy_maps_cursor_into_region()
@@ -3153,12 +5144,38 @@ if __name__ == "__main__":
     print("PASS test_reopen_after_exit_requires_awaited_pane_removal")
     test_kill_tracks_reap_for_atexit_join()
     print("PASS test_kill_tracks_reap_for_atexit_join")
+    test_join_all_reaps_reaches_helpers_registered_while_joining()
+    print("PASS test_join_all_reaps_reaches_helpers_registered_while_joining")
     test_posix_kill_signals_only_and_closes_off_thread()
     print("PASS test_posix_kill_signals_only_and_closes_off_thread")
     test_posix_reap_escalates_to_sigkill()
     print("PASS test_posix_reap_escalates_to_sigkill")
+    test_natural_eof_detaches_before_callbacks_preserves_tail_and_reaps_once()
+    print("PASS test_natural_eof_detaches_before_callbacks_preserves_tail_and_reaps_once")
+    test_lifecycle_generation_allows_exactly_one_detach_and_rejects_stale_eof()
+    print("PASS test_lifecycle_generation_allows_exactly_one_detach_and_rejects_stale_eof")
+    test_stale_reader_cannot_stop_flush_or_finalize_a_replacement_generation()
+    print("PASS test_stale_reader_cannot_stop_flush_or_finalize_a_replacement_generation")
+    test_retiring_generation_fences_attach_until_reader_cleanup_finishes()
+    print("PASS test_retiring_generation_fences_attach_until_reader_cleanup_finishes")
+    test_windows_kill_closes_and_taskkills_only_on_tracked_reaper()
+    print("PASS test_windows_kill_closes_and_taskkills_only_on_tracked_reaper")
+    test_windows_natural_eof_closes_without_taskkilling_a_recycled_pid()
+    print("PASS test_windows_natural_eof_closes_without_taskkilling_a_recycled_pid")
+    test_windows_kill_race_checks_backend_identity_before_taskkill()
+    print("PASS test_windows_kill_race_checks_backend_identity_before_taskkill")
+    test_windows_reap_fails_closed_when_handle_liveness_is_unreadable()
+    print("PASS test_windows_reap_fails_closed_when_handle_liveness_is_unreadable")
+    test_windows_reader_failure_reaps_tree_before_closing_conpty()
+    print("PASS test_windows_reader_failure_reaps_tree_before_closing_conpty")
+    test_posix_reap_kills_a_surviving_group_after_direct_child_exit()
+    print("PASS test_posix_reap_kills_a_surviving_group_after_direct_child_exit")
+    test_posix_reader_failure_posts_graceful_signals_then_reaps()
+    print("PASS test_posix_reader_failure_posts_graceful_signals_then_reaps")
     test_post_signal_never_raises()
     print("PASS test_post_signal_never_raises")
+    test_post_signal_never_falls_back_from_a_disappeared_process_group()
+    print("PASS test_post_signal_never_falls_back_from_a_disappeared_process_group")
     test_forward_mouse_sgr_encoding()
     print("PASS test_forward_mouse_sgr_encoding")
     test_forward_mouse_legacy_x10()
@@ -3199,6 +5216,10 @@ if __name__ == "__main__":
     print("PASS test_child_pty_env_hides_outer_terminal_identity_from_child")
     test_child_pty_env_presents_one_windows_terminal_identity_per_platform()
     print("PASS test_child_pty_env_presents_one_windows_terminal_identity_per_platform")
+    test_child_pty_env_scrubs_nested_terminals_and_normalizes_utf8()
+    print("PASS test_child_pty_env_scrubs_nested_terminals_and_normalizes_utf8")
+    test_windows_keepalive_text_inside_normal_output_is_preserved()
+    print("PASS test_windows_keepalive_text_inside_normal_output_is_preserved")
     test_cursor_sync_freezes_while_busy_and_settles_on_transition()
     print("PASS test_cursor_sync_freezes_while_busy_and_settles_on_transition")
     test_autoscroll_tick_pins_anchor_to_content()
@@ -3217,6 +5238,8 @@ if __name__ == "__main__":
     print("PASS test_encode_key_honours_decckm_kitty_and_legacy_alt_character")
     test_kitty_disambiguate_encodes_supported_key_classes_canonically()
     print("PASS test_kitty_disambiguate_encodes_supported_key_classes_canonically")
+    test_kitty_disambiguate_recovers_named_ascii_and_reserves_release_key()
+    print("PASS test_kitty_disambiguate_recovers_named_ascii_and_reserves_release_key")
     test_configure_release_focus_key_restores_old_key()
     print("PASS test_configure_release_focus_key_restores_old_key")
     test_copy_text_uses_pbcopy_on_macos_before_osc52()
@@ -3235,6 +5258,14 @@ if __name__ == "__main__":
     print("PASS test_kitty_keyboard_csi_u_is_scrubbed")
     test_mirror_tee_orders_seed_before_stream_verbatim()
     print("PASS test_mirror_tee_orders_seed_before_stream_verbatim")
+    test_mirror_seed_restores_saved_main_buffer_while_alt_is_active()
+    print("PASS test_mirror_seed_restores_saved_main_buffer_while_alt_is_active")
+    test_osc8_metadata_tracks_painted_cells_overwrites_and_active_state()
+    print("PASS test_osc8_metadata_tracks_painted_cells_overwrites_and_active_state")
+    test_mirror_reseeds_for_rich_width_edit_and_dropped_grapheme_semantics()
+    print("PASS test_mirror_reseeds_for_rich_width_edit_and_dropped_grapheme_semantics")
+    test_mirror_reseeds_when_active_kitty_keyboard_contract_changes()
+    print("PASS test_mirror_reseeds_when_active_kitty_keyboard_contract_changes")
     test_c1_queries_reply_once_and_never_reach_mirror_presentation()
     print("PASS test_c1_queries_reply_once_and_never_reach_mirror_presentation")
     test_mirror_seed_and_tee_are_lock_consistent()
@@ -3247,6 +5278,8 @@ if __name__ == "__main__":
     print("PASS test_selection_geometry_in_sel")
     test_extract_selection_slices_and_joins()
     print("PASS test_extract_selection_slices_and_joins")
+    test_wide_cell_selection_expands_stub_to_the_complete_grapheme()
+    print("PASS test_wide_cell_selection_expands_stub_to_the_complete_grapheme")
     test_frozen_pane_copy_uses_snapshot_not_live_buffer()
     print("PASS test_frozen_pane_copy_uses_snapshot_not_live_buffer")
     test_toggle_freeze_flips_and_resumes()
@@ -3267,6 +5300,8 @@ if __name__ == "__main__":
     print("PASS test_bracketed_paste_strip_is_idempotent_across_seams")
     test_forward_wheel_only_when_mouse_reporting()
     print("PASS test_forward_wheel_only_when_mouse_reporting")
+    test_forwarded_user_mouse_stamps_input_but_synthetic_release_does_not()
+    print("PASS test_forwarded_user_mouse_stamps_input_but_synthetic_release_does_not")
     test_sync_output_stager_holds_split_frame_until_close()
     print("PASS test_sync_output_stager_holds_split_frame_until_close")
     test_sync_output_stager_orders_back_to_back_and_combined_markers()
@@ -3307,12 +5342,26 @@ if __name__ == "__main__":
     print("PASS test_cursor_report_uses_the_cursor_at_the_querys_stream_position")
     test_cursor_report_clamps_pending_wrap_and_honours_origin_mode()
     print("PASS test_cursor_report_clamps_pending_wrap_and_honours_origin_mode")
+    test_split_emoji_width_drives_cpr_and_ime_anchor_cell()
+    print("PASS test_split_emoji_width_drives_cpr_and_ime_anchor_cell")
     test_decrqm_reports_the_modes_saikai_actually_implements()
     print("PASS test_decrqm_reports_the_modes_saikai_actually_implements")
     test_dcs_payloads_never_reach_the_grid()
     print("PASS test_dcs_payloads_never_reach_the_grid")
-    test_large_paste_never_blocks_the_ui_thread_and_keeps_order()
-    print("PASS test_large_paste_never_blocks_the_ui_thread_and_keeps_order")
+    test_all_pty_write_paths_are_nonblocking_fifo_and_utf8_accounted()
+    print("PASS test_all_pty_write_paths_are_nonblocking_fifo_and_utf8_accounted")
+    test_writer_queue_items_cannot_cross_pty_generations()
+    print("PASS test_writer_queue_items_cannot_cross_pty_generations")
+    test_query_replies_enter_the_writer_fifo_at_their_stream_position()
+    print("PASS test_query_replies_enter_the_writer_fifo_at_their_stream_position")
+    test_pty_writer_rejects_byte_overflow_and_stops_bounded()
+    print("PASS test_pty_writer_rejects_byte_overflow_and_stops_bounded")
+    test_mirror_raw_input_uses_public_pane_writer()
+    print("PASS test_mirror_raw_input_uses_public_pane_writer")
+    test_natural_eof_and_kill_stop_the_persistent_writer()
+    print("PASS test_natural_eof_and_kill_stop_the_persistent_writer")
+    test_spawn_starts_the_persistent_writer()
+    print("PASS test_spawn_starts_the_persistent_writer")
     test_reader_asks_for_large_reads_and_guards_the_eof_flush()
     print("PASS test_reader_asks_for_large_reads_and_guards_the_eof_flush")
     test_cursor_query_fail_open_only_for_a_RETAINED_query()

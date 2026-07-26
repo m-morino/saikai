@@ -49,10 +49,16 @@ def test_complete_sequences_match_at_every_byte_boundary():
         "DECSCUSR": b"\x1b[5 q",
         "OSC": b"\x1b]9;notice\x07",
         "DCS": b"\x1bP$qpayload\x1b\\",
+        "APC": b"\x1b_payload\x1b\\",
+        "PM": b"\x1b^payload\x1b\\",
+        "SOS": b"\x1bXpayload\x1b\\",
         "simple ESC": b"\x1b7",
         "C1 CSI": b"\x9b?2026$p",
         "C1 OSC": b"\x9d9;notice\x9c",
         "C1 DCS": b"\x90$qpayload\x9c",
+        "C1 APC": b"\x9fpayload\x9c",
+        "C1 PM": b"\x9epayload\x9c",
+        "C1 SOS": b"\x98payload\x9c",
     }
     for name, data in cases.items():
         expected = _one_shot_tokens(data)
@@ -89,6 +95,76 @@ def test_ordinary_text_and_c0_controls_keep_exact_raw_data():
     ]
 
 
+def test_c0_inside_csi_and_escape_executes_in_order_without_ending_sequence():
+    """C0 format effectors execute immediately while the enclosing VT state continues."""
+    for control in ("\x07", "\x08", "\x09", "\x0a", "\x0b", "\x0c", "\x0d"):
+        cases = (
+            (
+                ("A\x1b[3" + control + "1mB").encode("latin-1"),
+                [
+                    ("text", "A", "", "", ""),
+                    ("control", control, "", "", ""),
+                    ("csi", "\x1b[31m", "31", "", "m"),
+                    ("text", "B", "", "", ""),
+                ],
+            ),
+            (
+                ("A\x1b[5 " + control + "qB").encode("latin-1"),
+                [
+                    ("text", "A", "", "", ""),
+                    ("control", control, "", "", ""),
+                    ("csi", "\x1b[5 q", "5", " ", "q"),
+                    ("text", "B", "", "", ""),
+                ],
+            ),
+            (
+                ("A\x1b(" + control + "BB").encode("latin-1"),
+                [
+                    ("text", "A", "", "", ""),
+                    ("control", control, "", "", ""),
+                    ("esc", "\x1b(B", "", "(", "B"),
+                    ("text", "B", "", "", ""),
+                ],
+            ),
+        )
+        for raw, expected in cases:
+            one_shot = _one_shot_tokens(raw)
+            assert [
+                (token.kind, token.raw, token.parameters,
+                 token.intermediates, token.final)
+                for token in one_shot
+            ] == expected, (repr(control), repr(raw), one_shot)
+            for split_at in range(len(raw) + 1):
+                assert _tokens_after_byte_split(raw, split_at) == one_shot, (
+                    repr(control), repr(raw), split_at
+                )
+
+
+def test_can_sub_and_escape_keep_cancelling_active_csi_and_escape():
+    """Ordered C0 support must not turn the three existing cancellers into continuations."""
+    for prefix in ("\x1b[31", "\x1b("):
+        for cancel in ("\x18", "\x1a"):
+            tokens = rt.VTTokenizer().feed(prefix + cancel + "X")
+            assert [(token.kind, token.raw, token.literal) for token in tokens] == [
+                ("text", prefix, True),
+                ("control", cancel, False),
+                ("text", "X", False),
+            ]
+
+    tokens = rt.VTTokenizer().feed("\x1b[31\x1b[0mX")
+    assert [(token.kind, token.raw, token.literal) for token in tokens] == [
+        ("text", "\x1b[31", True),
+        ("csi", "\x1b[0m", False),
+        ("text", "X", False),
+    ]
+    tokens = rt.VTTokenizer().feed("\x1b(\x1b7X")
+    assert [(token.kind, token.raw, token.literal) for token in tokens] == [
+        ("text", "\x1b(", True),
+        ("esc", "\x1b7", False),
+        ("text", "X", False),
+    ]
+
+
 def test_osc_recognizes_bel_and_st_terminators_for_supported_codes():
     """A terminator regression would leave title, clipboard, and notifications carried."""
     for code in ("9", "52", "777", "99"):
@@ -99,14 +175,66 @@ def test_osc_recognizes_bel_and_st_terminators_for_supported_codes():
 
 
 def test_dcs_payload_does_not_create_nested_osc_or_csi_tokens():
-    """DCS payload is opaque until ST (or defensive BEL), even if it looks like VT."""
-    raw = "\x1bPpayload\x1b]9;not-a-notification\x1b[31m\x1b\\"
+    """DCS payload is opaque until ST (or defensive BEL)."""
+    raw = "\x1bPpayload-[not-a-vt]-end\x1b\\"
     tokens = rt.VTTokenizer().feed(raw)
     assert [(token.kind, token.raw) for token in tokens] == [("dcs", raw)]
     bel_raw = "\x1bPpayload\x07"
     assert [(token.kind, token.raw) for token in rt.VTTokenizer().feed(bel_raw)] == [
         ("dcs", bel_raw)
     ]
+
+
+def test_apc_pm_sos_payloads_are_opaque_until_st_not_bel():
+    """APC/PM/SOS are strings too; BEL remains payload while ST ends them."""
+    for kind, opener in (("apc", "\x1b_"), ("pm", "\x1b^"),
+                         ("sos", "\x1bX"), ("apc", "\x9f"),
+                         ("pm", "\x9e"), ("sos", "\x98")):
+        raw = opener + "payload\x07[not-a-vt]\x1b\\"
+        assert [(token.kind, token.raw) for token in rt.VTTokenizer().feed(raw)] == [
+            (kind, raw)
+        ]
+
+
+def test_control_strings_abort_on_can_sub_and_new_control_introducers():
+    """Cancelled strings suppress their side effects and reparse the interrupt."""
+    for opener in ("\x1b]", "\x1bP", "\x1b_", "\x1b^", "\x1bX",
+                   "\x9d", "\x90", "\x9f", "\x9e", "\x98"):
+        for abort in ("\x18", "\x1a"):
+            raw = opener + "payload" + abort + "B"
+            tokens = rt.VTTokenizer().feed(raw)
+            assert [(token.kind, token.raw) for token in tokens] == [
+                ("ignored", opener + "payload" + abort), ("text", "B")
+            ], (repr(opener), repr(abort), tokens)
+
+    # ESC starts a new sequence rather than staying black-holed inside OSC.
+    raw = b"\x1b]52;c;Y2xpcA==\x1b[31mB"
+    expected = _one_shot_tokens(raw)
+    assert [(token.kind, token.raw) for token in expected] == [
+        ("ignored", "\x1b]52;c;Y2xpcA=="), ("csi", "\x1b[31m"),
+        ("text", "B"),
+    ]
+    for split_at in range(len(raw) + 1):
+        assert _tokens_after_byte_split(raw, split_at) == expected, split_at
+
+    c1_raw = b"\x9dpayload\x9b31mB"
+    assert [(token.kind, token.raw) for token in _one_shot_tokens(c1_raw)] == [
+        ("ignored", "\x9dpayload"), ("csi", "\x9b31m"), ("text", "B"),
+    ]
+
+
+def test_cancelled_osc52_never_reaches_side_effects_or_grid():
+    """An OSC 52 cancelled by CAN/SUB must not copy its partial payload."""
+    for abort in ("\x18", "\x1a"):
+        raw = "A\x1b]52;c;Y2xpcGJvYXJk" + abort + "B"
+        for split_at in range(len(raw) + 1):
+            terminal = _terminal(cols=60, rows=3)
+            copied = []
+            terminal._honor_osc52 = copied.append
+            terminal._consume(raw[:split_at])
+            terminal._consume(raw[split_at:])
+            assert copied == [], (repr(abort), split_at, copied)
+            assert _screen_text(terminal).strip() == "AB", (repr(abort), split_at)
 
 
 def test_incomplete_sequences_carry_across_calls_and_fail_open_when_bounded():
@@ -171,6 +299,16 @@ def test_consume_dispatches_mixed_queries_in_stream_order_without_collapsing():
     )
 
 
+def test_private_dsr5_is_not_answered_or_stripped_as_a_saikai_query():
+    """Only standard 5n and 6n plus DECXCPR ?6n belong to saikai."""
+    terminal = _terminal()
+    terminal._consume("A\x1b[?5nB\x1b[5n\x1b[?6n")
+    assert "".join(terminal._protocol_replies) == "\x1b[0n\x1b[?1;2R"
+    assert rt._MIRROR_QUERY_STRIP_RE.search("\x1b[?5n") is None
+    assert rt._MIRROR_QUERY_STRIP_RE.search("\x1b[5n") is not None
+    assert rt._MIRROR_QUERY_STRIP_RE.search("\x1b[?6n") is not None
+
+
 def test_decrqm_observes_set_then_reset_at_each_stream_position():
     """A chunk-final pre-scan must not answer both DECRQMs from final mode state."""
     tracked = ("1", "25", "47", "1047", "1049", "1000", "1002", "1003",
@@ -198,14 +336,14 @@ def test_combined_dec_private_lists_apply_every_parameter():
 
     terminal._consume("\x1b[?1049;25h")
     terminal._consume("\x1b[?1049$p\x1b[?25$p")
-    assert terminal._protocol_replies[-1] == (
+    assert "".join(terminal._protocol_replies[-2:]) == (
         "\x1b[?1049;1$y\x1b[?25;1$y"
     )
     assert terminal._alt.in_alt is True
 
     terminal._consume("\x1b[?1049;25l")
     terminal._consume("\x1b[?1049$p\x1b[?25$p")
-    assert terminal._protocol_replies[-1] == (
+    assert "".join(terminal._protocol_replies[-2:]) == (
         "\x1b[?1049;2$y\x1b[?25;2$y"
     )
     assert terminal._alt.in_alt is False
@@ -309,8 +447,8 @@ def test_tokenized_dcs_and_fail_open_controls_cannot_trigger_side_effects():
     terminal._honor_osc52 = copied.append
 
     terminal._consume(
-        "A\x1bPpayload\x1b]52;c;Y2xpcGJvYXJk"
-        "\x1b[?2004h\x1b[c\x1b\\B"
+        "A\x1bPpayload]52;c;Y2xpcGJvYXJk"
+        "[?2004h[c\x1b\\B"
     )
     assert copied == []
     assert terminal._bracketed_paste is False
@@ -340,9 +478,11 @@ def test_dependency_lists_have_runtime_parity():
             break
         pep_deps.append(line.split("#", 1)[0].strip().rstrip(",").strip('"'))
     assert pep_deps == project_deps
-    for package in ("regex", "segno", "cryptography"):
+    for package in ("rich", "regex", "segno", "cryptography"):
         assert any(dependency.startswith(package) for dependency in project_deps), \
             f"runtime dependency missing {package}"
+    assert "rich>=15.0.0" in project_deps, \
+        "grapheme-aware cell_len/load_cell_table requires Rich 15 or newer"
 
 
 if __name__ == "__main__":
@@ -354,16 +494,28 @@ if __name__ == "__main__":
     print("PASS test_simple_escape_keeps_exact_raw_data")
     test_ordinary_text_and_c0_controls_keep_exact_raw_data()
     print("PASS test_ordinary_text_and_c0_controls_keep_exact_raw_data")
+    test_c0_inside_csi_and_escape_executes_in_order_without_ending_sequence()
+    print("PASS test_c0_inside_csi_and_escape_executes_in_order_without_ending_sequence")
+    test_can_sub_and_escape_keep_cancelling_active_csi_and_escape()
+    print("PASS test_can_sub_and_escape_keep_cancelling_active_csi_and_escape")
     test_osc_recognizes_bel_and_st_terminators_for_supported_codes()
     print("PASS test_osc_recognizes_bel_and_st_terminators_for_supported_codes")
     test_dcs_payload_does_not_create_nested_osc_or_csi_tokens()
     print("PASS test_dcs_payload_does_not_create_nested_osc_or_csi_tokens")
+    test_apc_pm_sos_payloads_are_opaque_until_st_not_bel()
+    print("PASS test_apc_pm_sos_payloads_are_opaque_until_st_not_bel")
+    test_control_strings_abort_on_can_sub_and_new_control_introducers()
+    print("PASS test_control_strings_abort_on_can_sub_and_new_control_introducers")
+    test_cancelled_osc52_never_reaches_side_effects_or_grid()
+    print("PASS test_cancelled_osc52_never_reaches_side_effects_or_grid")
     test_incomplete_sequences_carry_across_calls_and_fail_open_when_bounded()
     print("PASS test_incomplete_sequences_carry_across_calls_and_fail_open_when_bounded")
     test_completed_oversize_sequences_fail_open_at_every_split_boundary()
     print("PASS test_completed_oversize_sequences_fail_open_at_every_split_boundary")
     test_consume_dispatches_mixed_queries_in_stream_order_without_collapsing()
     print("PASS test_consume_dispatches_mixed_queries_in_stream_order_without_collapsing")
+    test_private_dsr5_is_not_answered_or_stripped_as_a_saikai_query()
+    print("PASS test_private_dsr5_is_not_answered_or_stripped_as_a_saikai_query")
     test_decrqm_observes_set_then_reset_at_each_stream_position()
     print("PASS test_decrqm_observes_set_then_reset_at_each_stream_position")
     test_combined_dec_private_lists_apply_every_parameter()

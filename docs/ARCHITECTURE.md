@@ -44,12 +44,53 @@ reader thread feeds `pyte` while Textual's UI thread renders the same screen.
 The lifecycle is:
 
 1. The provider builds a launch contract.
-2. `AgentTerminal` spawns the PTY and starts its reader.
-3. PTY chunks update the screen under `self._lock`.
-4. UI refresh/status work is coalesced and marshalled after releasing the lock.
-5. Teardown signals the process tree and reaps it off the UI thread.
+2. `AgentTerminal` scrubs outer-terminal IPC/identity variables, normalizes the
+   UTF-8 child contract, spawns the PTY, and attaches one
+   `(pty, pid, generation)` ownership tuple.
+3. One reader decodes PTY output and feeds the ordered terminal pipeline.
+4. Presentation updates the active screen under `self._lock`; UI
+   refresh/status/IME work is coalesced and marshalled after releasing it.
+5. Natural EOF flushes bounded parser and synchronized-output tails, detaches
+   ownership before announcing death, and reaps exactly once.
+6. Explicit teardown atomically competes for the same ownership generation,
+   signals as appropriate, and performs every blocking close/reap off the UI
+   thread.
 
 Windows uses ConPTY through `pywinpty`. POSIX platforms use `ptyprocess`.
+
+### Terminal data path
+
+Decoded output passes through one bounded incremental VT tokenizer. It retains
+only incomplete control strings, fails malformed/oversize input open as literal
+data, and dispatches mode changes, queries, notifications, clipboard requests,
+and presentation in original stream order. APC, PM, SOS, DCS, OSC, CSI, C1
+forms, cancellation, and synchronized-output boundaries therefore cannot leak
+embedded controls or reorder replies.
+
+Presentation uses extended grapheme clusters (`regex` `\X`) and Rich's cell
+width policy. A complete cluster occupies one leader cell plus as many
+deterministic continuation cells as Rich reports (the width is not assumed to
+stop at two), so pyte cursor position, native cursor anchoring, CPR, selection,
+and the browser mirror agree for combining text, variation selectors, emoji
+modifiers, ZWJ sequences, keycaps, regional-indicator flags, and wider
+conjuncts. MAIN and ALT are separate screen/stream pairs; switching buffers
+does not destroy MAIN history or cursor state.
+
+Every child input source—keys, paste, mouse, focus, terminal replies, and mirror
+control—enqueues into one persistent per-pane FIFO writer. Its capacity is
+accounted in encoded UTF-8 bytes in O(1); callers never block in `pty.write()`.
+
+The browser mirror receives a detailed screen/state seed and installs a
+grapheme provider over xterm.js using the exact Unicode width table loaded by
+the running Rich renderer. When one Rich EGC is wider than xterm's two-column
+cell representation, the provider splits only its xterm storage while
+preserving text and total columns. Pane input returns through the same public
+FIFO writer as local input.
+
+Terminal retention is deliberately bounded: tokenizer carries and control
+strings, synchronized-output bytes and age, Kitty keyboard stack, PTY write
+queue, history, mirror queues, truecolor cache, status timers, and tracked
+worker registries all have explicit caps or bounded shutdown.
 
 ## Concurrency invariants
 
@@ -59,13 +100,20 @@ Violating these rules can hard-freeze the UI or orphan agent worker processes:
    cross-thread operation while holding `self._lock`. Compute under the lock;
    marshal after releasing it.
 2. Never join the reader thread from Textual's UI thread.
-3. On POSIX, never call `ptyprocess.close()` or `terminate()` on the UI thread.
+3. Never call `pywinpty.close(force=True)`, `ptyprocess.close()`, or
+   `terminate()` on the UI thread.
    A reader can hold `io.BufferedRWPair`'s read lock while blocking in `read1()`;
    closing from the UI thread then waits on the same lock. Signal the child
    first and perform the blocking close on the reap thread.
-4. Track every process-tree reap and join outstanding reap threads at process
-   exit. Otherwise saikai can exit before descendants are terminated.
-5. Coalesce PTY-driven repaint and status work. A streaming agent can emit many
+4. Guard `(pty, pid, generation)` together. Natural EOF and explicit kill may
+   detach only the generation they observed; never signal a PID from a stale
+   reader callback.
+5. Route every PTY write through the bounded per-pane FIFO worker. No UI,
+   reader, timer, or mirror callback may call the backend writer inline.
+6. Track every process-tree reap, close helper, writer, and agent escalation;
+   bounded-join outstanding workers at process exit. Otherwise saikai can exit
+   before descendants are terminated.
+7. Coalesce PTY-driven repaint and status work. A streaming agent can emit many
    chunks and status transitions per second.
 
 Do not add locking to fix a cosmetic race unless the lock ordering has been
@@ -98,12 +146,14 @@ uv run python tests/test_pty_backend.py
 uv run python tests/test_resource_bounds.py
 uv run python tests/test_sort_recency.py
 uv run python tests/test_split_divider.py
+uv run python tests/test_terminal_protocol.py
 uv run python tests/test_terminal_concurrency.py
 uv run python tests/test_terminal_watchdog.py
 ```
 
 After terminal, threading, lock, async, or teardown changes, at minimum run
-`tests/test_terminal_concurrency.py`, `tests/test_resource_bounds.py`, and the
+`tests/test_terminal_protocol.py`, `tests/test_terminal_concurrency.py`,
+`tests/test_resource_bounds.py`, `tests/test_terminal_watchdog.py`, and the
 real-backend `tests/test_pty_backend.py`. Use Textual `App.run_test()` and
 `Pilot` for focus, key, and layout behavior.
 

@@ -12,6 +12,21 @@ following third-party packages, installed separately via your package manager
 | [pywinpty](https://github.com/andfoy/pywinpty) | MIT | Windows ConPTY backend (`sys_platform == 'win32'`) |
 | [ptyprocess](https://github.com/pexpect/ptyprocess) | ISC | POSIX PTY backend (non-Windows) |
 
+## Vendored terminal assets
+
+The browser mirror bundles the following unmodified xterm.js distribution
+assets under `saikai_mirror_static/`. They are served only to render the local
+mirror; unlike the packages above, these files are copied into this repository.
+
+| Vendored files | Upstream package | License | License file |
+|---|---|---|---|
+| `xterm.min.js`, `xterm.min.css` | [@xterm/xterm 5.5.0](https://www.npmjs.com/package/@xterm/xterm/v/5.5.0) | MIT | [upstream `LICENSE`](https://unpkg.com/@xterm/xterm@5.5.0/LICENSE) |
+| `addon-canvas.js` | [@xterm/addon-canvas 0.7.0](https://www.npmjs.com/package/@xterm/addon-canvas/v/0.7.0) | MIT | [upstream `LICENSE`](https://unpkg.com/@xterm/addon-canvas@0.7.0/LICENSE) |
+
+`addon-saikai-rich-graphemes.js` is saikai project code. It adapts the vendored
+xterm Unicode API to the same grapheme-break and Rich cell-width tables used by
+the local renderer.
+
 ## Note on pyte (LGPL-3.0)
 
 saikai imports `pyte` as an ordinary, unmodified dependency installed by the user

@@ -43,6 +43,7 @@ error line — it never tears down the host app.
 from __future__ import annotations
 
 import atexit
+import copy
 import os
 import re
 import signal
@@ -50,7 +51,9 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -65,6 +68,7 @@ _IS_WIN = sys.platform == "win32"
 # overrides this at startup from [limits] scrollback_lines / SAIKAI_SCROLLBACK
 # (clamped). Lower it (e.g. 1000 ≈ 20 MB/pane) on a memory-tight machine.
 SCROLLBACK_LINES = 2000
+_EGC_MAX_CODEPOINTS = 256
 
 
 def _log(msg: str) -> None:
@@ -87,12 +91,11 @@ def _log(msg: str) -> None:
         pass
 
 
-# IME-anchor: re-anchor the hardware cursor to claude's prompt cell + show the
-# native cursor there on Windows. This is a host-side IME anchor, not a child
-# render cursor: main-screen Claude may hide/draw its own cursor while it still
-# needs WT's native cursor at the prompt for CJK composition. Alt-screen UIs own
-# cursor presentation, and repaint-driven cursor moves are debounced so agents
-# redraws don't make WT chase transient positions. Set SAIKAI_IME_ANCHOR=0 to turn
+# IME-anchor: re-anchor the outer cursor to the child caret and, on Windows,
+# expose that native cursor for CJK composition. This is host-side anchoring,
+# not an extra child-rendered cursor. DECTCEM visibility and DECSCUSR shape are
+# followed on either buffer; redraw transients are settled so the candidate
+# window does not chase intermediate positions. Set SAIKAI_IME_ANCHOR=0 to turn
 # it off completely. (#ime-anchor-optout)
 _IME_ANCHOR = str(os.environ.get("SAIKAI_IME_ANCHOR", "1")).strip().lower() not in (
     "0", "false", "no", "off")
@@ -177,16 +180,15 @@ _HOST_TERMINAL_ENV_STRIP = {
     # take host-specific paths such as WT full repaint / terminal private
     # protocols that are correct for direct stdout but wrong behind saikai.
     #
-    # WT_SESSION is handled by _child_pty_env, not stripped here: on Windows the
-    # pane PRESENTS itself as Windows Terminal (see the byte-identical Primary DA
-    # reply), so the env must agree. (#wt-session)
+    # WT_SESSION is handled by _child_pty_env, not stripped here: it is a
+    # deliberate Windows-only caret compatibility signal. (#wt-session)
     "TERM_PROGRAM",
     "TERM_PROGRAM_VERSION",
     "LC_TERMINAL",
     "LC_TERMINAL_VERSION",
-    "KITTY_WINDOW_ID",
-    "ALACRITTY_LOG",
-    "KONSOLE_VERSION",
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
     "VTE_VERSION",
     "ZED_TERM",
     # Claude sets this for Windows/WT fleet views; saikai's pane is neither.
@@ -195,13 +197,23 @@ _HOST_TERMINAL_ENV_STRIP = {
     # atomically instead of needing the child to avoid them.
     "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT",
 }
-# The whole WEZTERM_* family, not a hand-listed pair: WEZTERM_UNIX_SOCKET is a live
-# mux socket, so leaking it lets a pane child drive the REAL outer window through
-# `wezterm cli`, and WEZTERM_CONFIG_* re-identifies the host we just masked.
-_HOST_TERMINAL_ENV_STRIP_PREFIXES = ("WEZTERM_",)
+# Whole emulator families include live IPC endpoints (WEZTERM_UNIX_SOCKET,
+# KITTY_LISTEN_ON, ALACRITTY_SOCKET, Konsole/GNOME DBus identifiers), so a
+# hand-list is both fragile and unsafe. TERMINFO* is also host-specific: an
+# inherited override can make the child emit capabilities that saikai's virtual
+# terminal does not implement.
+_HOST_TERMINAL_ENV_STRIP_PREFIXES = (
+    "WEZTERM_",
+    "KITTY_",
+    "ALACRITTY_",
+    "KONSOLE_",
+    "GNOME_TERMINAL_",
+    "TERMINFO",
+)
 
-# Opt out of presenting the pane as Windows Terminal (env side): SAIKAI_WT_IDENTITY=0
-# leaves WT_SESSION exactly as the host set it. (#wt-session-optout)
+# Opt out of presenting the pane as Windows Terminal (env side):
+# SAIKAI_WT_IDENTITY=0 leaves WT_SESSION as the host set it on Windows. POSIX/WSL
+# always strips it because the pane does not emulate WT there. (#wt-session-optout)
 _WT_IDENTITY = str(os.environ.get("SAIKAI_WT_IDENTITY", "1")).strip().lower() not in (
     "0", "false", "no", "off")
 # One synthesized session id per saikai PROCESS: real WT gives every pane in a
@@ -217,6 +229,21 @@ def _wt_session_id() -> str:
     return _WT_SESSION_SYNTH
 
 
+def _utf8_locale(value: object) -> str:
+    """Replace only a locale's codeset, preserving language and modifier."""
+    locale = str(value or "").strip()
+    if not locale:
+        return locale
+    if locale.upper() in ("UTF-8", "UTF8"):
+        return locale
+    base_and_codeset, marker, modifier = locale.partition("@")
+    base = base_and_codeset.split(".", 1)[0]
+    if base.upper() == "POSIX":
+        base = "C"
+    normalized = f"{base or 'C'}.UTF-8"
+    return normalized + (marker + modifier if marker else "")
+
+
 def _child_pty_env(base_env, is_win: Optional[bool] = None) -> dict:
     """Environment advertised by saikai's PTY renderer to the child.
 
@@ -224,39 +251,71 @@ def _child_pty_env(base_env, is_win: Optional[bool] = None) -> dict:
     explicit and deterministic instead of inheriting the outer terminal's brand
     probes (TERM_PROGRAM, WEZTERM_*, KITTY_WINDOW_ID, …).
 
-    WT_SESSION is the one identity saikai ASSERTS rather than inherits, because
-    the pane emulates Windows Terminal (the Primary DA reply is byte-identical).
-    MEASURED on-device: with WT_SESSION present Claude tracks the input caret with
+    WT_SESSION is the one host compatibility signal saikai preserves or
+    synthesizes on Windows. MEASURED on-device: with it present Claude tracks the
+    input caret with
     the terminal cursor — which is what the IME anchor follows; without it Claude
     PARKS the cursor at a fixed base cell and the anchor pins composition there.
     Inheriting it made that a lottery on the outer host (broken under WezTerm and
-    conhost), so synthesize one on Windows. On POSIX the anchor is _IS_WIN-gated,
-    so a WT identity buys nothing and WSL — where Windows Terminal exports
-    WT_SESSION into Linux — would take WT redraw paths behind pyte for free.
+    conhost), so synthesize one on Windows. On POSIX the pane is not a WT
+    endpoint, and WSL may inherit WT_SESSION from its outer host; strip it there
+    so the child does not select WT-specific redraw paths behind pyte.
     (#agents-cursor #wt-session #wsl)"""
+    platform_is_win = _IS_WIN if is_win is None else is_win
     env = dict(base_env)
-    for key in _HOST_TERMINAL_ENV_STRIP:
-        env.pop(key, None)
-    for key in [k for k in env if k.startswith(_HOST_TERMINAL_ENV_STRIP_PREFIXES)]:
-        env.pop(key, None)
-    if _WT_IDENTITY:
-        if _IS_WIN if is_win is None else is_win:
-            env.setdefault("WT_SESSION", _wt_session_id())
-        else:
-            env.pop("WT_SESSION", None)
+
+    # os.environ is case-insensitive on Windows, but callers/tests may supply a
+    # plain dict. Match the target platform's semantics and remove duplicate
+    # spellings before adding canonical saikai values.
+    for key in list(env):
+        comparable = key.upper() if platform_is_win else key
+        if (comparable in _HOST_TERMINAL_ENV_STRIP
+                or comparable.startswith(_HOST_TERMINAL_ENV_STRIP_PREFIXES)):
+            env.pop(key, None)
+
+    outer_wt = None
+    for key in list(env):
+        if (key.upper() if platform_is_win else key) == "WT_SESSION":
+            outer_wt = env.pop(key)
+    if platform_is_win:
+        if _WT_IDENTITY:
+            env["WT_SESSION"] = outer_wt or _wt_session_id()
+        elif outer_wt is not None:
+            env["WT_SESSION"] = outer_wt
+    # POSIX/WSL never inherits WT_SESSION, including when the Windows identity
+    # compatibility switch is disabled.
+
+    for key in list(env):
+        comparable = key.upper() if platform_is_win else key
+        if comparable == "LANG" or comparable.startswith("LC_"):
+            if env[key]:
+                env[key] = _utf8_locale(env[key])
+    if not any(env.get(key) for key in ("LC_ALL", "LC_CTYPE", "LANG")):
+        env["LC_CTYPE"] = "C.UTF-8"
+
+    for key in list(env):
+        if (key.upper() if platform_is_win else key) in {
+                "TERM", "COLORTERM", "TERM_PROGRAM",
+                "PYTHONUTF8", "PYTHONIOENCODING"}:
+            env.pop(key, None)
     env["TERM"] = "xterm-256color"
     env["COLORTERM"] = "truecolor"
+    env["TERM_PROGRAM"] = "saikai"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 
 # ── global reap-thread registry ───────────────────────────────────────────────
-# Every kill() spawns a daemon thread running `taskkill /F /T` to reap the
-# child's grandchildren (claude's node workers). If saikai exits before that
-# taskkill finishes the daemon dies and the workers orphan (the 0fd9fcf hazard).
-# on_unmount-driven teardown and exceptions don't route through the App's
-# join_reaps, so track EVERY reap here and join them at interpreter exit.
+# Every detached PTY is closed/reaped on daemon workers; explicit Windows kill
+# also runs `taskkill /F /T` there. If saikai exits first, descendants may orphan
+# and blocking backend cleanup may be abandoned. on_unmount-driven teardown and
+# exceptions do not all route through the App's join_reaps, so track every reap
+# and close helper here and bounded-join them at interpreter exit.
 _REAP_THREADS: list = []
 _REAP_LOCK = threading.Lock()
+_PTY_WRITER_THREADS: list = []
+_PTY_WRITER_THREADS_LOCK = threading.Lock()
 
 
 def _track_reap(t) -> None:
@@ -267,20 +326,62 @@ def _track_reap(t) -> None:
         _REAP_THREADS.append(t)
 
 
+def _track_pty_writer(thread) -> None:
+    if thread is None:
+        return
+    with _PTY_WRITER_THREADS_LOCK:
+        _PTY_WRITER_THREADS[:] = [
+            item for item in _PTY_WRITER_THREADS if item.is_alive()]
+        _PTY_WRITER_THREADS.append(thread)
+
+
+def join_all_pty_writers(timeout: float = 1.0) -> None:
+    """Bounded-join stopped pane writers and prune the global registry."""
+    deadline = time.monotonic() + timeout
+    with _PTY_WRITER_THREADS_LOCK:
+        threads = list(_PTY_WRITER_THREADS)
+    for thread in threads:
+        try:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:
+            pass
+    with _PTY_WRITER_THREADS_LOCK:
+        _PTY_WRITER_THREADS[:] = [
+            item for item in _PTY_WRITER_THREADS if item.is_alive()]
+
+
 def join_all_reaps(timeout: float = 3.0) -> None:
     """Bounded-join every tracked reap so process exit doesn't orphan node
     workers. Safe to call repeatedly; prunes finished threads."""
     import time
     deadline = time.monotonic() + timeout
-    with _REAP_LOCK:
-        threads = list(_REAP_THREADS)
-    for t in threads:
-        try:
-            t.join(timeout=max(0.0, deadline - time.monotonic()))
-        except Exception:
-            pass
+    current = threading.current_thread()
+    # A POSIX reaper can register its reap-close helper while this function is
+    # already joining that parent. Keep taking live snapshots until the
+    # registry reaches a fixed point (or the shared deadline expires), rather
+    # than abandoning helpers absent from the first snapshot.
+    while True:
+        with _REAP_LOCK:
+            _REAP_THREADS[:] = [x for x in _REAP_THREADS if x.is_alive()]
+            threads = [x for x in _REAP_THREADS if x is not current]
+        if not threads:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            try:
+                # Short rounds let a newly registered helper receive part of
+                # the same bounded shutdown budget even if another reap stalls.
+                thread.join(timeout=min(0.05, remaining))
+            except Exception:
+                pass
     with _REAP_LOCK:
         _REAP_THREADS[:] = [x for x in _REAP_THREADS if x.is_alive()]
+    join_all_pty_writers(timeout=max(0.0, deadline - time.monotonic()))
 
 
 atexit.register(join_all_reaps)
@@ -289,22 +390,43 @@ atexit.register(join_all_reaps)
 def _post_signal(pid, sig_name: str) -> None:
     """POSIX: send `sig_name` to pid's process GROUP (ptyprocess setsid()s the
     child, so pgid == pid and the group covers claude's node workers — the
-    `taskkill /T` analog), falling back to the single process. The signal is
-    looked up by NAME so this module — and the headless tests that exercise the
-    POSIX kill path — stay importable on Windows, where signal.SIGHUP doesn't
-    exist. Never raises; no-op for a missing signal or pid."""
+    `taskkill /T` analog). Fall back to the single process only when the host
+    has no process-group API; an ESRCH from killpg must not be retried against
+    a numeric PID which may already have been reused. The signal is looked up
+    by NAME so this module — and the headless tests that exercise the POSIX kill
+    path — stay importable on Windows. Never raises."""
     sig = getattr(signal, sig_name, None)
     if not pid or sig is None:
         return
     try:
-        os.killpg(pid, sig)     # AttributeError on Windows lands in the except
+        os.killpg(pid, sig)
         return
-    except Exception:
+    except (AttributeError, NotImplementedError):
+        # Windows and a few restricted POSIX runtimes have no group primitive.
         pass
+    except Exception:
+        # The group disappeared or access was denied. Never reinterpret that as
+        # authority to signal a possibly recycled bare PID.
+        return
     try:
         os.kill(pid, sig)
     except Exception:
         pass
+
+
+def _process_group_alive(pgid) -> bool:
+    """Return whether a POSIX PTY process group still has any member."""
+    if _IS_WIN or not pgid:
+        return False
+    try:
+        os.killpg(int(pgid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
 
 # ── Soft imports ─────────────────────────────────────────────────────────────
 # The widget is only constructed when these are present (saikai probes
@@ -313,87 +435,569 @@ def _post_signal(pid, sig_name: str) -> None:
 # and lets py_compile / unit tests run without textual/pyte/pywinpty.
 try:
     import pyte  # type: ignore
-    # pyte (via the wcwidth module) counts each Regional-Indicator symbol
-    # (U+1F1E6–U+1F1FF) as width 2, so a flag emoji like 🇯🇵 occupies FOUR cells in
-    # pyte's grid. But Rich/Textual AND Windows Terminal render a flag pair as
-    # width 2 (verified: rich.cell_len('🇯🇵')==2). That 4-vs-2 disagreement shifts
-    # every line carrying a flag (e.g. claude's "🇯🇵 JA" status line) two columns
-    # and cascades into stale-cell garble in the rows below. Reconcile pyte to the
-    # render target: treat each RI as width 1, so a pair renders as 2 like Rich/WT.
-    # (#flag-width — confirmed via the Ctrl+F12 pane dump: pyte stored 🇯🇵 as 4 cells)
-    try:
-        _pyte_wcwidth_orig = pyte.screens.wcwidth
+    import regex as _regex
+    from rich.cells import cell_len as _rich_cell_len
 
-        def _wcwidth_flag_aware(char, _orig=_pyte_wcwidth_orig):
-            if char and 0x1F1E6 <= ord(char[0]) <= 0x1F1FF:
-                return 1
-            return _orig(char)
-
-        pyte.screens.wcwidth = _wcwidth_flag_aware
-    except Exception:
-        pass
-
-    # pyte's Screen.draw merges only TRUE combining marks (unicodedata.combining
-    # != 0) into the previous cell and `break`s on any OTHER width-0 char — which
-    # ABORTS the whole draw() call, silently dropping every remaining character in
-    # that chunk. ZWJ (U+200D, category Cf, combining==0) and emoji variation
-    # selectors (U+FE0F) are width-0 non-combining, so a single ZWJ-emoji family
-    # (👨‍👩‍👧‍👦) or a VS16 emoji (❤️) in claude's output truncated the pane from that
-    # point on. Subclass to merge ANY width-0 char into the previous cell (keeping
-    # the grapheme's codepoints contiguous so the outer terminal can render it) and
-    # to SKIP (not break on) width<0 chars. Faithful copy of pyte's draw otherwise;
-    # guarded so a pyte-internal change just falls back to the stock screen. (#audit-zwj)
+    _GRAPHEME_RE = _regex.compile(r"\X")
     _HistoryScreenBase = pyte.HistoryScreen
     try:
-        import unicodedata as _ud
         from pyte import modes as _mo
 
         class _SaikaiHistoryScreen(pyte.HistoryScreen):  # type: ignore[misc]
+            """A pyte history screen whose grid stores complete Unicode EGCs.
+
+            pyte draws codepoints and uses a process-global wcwidth function.
+            Rich/Textual render grapheme clusters, so codepoint widths disagree
+            for flags, VS16, keycaps, emoji modifiers, and ZWJ sequences. Keep
+            that policy local: segment with ``regex \\X``, put one complete EGC
+            in its leader cell, and advance by Rich's own cell-width function.
+
+            A base character is visible immediately. Only bounded metadata for
+            the most recent EGC is retained; a later adjacent draw may replace
+            it retrospectively when the new codepoints extend the cluster.
+            """
+
+            def __init__(self, *args, **kwargs) -> None:
+                self._egc_candidate = None
+                self._history_generation = 0
+                # OSC 8 metadata is kept beside pyte's immutable Char tuples.
+                # id -> (strong Char ref, (params, uri)); the strong reference
+                # prevents Python id reuse until bounded pruning.
+                self._saikai_hyperlink_refs = {}
+                self._saikai_hyperlinks = {}
+                self._saikai_active_hyperlink = None
+                # xterm.js stores a grapheme in at most two physical cells.
+                # Mark semantics which require a final authoritative reseed.
+                self._saikai_mirror_hazard_serial = 0
+                self._saikai_mirror_has_wide_cluster = False
+                super().__init__(*args, **kwargs)
+
+            def invalidate_grapheme_candidate(self) -> None:
+                self._egc_candidate = None
+
+            def before_event(self, event: str) -> None:
+                # Any VT operation between two draw events is a hard grapheme
+                # boundary, even when it happens to leave the cursor adjacent.
+                if event != "draw":
+                    self.invalidate_grapheme_candidate()
+                super().before_event(event)
+
+            def reset(self) -> None:
+                self.invalidate_grapheme_candidate()
+                super().reset()
+                self._saikai_hyperlink_refs.clear()
+                self._saikai_hyperlinks.clear()
+                self._saikai_active_hyperlink = None
+                self._saikai_mirror_has_wide_cluster = False
+
+            def _mark_mirror_semantics_hazard(self, *, wide=False) -> None:
+                self._saikai_mirror_hazard_serial += 1
+                if wide:
+                    self._saikai_mirror_has_wide_cluster = True
+
+            def _refresh_mirror_wide_state(self) -> bool:
+                """Recompute whether visible xterm cell edits need reseeding."""
+                self._saikai_mirror_has_wide_cluster = any(
+                    bool(char.data)
+                    and int(_rich_cell_len(char.data)) > 2
+                    for row in range(self.lines)
+                    for char in (
+                        self.buffer[row][column]
+                        for column in range(self.columns)
+                    )
+                )
+                return self._saikai_mirror_has_wide_cluster
+
+            def _stamp_active_hyperlink(self, char) -> None:
+                link = self._saikai_active_hyperlink
+                if link is None:
+                    return
+                refs = self._saikai_hyperlink_refs
+                refs[id(char)] = (char, link)
+                cap = max(1024, self.lines * self.columns * 4)
+                if len(refs) > cap:
+                    self._refresh_saikai_hyperlinks(prune=True)
+
+            def _refresh_saikai_hyperlinks(self, *, prune=False):
+                """Materialize visible OSC 8 cell coordinates for mirror seeds."""
+                refs = self._saikai_hyperlink_refs
+                coordinates = {}
+                live_ids = set()
+                for row in range(self.lines):
+                    line = self.buffer[row]
+                    for column in range(self.columns):
+                        char = line[column]
+                        entry = refs.get(id(char))
+                        if entry is None or entry[0] is not char:
+                            continue
+                        coordinates[(row, column)] = entry[1]
+                        live_ids.add(id(char))
+                self._saikai_hyperlinks = coordinates
+                if prune:
+                    self._saikai_hyperlink_refs = {
+                        key: refs[key] for key in live_ids
+                    }
+                return coordinates
+
+            @staticmethod
+            def _fixed_pane_modes(modes, *, private: bool):
+                """Drop modes whose pyte side effects violate a fixed pane.
+
+                DECCOLM resizes only pyte's active screen to 80/132 columns,
+                leaving the PTY, widget, inactive buffer, and mirror at the real
+                pane width. DECSCNM destructively rewrites cell SGR attributes
+                instead of applying a renderer-wide reverse-video flag. The
+                embedded xterm.js ignores both with its default options, so keep
+                them side-effect free locally as well.
+                """
+                ignored = (
+                    {3, 5} if private
+                    else {_mo.DECCOLM, _mo.DECSCNM}
+                )
+                return tuple(mode for mode in modes if mode not in ignored)
+
+            def set_mode(self, *modes: int, **kwargs) -> None:
+                filtered = self._fixed_pane_modes(
+                    modes, private=bool(kwargs.get("private")))
+                if filtered:
+                    super().set_mode(*filtered, **kwargs)
+
+            def reset_mode(self, *modes: int, **kwargs) -> None:
+                filtered = self._fixed_pane_modes(
+                    modes, private=bool(kwargs.get("private")))
+                if filtered:
+                    super().reset_mode(*filtered, **kwargs)
+
+            def save_cursor(self) -> None:
+                """Model xterm's one overwriteable DECSC slot, not a stack."""
+                super().save_cursor()
+                if len(self.savepoints) > 1:
+                    self.savepoints[:] = [self.savepoints[-1]]
+
+            def restore_cursor(self) -> None:
+                """DECRC is repeatable; restoring does not consume the slot."""
+                if not self.savepoints:
+                    super().restore_cursor()
+                    return
+                saved = self.savepoints[-1]
+                # pyte assigns saved.cursor directly to self.cursor. Retain a
+                # distinct copy or later cursor movement would mutate the slot.
+                persistent = saved._replace(cursor=copy.copy(saved.cursor))
+                super().restore_cursor()
+                self.savepoints[:] = [persistent]
+
+            def resize(self, lines=None, columns=None) -> None:
+                self.invalidate_grapheme_candidate()
+                old_columns = self.columns
+                super().resize(lines, columns)
+                # pyte clips visible rows cell-by-cell and does not resize its
+                # history queues. A shrink through the stub of a wide EGC can
+                # therefore leave a two-cell leader in the new final column;
+                # old explicit history cells beyond the new width can also
+                # reappear after a later grow. Canonicalize every retained row.
+                for row in range(self.lines):
+                    self._normalize_row_clusters(row)
+                for history_rows in (
+                        getattr(self.history, "top", ()),
+                        getattr(self.history, "bottom", ())):
+                    for line in history_rows:
+                        if self.columns >= old_columns:
+                            continue
+                        for column in range(self.columns, old_columns):
+                            line.pop(column, None)
+                        # Rich permits a single EGC to occupy more than two
+                        # cells (for example repeated Hangul L or some Indic
+                        # conjuncts). A shrink can therefore clip a leader far
+                        # from the new edge; validate the complete retained row.
+                        self._normalize_line_clusters(line)
+
+            def index(self) -> None:
+                top, bottom = self.margins or (0, self.lines - 1)
+                if self.cursor.y == bottom:
+                    self._history_generation += 1
+                super().index()
+
+            def _candidate_is_live(self, candidate) -> bool:
+                (text, row, col, width, after_row, after_col,
+                 _displaced, _rollback) = candidate
+                if (self.cursor.y, self.cursor.x) != (after_row, after_col):
+                    return False
+                if not (0 <= row < self.lines and 0 <= col < self.columns):
+                    return False
+                line = self.buffer[row]
+                if line[col].data != text:
+                    return False
+                return all(
+                    col + offset < self.columns
+                    and line[col + offset].data == ""
+                    for offset in range(1, width)
+                )
+
+            def _intersecting_cell_positions(
+                    self, row: int, start: int, width: int) -> tuple[int, ...]:
+                """Return every leader/stub cell touched by a replacement.
+
+                A narrow overwrite of a wide glyph must also clear its old stub;
+                writing into a stub must clear the old leader. pyte's stock draw
+                leaves those half-glyph cells behind.
+                """
+                line = self.buffer[row]
+                touched = set()
+                for pos in range(start, min(self.columns, start + max(1, width))):
+                    leader = pos
+                    while leader > 0 and line[leader].data == "":
+                        leader -= 1
+                    touched.add(leader)
+                positions = set()
+                for leader in touched:
+                    positions.add(leader)
+                    pos = leader + 1
+                    while pos < self.columns and line[pos].data == "":
+                        positions.add(pos)
+                        pos += 1
+                return tuple(sorted(positions))
+
+            def _clear_intersecting_cells(self, row: int, start: int, width: int) -> None:
+                blank = self.cursor.attrs._replace(data=" ")
+                line = self.buffer[row]
+                for pos in self._intersecting_cell_positions(row, start, width):
+                    line[pos] = blank
+
+            def _snapshot_displaced_cells(
+                    self, row: int, start: int, width: int,
+                    *, insert_mode: bool) -> tuple:
+                """Save the bounded row cells changed by a provisional EGC.
+
+                Most snapshots contain one or two cells. In insert mode the
+                affected suffix is included because pyte shifts it; its size is
+                bounded by the already-allocated terminal row.
+                """
+                positions = set(
+                    self._intersecting_cell_positions(row, start, width))
+                if insert_mode:
+                    positions.update(range(start, self.columns))
+                line = self.buffer[row]
+                return tuple((pos, line[pos]) for pos in sorted(positions))
+
+            def _restore_displaced_cells(self, row: int, displaced: tuple) -> None:
+                line = self.buffer[row]
+                for pos, char in displaced:
+                    if 0 <= pos < self.columns:
+                        line[pos] = char
+                self.dirty.add(row)
+
+            def _merge_displaced_cells(
+                    self, row: int, start: int, width: int,
+                    *, insert_mode: bool, displaced: tuple) -> tuple:
+                """Extend a provisional EGC's snapshot without losing old cells.
+
+                A cluster can widen more than once as one PTY write is split
+                (for example an Indic conjunct whose Rich width progresses
+                1 -> 2 -> 3).  Snapshot newly covered cells before replacing
+                them, while retaining the values saved before the first draw.
+                """
+                saved = dict(displaced)
+                for position, char in self._snapshot_displaced_cells(
+                        row, start, width, insert_mode=insert_mode):
+                    saved.setdefault(position, char)
+                return tuple(sorted(saved.items()))
+
+            def _capture_scroll_rollback(self):
+                """Capture the bounded state needed to undo one provisional wrap."""
+                top, bottom = self.margins or (0, self.lines - 1)
+                if self.cursor.y != bottom:
+                    return None
+                history_top = self.history.top
+                evicted = (
+                    history_top[0]
+                    if history_top.maxlen is not None
+                    and history_top.maxlen > 0
+                    and len(history_top) == history_top.maxlen
+                    else None
+                )
+                return (
+                    top,
+                    bottom,
+                    tuple((row, self.buffer[row])
+                          for row in range(top, bottom + 1)),
+                    evicted,
+                    self._history_generation,
+                )
+
+            def _restore_candidate_rollback(self, rollback) -> None:
+                origin_y, origin_x, scrolls = rollback
+                for top, bottom, rows, evicted, generation in reversed(scrolls):
+                    history_top = self.history.top
+                    if history_top:
+                        history_top.pop()
+                    if evicted is not None:
+                        history_top.appendleft(evicted)
+                    for row, line in rows:
+                        self.buffer[row] = line
+                    self._history_generation = generation
+                    self.dirty.update(range(top, bottom + 1))
+                self.cursor.y = max(0, min(origin_y, self.lines - 1))
+                self.cursor.x = max(0, min(origin_x, self.columns))
+
+            def _normalize_line_clusters(self, line) -> None:
+                """Remove orphan stubs and leaders clipped by a cell operation."""
+                for column in tuple(line):
+                    if column < 0 or column >= self.columns:
+                        line.pop(column, None)
+                col = 0
+                while col < self.columns:
+                    char = line[col]
+                    data = char.data
+                    if data == "":
+                        line[col] = char._replace(data=" ")
+                        col += 1
+                        continue
+                    width = max(0, int(_rich_cell_len(data)))
+                    if width > 1:
+                        if (col + width > self.columns
+                                or any(
+                                    line[col + offset].data != ""
+                                    for offset in range(1, width)
+                                )):
+                            line[col] = char._replace(data=" ")
+                            col += 1
+                            continue
+                        col += width
+                        continue
+                    col += 1
+
+            def _normalize_row_clusters(self, row: int) -> None:
+                """Canonicalize one visible row after a cell-level mutation."""
+                self._normalize_line_clusters(self.buffer[row])
+                self.dirty.add(row)
+
+            def _clear_edit_intersections(
+                    self, row: int, start: int, end: int) -> None:
+                """Blank complete clusters touched by an erase/delete interval."""
+                start = max(0, min(int(start), self.columns))
+                end = max(start, min(int(end), self.columns))
+                if start >= end:
+                    return
+                blank = self.cursor.attrs._replace(data=" ")
+                line = self.buffer[row]
+                # The operation itself overwrites every cell in the interval.
+                # Only clusters crossing either boundary need extra clearing;
+                # probing the whole interval made EL/ED several times slower
+                # during full-screen repaint storms.
+                positions = set()
+                for probe in {start, end - 1}:
+                    positions.update(
+                        self._intersecting_cell_positions(row, probe, 1))
+                for position in positions:
+                    line[position] = blank
+
+            def _clear_wide_cluster_at_cursor(self) -> None:
+                """ICH inside a wide EGC's stub first erases that whole EGC."""
+                row = self.cursor.y
+                column = int(self.cursor.x)
+                if not (0 <= row < self.lines and 0 <= column < self.columns):
+                    return
+                line = self.buffer[row]
+                if line[column].data != "":
+                    return
+                positions = self._intersecting_cell_positions(row, column, 1)
+                blank = self.cursor.attrs._replace(data=" ")
+                for position in positions:
+                    line[position] = blank
+
+            def erase_characters(self, count=None) -> None:
+                effective = count or 1
+                self._clear_edit_intersections(
+                    self.cursor.y, self.cursor.x,
+                    self.cursor.x + effective)
+                super().erase_characters(count)
+
+            def delete_characters(self, count=None) -> None:
+                effective = count or 1
+                self._clear_edit_intersections(
+                    self.cursor.y, self.cursor.x,
+                    self.cursor.x + effective)
+                super().delete_characters(count)
+
+            def insert_characters(self, count=None) -> None:
+                self._clear_wide_cluster_at_cursor()
+                super().insert_characters(count)
+                # A right shift may clip several stubs from one EGC, whose
+                # leader can be multiple cells away from the edge.
+                self._normalize_row_clusters(self.cursor.y)
+
+            def erase_in_line(self, how: int = 0, private: bool = False) -> None:
+                if how == 0:
+                    start, end = self.cursor.x, self.columns
+                elif how == 1:
+                    start, end = 0, self.cursor.x + 1
+                elif how == 2:
+                    start, end = 0, self.columns
+                else:
+                    start = end = 0
+                self._clear_edit_intersections(
+                    self.cursor.y, start, end)
+                super().erase_in_line(how, private)
+
+            def erase_in_display(self, how: int = 0, *args, **kwargs) -> None:
+                # The base implementation calls our erase_in_line override for
+                # the partial current row; all other affected rows are replaced
+                # completely, so no additional full-grid normalization is needed.
+                super().erase_in_display(how, *args, **kwargs)
+
+            def _write_cluster(
+                    self, cluster: str, *, apply_insert: bool = True,
+                    displaced_override=None, rollback_override=None):
+                # One EGC is theoretically unbounded (base + infinite combining
+                # marks). Cap the retained/grid value so hostile incremental
+                # input cannot grow metadata forever or make re-segmentation
+                # quadratic without bound.
+                if len(cluster) > _EGC_MAX_CODEPOINTS:
+                    cluster = cluster[:_EGC_MAX_CODEPOINTS]
+                width = max(0, int(_rich_cell_len(cluster)))
+                if width <= 0:
+                    self._mark_mirror_semantics_hazard()
+                    self.invalidate_grapheme_candidate()
+                    return None
+                if self.columns <= 0 or self.lines <= 0:
+                    self.invalidate_grapheme_candidate()
+                    return None
+                if width > self.columns:
+                    # An EGC is atomic, so there is no valid leader/stub layout
+                    # when it is wider than the whole viewport. Dropping that
+                    # one cluster preserves the grid and leaves following text
+                    # at the correct cursor instead of installing a clipped
+                    # leader whose declared width crosses rows.
+                    self._mark_mirror_semantics_hazard()
+                    self.invalidate_grapheme_candidate()
+                    return None
+
+                rollback = (
+                    rollback_override
+                    if rollback_override is not None
+                    else (self.cursor.y, self.cursor.x, ())
+                )
+
+                # Pending-wrap and a wide EGC that cannot fit both wrap before
+                # presentation. The latter matters when a quiet narrow base at
+                # the final column later widens through VS16/keycap/RI input.
+                needs_wrap = (
+                    self.cursor.x == self.columns
+                    or self.cursor.x + width > self.columns
+                )
+                if needs_wrap and _mo.DECAWM in self.mode:
+                    scroll_rollback = self._capture_scroll_rollback()
+                    self.dirty.add(self.cursor.y)
+                    self.carriage_return()
+                    self.linefeed()
+                    if scroll_rollback is not None:
+                        rollback = (
+                            rollback[0],
+                            rollback[1],
+                            rollback[2] + (scroll_rollback,),
+                        )
+                elif needs_wrap:
+                    # xterm/WT do not teleport a double-width glyph leftward
+                    # just to make it fit with DECAWM disabled. A pending-wrap
+                    # narrow glyph overwrites the final cell; a wide glyph that
+                    # cannot start there is ignored.
+                    self.cursor.x = min(self.cursor.x, self.columns - 1)
+                    if self.cursor.x + width > self.columns:
+                        self.invalidate_grapheme_candidate()
+                        return None
+
+                row, col = self.cursor.y, self.cursor.x
+                insert_mode = bool(apply_insert and _mo.IRM in self.mode)
+                displaced = (
+                    self._snapshot_displaced_cells(
+                        row, col, width, insert_mode=insert_mode)
+                    if displaced_override is None else displaced_override
+                )
+
+                if insert_mode:
+                    self.insert_characters(width)
+                    self._normalize_row_clusters(self.cursor.y)
+
+                self._clear_intersecting_cells(row, col, width)
+                line = self.buffer[row]
+                leader = self.cursor.attrs._replace(data=cluster)
+                line[col] = leader
+                self._stamp_active_hyperlink(leader)
+                if width > 2:
+                    self._mark_mirror_semantics_hazard(wide=True)
+                for offset in range(1, width):
+                    if col + offset < self.columns:
+                        line[col + offset] = self.cursor.attrs._replace(data="")
+                self.cursor.x = min(col + width, self.columns)
+                self.dirty.add(row)
+                candidate = (
+                    cluster, row, col, width, self.cursor.y, self.cursor.x,
+                    displaced, rollback)
+                self._egc_candidate = candidate
+                return candidate
+
+            def _replace_candidate(self, candidate, cluster: str) -> None:
+                (_text, row, col, old_width, _after_row, _after_col,
+                 displaced, rollback) = candidate
+                new_width = max(0, int(_rich_cell_len(cluster)))
+                insert_mode = _mo.IRM in self.mode
+                displaced = self._merge_displaced_cells(
+                    row, col, new_width,
+                    insert_mode=insert_mode, displaced=displaced)
+                self._restore_displaced_cells(row, displaced)
+
+                if new_width <= 0 or new_width > self.columns:
+                    # The complete EGC could never have been represented. Undo
+                    # every provisional prefix, including a wrap/scroll caused
+                    # by an earlier narrower prefix, and leave the cursor where
+                    # the atomic cluster began.
+                    self._mark_mirror_semantics_hazard()
+                    self._restore_candidate_rollback(rollback)
+                    self.invalidate_grapheme_candidate()
+                    return
+
+                reflow = (
+                    new_width > 1 and col + new_width > self.columns
+                    and _mo.DECAWM in self.mode
+                )
+                self.cursor.y = row
+                clipped = (
+                    new_width > 1 and col + new_width > self.columns
+                    and _mo.DECAWM not in self.mode
+                )
+                if clipped:
+                    self.cursor.x = min(col, self.columns - 1)
+                    self.invalidate_grapheme_candidate()
+                    return
+                self.cursor.x = col
+                self._write_cluster(
+                    cluster,
+                    # On a reflow the destination row has its own displaced
+                    # cells; otherwise retain the cumulative pre-prefix image.
+                    displaced_override=None if reflow else displaced,
+                    rollback_override=rollback,
+                )
+
             def draw(self, data: str) -> None:
                 data = data.translate(
                     self.g1_charset if self.charset else self.g0_charset)
-                _ww = pyte.screens.wcwidth   # the flag-aware wrapper installed above
-                for char in data:
-                    char_width = _ww(char)
-                    if self.cursor.x == self.columns:
-                        if _mo.DECAWM in self.mode:
-                            self.dirty.add(self.cursor.y)
-                            self.carriage_return()
-                            self.linefeed()
-                        elif char_width > 0:
-                            self.cursor.x -= char_width
-                    if _mo.IRM in self.mode and char_width > 0:
-                        self.insert_characters(char_width)
-                    line = self.buffer[self.cursor.y]
-                    if char_width == 1:
-                        line[self.cursor.x] = self.cursor.attrs._replace(data=char)
-                    elif char_width == 2:
-                        line[self.cursor.x] = self.cursor.attrs._replace(data=char)
-                        if self.cursor.x + 1 < self.columns:
-                            line[self.cursor.x + 1] = self.cursor.attrs._replace(data="")
-                    elif char_width == 0:
-                        # Merge ANY zero-width char (combining mark, ZWJ, VS16, other
-                        # Cf) into the preceding cell instead of pyte's break. NFC-fold
-                        # only real combining marks, to match pyte's prior behaviour.
-                        if self.cursor.x:
-                            last = line[self.cursor.x - 1]
-                            merged = last.data + char
-                            if _ud.combining(char):
-                                merged = _ud.normalize("NFC", merged)
-                            line[self.cursor.x - 1] = last._replace(data=merged)
-                        elif self.cursor.y:
-                            prev = self.buffer[self.cursor.y - 1][self.columns - 1]
-                            merged = prev.data + char
-                            if _ud.combining(char):
-                                merged = _ud.normalize("NFC", merged)
-                            self.buffer[self.cursor.y - 1][self.columns - 1] = \
-                                prev._replace(data=merged)
-                        # else: leading zero-width char, nothing on-screen to attach to.
-                    else:
-                        continue   # width < 0: unprintable; skip it, DON'T abort the chunk
-                    if char_width > 0:
-                        self.cursor.x = min(self.cursor.x + char_width, self.columns)
-                self.dirty.add(self.cursor.y)
+                if not data:
+                    return
+
+                candidate = self._egc_candidate
+                if candidate is not None and self._candidate_is_live(candidate):
+                    old = candidate[0]
+                    joined = list(_GRAPHEME_RE.findall(old + data))
+                    if joined and joined[0] != old and joined[0].startswith(old):
+                        merged = joined[0]
+                        consumed = len(merged) - len(old)
+                        self._replace_candidate(candidate, merged)
+                        data = data[consumed:]
+                else:
+                    self.invalidate_grapheme_candidate()
+
+                for cluster in _GRAPHEME_RE.findall(data):
+                    self._write_cluster(cluster)
 
             _bell_rang = False
 
@@ -415,9 +1019,24 @@ except Exception:  # pragma: no cover - exercised only when dep absent
 # Origin mode (DECOM) marker as pyte stores it in Screen.mode — a cursor report is
 # margin-relative while it is set. None when pyte is absent. (#term-queries)
 try:
-    from pyte.modes import DECOM as _PYTE_DECOM  # type: ignore
+    from pyte.modes import (  # type: ignore
+        DECAWM as _PYTE_DECAWM,
+        DECOM as _PYTE_DECOM,
+        DECTCEM as _PYTE_DECTCEM,
+        IRM as _PYTE_IRM,
+        LNM as _PYTE_LNM,
+    )
 except Exception:  # pragma: no cover - exercised only when dep absent
+    _PYTE_DECAWM = None  # type: ignore
     _PYTE_DECOM = None  # type: ignore
+    _PYTE_DECTCEM = None  # type: ignore
+    _PYTE_IRM = None  # type: ignore
+    _PYTE_LNM = None  # type: ignore
+
+_PYTE_GLOBAL_SCREEN_MODES = tuple(
+    mode for mode in (_PYTE_DECAWM, _PYTE_DECOM, _PYTE_IRM, _PYTE_LNM)
+    if mode is not None
+)
 
 _PTY_IMPORT_ERROR: Optional[str] = None
 PtyProcess = None  # type: ignore
@@ -594,7 +1213,8 @@ _PYTE_TO_RICH = {
     "brightmagenta": "bright_magenta", "brightcyan": "bright_cyan",
     "brightwhite": "bright_white",
 }
-_COLOR_CACHE: dict = {}
+_COLOR_CACHE_MAX = 128
+_COLOR_CACHE: dict[str, Optional[str]] = {}
 
 
 def _pyte_color(color: Optional[str]) -> Optional[str]:
@@ -605,18 +1225,23 @@ def _pyte_color(color: Optional[str]) -> Optional[str]:
     never tear down the pane."""
     if not color or color == "default":
         return None
-    if color in _COLOR_CACHE:
-        return _COLOR_CACHE[color]
+    # Arbitrary 24-bit values are already valid Rich colors; retaining each
+    # unique value would make a hostile/animated truecolor stream a global leak.
     if _HEX6.match(color):
-        val: Optional[str] = "#" + color
-    else:
-        name = _PYTE_TO_RICH.get(color, color)
-        try:
-            from rich.color import Color as _RichColor
-            _RichColor.parse(name)
-            val = name
-        except Exception:
-            val = None
+        return "#" + color
+    if color in _COLOR_CACHE:
+        val = _COLOR_CACHE.pop(color)
+        _COLOR_CACHE[color] = val
+        return val
+    name = _PYTE_TO_RICH.get(color, color)
+    try:
+        from rich.color import Color as _RichColor
+        _RichColor.parse(name)
+        val: Optional[str] = name
+    except Exception:
+        val = None
+    if len(_COLOR_CACHE) >= _COLOR_CACHE_MAX:
+        _COLOR_CACHE.pop(next(iter(_COLOR_CACHE)))
     _COLOR_CACHE[color] = val
     return val
 
@@ -717,6 +1342,17 @@ _KITTY_MODIFIER_KEYS = {
     if name.endswith(("_shift", "_control", "_alt", "_super", "_hyper", "_meta"))
     or name.startswith("iso_level")
 }
+_TEXTUAL_ASCII_UNICODE_NAMES = {
+    # Textual shortens these Unicode names when it constructs Key.key.
+    "slash": "SOLIDUS",
+    "backslash": "REVERSE SOLIDUS",
+    "at": "COMMERCIAL AT",
+    "minus": "HYPHEN-MINUS",
+    "plus": "PLUS SIGN",
+    "underscore": "LOW LINE",
+    "less_than_sign": "LESS-THAN SIGN",
+    "greater_than_sign": "GREATER-THAN SIGN",
+}
 
 
 def _kitty_parameter(code: int, modifier: int, final: str = "u") -> str:
@@ -740,6 +1376,19 @@ def _kitty_functional_key(base: str, modifier: int) -> Optional[str]:
     if base in _KITTY_MODIFIER_KEYS:
         return None
     return _kitty_parameter(code, modifier)
+
+
+def _textual_named_ascii_codepoint(base: str) -> Optional[int]:
+    """Recover printable ASCII from the key names Textual emits for Kitty input."""
+    unicode_name = _TEXTUAL_ASCII_UNICODE_NAMES.get(
+        base, base.replace("_", " ").upper())
+    try:
+        character = unicodedata.lookup(unicode_name)
+    except KeyError:
+        return None
+    if len(character) == 1 and 0x20 <= ord(character) <= 0x7e:
+        return ord(character)
+    return None
 
 
 def _normalize_key(spec: str) -> str:
@@ -793,9 +1442,19 @@ def encode_key(key: str, character: Optional[str], *,
     Home, and End keys; negotiated Kitty flags encode keys this terminal can
     describe truthfully from a Textual press event.
     """
+    if key == RELEASE_FOCUS_KEY:
+        return None
     parts = key.split("+")
     base, modifiers = parts[-1], set(parts[:-1])
-    mod = 1 + ("shift" in modifiers) + 2 * ("alt" in modifiers) + 4 * ("ctrl" in modifiers)
+    mod = (
+        1
+        + ("shift" in modifiers)
+        + 2 * ("alt" in modifiers)
+        + 4 * ("ctrl" in modifiers)
+        + 8 * ("super" in modifiers)
+        + 16 * ("hyper" in modifiers)
+        + 32 * ("meta" in modifiers)
+    )
     negotiated = int(kitty_flags or 0) & _KITTY_KBD_SUPPORTED_FLAGS
     if negotiated:
         functional = _kitty_functional_key(base, mod)
@@ -814,9 +1473,12 @@ def encode_key(key: str, character: Optional[str], *,
         codepoint = ord(base)
     elif character and len(character) == 1 and character.isprintable():
         codepoint = ord(character)
+    elif negotiated:
+        codepoint = _textual_named_ascii_codepoint(base)
     if negotiated and codepoint is not None:
         if modifiers and (
-                modifiers.intersection({"alt", "ctrl"})
+                modifiers.intersection({
+                    "alt", "ctrl", "super", "hyper", "meta"})
                 or base in ("enter", "return")):
             return f"\x1b[{codepoint};{mod}u"
 
@@ -856,21 +1518,46 @@ def encode_key(key: str, character: Optional[str], *,
     return None
 
 
-# ── alt-screen tracking (pyte gap, see pyte spike) ────────────────────────────
-# pyte records the ?1049h/?1049l mode bit but has only ONE buffer: it does NOT
-# swap/save/restore, and ignores ?47/?1047 entirely. NOTE: current claude
-# renders to the NORMAL buffer (probe 2026-06: no ?1049h alt-screen, no mouse
-# reporting) — which is why the HistoryScreen scrollback above works. The
-# alt-reset below is now a dormant SAFETY NET: if some tool DOES swap buffers,
-# resetting pyte's single buffer at the boundary keeps a pre-alt prompt from
-# bleeding under its UI and stops the last frame lingering after it exits.
-_ALT_PRIVATE_LIST = (
-    r"(?:\x1b\[|\x9b)\?"
-    r"(?=(?:[0-9]+;)*(?:47|1047|1049)(?:;|[hl]))[0-9;]+"
-)
-_ALT_ENTER_RE = re.compile(_ALT_PRIVATE_LIST + "h")
-_ALT_LEAVE_RE = re.compile(_ALT_PRIVATE_LIST + "l")
-_ALT_ANY_RE = re.compile(_ALT_PRIVATE_LIST + "[hl]")
+# Runtime alternate-buffer switching is token-driven and uses distinct MAIN/ALT
+# screen+stream pairs; 47/1047 are normalized to saikai's exact-main-restore
+# 1049 contract.
+# Internal noncharacter framing for presentation-only grapheme boundaries.
+# Raw occurrences are escaped, so the marker never leaks to pyte or the mirror.
+_EGC_BOUNDARY_MARKER = "\ufdd0"
+_EGC_BOUNDARY_TOKEN = _EGC_BOUNDARY_MARKER + "B"
+_EGC_LITERAL_TOKEN = _EGC_BOUNDARY_MARKER + "T"
+
+
+def _encode_presentation_data(text: str) -> str:
+    return text.replace(_EGC_BOUNDARY_MARKER, _EGC_LITERAL_TOKEN)
+
+
+def _presentation_fragments(text: str):
+    """Yield (decoded_text, is_boundary) from internal presentation framing."""
+    out = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char != _EGC_BOUNDARY_MARKER:
+            out.append(char)
+            index += 1
+            continue
+        if out:
+            yield "".join(out), False
+            out.clear()
+        suffix = text[index + 1:index + 2]
+        if suffix == "T":
+            out.append(_EGC_BOUNDARY_MARKER)
+            index += 2
+        elif suffix == "B":
+            yield "", True
+            index += 2
+        else:
+            # A fail-open truncation may cut the two-character framing token.
+            # Drop the internal marker rather than rendering a noncharacter.
+            index += 1
+    if out:
+        yield "".join(out), False
 # Private-intro CSI sequences that END in 'm' but are NOT SGR: XTMODKEYS
 # (\x1b[>4;2m = modifyOtherKeys) and friends. pyte ignores the >/</= private
 # marker and misapplies the params as SGR — '>4;2m' becomes underline(4)+faint(2),
@@ -881,9 +1568,10 @@ _PRIVATE_SGR_RE = re.compile(r"\x1b\[[<>=][0-9;:]*m")
 # Kitty keyboard protocol push/pop/set/query (CSI >/</=/? … u). pyte doesn't
 # model it and LEAKS the trailing 'u' into the grid — so a kanji being edited
 # appears to gain a stray 'u' (the leaked byte lands at the cursor). claude emits
-# these to negotiate key reporting, but saikai encodes keys in the legacy format
-# regardless, so dropping the negotiation is display-only and harmless. (Plain
-# CSI u = SCO restore-cursor has no private marker, so it is NOT stripped.)
+# these to negotiate key reporting. saikai tracks the state and honors the
+# supported disambiguation flag while keeping negotiation bytes out of the
+# display grid. (Plain CSI u = SCO restore-cursor has no private marker, so it is
+# NOT stripped.)
 _KITTY_KBD_RE = re.compile(r"\x1b\[[<>=?][0-9;:]*u")
 _KITTY_KBD_STACK_MAX = 16
 # Textual supplies press events, a delivered character, and modifier names, so
@@ -926,7 +1614,7 @@ _OSC_INTRO_RE = r"(?:\x1b\]|\x9d)"
 _OSC_TERM_RE = r"(?:\x07|\x1b\\|\x9c)"
 _DA_RE = re.compile(_CSI_INTRO_RE + r"0?c")              # Primary Device Attributes
 _DA2_RE = re.compile(_CSI_INTRO_RE + r">0?c")            # Secondary DA (vim t_RV, tmux)
-_DSR_RE = re.compile(_CSI_INTRO_RE + r"(\??)([56])n")    # DSR: 5=status, 6=cursor position
+_DSR_RE = re.compile(_CSI_INTRO_RE + r"(?:[56]|\?6)n")  # standard DSR + DECXCPR
 _DECRQM_RE = re.compile(_CSI_INTRO_RE + r"\?(\d+)\$p")   # DECRQM (mode support query)
 _XTVERSION_RE = re.compile(_CSI_INTRO_RE + r">0?q")      # XTVERSION (terminal name/version)
 _OSC_COLOR_Q_RE = re.compile(                            # OSC 10/11 fg/bg color query
@@ -969,13 +1657,10 @@ _NATIVE_CURSOR_HIDE_SETTLE = 0.5
 # freeze decision, and neither may latch for the pane's lifetime. (#ime-midframe)
 _SYNC_ATOMIC_TTL = 2.0
 _SYNC_BYPASS_TTL = 2.0
-# Above this a PTY write is handed to the pane's writer thread instead of running on
-# the UI thread, where a full pty input queue would freeze the event loop. Keystrokes,
-# mouse reports and query replies are far below it and stay inline. (#paste-block)
-_PTY_INLINE_WRITE_MAX = 4096
-# Ceiling on writes waiting for that thread. A child that stops reading stdin for
-# good would otherwise turn the queue into an unbounded buffer that also swallows
-# every later keystroke. Far above any real typing or paste. (#paste-block)
+# UTF-8-byte ceiling for all accepted but not-yet-written pane input. A child
+# that stops reading stdin must not turn the serialized writer into an unbounded
+# buffer. The in-flight item counts too, so retained input is bounded even while
+# the backend's write call is blocked.
 _PTY_WRITE_QUEUE_MAX = 4 * 1024 * 1024
 # Reader buffer. ptyprocess defaults read() to 1024 bytes, which turns a big turn
 # into ~1000 wakeups per MB, each paying the whole per-chunk pipeline. winpty
@@ -997,13 +1682,14 @@ _DECRQM_TRACKED = {
 _DECRQM_ALT_SCREEN = ("47", "1047", "1049")
 
 
-# DCS strings (ESC P … ST): sixel images, DECRQSS/XTGETTCAP replies. pyte has no
-# DCS handler and DRAWS the payload body into the grid, and the pane advertises
-# sixel in its Windows-Terminal DA reply, so an auto-detecting image tool would
-# fill the pane with garbage. Strip them before pyte and the mirror. (#dcs-scrub)
-_DCS_END_RE = re.compile(r"\x07|\x1b\\")
+# DCS/APC/PM/SOS strings are opaque terminal-private payloads. pyte does not
+# implement them and draws their bodies into the grid, so strip them before pyte
+# and the mirror. OSC and DCS retain their historical defensive BEL terminator;
+# APC/PM/SOS require ST. (#dcs-scrub)
 _DCS_MAX_DROP = 4 * 1024 * 1024
 _VT_TOKENIZER_MAX_CARRY = 64 * 1024
+_OPAQUE_STRING_KINDS = frozenset(("dcs", "apc", "pm", "sos", "ignored"))
+_STRING_C1_INTRODUCERS = frozenset(("\x9b", "\x9d", "\x90", "\x9f", "\x9e", "\x98"))
 
 
 @dataclass(frozen=True)
@@ -1035,7 +1721,7 @@ class VTTokenizer:
         self.max_carry = max(1, int(max_carry))
         self.max_dropped_string = max(0, int(max_dropped_string))
         self.carry = ""
-        # Bounded accounting for malformed OSC/DCS strings that have failed open.
+        # Bounded accounting for malformed control strings that have failed open.
         # It is diagnostic state only; the raw data is emitted, never discarded.
         self.dropped_string_chars = 0
         # An over-cap unit has already been exposed as text. Retain only its
@@ -1081,7 +1767,8 @@ class VTTokenizer:
                 self.max_dropped_string, self.dropped_string_chars + len(raw))
         out.append(VTToken("text", raw, literal=True))
         self._fail_open_kind = kind
-        self._fail_open_pending_esc = kind in ("osc", "dcs") and raw.endswith("\x1b")
+        self._fail_open_pending_esc = kind in (
+            "osc", "dcs", "apc", "pm", "sos") and raw.endswith("\x1b")
 
     def _drain_fail_open(self, text: str, out: list[VTToken]) -> int:
         """Emit text through the terminator of an already fail-open unit.
@@ -1093,7 +1780,7 @@ class VTTokenizer:
         kind = self._fail_open_kind
         if not kind:
             return 0
-        if kind in ("osc", "dcs") and self._fail_open_pending_esc:
+        if kind in ("osc", "dcs", "apc", "pm", "sos") and self._fail_open_pending_esc:
             if text.startswith("\\"):
                 out.append(VTToken("text", "\\", literal=True))
                 self._fail_open_kind = None
@@ -1113,99 +1800,175 @@ class VTTokenizer:
                 if self._is_escape_final(ch) or self._is_control(ch):
                     end = pos + 1
                     break
-            else:  # OSC / DCS strings
-                if ch in ("\x07", "\x9c"):
+            else:  # OSC / opaque strings
+                if ch == "\x9c" or (ch == "\x07" and kind in ("osc", "dcs")):
+                    end = pos + 1
+                    break
+                if ch in ("\x18", "\x1a"):
                     end = pos + 1
                     break
                 if ch == "\x1b" and pos + 1 < len(text) and text[pos + 1] == "\\":
                     end = pos + 2
+                    break
+                if ch == "\x1b" or ch in _STRING_C1_INTRODUCERS:
+                    end = pos
                     break
             pos += 1
         if end is None:
             if text:
                 out.append(VTToken("text", text, literal=True))
                 self._fail_open_pending_esc = (
-                    kind in ("osc", "dcs") and text.endswith("\x1b"))
+                    kind in ("osc", "dcs", "apc", "pm", "sos")
+                    and text.endswith("\x1b"))
             return len(text)
-        out.append(VTToken("text", text[:end], literal=True))
+        if end:
+            out.append(VTToken("text", text[:end], literal=True))
         self._fail_open_kind = None
         self._fail_open_pending_esc = False
         return end
 
     def _parse_csi(self, text: str, start: int, body: int,
-                   out: list[VTToken]) -> int | None:
+                   out: list[VTToken], *, introducer: str | None = None
+                   ) -> int | None:
         """Emit a CSI at *start*, or retain an incomplete unit and return None."""
+        introducer = text[start:body] if introducer is None else introducer
         pos = body
-        params_start = pos
-        while pos < len(text) and self._is_parameter(text[pos]):
-            pos += 1
-        params = text[params_start:pos]
-        inter_start = pos
-        while pos < len(text) and self._is_intermediate(text[pos]):
-            pos += 1
-        intermediates = text[inter_start:pos]
-        if pos == len(text):
-            self._retain_or_fail_open(text[start:], out, kind="csi")
-            return None
-        if self._is_final(text[pos]):
-            pos += 1
-            self._emit_or_fail_open(VTToken(
-                "csi", text[start:pos], params, intermediates, text[pos - 1]), out)
+        parameters: list[str] = []
+        intermediates: list[str] = []
+        in_intermediates = False
+        while pos < len(text):
+            ch = text[pos]
+            # Preserve the existing cancellation contract: expose the incomplete
+            # prefix, then let the outer tokenizer execute CAN/SUB or reparse ESC.
+            if ch in ("\x18", "\x1a", "\x1b"):
+                partial = (
+                    introducer + "".join(parameters) + "".join(intermediates))
+                out.append(VTToken("text", partial, literal=True))
+                return pos
+            # ECMA-48 C0 controls execute without leaving CSI entry/parameter/
+            # intermediate state. They therefore precede the eventual CSI token.
+            if ord(ch) < 0x20:
+                out.append(VTToken("control", ch))
+                pos += 1
+                continue
+            if not in_intermediates and self._is_parameter(ch):
+                parameters.append(ch)
+                pos += 1
+                continue
+            if self._is_intermediate(ch):
+                in_intermediates = True
+                intermediates.append(ch)
+                pos += 1
+                continue
+            if self._is_final(ch):
+                params = "".join(parameters)
+                inters = "".join(intermediates)
+                self._emit_or_fail_open(VTToken(
+                    "csi", introducer + params + inters + ch,
+                    params, inters, ch), out)
+                return pos + 1
+            # An invalid byte cannot complete this CSI. Keep no poison for a
+            # later PTY read: return its normalized raw prefix as ordinary data.
+            partial = introducer + "".join(parameters) + "".join(intermediates)
+            out.append(VTToken("text", partial, literal=True))
             return pos
-        # A control or an invalid byte cannot complete this CSI. Keep no poison
-        # for a later PTY read: return its raw prefix as ordinary data instead.
-        out.append(VTToken("text", text[start:pos], literal=True))
-        return pos
+        raw = introducer + "".join(parameters) + "".join(intermediates)
+        self._retain_or_fail_open(raw, out, kind="csi")
+        return None
 
     def _parse_string(self, text: str, start: int, body: int, kind: str,
-                      out: list[VTToken]) -> int | None:
-        """Emit OSC/DCS through BEL, ESC-ST, or C1-ST; else carry it bounded."""
+                      out: list[VTToken], *, introducer: str | None = None
+                      ) -> int | None:
+        """Emit one complete control string, or carry its bounded suffix.
+
+        CAN/SUB cancel a string. A non-ST ESC or a C1 control introducer ends
+        it immediately and is reparsed by the outer tokenizer, matching xterm.
+        """
+        introducer = text[start:body] if introducer is None else introducer
+
+        def raw_through(end: int) -> str:
+            return introducer + text[body:end]
+
         pos = body
         while pos < len(text):
             ch = text[pos]
-            if ch in ("\x07", "\x9c"):
+            if ch == "\x9c" or (ch == "\x07" and kind in ("osc", "dcs")):
                 pos += 1
-                self._emit_or_fail_open(VTToken(kind, text[start:pos]), out)
+                self._emit_or_fail_open(VTToken(kind, raw_through(pos)), out)
+                return pos
+            if ch in ("\x18", "\x1a"):
+                pos += 1
+                self._emit_or_fail_open(VTToken("ignored", raw_through(pos)), out)
                 return pos
             if ch == "\x1b":
                 if pos + 1 == len(text):
-                    self._retain_or_fail_open(text[start:], out, string=True, kind=kind)
+                    self._retain_or_fail_open(
+                        raw_through(len(text)), out, string=True, kind=kind)
                     return None
                 if text[pos + 1] == "\\":
                     pos += 2
-                    self._emit_or_fail_open(VTToken(kind, text[start:pos]), out)
+                    self._emit_or_fail_open(VTToken(kind, raw_through(pos)), out)
                     return pos
+                self._emit_or_fail_open(
+                    VTToken("ignored", raw_through(pos)), out)
+                return pos
+            if ch in _STRING_C1_INTRODUCERS:
+                self._emit_or_fail_open(
+                    VTToken("ignored", raw_through(pos)), out)
+                return pos
             pos += 1
-        self._retain_or_fail_open(text[start:], out, string=True, kind=kind)
+        self._retain_or_fail_open(
+            raw_through(len(text)), out, string=True, kind=kind)
         return None
 
     def _parse_escape(self, text: str, start: int,
                       out: list[VTToken]) -> int | None:
         """Parse ESC plus its optional intermediate bytes and final byte."""
         pos = start + 1
-        if pos == len(text):
-            self._retain_or_fail_open(text[start:], out, kind="esc")
-            return None
-        leader = text[pos]
-        if leader == "[":
-            return self._parse_csi(text, start, pos + 1, out)
-        if leader == "]":
-            return self._parse_string(text, start, pos + 1, "osc", out)
-        if leader == "P":
-            return self._parse_string(text, start, pos + 1, "dcs", out)
-        while pos < len(text) and self._is_intermediate(text[pos]):
-            pos += 1
-        if pos == len(text):
-            self._retain_or_fail_open(text[start:], out, kind="esc")
-            return None
-        if self._is_escape_final(text[pos]):
-            pos += 1
-            self._emit_or_fail_open(VTToken(
-                "esc", text[start:pos], intermediates=text[start + 1:pos - 1],
-                final=text[pos - 1]), out)
+        intermediates: list[str] = []
+        while pos < len(text):
+            ch = text[pos]
+            # CAN/SUB cancel and a fresh ESC restarts parsing at its own position.
+            if ch in ("\x18", "\x1a", "\x1b"):
+                partial = "\x1b" + "".join(intermediates)
+                out.append(VTToken("text", partial, literal=True))
+                return pos
+            # As in CSI state, ordinary C0 controls execute and ESC parsing
+            # continues in the same intermediate state.
+            if ord(ch) < 0x20:
+                out.append(VTToken("control", ch))
+                pos += 1
+                continue
+            if not intermediates and ch == "[":
+                return self._parse_csi(
+                    text, start, pos + 1, out, introducer="\x1b[")
+            if not intermediates and ch == "]":
+                return self._parse_string(
+                    text, start, pos + 1, "osc", out, introducer="\x1b]")
+            if not intermediates and ch == "P":
+                return self._parse_string(
+                    text, start, pos + 1, "dcs", out, introducer="\x1bP")
+            if not intermediates and ch in ("_", "^", "X"):
+                return self._parse_string(
+                    text, start, pos + 1,
+                    {"_": "apc", "^": "pm", "X": "sos"}[ch], out,
+                    introducer="\x1b" + ch)
+            if self._is_intermediate(ch):
+                intermediates.append(ch)
+                pos += 1
+                continue
+            if self._is_escape_final(ch):
+                inters = "".join(intermediates)
+                self._emit_or_fail_open(VTToken(
+                    "esc", "\x1b" + inters + ch,
+                    intermediates=inters, final=ch), out)
+                return pos + 1
+            partial = "\x1b" + "".join(intermediates)
+            out.append(VTToken("text", partial, literal=True))
             return pos
-        out.append(VTToken("text", text[start:pos], literal=True))
-        return pos
+        self._retain_or_fail_open(
+            "\x1b" + "".join(intermediates), out, kind="esc")
+        return None
 
     def feed(self, text: str) -> list[VTToken]:
         """Tokenize one decoded PTY chunk, retaining only an incomplete suffix."""
@@ -1252,6 +2015,15 @@ class VTTokenizer:
                     break
                 pos = text_start = next_pos
                 continue
+            if ch in ("\x9f", "\x9e", "\x98"):
+                emit_text(pos)
+                next_pos = self._parse_string(
+                    text, pos, pos + 1,
+                    {"\x9f": "apc", "\x9e": "pm", "\x98": "sos"}[ch], out)
+                if next_pos is None:
+                    break
+                pos = text_start = next_pos
+                continue
             if self._is_control(ch):
                 emit_text(pos)
                 out.append(VTToken("control", ch))
@@ -1261,6 +2033,35 @@ class VTTokenizer:
         else:
             emit_text(len(text))
         return out
+
+    def flush(self) -> list[VTToken]:
+        """Fail an incomplete EOF suffix open once, then retire parser state."""
+        raw = self.carry
+        self.carry = ""
+        self._fail_open_kind = None
+        self._fail_open_pending_esc = False
+        if not raw:
+            return []
+        return [VTToken("text", raw, literal=True)]
+
+
+def _mirror_alt_contract_token(token: VTToken) -> str:
+    """Map legacy alternate-buffer switches to saikai's 1049 semantics.
+
+    Local 47/1047 deliberately preserve MAIN's cursor just like 1049. Browser
+    xterm implements their historical no-save behavior, so forwarding them
+    verbatim would make a connected mirror diverge after the first switch.
+    """
+    if (token.kind != "csi" or token.intermediates
+            or token.final not in ("h", "l")
+            or not token.parameters.startswith("?")):
+        return token.raw
+    modes = token.parameters[1:].split(";")
+    if not any(mode in ("47", "1047") for mode in modes):
+        return token.raw
+    mapped = ["1049" if mode in ("47", "1047") else mode for mode in modes]
+    introducer = "\x9b" if token.raw.startswith("\x9b") else "\x1b["
+    return introducer + "?" + ";".join(mapped) + token.final
 
 
 def _literalize_control_data(text: str) -> str:
@@ -1295,54 +2096,6 @@ def _osc_parts(token: VTToken) -> tuple[str, str, str]:
     return (code, payload if sep else "", terminator)
 
 
-def _strip_dcs(text: str, inside: bool = False, dropped: int = 0):
-    """Remove DCS strings from *text*, carrying the 'inside a DCS' state.
-
-    Returns (clean_text, inside, dropped). A payload split across PTY reads keeps
-    being dropped until its terminator arrives; past _DCS_MAX_DROP the strip gives
-    up and passes text through, so a malformed stream degrades to garbage rather
-    than blackholing the pane forever."""
-    out = []
-    pos = 0
-    while pos < len(text):
-        if inside:
-            match = _DCS_END_RE.search(text, pos)
-            if match is None:
-                dropped += len(text) - pos
-                if dropped > _DCS_MAX_DROP:
-                    out.append(text[pos:])
-                    inside, dropped = False, 0
-                return "".join(out), inside, dropped
-            inside, dropped = False, 0
-            pos = match.end()
-            continue
-        start = text.find("\x1bP", pos)
-        if start < 0:
-            out.append(text[pos:])
-            break
-        out.append(text[pos:start])
-        inside = True
-        pos = start + 2
-    return "".join(out), inside, dropped
-
-
-# Queries whose answer depends on state the SAME chunk may still change, so they are
-# answered at their own stream position rather than up front: cursor position (DSR 6)
-# and mode state (DECRQM). Groups: 1-2 = DSR privacy/kind, 3 = DECRQM mode.
-_POSITIONAL_QUERY_RE = re.compile("|".join((_DSR_RE.pattern, _DECRQM_RE.pattern)))
-
-
-def _has_positional_query(text: str) -> bool:
-    """True if *text* holds a query that must be answered at its stream position.
-
-    A child can block on one of these before it emits ?2026l, so a retained frame
-    holding one has to fail open rather than deadlock."""
-    for match in _POSITIONAL_QUERY_RE.finditer(text):
-        if match.group(3) is not None or match.group(2) == "6":
-            return True
-    return False
-
-
 class _SynchronizedOutputStager:
     """Hold DEC 2026 output until a complete frame is available."""
 
@@ -1358,7 +2111,6 @@ class _SynchronizedOutputStager:
         self._last_frame_at = 0.0    # monotonic ts of the last CLEAN frame close
         self._bypass_at = 0.0        # monotonic ts the current fail-open started
         self._now = 0.0              # clock of the push/flush in progress
-        self._cursor_query = False
 
     @property
     def active(self):
@@ -1388,15 +2140,6 @@ class _SynchronizedOutputStager:
         return bool(self._last_frame_at) and (now - self._last_frame_at) <= _SYNC_ATOMIC_TTL
 
     @property
-    def pending_query(self):
-        """True when the RETAINED text holds a position-dependent query (DSR-6 or
-        DECRQM). The child may be waiting for that reply before it emits ?2026l, so
-        the frame has to fail open — but only for a query we are actually holding: one
-        that arrived before the block opened is answerable from the plain prefix and
-        must not tear the frame."""
-        return self._cursor_query
-
-    @property
     def in_block(self):
         """True while the child is inside a BSU/ESU pair, whether we are still
         holding the frame or streaming it through after a fail-open. This is what
@@ -1412,21 +2155,17 @@ class _SynchronizedOutputStager:
         self._parts = [marker]
         self._chars = len(marker)
         self._opened_at = now
-        self._cursor_query = False
 
     def _append(self, text):
         if text:
             self._parts.append(text)
             self._chars += len(text)
-            if not self._cursor_query and _has_positional_query(text):
-                self._cursor_query = True
 
     def _release(self, reason=None, bypass=False):
         text = "".join(self._parts)
         self._parts = []
         self._chars = 0
         self._opened_at = 0.0
-        self._cursor_query = False
         self._state = "bypass" if bypass else "outside"
         if bypass:
             self._bypass_at = self._now
@@ -1715,12 +2454,24 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._on_exit = on_exit
         self._status_classifier = status_classifier or classify_pty_status
 
+        # PTY ownership is one versioned tuple. The reader EOF path and the UI
+        # kill path race through _detach_owned_pty; exactly one generation wins
+        # cleanup, so a late callback can never signal a replacement/reused PID.
+        self._lifecycle_lock = threading.Lock()
+        self._lifecycle_generation = 0
+        self._lifecycle_retiring_generation = None
+        self._lifecycle_eof_events = {}
         self._pty = None
         self._pid: Optional[int] = None
-        self._screen = None          # pyte.Screen
-        self._stream = None          # pyte.Stream (feeds str)
+        self._screen = None          # currently active pyte screen
+        self._stream = None          # stream paired with the active screen
+        self._main_screen = None
+        self._main_stream = None
+        self._alt_screen = None
+        self._alt_stream = None
         self._alt = AltScreenTracker()
         self._scroll = 0             # lines scrolled back (0 = live bottom)
+        self._scroll_snapshot = None # immutable combined history/live view while pinned
         self._frozen = False         # paused repaint: hold the view still so a
                                      # streaming pane can be drag-selected
         self._sel_anchor = None      # (row,col) drag start — saikai-OWNED selection
@@ -1748,9 +2499,23 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                                      # (the reader keeps mutating screen.buffer, so
                                      # render + copy must read the FROZEN frame)
         self._vt_tokenizer = VTTokenizer()  # the only decoded-stream carry/parser
-        self._write_lock = threading.Lock()  # guards the PTY write queue below
-        self._write_q: list = []     # oversized writes waiting for the writer thread
-        self._writer = None          # daemon draining _write_q in order (#paste-block)
+        # Every PTY write is serialized by one persistent worker. UI and reader
+        # threads only append to this bounded deque; the condition is never held
+        # across the backend's potentially blocking write().
+        self._write_condition = threading.Condition()
+        self._write_q = deque()
+        self._write_queued_bytes = 0
+        self._write_inflight_bytes = 0
+        self._write_pending_bytes = 0
+        self._write_drop_count = 0
+        self._write_drop_bytes = 0
+        self._write_drop_reason = ""
+        self._write_accepting = False
+        self._write_stop = False
+        self._write_closed = False
+        self._writer: Optional[threading.Thread] = None
+        self._writer_generation = None
+        self._writer_workers_started = 0
         self._sync_output = _SynchronizedOutputStager()
         # The reader and one persistent deadline worker share only the stager.
         # This lock is never nested with self._lock; units are fed after release.
@@ -1771,7 +2536,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._alt_screen_mode = False  # ?47/?1047/?1049 DECRQM state at stream position
         self._kitty_keyboard_flags = {False: 0, True: 0}
         self._kitty_keyboard_stacks = {False: [], True: []}
+        self._osc8_active = None
+        self._mirror_mode_reseed_pending = False
         self._hw_cursor_visible: Optional[bool] = None  # last ?25 visibility we wrote
+        self._hw_cursor_shape = 0    # DECSCUSR shape last applied to the outer driver
+        self._cursor_style = 0       # child-requested DECSCUSR shape (0..6)
         self._anchored_xy = None  # last IME anchor cell we set (freeze/flush bookkeeping)
         self._cursor_hidden_since = 0.0  # monotonic ts the child hid its cursor (?25l settle)
         # Mirror pane-direct tee (#pane-direct): tee(str) forwards a scrubbed
@@ -1806,6 +2575,10 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # the final busy→idle tick comes from the UI-thread poll and never the
         # reader. (#linux-state-regroup)
         self.last_input_ts = 0.0
+        self._input_status_deadline = 0.0
+        self._input_status_deadline_seen = True
+        self._input_status_generation = 0
+        self._input_status_timer = None
 
     # ── geometry helpers ──────────────────────────────────────────────────────
     def _dims(self) -> tuple[int, int]:
@@ -1824,15 +2597,229 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             h = h if h >= 4 else 24
         return max(h, 2), max(w, 2)
 
+    def _create_screen_pair(self, rows: int, cols: int) -> None:
+        """Create independent main/alternate grids and select the main grid."""
+        # HistoryScreen keeps scrolled-off MAIN lines in .history.top. The
+        # alternate grid deliberately has no terminal scrollback; fullscreen
+        # children own their own viewport and every entry starts clean.
+        main = _HistoryScreenBase(cols, rows, history=SCROLLBACK_LINES)
+        alternate = _HistoryScreenBase(cols, rows, history=0)
+        self._main_screen = main
+        self._main_stream = pyte.Stream(main)
+        self._alt_screen = alternate
+        self._alt_stream = pyte.Stream(alternate)
+        self._screen = main
+        self._stream = self._main_stream
+        self._alt.in_alt = False
+        self._alt_screen_mode = False
+
+    def _ensure_screen_pair_locked(self) -> None:
+        """Install a missing pair for legacy/headless objects (lock held)."""
+        screen = getattr(self, "_screen", None)
+        stream = getattr(self, "_stream", None)
+        if screen is None:
+            return
+        main = getattr(self, "_main_screen", None)
+        alternate = getattr(self, "_alt_screen", None)
+        if main is None:
+            self._main_screen = screen
+            self._main_stream = stream if stream is not None else pyte.Stream(screen)
+        if alternate is None:
+            alternate = _HistoryScreenBase(
+                screen.columns, screen.lines, history=0)
+            self._alt_screen = alternate
+            self._alt_stream = pyte.Stream(alternate)
+
+    @staticmethod
+    def _invalidate_screen_grapheme(screen) -> None:
+        invalidator = getattr(screen, "invalidate_grapheme_candidate", None)
+        if invalidator is not None:
+            invalidator()
+
+    def _switch_alt_screen_locked(self, enabled: bool) -> bool:
+        """Switch the active screen at one stream position (lock held)."""
+        self._ensure_screen_pair_locked()
+        current = bool(getattr(getattr(self, "_alt", None), "in_alt", False))
+        if enabled == current:
+            return False
+        main = self._main_screen
+        alternate = self._alt_screen
+        if main is None or alternate is None:
+            return False
+        self._invalidate_screen_grapheme(main)
+        self._invalidate_screen_grapheme(alternate)
+        title = getattr(self._screen, "title", "") or ""
+        icon_name = getattr(self._screen, "icon_name", "") or ""
+        if enabled:
+            source = self._screen
+            # xterm's 1049-like entry uses the active MAIN buffer's one DECSC
+            # slot. It therefore overwrites an older explicit ESC 7 savepoint
+            # with the entry cursor/rendition. The main grid itself remains
+            # untouched, so leaving ALT still restores that exact live state.
+            # The idempotence return above ensures a repeated SET cannot
+            # overwrite the slot again or clear the already-active ALT buffer.
+            source.save_cursor()
+            alternate.reset()
+            # A 1049-style switch clears the alternate grid, but begins it with
+            # the current cursor/rendition/charset. Terminal-global modes remain
+            # in force; DECSTBM margins are buffer-local and reset with ALT.
+            # The two cursor objects then diverge so
+            # leaving ALT restores MAIN exactly.
+            for mode in _PYTE_GLOBAL_SCREEN_MODES:
+                if mode in getattr(source, "mode", ()):
+                    alternate.mode.add(mode)
+                else:
+                    alternate.mode.discard(mode)
+            try:
+                alternate.cursor.y = max(
+                    0, min(int(source.cursor.y), alternate.lines - 1))
+                alternate.cursor.x = max(
+                    0, min(int(source.cursor.x), alternate.columns))
+                alternate.cursor.attrs = source.cursor.attrs
+                alternate.g0_charset = source.g0_charset
+                alternate.g1_charset = source.g1_charset
+                alternate.charset = source.charset
+            except Exception:
+                pass
+            alternate.title = title
+            alternate.icon_name = icon_name
+            self._screen = alternate
+            self._stream = self._alt_stream
+        else:
+            # Window/icon titles are terminal-global even though cells/cursors
+            # are buffer-local, so retain a title set while alternate was active.
+            main.title = title
+            main.icon_name = icon_name
+            self._screen = main
+            self._stream = self._main_stream
+        try:
+            visible = bool(getattr(self, "_cursor_visible", True))
+            if _PYTE_DECTCEM is not None:
+                if visible:
+                    self._screen.mode.add(_PYTE_DECTCEM)
+                else:
+                    self._screen.mode.discard(_PYTE_DECTCEM)
+            self._screen.cursor.hidden = not visible
+        except Exception:
+            pass
+        self._alt.in_alt = enabled
+        self._alt_screen_mode = enabled
+        self._scroll = 0
+        self._scroll_snapshot = None
+        return True
+
+    def _sync_global_screen_state_locked(self, token: "VTToken") -> None:
+        """Copy global mode results without moving the inactive saved cursor."""
+        if token.kind != "csi" or token.intermediates:
+            return
+        sync_modes = (
+            token.final in ("h", "l")
+            and not token.parameters.startswith((">", "<", "="))
+        )
+        if not sync_modes:
+            return
+        self._ensure_screen_pair_locked()
+        active = self._screen
+        inactive = (
+            self._main_screen if active is self._alt_screen
+            else self._alt_screen
+        )
+        if active is None or inactive is None:
+            return
+        for mode in _PYTE_GLOBAL_SCREEN_MODES:
+            if mode in getattr(active, "mode", ()):
+                inactive.mode.add(mode)
+            else:
+                inactive.mode.discard(mode)
+
     # ── lifecycle ─────────────────────────────────────────────────────────────
+    def _ensure_lifecycle_state(self) -> None:
+        """Initialize ownership fields for lightweight ``__new__`` test panes."""
+        if getattr(self, "_lifecycle_lock", None) is not None:
+            return
+        self._lifecycle_lock = threading.Lock()
+        self._lifecycle_generation = int(
+            getattr(self, "_lifecycle_generation", 0))
+        self._lifecycle_retiring_generation = getattr(
+            self, "_lifecycle_retiring_generation", None)
+        self._lifecycle_eof_events = getattr(
+            self, "_lifecycle_eof_events", {})
+        if not hasattr(self, "_pty"):
+            self._pty = None
+        if not hasattr(self, "_pid"):
+            self._pid = None
+
+    def _attach_pty(self, pty, pid=None) -> int:
+        """Attach a newly spawned PTY and return its monotonically increasing id."""
+        self._ensure_lifecycle_state()
+        with self._lifecycle_lock:
+            if self._pty is not None or self._pid is not None:
+                raise RuntimeError("cannot replace an attached PTY generation")
+            if self._lifecycle_retiring_generation is not None:
+                raise RuntimeError(
+                    "cannot attach a PTY while the previous generation retires")
+            self._lifecycle_generation += 1
+            self._pty = pty
+            self._pid = pid
+            self._lifecycle_eof_events[
+                self._lifecycle_generation] = threading.Event()
+            return self._lifecycle_generation
+
+    def _lifecycle_snapshot(self):
+        """Return the current ``(pty, pid, generation)`` atomically."""
+        self._ensure_lifecycle_state()
+        with self._lifecycle_lock:
+            return (
+                self._pty,
+                self._pid,
+                self._lifecycle_generation,
+            )
+
+    def _detach_owned_pty(self, pty, generation):
+        """Detach only the exact generation owned by a reader/kill caller."""
+        self._ensure_lifecycle_state()
+        with self._lifecycle_lock:
+            if (self._pty is not pty
+                    or self._lifecycle_generation != generation):
+                return None
+            pid = self._pid
+            if pty is None and pid is None:
+                return None
+            self._pty = None
+            self._pid = None
+            self._lifecycle_retiring_generation = generation
+            return pty, pid, generation
+
+    def _mark_generation_natural_eof(self, generation: int) -> None:
+        """Publish EOF even when kill won the detach race for this generation."""
+        self._ensure_lifecycle_state()
+        with self._lifecycle_lock:
+            event = self._lifecycle_eof_events.get(generation)
+        if event is not None:
+            event.set()
+
+    def _generation_eof_event(self, generation: int):
+        self._ensure_lifecycle_state()
+        with self._lifecycle_lock:
+            return self._lifecycle_eof_events.get(generation)
+
+    def _generation_is_retiring(self, generation: int) -> bool:
+        self._ensure_lifecycle_state()
+        with self._lifecycle_lock:
+            return self._lifecycle_retiring_generation == generation
+
+    def _finish_pty_retirement(self, generation: int) -> None:
+        """Release the attach fence after old-reader shared cleanup is complete."""
+        self._ensure_lifecycle_state()
+        with self._lifecycle_lock:
+            if self._lifecycle_retiring_generation == generation:
+                self._lifecycle_retiring_generation = None
+                self._lifecycle_eof_events.pop(generation, None)
+
     def on_mount(self) -> None:
         rows, cols = self._dims()
         try:
-            # HistoryScreen keeps scrolled-off lines in .history.top so the pane
-            # can scroll back (claude renders to the NORMAL buffer — verified by
-            # probe: no ?1049h alt-screen — so terminal-side scrollback applies).
-            self._screen = _HistoryScreenBase(cols, rows, history=SCROLLBACK_LINES)  # (cols, rows)!
-            self._stream = pyte.Stream(self._screen)        # feed str; pywinpty already decodes
+            self._create_screen_pair(rows, cols)
         except Exception as e:  # pragma: no cover
             self._fail(f"pyte init failed: {e!r}")
             return
@@ -1841,8 +2828,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception as e:
             self._fail(f"spawn failed: {e!r}")
             return
+        pty, _pid, generation = self._lifecycle_snapshot()
+        if pty is None:
+            self._fail("spawn failed: backend returned no PTY")
+            return
         self._reader = threading.Thread(
-            target=self._read_loop, name=f"pty-read-{self.sid or 'new'}",
+            target=self._read_loop, args=(pty, generation),
+            name=f"pty-read-{self.sid or 'new'}",
             daemon=True,
         )
         self._reader.start()
@@ -1862,7 +2854,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         env = _child_pty_env(base_env)
         kwargs["env"] = env
         # argv MUST be a list (pywinpty spike gotcha #3).
-        self._pty = PtyProcess.spawn(self._argv, **kwargs)
+        pty = PtyProcess.spawn(self._argv, **kwargs)
         # POSIX ptyprocess.PtyProcessUnicode decodes with codec_errors='strict'
         # by default, so a single invalid UTF-8 byte from the child (a binary blob
         # cat'd into the pane, a legacy-encoded log) raises UnicodeDecodeError out
@@ -1870,16 +2862,18 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # showing a replacement char. Swap in a lenient decoder right after spawn
         # (nothing has been read yet, so no buffered state is lost). winpty returns
         # str already and has no decoder attr, so this is POSIX-only. (#audit-pty-decode)
-        if not _IS_WIN and self._pty is not None:
+        if not _IS_WIN and pty is not None:
             try:
                 import codecs
-                enc = getattr(self._pty, "encoding", None) or "utf-8"
-                self._pty.codec_errors = "replace"
-                self._pty.decoder = codecs.getincrementaldecoder(enc)(errors="replace")
+                enc = getattr(pty, "encoding", None) or "utf-8"
+                pty.codec_errors = "replace"
+                pty.decoder = codecs.getincrementaldecoder(enc)(errors="replace")
             except Exception:
                 pass
-        self._pid = getattr(self._pty, "pid", None)
-        _log(f"spawn: sid={(getattr(self, 'sid', None) or '?')[:8]} pid={self._pid}")
+        pid = getattr(pty, "pid", None)
+        self._attach_pty(pty, pid)
+        self._start_writer(reopen=True)
+        _log(f"spawn: sid={(getattr(self, 'sid', None) or '?')[:8]} pid={pid}")
 
     def _fail(self, msg: str) -> None:
         _log(f"spawn FAIL: sid={(getattr(self, 'sid', None) or '?')[:8]} — {msg}")
@@ -1898,31 +2892,41 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     # ── (1) render a grid of styled cells, one Strip per row ───────────────────
     def render_line(self, y: int):  # -> Strip
         width = self.size.width
-        screen = self._screen
         if self._spawn_error is not None:
             # Graceful failure surface: show the error on row 0, blanks below.
             if y == 0:
                 text = f" ⚠ terminal unavailable: {self._spawn_error}"
                 return Strip([Segment(text[:width] if width else text)])
             return Strip.blank(width)
-        if screen is None or y >= screen.lines:
-            return Strip.blank(width)
-        if self.is_dead and self._scroll == 0 and y == screen.lines - 1:
-            # claude exited: overlay a one-line hint on the bottom row so a dead
-            # pane isn't just a frozen frame with no cue on how to act. Reads only
-            # atomic int/bool (no lock); live view only (s==0) so scrolled-back
-            # history stays clean for copy/read. _finalize already repaints once.
-            msg = " ⏎ agent exited — Enter relaunches · F10 closes this tab "
-            return Strip([Segment(msg[:width] if width else msg, Style(reverse=True))])
-        if self._frozen and not self.is_dead and self._scroll == 0 and y == 0:
-            # Frozen for copy/select: the view holds still while claude streams in
-            # the background, so a WezTerm Shift+drag selection survives. One-row
-            # hint at the TOP (recent output is at the bottom, where you select);
-            # Shift+F9 or any keypress resumes.
-            msg = " ❄ frozen — Shift+drag to copy · Shift+F9 / type to resume "
-            return Strip([Segment(msg[:width] if width else msg, Style(reverse=True))])
 
         with self._lock:
+            # Buffer switches happen on the reader thread under this same lock.
+            # Select the active screen only after acquiring it, otherwise one
+            # render can combine a stale buffer pointer with the new terminal
+            # state.
+            screen = self._screen
+            if screen is None or y >= screen.lines:
+                return Strip.blank(width)
+            if self.is_dead and self._scroll == 0 and y == screen.lines - 1:
+                # Never overwrite the process's final diagnostic. Use the bottom
+                # row for the exit hint only when that row is genuinely blank.
+                bottom = screen.buffer[y]
+                if not any(
+                        (bottom[x].data or "").strip()
+                        for x in range(screen.columns)):
+                    msg = (
+                        " ⏎ agent exited — Enter relaunches · "
+                        "F10 closes this tab "
+                    )
+                    return Strip([Segment(
+                        msg[:width] if width else msg, Style(reverse=True))])
+            if (self._frozen and not self.is_dead
+                    and self._scroll == 0 and y == 0):
+                # Frozen for copy/select: keep the hint at the top so recent
+                # output at the bottom remains selectable.
+                msg = " ❄ frozen — Shift+drag to copy · Shift+F9 / type to resume "
+                return Strip([Segment(
+                    msg[:width] if width else msg, Style(reverse=True))])
             cols = screen.columns
             # Clamp into the (possibly just-resized) grid — pyte does NOT clamp the
             # cursor on shrink, so a stale cursor_y >= lines would make the cursor
@@ -1938,13 +2942,23 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             s = self._scroll
             buf = self._buf_for_row(screen, s, y)
             cells = [buf[x] for x in range(cols)] if buf is not None else None
+            if (cells is not None and s == 0 and y == cursor_y
+                    and 0 <= cursor_x < cols):
+                # Addressing the right half of a wide cell lands on pyte's empty
+                # stub. render_line skips stubs, so draw the software caret over
+                # the complete grapheme's leader instead of losing it.
+                while cursor_x > 0 and cells[cursor_x].data == "":
+                    cursor_x -= 1
+            selection_bounds = (
+                self._selection_bounds_for_row(y, cells, cols)
+                if cells is not None else None
+            )
 
         if cells is None:
             return Strip.blank(width)
         # Cursor only in the live view (it lives at the bottom, not in history).
         show_cursor = (s == 0 and self.has_focus and y == cursor_y
                        and not self.is_dead and not cursor_hidden)
-        _has_sel = self._sel_anchor is not None and self._sel_head is not None
         segments = []
         run_chars: list[str] = []
         run_style = None
@@ -1976,7 +2990,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 run_style = None
                 continue
             st = _cell_style(ch)
-            if _has_sel and self._in_sel(y, x):
+            if (selection_bounds is not None
+                    and selection_bounds[0] <= x <= selection_bounds[1]):
                 # XOR reverse so the selection stays visible even over claude's OWN
                 # reverse-video cells (highlighted menu row / footer); a plain
                 # +reverse=True would no-op on an already-reversed cell.
@@ -2013,7 +3028,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         )
         if data is None:
             return
-        self.last_input_ts = time.monotonic()   # (#linux-state-regroup)
+        self._note_input()
         self._snap_to_live()   # typing returns the view to the live bottom
         try:
             self._write_child(data)
@@ -2029,12 +3044,14 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         the frame the user sees. The reader keeps feeding pyte into screen.buffer
         while frozen, so reading it live would render/copy text that scrolled in
         AFTER the freeze (the wrong-copy bug). Takes the lock (UI-thread caller)."""
-        scr = getattr(self, "_screen", None)   # getattr: __new__-built test instances
-        if scr is None:
-            self._frozen_buf = None
-            return
         try:
             with self._lock:
+                # Buffer switches use this lock too; selecting the screen here
+                # gives the snapshot one exact presentation order.
+                scr = getattr(self, "_screen", None)
+                if scr is None:
+                    self._frozen_buf = None
+                    return
                 cols = scr.columns
                 self._frozen_buf = {y: [scr.buffer[y][x] for x in range(cols)]
                                     for y in range(scr.lines)}
@@ -2067,6 +3084,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # _wrap_bracketed_paste strips any embedded markers to block breakout.
             if getattr(self, "_bracketed_paste", False):
                 text = _wrap_bracketed_paste(text)
+            self._note_input()
             self._snap_to_live()   # pasting returns the view to the live bottom
             try:
                 self._write_child(text)
@@ -2082,7 +3100,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         text = _normalize_paste_newlines(text)   # CRLF → LF (Windows double-enter)
         if getattr(self, "_bracketed_paste", False):
             text = _wrap_bracketed_paste(text)   # strips embedded markers (breakout)
-        self.last_input_ts = time.monotonic()    # (#linux-state-regroup)
+        self._note_input()
         self._snap_to_live()   # injected input returns the view to the live bottom
         try:
             self._write_child(text)
@@ -2093,11 +3111,66 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         """Send a single Enter (\\r) to submit the current input. UI-thread only."""
         if self._pty is None or self.is_dead:
             return
+        self._note_input()
         self._snap_to_live()   # submitting returns the view to the live bottom
         try:
             self._write_child("\r")
         except Exception:
             pass
+
+    def _note_input(self, now=None) -> None:
+        """Stamp user input and arm one bounded four-second status invalidation."""
+        stamp = time.monotonic() if now is None else float(now)
+        self.last_input_ts = stamp
+        self._input_status_deadline = stamp + 4.0
+        self._input_status_deadline_seen = False
+        self._input_status_generation = (
+            int(getattr(self, "_input_status_generation", 0)) + 1)
+        generation = self._input_status_generation
+        old_timer = getattr(self, "_input_status_timer", None)
+        if old_timer is not None:
+            try:
+                old_timer.stop()
+            except Exception:
+                pass
+        self._input_status_timer = None
+        try:
+            if not self.is_attached:
+                return
+        except Exception:
+            return
+        try:
+            self._input_status_timer = self.set_timer(
+                4.0,
+                lambda g=generation: self._expire_input_status(g),
+            )
+        except Exception:
+            # Headless tests and pre-mount input still get deterministic expiry
+            # through the host's periodic refresh_status poll.
+            self._input_status_timer = None
+
+    def _expire_input_status(self, generation: int) -> None:
+        """UI-timer callback; stale timers cannot reclassify newer input."""
+        if generation != getattr(self, "_input_status_generation", 0):
+            return
+        self._input_status_timer = None
+        self.refresh_status()
+
+    def _stop_input_status_timer(self) -> None:
+        timer = self._retire_input_status_timer()
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
+    def _retire_input_status_timer(self):
+        """Invalidate and detach the timer without touching its asyncio loop."""
+        self._input_status_generation = (
+            int(getattr(self, "_input_status_generation", 0)) + 1)
+        timer = getattr(self, "_input_status_timer", None)
+        self._input_status_timer = None
+        return timer
 
     def kill_input_line(self) -> None:
         """Send Ctrl+U to clear the child's input line before an injection.
@@ -2152,6 +3225,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             col, row = self._event_cell(event)
             btn = 64 if up else 65                           # wheel: 64 = up, 65 = down
             self._write_child(self._mouse_seq(btn, col, row, "M"))
+            self._note_input()
             return True
         except Exception:
             return False
@@ -2165,8 +3239,18 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         if self._screen is None:
             return
-        with self._lock:   # same lock the reader uses to bump _scroll in _consume
-            self._scroll = min(self._scroll + 3, len(self._screen.history.top))
+        with self._lock:
+            if self._scroll == 0:
+                self._capture_scroll_snapshot_locked()
+            snapshot = getattr(self, "_scroll_snapshot", None)
+            hist_len = (
+                max(0, len(snapshot["rows"]) - snapshot["lines"])
+                if snapshot is not None
+                else len(self._screen.history.top)
+            )
+            self._scroll = min(self._scroll + 3, hist_len)
+            if self._scroll == 0:
+                self._scroll_snapshot = None
         try:
             event.stop()
         except Exception:
@@ -2185,6 +3269,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             if moved:
                 self._scroll = max(0, self._scroll - 3)
             back_at_live = moved and self._scroll == 0
+            if back_at_live:
+                self._scroll_snapshot = None
         if moved:
             self.refresh()
         if back_at_live:
@@ -2208,6 +3294,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         with self._lock:
             changed = self._scroll != 0
             self._scroll = 0
+            self._scroll_snapshot = None
         if changed:
             try:
                 self.refresh()
@@ -2224,10 +3311,47 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     # saikai/CLAUDE.md). saikai therefore captures a plain LEFT-drag itself: freeze
     # on press (stream can't repaint over it), highlight while dragging, copy on
     # release. Coords are widget-relative display rows/cols, matching render_line.
+    def _capture_scroll_snapshot_locked(self) -> None:
+        """Pin one bounded combined history/live image (lock held).
+
+        ``deque(maxlen)`` keeps the same length while evicting, so inferring
+        scroll movement from ``len(history)`` cannot hold a displayed line
+        stable. A snapshot makes render and selection copy read identical cells
+        until the user returns to the live bottom.
+        """
+        screen = self._screen
+        if screen is None:
+            self._scroll_snapshot = None
+            return
+        cols = screen.columns
+        rows = [
+            [line[x] for x in range(cols)]
+            for line in list(screen.history.top)
+        ]
+        rows.extend(
+            [screen.buffer[y][x] for x in range(cols)]
+            for y in range(screen.lines)
+        )
+        self._scroll_snapshot = {
+            "screen": screen,
+            "rows": rows,
+            "lines": screen.lines,
+            "columns": cols,
+        }
+
     def _buf_for_row(self, screen, s, y):
         """pyte cell-row backing display row y (lock held). s>0 windows into
         history.top + live buffer; None = past the scrollback top."""
         if s > 0:
+            snapshot = getattr(self, "_scroll_snapshot", None)
+            if (snapshot is not None
+                    and snapshot.get("screen") is screen
+                    and snapshot.get("lines") == screen.lines
+                    and snapshot.get("columns") == screen.columns):
+                rows = snapshot["rows"]
+                hist_len = max(0, len(rows) - screen.lines)
+                idx = _scroll_row_index(hist_len, s, y)
+                return rows[idx] if 0 <= idx < len(rows) else None
             hist = screen.history.top
             idx = _scroll_row_index(len(hist), s, y)
             if idx < 0:
@@ -2259,14 +3383,43 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return x <= c1
         return True
 
+    def _selection_bounds_for_row(self, y: int, cells, cols: int):
+        """Return inclusive bounds expanded to complete wide graphemes."""
+        a, h = self._sel_anchor, self._sel_head
+        if a is None or h is None or cells is None or cols <= 0:
+            return None
+        (r0, c0), (r1, c1) = (a, h) if a <= h else (h, a)
+        if y < r0 or y > r1:
+            return None
+        if r0 == r1:
+            lo, hi = c0, c1
+        elif y == r0:
+            lo, hi = c0, cols - 1
+        elif y == r1:
+            lo, hi = 0, c1
+        else:
+            lo, hi = 0, cols - 1
+        lo = max(0, min(int(lo), cols - 1))
+        hi = max(0, min(int(hi), cols - 1))
+        while lo > 0 and cells[lo].data == "":
+            lo -= 1
+        if cells[hi].data == "":
+            while hi > 0 and cells[hi].data == "":
+                hi -= 1
+        while hi + 1 < cols and cells[hi + 1].data == "":
+            hi += 1
+        return lo, hi
+
     def _extract_selection(self) -> str:
         a, h = self._sel_anchor, self._sel_head
-        screen = self._screen
-        if a is None or h is None or screen is None:
+        if a is None or h is None:
             return ""
         (r0, c0), (r1, c1) = (a, h) if a <= h else (h, a)
         lines = []
         with self._lock:
+            screen = self._screen
+            if screen is None:
+                return ""
             s = self._scroll
             cols = screen.columns
             for y in range(r0, r1 + 1):
@@ -2274,16 +3427,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 if buf is None:
                     lines.append("")
                     continue
-                if r0 == r1:
-                    lo, hi = c0, c1
-                elif y == r0:
-                    lo, hi = c0, cols - 1
-                elif y == r1:
-                    lo, hi = 0, c1
-                else:
-                    lo, hi = 0, cols - 1
-                hi = min(hi, cols - 1)
-                row = "".join(buf[x].data for x in range(max(lo, 0), hi + 1)
+                bounds = self._selection_bounds_for_row(y, buf, cols)
+                if bounds is None:
+                    lines.append("")
+                    continue
+                lo, hi = bounds
+                row = "".join(buf[x].data for x in range(lo, hi + 1)
                               if buf[x].data != "")
                 lines.append(row.rstrip())
         return "\n".join(lines).strip("\n")
@@ -2333,8 +3482,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         selection / drag-autoscroll — exactly what it gets under a native terminal.
         Inverts Textual's SGR decode (button = (cb+1)&3): cb = (button-1)&3, motion
         adds 32, shift/meta/ctrl add 4/8/16. SGR (?1006) when negotiated, else legacy
-        X10. kind ∈ {down,up,move}. UI-thread only (like _forward_wheel; pty.write is
-        non-blocking). (#faithful-mouse)"""
+        X10. kind ∈ {down,up,move}. UI-thread only; the pane writer enqueue is
+        non-blocking and the backend write runs on its worker. (#faithful-mouse)"""
         if self._pty is None or self.is_dead:
             return
         try:
@@ -2355,6 +3504,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             else:                                           # X10: a release is button code 3
                 lb = (3 if kind == "up" else base) + motion + mods
                 self._write_child(self._mouse_seq(lb, col, row, "M"))
+            self._note_input()
         except Exception:
             pass
 
@@ -2363,7 +3513,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         return bool(self._mouse_reporting) and self._pty is not None and not self.is_dead
 
     def on_mouse_down(self, event) -> None:   # events.MouseDown
-        if self._screen is None or self.is_dead:
+        if self._screen is None:
             return
         # FAITHFUL TERMINAL: when the child tracks the mouse (its fullscreen renderer),
         # forward EVERY press + drag — incl. Shift — so the child runs its OWN
@@ -2485,10 +3635,19 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         d = self._autoscroll_dir
         with self._lock:
-            hist = len(scr.history.top)
+            if self._scroll == 0 and d > 0:
+                self._capture_scroll_snapshot_locked()
+            snapshot = getattr(self, "_scroll_snapshot", None)
+            hist = (
+                max(0, len(snapshot["rows"]) - snapshot["lines"])
+                if snapshot is not None
+                else len(scr.history.top)
+            )
             old = self._scroll
             self._scroll = (min(old + 1, hist) if d > 0 else max(old - 1, 0))
             new = self._scroll
+            if new == 0:
+                self._scroll_snapshot = None
         delta = new - old
         if delta == 0:
             return                              # hit the scrollback top / live bottom
@@ -2559,17 +3718,104 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         rows, cols = self._dims()
         with self._lock:
-            self._scroll = 0     # geometry changed; drop any scrollback offset
+            self._ensure_screen_pair_locked()
+            frozen_before = (
+                getattr(self, "_frozen_buf", None)
+                if getattr(self, "_frozen", False) else None
+            )
+            screens = []
+            for screen in (self._main_screen, self._alt_screen):
+                if screen is not None and screen not in screens:
+                    screens.append(screen)
+            for screen in screens:
+                self._invalidate_screen_grapheme(screen)
+                try:
+                    screen.resize(rows, cols)       # pyte: (rows, cols)!
+                except Exception:
+                    continue
+                # pyte may retain an out-of-range cursor after a shrink.
+                try:
+                    screen.cursor.y = max(0, min(int(screen.cursor.y), rows - 1))
+                    screen.cursor.x = max(0, min(int(screen.cursor.x), cols))
+                except Exception:
+                    pass
+            self._scroll = 0
+            self._scroll_snapshot = None
+            active = self._screen
+            if getattr(self, "_frozen", False) and active is not None:
+                if frozen_before is None:
+                    # Defensive legacy state: frozen without a pinned frame.
+                    self._frozen_buf = {
+                        y: [active.buffer[y][x] for x in range(active.columns)]
+                        for y in range(active.lines)
+                    }
+                else:
+                    # Resize the frame the user actually froze. The live grid
+                    # may have advanced far beyond it while repaints were paused;
+                    # re-snapshotting live here makes the display jump on resize.
+                    blank = getattr(active, "default_char", None)
+                    if blank is None:
+                        blank = active.cursor.attrs._replace(data=" ")
+                    resized = {}
+                    for row_index in range(rows):
+                        old_row = list(frozen_before.get(row_index, ()))
+                        row = old_row[:cols]
+                        row.extend([blank] * (cols - len(row)))
+                        # A horizontal crop may cut off a wide EGC's stub.
+                        column = 0
+                        while column < cols:
+                            data = row[column].data
+                            if data == "":
+                                row[column] = blank
+                                column += 1
+                                continue
+                            cell_width = max(
+                                0, int(_rich_cell_len(data)))
+                            if cell_width > 1:
+                                if (column + cell_width > cols
+                                        or any(
+                                            row[column + offset].data != ""
+                                            for offset in range(1, cell_width)
+                                        )):
+                                    row[column] = blank
+                                    column += 1
+                                else:
+                                    column += cell_width
+                            else:
+                                column += 1
+                        resized[row_index] = row
+                    self._frozen_buf = resized
+            else:
+                self._frozen_buf = None
+            if active is not None:
+                def clamp_point(point):
+                    if point is None:
+                        return None
+                    y, x = point
+                    return (
+                        max(0, min(int(y), active.lines - 1)),
+                        max(0, min(int(x), active.columns - 1)),
+                    )
+                self._sel_anchor = clamp_point(self._sel_anchor)
+                self._sel_head = clamp_point(self._sel_head)
+                self._pending_anchor = clamp_point(self._pending_anchor)
+            self._scr_ver += 1
+            self._cached_ver = -1
+            self._cached_screen = ("", "")
+            self._last_poll_ver = -1
+        pty, _pid, _generation = self._lifecycle_snapshot()
+        if pty is not None and not self.is_dead:
             try:
-                self._screen.resize(rows, cols)     # pyte: (rows, cols)!
-            except Exception:
-                pass
-        if self._pty is not None and not self.is_dead:
-            try:
-                self._pty.setwinsize(rows, cols)    # winpty: (rows, cols)
+                pty.setwinsize(rows, cols)          # winpty: (rows, cols)
             except Exception:
                 pass
         self.refresh()
+        # Host/IME/mirror callbacks stay outside the pyte lock.
+        self._sync_terminal_cursor(reason="focus")
+        try:
+            self.mirror_reseed()
+        except Exception:
+            pass
 
     # ── (4) background reader -> feed pyte -> repaint on the UI thread ─────────
     def _ensure_sync_deadline_state(self) -> None:
@@ -2760,9 +4006,15 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 self._marshal(callback)
         return changed
 
-    def _read_loop(self) -> None:
-        pty = self._pty
+    def _read_loop(self, pty=None, generation=None) -> None:
+        if pty is None or generation is None:
+            current_pty, _pid, current_generation = self._lifecycle_snapshot()
+            if pty is None:
+                pty = current_pty
+            if generation is None:
+                generation = current_generation
         assert pty is not None
+        natural_eof = False
         try:
             while not self._stop.is_set():
                 try:
@@ -2771,6 +4023,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                     # the whole per-chunk pipeline each time. (#linux-read-size)
                     chunk = pty.read(_PTY_READ_SIZE)   # blocking; str on winpty
                 except EOFError:                     # child closed the pty
+                    natural_eof = True
+                    self._mark_generation_natural_eof(generation)
                     break
                 except Exception:
                     break
@@ -2778,6 +4032,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                     # Defensive: some backends may yield "" transiently. Avoid a
                     # busy-spin; re-check isalive and back off before continuing.
                     if not _safe_isalive(pty):
+                        natural_eof = True
+                        self._mark_generation_natural_eof(generation)
                         break
                     time.sleep(0.01)
                     continue
@@ -2795,14 +4051,54 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 if changed and self._scroll == 0 and not self._frozen:
                     self._schedule_pane_refresh()
         finally:
-            # Guarded: the flush feeds pyte and then the status classifier — a
-            # caller-supplied callable — so a raise here must not cost us
-            # _finalize, which is what marks the pane dead. (#eof-flush)
+            bundle = self._detach_owned_pty(pty, generation)
+            same_generation_ended = (
+                bundle is not None
+                or self._generation_is_retiring(generation)
+            )
+            if not same_generation_ended:
+                # A stale reader must not stop, flush, or finalize a replacement
+                # generation which another owner attached after explicit detach.
+                return
+
             try:
-                self._flush_sync_output("eof")
-            except Exception:
-                pass
-            self._finalize()
+                writer = self._stop_writer()
+                if bundle is not None:
+                    # Flush a truncated final escape as visible literal data before
+                    # the synchronized-output stager. This preserves the last bytes
+                    # instead of silently losing an incomplete CSI/OSC at EOF.
+                    try:
+                        self._flush_vt_tokenizer_eof()
+                    except Exception:
+                        pass
+                    # Guarded: either flush can feed pyte and then the status
+                    # classifier (a caller-supplied callable), so a raise must not
+                    # cost us reap or the final death notification. (#eof-flush)
+                    try:
+                        self._flush_sync_output("eof")
+                    except Exception:
+                        pass
+                    try:
+                        with self._lock:
+                            for screen in (
+                                    getattr(self, "_main_screen", None),
+                                    getattr(self, "_alt_screen", None)):
+                                if screen is not None:
+                                    self._invalidate_screen_grapheme(screen)
+                    except Exception:
+                        pass
+                    self._stop.set()
+                    if not natural_eof and not _IS_WIN:
+                        _post_signal(bundle[1], "SIGHUP")
+                        _post_signal(bundle[1], "SIGTERM")
+                    self._start_owned_reaper(
+                        bundle, writer, natural=natural_eof)
+
+                # kill may have won the detach race; it already stopped the pane.
+                # Either way, this exact generation owns the death callback.
+                self._finalize()
+            finally:
+                self._finish_pty_retirement(generation)
 
     def _honor_osc52(self, b64: str, deferred_ui=None) -> None:
         """Put an OSC 52 clipboard-write payload from the child onto the HOST
@@ -2843,72 +4139,234 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if text and self._osc52_copy_allowed():
             self._copy_text(text)
 
-    def _write_child(self, data: str) -> None:
-        """Write to the PTY without ever blocking the UI thread on a full pty buffer.
-
-        A POSIX pty input queue is a few KiB, so a large paste into a child that is
-        momentarily not reading stdin blocks write() — and with it the whole Textual
-        event loop. Oversized writes go to a daemon writer instead; while that queue
-        drains every later write joins it, so the child still receives the bytes in
-        order. Small writes (keystrokes, mouse reports, query replies) stay inline,
-        which is the overwhelmingly common case. (#paste-block)"""
-        if not data or self._pty is None or self.is_dead:
+    def _ensure_writer_state(self) -> None:
+        """Initialize writer fields for lightweight ``__new__`` test panes."""
+        if getattr(self, "_write_condition", None) is not None:
             return
-        lock = getattr(self, "_write_lock", None)
-        queue = getattr(self, "_write_q", None)
-        if lock is not None and queue is not None:
-            with lock:
-                # Queue while a writer is ALIVE, not merely while the queue is
-                # non-empty: it holds the popped item outside the queue for the whole
-                # blocking write, and an inline write during that window would reach
-                # the child first.
-                if (queue or getattr(self, "_writer", None) is not None
-                        or len(data) > _PTY_INLINE_WRITE_MAX):
-                    if sum(len(part) for part in queue) + len(data) > _PTY_WRITE_QUEUE_MAX:
-                        # The child has stopped reading stdin for good. Refuse rather
-                        # than buffer without limit; the pane is already unusable and
-                        # the queue would just grow until memory ran out.
-                        _log(f"pty write dropped: queue full ({len(data)} chars)")
-                        return
-                    queue.append(data)
-                    if getattr(self, "_writer", None) is None:
-                        self._writer = threading.Thread(
-                            target=self._writer_loop,
-                            name=f"saikai-pty-write-{getattr(self, 'sid', '?')}",
-                            daemon=True)
-                        self._writer.start()
-                    return
-        try:
-            self._pty.write(data)
-        except Exception:
-            pass
+        self._write_condition = threading.Condition()
+        self._write_q = deque()
+        self._write_queued_bytes = 0
+        self._write_inflight_bytes = 0
+        self._write_pending_bytes = 0
+        self._write_drop_count = 0
+        self._write_drop_bytes = 0
+        self._write_drop_reason = ""
+        self._write_accepting = False
+        self._write_stop = False
+        self._write_closed = False
+        self._writer = None
+        self._writer_generation = None
+        self._writer_workers_started = 0
 
-    def _writer_loop(self) -> None:
-        """Drain queued PTY writes off the UI thread, in order. (#paste-block)"""
-        while True:
-            with self._write_lock:
-                if not self._write_q:
+    def _start_writer(self, *, reopen: bool = False):
+        """Start this pane's sole persistent PTY writer.
+
+        ``reopen`` is reserved for the spawn boundary. Once teardown closes the
+        queue, an input race must not resurrect a worker against the dying PTY.
+        """
+        self._ensure_writer_state()
+        pty, _pid, generation = self._lifecycle_snapshot()
+        condition = self._write_condition
+        worker = None
+        with condition:
+            if reopen:
+                self._write_closed = False
+                self._write_stop = False
+            current = self._writer
+            if (current is not None and current.is_alive()
+                    and self._writer_generation == generation):
+                return current
+            if (self._write_closed or self._write_stop
+                    or pty is None or self.is_dead):
+                return current
+            self._write_accepting = True
+            worker = threading.Thread(
+                target=self._writer_loop, args=(generation,),
+                name=f"saikai-pty-write-{getattr(self, 'sid', None) or 'new'}",
+                daemon=True,
+            )
+            self._writer = worker
+            self._writer_generation = generation
+            self._writer_workers_started += 1
+        try:
+            worker.start()
+        except Exception:
+            with condition:
+                if self._writer is worker:
                     self._writer = None
-                    return
-                data = self._write_q.pop(0)
-            pty = self._pty
-            if pty is None:
-                continue
-            try:
-                pty.write(data)
-            except Exception:
-                pass
+                    self._writer_generation = None
+                self._write_accepting = False
+                self._write_closed = True
+                condition.notify_all()
+            return None
+        _track_pty_writer(worker)
+        return worker
 
-    def _send_to_child(self, data: str) -> None:
-        """Write bytes to the child PTY (guarded). Called on the UI thread (via
-        _marshal) so a query reply can't interleave a concurrent keystroke —
-        _write_child keeps that ordering even when a paste is still draining."""
-        if self._pty is None or self.is_dead:
-            return
+    def _stop_writer(self):
+        """Stop acceptance, discard queued input, and wake the worker.
+
+        Never joins: kill/on_unmount may run on Textual's UI thread and the
+        worker may currently be blocked in the backend. The process reaper
+        closes/signals the PTY; callers that are already off-thread may bounded-
+        join the returned worker.
+        """
+        condition = getattr(self, "_write_condition", None)
+        if condition is None:
+            return None
+        with condition:
+            self._write_accepting = False
+            self._write_closed = True
+            self._write_stop = True
+            queued = self._write_queued_bytes
+            self._write_q.clear()
+            self._write_queued_bytes = 0
+            self._write_pending_bytes = max(
+                self._write_inflight_bytes,
+                self._write_pending_bytes - queued,
+            )
+            worker = self._writer
+            condition.notify_all()
+            return worker
+
+    def _record_write_drop(self, reason: str, encoded_bytes: int = 0) -> None:
+        """Aggregate a bounded diagnostic without caller-thread filesystem I/O."""
+        self._ensure_writer_state()
+        condition = self._write_condition
+        with condition:
+            if self._write_drop_count == 0:
+                self._write_drop_reason = reason
+            elif self._write_drop_reason != reason:
+                self._write_drop_reason = "multiple reasons"
+            self._write_drop_count = min(
+                0x7fffffff, self._write_drop_count + 1)
+            self._write_drop_bytes = min(
+                0x7fffffffffffffff,
+                self._write_drop_bytes + max(0, int(encoded_bytes)),
+            )
+            condition.notify_all()
+
+    def write(self, data: str) -> bool:
+        """Enqueue raw child input in O(1), bounded by encoded UTF-8 bytes."""
+        pty, _pid, _generation = self._lifecycle_snapshot()
+        if not isinstance(data, str) or not data or pty is None or self.is_dead:
+            return False
+        self._ensure_writer_state()
+        if self._writer is None:
+            self._start_writer()
         try:
-            self._write_child(data)
-        except Exception:
-            pass
+            encoded_bytes = len(data.encode("utf-8"))
+        except UnicodeEncodeError:
+            self._record_write_drop("input is not valid UTF-8")
+            return False
+
+        condition = self._write_condition
+        rejection = None
+        with condition:
+            if (not self._write_accepting or self._write_stop
+                    or self._writer is None):
+                return False
+            if encoded_bytes > _PTY_WRITE_QUEUE_MAX:
+                rejection = "item too large"
+            elif self._write_pending_bytes + encoded_bytes > _PTY_WRITE_QUEUE_MAX:
+                rejection = "queue full"
+            else:
+                # Bind acceptance to one exact PTY generation. A detached
+                # generation's queued key must never be delivered to a later
+                # process which happens to reuse this pane.
+                self._write_q.append(
+                    (data, encoded_bytes, pty, _generation))
+                self._write_queued_bytes += encoded_bytes
+                self._write_pending_bytes += encoded_bytes
+                condition.notify()
+                return True
+            if self._write_drop_count == 0:
+                self._write_drop_reason = str(rejection)
+            elif self._write_drop_reason != rejection:
+                self._write_drop_reason = "multiple reasons"
+            self._write_drop_count = min(
+                0x7fffffff, self._write_drop_count + 1)
+            self._write_drop_bytes = min(
+                0x7fffffffffffffff,
+                self._write_drop_bytes + encoded_bytes,
+            )
+            condition.notify_all()
+        return False
+
+    def _write_child(self, data: str) -> bool:
+        """Compatibility name for local input paths; all work is queued."""
+        return self.write(data)
+
+    def _writer_loop(self, generation=None) -> None:
+        """Drain all accepted PTY writes in FIFO order off caller threads."""
+        if generation is None:
+            _pty, _pid, generation = self._lifecycle_snapshot()
+        condition = self._write_condition
+        me = threading.current_thread()
+        while True:
+            drop_count = 0
+            drop_bytes = 0
+            drop_reason = ""
+            stop = False
+            item = None
+            pty = None
+            with condition:
+                while (not self._write_q and not self._write_stop
+                       and self._write_drop_count == 0
+                       and self._writer is me
+                       and self._writer_generation == generation):
+                    condition.wait()
+                if self._write_drop_count:
+                    drop_count = self._write_drop_count
+                    drop_bytes = self._write_drop_bytes
+                    drop_reason = self._write_drop_reason
+                    self._write_drop_count = 0
+                    self._write_drop_bytes = 0
+                    self._write_drop_reason = ""
+                if (self._writer is not me
+                        or self._writer_generation != generation):
+                    # A replacement generation installed its own worker. This
+                    # worker may finish an in-flight old write, but may not
+                    # consume the replacement's queue.
+                    stop = True
+                elif self._write_stop:
+                    if self._writer is me:
+                        self._writer = None
+                        self._writer_generation = None
+                    condition.notify_all()
+                    stop = True
+                elif self._write_q:
+                    item = self._write_q.popleft()
+                    self._write_queued_bytes -= item[1]
+                    self._write_inflight_bytes += item[1]
+            if drop_count:
+                suffix = (
+                    f", {drop_count} items"
+                    if drop_count != 1 else "")
+                _log(
+                    f"pty write dropped: {drop_reason} "
+                    f"({drop_bytes} UTF-8 bytes{suffix})"
+                )
+            if stop:
+                return
+            if item is None:
+                continue
+            data, encoded_bytes, item_pty, item_generation = item
+            current_pty, _pid, current_generation = self._lifecycle_snapshot()
+            if (current_pty is item_pty
+                    and current_generation == item_generation):
+                try:
+                    item_pty.write(data)
+                except Exception:
+                    pass
+            with condition:
+                self._write_inflight_bytes -= encoded_bytes
+                self._write_pending_bytes = max(
+                    0, self._write_pending_bytes - encoded_bytes)
+                condition.notify_all()
+
+    def _send_to_child(self, data: str) -> bool:
+        """Guarded compatibility entry point for terminal-generated replies."""
+        return self.write(data)
 
     # ── Mirror pane-direct view (#pane-direct) ────────────────────────────────
     def attach_mirror(self, tee, reset, synth) -> None:
@@ -2937,10 +4395,25 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         with self._lock:
             self._mirror_reseed_locked()
 
-    def _mirror_reseed_locked(self) -> None:
+    def _mirror_reseed_locked(self) -> bool:
         reset, synth, scr = self._mirror_reset, self._mirror_synth, self._screen
         if reset is None or synth is None or scr is None:
-            return
+            return False
+        for tracked in (
+                getattr(self, "_main_screen", None),
+                getattr(self, "_alt_screen", None)):
+            if tracked is None:
+                continue
+            try:
+                tracked._refresh_saikai_hyperlinks()
+                tracked._refresh_mirror_wide_state()
+            except Exception:
+                pass
+        try:
+            scr._saikai_active_hyperlink = getattr(
+                self, "_osc8_active", None)
+        except Exception:
+            pass
         modes = {
             "alt": self._alt.in_alt,
             "app_cursor": self._app_cursor,
@@ -2951,11 +4424,20 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             "focus_reporting": self._focus_reporting,
             "bracketed_paste": getattr(self, "_bracketed_paste", False),
             "cursor_hidden": bool(getattr(scr.cursor, "hidden", False)),
+            "cursor_style": int(getattr(self, "_cursor_style", 0) or 0),
+            "kitty_keyboard": self._kitty_flags(),
+            # Private seed inputs. Keeping the four-argument synth callback
+            # contract preserves embedders/tests while the built-in serializer
+            # can reconstruct both real buffers.
+            "_main_screen": getattr(self, "_main_screen", None),
+            "_alt_screen": getattr(self, "_alt_screen", None),
         }
         try:
             reset(synth(scr, scr.columns, scr.lines, modes))
+            self._mirror_mode_reseed_pending = False
+            return True
         except Exception:
-            pass
+            return False
 
     def _ring_bell(self) -> None:
         """Ring the host terminal bell (UI thread)."""
@@ -3002,9 +4484,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             try:
                 row = int(scr.cursor.y) + 1
                 col = int(scr.cursor.x) + 1
+                lines = int(getattr(scr, "lines", 0) or 0)
                 cols = int(getattr(scr, "columns", 0) or 0)
+                if lines:
+                    row = min(max(1, row), lines)
                 if cols:
-                    col = min(col, cols)
+                    col = min(max(1, col), cols)
                 if _PYTE_DECOM is not None and _PYTE_DECOM in getattr(scr, "mode", ()):
                     margins = getattr(scr, "margins", None)
                     if margins is not None:
@@ -3045,6 +4530,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 or token.final not in ("h", "l")
                 or not token.parameters.startswith("?")):
             return
+        old_kitty_flags = self._kitty_flags()
         enabled = token.final == "h"
         for mode in token.parameters[1:].split(";"):
             if mode == "1":
@@ -3070,6 +4556,21 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             or getattr(self, "_mouse_btn_motion", False)
             or getattr(self, "_mouse_any_motion", False)
         )
+        if self._kitty_flags() != old_kitty_flags:
+            self._mirror_mode_reseed_pending = True
+
+    def _apply_cursor_style(self, token: VTToken) -> bool:
+        """Track DECSCUSR (CSI Ps SP q); return whether the token matched."""
+        if (token.kind != "csi" or token.final != "q"
+                or token.intermediates != " "
+                or token.parameters.startswith((">", "?", "<", "="))):
+            return False
+        try:
+            style = int(token.parameters or "0")
+        except ValueError:
+            style = 0
+        self._cursor_style = style if 0 <= style <= 6 else 0
+        return True
 
     def _ensure_kitty_keyboard_state(self) -> None:
         if not hasattr(self, "_kitty_keyboard_flags"):
@@ -3101,6 +4602,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
 
         alternate = bool(getattr(self, "_alt_screen_mode", False))
         current = self._kitty_keyboard_flags[alternate]
+        old_current = current
         stack = self._kitty_keyboard_stacks[alternate]
         if prefix == "?":
             return f"\x1b[?{current}u"
@@ -3124,6 +4626,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             for _ in range(max(1, number(0, 1))):
                 current = stack.pop() if stack else 0
         self._kitty_keyboard_flags[alternate] = current
+        if current != old_current:
+            self._mirror_mode_reseed_pending = True
         return None
 
     def _csi_query_reply(self, token: VTToken) -> Optional[str]:
@@ -3142,7 +4646,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if token.final == "n" and not token.intermediates:
             private = "?" if params.startswith("?") else ""
             kind = params[1:] if private else params
-            if kind == "5":
+            if kind == "5" and not private:
                 return "\x1b[0n"
             if kind == "6":
                 row, col = self._cursor_rowcol()
@@ -3170,11 +4674,27 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if not token.intermediates and token.final == "c":
             return params in ("", "0", ">", ">0")
         if not token.intermediates and token.final == "n":
-            return params in ("5", "?5", "6", "?6")
+            return params in ("5", "6", "?6")
         if token.intermediates == "$" and token.final == "p":
             return params.startswith("?") and params[1:].isdigit()
         return (not token.intermediates and token.final == "q"
                 and params in (">", ">0"))
+
+    def _apply_osc8_state(self, token: VTToken) -> bool:
+        """Track the ordered OSC 8 link applied to subsequently drawn cells."""
+        if token.kind != "osc":
+            return False
+        code, payload, _terminator = _osc_parts(token)
+        if code != "8":
+            return False
+        params, separator, uri = payload.partition(";")
+        if not separator:
+            return False
+        self._osc8_active = (params, uri) if uri else None
+        screen = getattr(self, "_screen", None)
+        if screen is not None:
+            screen._saikai_active_hyperlink = self._osc8_active
+        return True
 
     def _osc_side_effect(self, token: VTToken, deferred_ui=None) -> Optional[str]:
         """Dispatch a complete OSC and return its query reply, if any."""
@@ -3214,15 +4734,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
 
     def _answer_queries(self, chunk: str) -> None:
         """Answer already-presented queries once each, in token order."""
-        replies = []
         for token in VTTokenizer().feed(chunk):
             reply = (self._osc_side_effect(token) if token.kind == "osc"
                      else self._csi_query_reply(token))
             if reply is not None:
-                replies.append(reply)
-        if replies:
-            response = "".join(replies)
-            self._marshal(lambda r=response: self._send_to_child(r))
+                self._send_to_child(reply)
 
     def _answer_static_queries(self, chunk: str) -> None:
         """Compatibility wrapper; ordered callers use `_consume` directly."""
@@ -3245,7 +4761,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 self._marshal(callback)
         return changed
 
-    def _consume_ordered(self, chunk: str, deferred_ui=None) -> bool:
+    def _consume_ordered(
+            self, chunk: str, deferred_ui=None, *, tokens=None) -> bool:
         """Stage decoded output and feed only complete units to pyte."""
         if _PTY_CAPTURE:
             try:
@@ -3253,12 +4770,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                     _cf.write(repr(chunk) + "\n")   # raw chunk, escape seqs visible
             except Exception:
                 pass
-        if _IS_WIN:
-            # pywinpty 3.x keepalive sentinel — Windows-only noise. On the POSIX
-            # (ptyprocess) byte stream "0011Ignore" is ordinary output, so scrubbing
-            # it on every backend would silently corrupt a child that legitimately
-            # prints that string (a log line, a hex dump, a test fixture). (#12)
-            chunk = chunk.replace("0011Ignore", "")
         tokenizer = getattr(self, "_vt_tokenizer", None)
         if tokenizer is None:                       # minimal __new__ test objects
             tokenizer = self._vt_tokenizer = VTTokenizer()
@@ -3267,7 +4778,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             sync_output = self._sync_output = _SynchronizedOutputStager()
         self._ensure_sync_deadline_state()
         ready = []
-        replies = []
         changed = False
 
         def stage(text):
@@ -3320,19 +4830,23 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                     self._present_sync_unit(text, deferred_ui=deferred_ui)
                     changed = True
 
-        for token in tokenizer.feed(chunk):
+        token_stream = tokenizer.feed(chunk) if tokens is None else tokens
+        for token in token_stream:
             # A tokenizer fail-open is DATA, not another chance to interpret ESC.
             raw = _literalize_control_data(token.raw) if token.literal else token.raw
-            if token.kind == "dcs":
-                continue                         # opaque DCS never reaches pyte/mirror
+            if token.kind in _OPAQUE_STRING_KINDS:
+                stage(_EGC_BOUNDARY_TOKEN)
+                continue                         # opaque strings never reach pyte/mirror
             if (token.kind == "csi" and token.final == "m"
                     and token.parameters[:1] in "<>="):
+                stage(_EGC_BOUNDARY_TOKEN)
                 continue                         # private SGR negotiation, display-inert
             if (token.kind == "csi" and token.final == "u"
                     and token.parameters[:1] in "<>=?"):
                 kitty_reply = self._apply_kitty_keyboard(token)
                 if kitty_reply is not None:
-                    replies.append(kitty_reply)
+                    self._send_to_child(kitty_reply)
+                stage(_EGC_BOUNDARY_TOKEN)
                 continue                         # effect first; never leak trailing "u"
 
             csi_query = self._is_csi_query(token)
@@ -3344,7 +4858,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             )
             # Keep the reader-side tee byte-faithful.  Host-owned queries are
             # removed by the mirror hub's drain-side C1-aware strip regex.
-            stage(raw)
+            stage(_encode_presentation_data(raw))
 
             # A cursor report must include all preceding presentation, including a
             # retained synchronized frame, but never trailing presentation.
@@ -3353,13 +4867,30 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 present_ready()
             reply = osc_reply if osc_reply is not None else self._csi_query_reply(token)
             if reply is not None:
-                replies.append(reply)
+                # Enter the shared FIFO at this exact stream position. Delaying
+                # replies until the end of a large chunk lets a concurrent UI
+                # key overtake an earlier child query.
+                self._send_to_child(reply)
 
         present_ready()
-        if replies:
-            response = "".join(replies)
-            self._queue_or_marshal(
-                lambda r=response: self._send_to_child(r), deferred_ui)
+        return changed
+
+    def _flush_vt_tokenizer_eof(self) -> bool:
+        """Fail open the tokenizer's bounded EOF tail through normal ordering."""
+        tokenizer = getattr(self, "_vt_tokenizer", None)
+        if tokenizer is None:
+            return False
+        tokens = tokenizer.flush()
+        if not tokens:
+            return False
+        self._ensure_sync_deadline_state()
+        deferred_ui = []
+        with self._sync_dispatch_lock:
+            changed = self._consume_ordered(
+                "", deferred_ui=deferred_ui, tokens=tokens)
+        if not getattr(self, "_stop", threading.Event()).is_set():
+            for callback in deferred_ui:
+                self._marshal(callback)
         return changed
 
     def _consume_ready(self, chunk: str, deferred_ui=None) -> None:
@@ -3367,58 +4898,54 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if not chunk:
             return
         with self._lock:
-            top_before = len(self._screen.history.top)
+            mirror_parts = []
+            mirror_hazard = False
             try:
-                marks = list(_ALT_ANY_RE.finditer(chunk))
-                if len(marks) <= 1:
-                    # 0 or 1 transition — the normal case; feed exactly as before.
-                    pos = 0
-                    for m in marks:
-                        seg = chunk[pos:m.start()]
-                        if seg:
-                            self._stream.feed(seg)
-                        entering = m.group().endswith("h")
-                        if entering != self._alt.in_alt:
-                            self._alt.in_alt = entering
-                            self._screen.reset()
-                            self._scroll = 0
-                        self._stream.feed(m.group())
-                        pos = m.end()
-                    rest = chunk[pos:]
-                    if rest:
-                        self._stream.feed(rest)
-                else:
-                    # >1 transition in one chunk: collapse the reset amplification.
-                    # Nothing renders mid-_consume and each reset() (a full pyte
-                    # buffer reallocation, here under self._lock) discards the prior
-                    # buffer, so only the content AFTER the LAST state-changing toggle
-                    # is ever visible. Simulate to find that toggle, reset ONCE, and
-                    # feed from there — behaviourally identical, but O(1) resets. (#audit-altscreen-reset)
-                    sim = self._alt.in_alt
-                    last_reset = None
-                    for m in marks:
-                        entering = m.group().endswith("h")
-                        if entering != sim:
-                            sim = entering
-                            last_reset = m.start()
-                    if last_reset is None:
-                        self._stream.feed(chunk)      # every marker was a no-op
-                    else:
-                        self._screen.reset()
-                        self._alt.in_alt = sim
-                        self._scroll = 0
-                        self._stream.feed(chunk[last_reset:])
+                # Tokenize again only at the presentation boundary. This keeps
+                # screen switching and grapheme invalidation at their exact
+                # stream positions even when one synchronized frame contains
+                # several main/alternate transitions.
+                for presentation, is_boundary in _presentation_fragments(chunk):
+                    if is_boundary:
+                        self._invalidate_screen_grapheme(self._screen)
+                        continue
+                    for token in VTTokenizer().feed(presentation):
+                        mirror_parts.append(_mirror_alt_contract_token(token))
+                        if token.kind != "text":
+                            self._invalidate_screen_grapheme(self._screen)
+                        self._apply_cursor_style(token)
+                        if (token.kind == "csi"
+                                and token.final in ("h", "l")
+                                and not token.intermediates
+                                and token.parameters.startswith("?")):
+                            modes = token.parameters[1:].split(";")
+                            if any(mode in _DECRQM_ALT_SCREEN for mode in modes):
+                                self._switch_alt_screen_locked(token.final == "h")
+                        screen = self._screen
+                        hazard_serial = int(getattr(
+                            screen, "_saikai_mirror_hazard_serial", 0))
+                        if bool(getattr(
+                                screen, "_saikai_mirror_has_wide_cluster", False)):
+                            mirror_hazard = True
+                        if token.kind == "osc":
+                            self._apply_osc8_state(token)
+                        elif (token.kind == "esc" and token.final == "c"
+                              and not token.intermediates):
+                            self._osc8_active = None
+                        try:
+                            screen._saikai_active_hyperlink = getattr(
+                                self, "_osc8_active", None)
+                        except Exception:
+                            pass
+                        self._stream.feed(token.raw)
+                        if int(getattr(
+                                screen, "_saikai_mirror_hazard_serial", 0)
+                               ) != hazard_serial:
+                            mirror_hazard = True
+                        self._sync_global_screen_state_locked(token)
             except Exception:
                 # A malformed sequence must not kill the reader; drop rather than crash.
                 pass
-            # If the user is scrolled back, advance the offset by however many
-            # lines just scrolled into history so their view stays pinned to the
-            # same content instead of being dragged by new output.
-            if self._scroll > 0:
-                added = len(self._screen.history.top) - top_before
-                if added > 0:
-                    self._scroll = min(self._scroll + added,
-                                       len(self._screen.history.top))
             self._scr_ver += 1   # screen mutated → invalidates the _current_screen cache
             # Mirror pane-direct tee — INSIDE the lock, after the pyte feed, so
             # attach_mirror()'s seed (computed under this same lock) strictly
@@ -3427,14 +4954,25 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # ingest queue — no marshal, no blocking, no regex (invariant #1
             # holds; the child-query strip runs on the hub's DRAIN thread via
             # set_pane_strip(_MIRROR_QUERY_STRIP_RE), so a burst never pays a
-            # regex scan while holding this lock). The FULL scrubbed chunk goes
-            # through: the alt-collapse above may feed pyte only a suffix, but
-            # the browser xterm has both buffers natively and must see every
-            # byte. (#pane-direct)
+            # regex scan while holding this lock). All scrubbed presentation
+            # goes through in order. Only 47/1047 are rewritten to 1049 so the
+            # browser follows saikai's exact-main-restore buffer contract.
+            # (#pane-direct)
             _tee = getattr(self, "_mirror_tee", None)   # getattr: minimal test
             if _tee is not None:                        # instances skip __init__
                 try:
-                    _tee(chunk)
+                    needs_reseed = (
+                        mirror_hazard
+                        or bool(getattr(
+                            self, "_mirror_mode_reseed_pending", False))
+                    )
+                    can_reseed = (
+                        getattr(self, "_mirror_reset", None) is not None
+                        and getattr(self, "_mirror_synth", None) is not None
+                    )
+                    if not (needs_reseed and can_reseed
+                            and self._mirror_reseed_locked()):
+                        _tee("".join(mirror_parts))
                 except Exception:
                     pass
         # Classify from the CURRENT screen + claude's OSC-0 title (its own state
@@ -3536,9 +5074,18 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # debounce (_pending_status set): the trust-folder gate classifies
         # 'waiting' once, then claude goes silent, so without the pending check the
         # 'waiting' never gets its 2nd tick and the pane never shows "Needs input".
+        now = time.monotonic()
+        input_deadline_due = bool(
+            not getattr(self, "_input_status_deadline_seen", True)
+            and getattr(self, "_input_status_deadline", 0.0) > 0.0
+            and now >= self._input_status_deadline
+        )
         if (self._scr_ver == self._last_poll_ver and self._status != "busy"
-                and getattr(self, "_pending_status", None) is None):
+                and getattr(self, "_pending_status", None) is None
+                and not input_deadline_due):
             return
+        if input_deadline_due:
+            self._input_status_deadline_seen = True
         self._last_poll_ver = self._scr_ver
         txt, title = self._current_screen()
         self._update_status(self._classify(txt, title))
@@ -3601,18 +5148,25 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         """Reader-thread teardown: mark dead, notify the host (on the UI
         thread), repaint once more so the final frame is shown."""
         self._retire_sync_deadline()
+        input_timer = self._retire_input_status_timer()
+        if input_timer is not None:
+            # Timer.stop mutates Textual's asyncio task/event and therefore must
+            # run on the UI loop, not this reader thread.
+            self._marshal(lambda timer=input_timer: timer.stop())
         if not self.is_dead:
             _log(f"exit: sid={(getattr(self, 'sid', None) or '?')[:8]} (agent ended)")
         self.is_dead = True
+        self._stop_writer()
+        self._marshal(lambda: self._show_hw_cursor(False, force=True))
         # A pane frozen for copy/select (Shift+F9) that then dies must not stay
         # pinned to its stale snapshot — clear freeze so the final live frame shows
         # (on_key early-returns for a dead pane before its resume-unfreeze line).
         # BUT do not clobber an ACTIVE drag-selection's pinned snapshot: if the
         # child exits mid-drag, on_mouse_up still needs _frozen_buf to extract the
         # selection (else it falls back to the live/dead buffer). is_dead is set
-        # ABOVE, so no NEW drag can start (on_mouse_down bails on is_dead); only an
-        # in-progress drag (sel_anchor set) is preserved, and its own on_mouse_up
-        # restores the state. (#audit-finalize-race)
+        # ABOVE. A later drag can still select the retained final screen; only an
+        # in-progress drag (sel_anchor set) needs its current snapshot preserved,
+        # and its own on_mouse_up restores the state. (#audit-finalize-race)
         if self._sel_anchor is None:
             self._frozen = False
             self._frozen_buf = None
@@ -3741,32 +5295,119 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             except Exception:
                 return False
 
-    def _show_hw_cursor(self, show: bool, *, force: bool = False) -> None:
-        """Show/hide the REAL terminal cursor (Windows).
-
-        This cursor is an IME anchor for the classic prompt. Repaint-driven moves
-        are debounced separately so it does not chase child full-screen redraw.
-        Repeated identical DEC visibility writes are suppressed; focus/app-focus
-        can force one re-assertion after WT/Textual regained the window.
-        (#native-cursor #agents-cursor)"""
-        if not _IS_WIN or not _IME_ANCHOR:
+    def _set_hw_cursor_shape(
+            self, shape: int, *, force: bool = False, _driver=None) -> None:
+        """Apply one DECSCUSR shape to the shared outer driver."""
+        if not _IME_ANCHOR:
             return
-        if not force and getattr(self, "_hw_cursor_visible", None) is show:
+        try:
+            drv = _driver
+            if drv is None:
+                drv = getattr(self.app, "_driver", None)
+            if drv is None:
+                return
+            desired = shape if 0 <= int(shape) <= 6 else 0
+            owner = getattr(drv, "_saikai_cursor_owner", None)
+            fallback_owner = (
+                owner is None
+                and (getattr(self, "_hw_cursor_visible", None) is True
+                     or int(getattr(self, "_hw_cursor_shape", 0) or 0) != 0)
+            )
+            if desired == 0 and owner is not self and not fallback_owner:
+                return
+            applied = int(getattr(
+                drv, "_saikai_cursor_shape",
+                getattr(self, "_hw_cursor_shape", 0)) or 0)
+            if desired != applied or (force and desired != 0):
+                drv.write(f"\x1b[{desired} q")
+            drv._saikai_cursor_shape = desired
+            self._hw_cursor_shape = desired
+        except Exception:
+            pass
+
+    def _release_hw_cursor_owner(self, driver=None) -> None:
+        """Relinquish shared driver state without changing Textual's visibility."""
+        try:
+            drv = driver if driver is not None else getattr(
+                self.app, "_driver", None)
+            if drv is not None and getattr(
+                    drv, "_saikai_cursor_owner", None) is self:
+                drv._saikai_cursor_owner = None
+        except Exception:
+            pass
+        self._hw_cursor_visible = None
+        self._hw_cursor_shape = 0
+
+    def _show_hw_cursor(self, show: bool, *, force: bool = False) -> None:
+        """Apply child cursor shape and show/hide the REAL cursor on Windows.
+
+        DECSCUSR shape is safe on the outer terminals Textual supports and is
+        restored to Textual's default whenever the pane no longer owns the
+        cursor. Visibility remains Windows-specific: there the hardware cursor
+        is the IME anchor; Textual uses a software cursor elsewhere.
+        Repeated identical writes are suppressed.
+        (#native-cursor #agents-cursor)"""
+        if not _IME_ANCHOR:
             return
         try:
             drv = getattr(self.app, "_driver", None)
-            if drv is not None:
+        except Exception:
+            return
+        if drv is None:
+            return
+        owner = getattr(drv, "_saikai_cursor_owner", None)
+        fallback_owner = (
+            owner is None
+            and (getattr(self, "_hw_cursor_visible", None) is True
+                 or int(getattr(self, "_hw_cursor_shape", 0) or 0) != 0)
+        )
+        focused_owner = False
+        if owner is None and not fallback_owner:
+            try:
+                focused_owner = self._is_focused_pane()
+            except Exception:
+                pass
+        if show:
+            try:
+                drv._saikai_cursor_owner = self
+            except Exception:
+                pass
+        elif owner is not self and not fallback_owner and not focused_owner:
+            # Another pane owns the one real outer cursor. A background pane's
+            # EOF/hide/unmount must not reset its shape or hide it.
+            return
+        elif focused_owner:
+            try:
+                drv._saikai_cursor_owner = self
+            except Exception:
+                pass
+        desired_shape = (
+            int(getattr(self, "_cursor_style", 0) or 0) if show else 0)
+        self._set_hw_cursor_shape(
+            desired_shape, force=force, _driver=drv)
+        if not _IS_WIN:
+            if not show:
+                self._release_hw_cursor_owner(drv)
+            return
+        try:
+            applied = getattr(
+                drv, "_saikai_cursor_visible",
+                getattr(self, "_hw_cursor_visible", None))
+            if force or applied is not show:
                 drv.write("\x1b[?25h" if show else "\x1b[?25l")
-                self._hw_cursor_visible = show
-                if _IME_DEBUG:
-                    try:
-                        foc = type(self.screen.focused).__name__
-                    except Exception:
-                        foc = "?"
-                    _ime_dbg(f"hwcursor show={show} force={force} "
-                             f"focused_pane={self._is_focused_pane()} screen.focused={foc}")
+            drv._saikai_cursor_visible = show
+            self._hw_cursor_visible = show
+            if _IME_DEBUG:
+                try:
+                    foc = type(self.screen.focused).__name__
+                except Exception:
+                    foc = "?"
+                _ime_dbg(f"hwcursor show={show} force={force} "
+                         f"focused_pane={self._is_focused_pane()} screen.focused={foc}")
         except Exception:
             pass
+        if not show:
+            self._release_hw_cursor_owner(drv)
 
     def on_focus(self, event=None) -> None:
         # Anchor the IME the moment the pane is focused (don't wait for a repaint).
@@ -3966,11 +5607,21 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             _hands_off = isinstance(self.screen.focused, (Input, TextArea))
         except Exception:
             _hands_off = False
-        if not _hands_off:
+        if _hands_off:
+            # Input/TextArea owns visibility and position, but must not inherit
+            # the child pane's underline/bar DECSCUSR shape.
+            self._set_hw_cursor_shape(0)
+            self._release_hw_cursor_owner()
+        else:
             self._show_hw_cursor(False)
         if getattr(self, "_focus_reporting", False):                # ?1004: tell the child it lost focus
             self._send_to_child("\x1b[O")
         self._cancel_forwarded_drag()          # a lost MouseUp must not stick capture
+
+    def on_hide(self, event=None) -> None:
+        """A hidden tab/screen relinquishes native cursor state completely."""
+        self._show_hw_cursor(False, force=True)
+        self._cancel_forwarded_drag()
 
     # ── thread → UI marshaling (defensive) ─────────────────────────────────────
     def _marshal(self, fn: Callable) -> None:
@@ -4005,6 +5656,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
 
     # ── teardown ───────────────────────────────────────────────────────────────
     def on_unmount(self) -> None:
+        self._show_hw_cursor(False, force=True)
         self.kill()
 
     def kill(self):
@@ -4012,9 +5664,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         reap thread (or None) so a caller that must not exit before the reap
         completes (kill_all on quit) can join it. Idempotent.
 
-        Windows: pywinpty's close() cancels console I/O natively, so it both
-        unblocks the blocked reader AND returns fast — safe inline; only the
-        slow `taskkill /T` runs on a reap thread.
+        Windows: pywinpty close/terminate and taskkill all run on the tracked
+        reaper.  ConPTY teardown can block, so none of it belongs on Textual's
+        UI thread.
 
         POSIX: ptyprocess's close()/terminate() must NEVER run on this (UI)
         thread. Both block (multiple 0.1 s sleeps) — and close() DEADLOCKS:
@@ -4031,46 +5683,89 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         off-thread."""
         self._stop.set()
         self._retire_sync_deadline()
-        # Drop anything still queued for the writer: the pane is going away, and a
-        # writer blocked on a dying pty should retire instead of draining. (#paste-block)
-        lock = getattr(self, "_write_lock", None)
-        if lock is not None:
-            with lock:
-                if getattr(self, "_write_q", None):
-                    self._write_q.clear()
-        pty, pid = self._pty, self._pid
-        self._pty = None
-        self._pid = None        # idempotent: a 2nd kill() must not re-kill a (recycled) PID
-        if pty is None and pid is None:
+        self._stop_input_status_timer()
+        # Stop acceptance and wake the persistent writer without joining it on
+        # this UI-thread path. Closing/signalling below releases an in-flight
+        # backend write; the worker then retires.
+        writer = self._stop_writer()
+        pty, pid, generation = self._lifecycle_snapshot()
+        bundle = self._detach_owned_pty(pty, generation)
+        if bundle is None:
             return None
         if pid:
             _log(f"kill: sid={(getattr(self, 'sid', None) or '?')[:8]} pid={pid}")
-        if _IS_WIN:
-            if pty is not None:
-                try:
-                    pty.close(force=True)   # → terminate() → cancel_io(): unblock reader fast
-                except Exception:
-                    try:
-                        pty.terminate(force=True)
-                    except Exception:
-                        pass
-            if pid:
-                t = threading.Thread(target=self._reap_tree, args=(pid,),
-                                     name=f"reap-{pid}", daemon=True)
-                t.start()
-                _track_reap(t)   # joined at interpreter exit (atexit) on every exit path
-                return t
+        if not _IS_WIN:
+            # POSIX: signals only on this thread (see docstring); blocking close
+            # stays on the reaper. SIGHUP mirrors closing a controlling master;
+            # SIGTERM covers children which deliberately ignore SIGHUP.
+            _post_signal(pid, "SIGHUP")
+            _post_signal(pid, "SIGTERM")
+        return self._start_owned_reaper(bundle, writer)
+
+    @staticmethod
+    def _join_writer_worker(writer, timeout: float = 2.0) -> None:
+        """Bounded-join a pane writer from a non-UI teardown worker."""
+        if writer is None or writer is threading.current_thread():
+            return
+        try:
+            writer.join(timeout=max(0.0, float(timeout)))
+        except Exception:
+            pass
+
+    def _start_owned_reaper(self, bundle, writer=None, *, natural=False):
+        """Start and globally track cleanup for one detached PTY generation."""
+        if bundle is None:
             return None
-        # POSIX: signals only on this thread (see docstring); blocking close on
-        # the reap thread. SIGHUP = what the kernel would send on master close;
-        # SIGTERM = belt-and-braces for a SIGHUP-ignoring child.
-        _post_signal(pid, "SIGHUP")
-        _post_signal(pid, "SIGTERM")
-        t = threading.Thread(target=self._reap_posix, args=(pty, pid),
-                             name=f"reap-{pid or 'pty'}", daemon=True)
-        t.start()
-        _track_reap(t)   # joined at quit (kill_all wait=True) and atexit
-        return t
+        pty, pid, generation = bundle
+        target = self._reap_windows if _IS_WIN else self._reap_posix
+        eof_event = self._generation_eof_event(generation)
+        args = ((pty, pid, writer, natural, eof_event)
+                if _IS_WIN else (pty, pid, 2.0, writer))
+        thread = threading.Thread(
+            target=target,
+            args=args,
+            name=f"reap-{pid or 'pty'}",
+            daemon=True,
+        )
+        thread.start()
+        _track_reap(thread)
+        return thread
+
+    @staticmethod
+    def _reap_windows(
+            pty, pid, writer=None, natural=False, eof_event=None) -> None:
+        """Close ConPTY and reap its process tree entirely off the UI thread."""
+        if eof_event is not None and eof_event.is_set():
+            natural = True
+        handle_proves_live_child = False
+        # pywinpty's process liveness check is handle-backed. It closes the
+        # tiny race where EOF returned but the reader has not yet published its
+        # generation marker; unlike a bare PID lookup it cannot bless reuse.
+        if not natural and pty is not None:
+            try:
+                handle_proves_live_child = bool(pty.isalive())
+                if not handle_proves_live_child:
+                    natural = True
+            except Exception:
+                # Fail closed: without the handle-backed identity check, a bare
+                # numeric PID may already name an unrelated process.
+                handle_proves_live_child = False
+        # taskkill must enumerate the tree while the root PID still exists.
+        # Closing ConPTY first can terminate that root and make /T miss already
+        # detached descendants.
+        if pid and not natural and handle_proves_live_child:
+            AgentTerminal._reap_tree(pid)
+        if pty is not None:
+            try:
+                pty.close(force=True)
+            except Exception:
+                try:
+                    pty.terminate(force=True)
+                except Exception:
+                    pass
+        # Natural EOF, a dead handle, or an unreadable handle skips taskkill:
+        # none authorizes acting on a possibly recycled bare numeric PID.
+        AgentTerminal._join_writer_worker(writer)
 
     @staticmethod
     def _reap_tree(pid) -> None:
@@ -4087,17 +5782,23 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             pass
 
     @staticmethod
-    def _reap_posix(pty, pid, deadline_s: float = 2.0) -> None:
+    def _reap_posix(
+            pty, pid, deadline_s: float = 2.0, writer=None) -> None:
         # POSIX analog of _reap_tree: bounded wait for the (already signalled)
         # child to die, escalate to SIGKILL, then close the pty fd. The close
         # MUST stay off the UI thread — BufferedRWPair.close() blocks on the
         # reader lock until the reader unblocks at EOF; harmless on this daemon
         # (joined bounded at quit/atexit), fatal on the UI thread. deadline_s is
         # injectable for the headless tests.
-        deadline = time.monotonic() + deadline_s
-        while pty is not None and _safe_isalive(pty) and time.monotonic() < deadline:
+        deadline = time.monotonic() + max(0.0, float(deadline_s))
+        direct_alive = pty is not None and _safe_isalive(pty)
+        group_alive = _process_group_alive(pid)
+        while ((direct_alive or group_alive)
+               and time.monotonic() < deadline):
             time.sleep(0.05)
-        if pty is None or _safe_isalive(pty):
+            direct_alive = pty is not None and _safe_isalive(pty)
+            group_alive = _process_group_alive(pid)
+        if direct_alive or group_alive:
             _post_signal(pid, "SIGKILL")
         if pty is not None:
             # close() takes the BufferedRWPair reader lock that the reader holds in
@@ -4105,11 +5806,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # close() returns at once — but a grandchild that survived and kept the
             # slave fd open means no EOF, so close() would block THIS reap thread
             # forever (and join_reaps at quit would only time out, leaking it). We
-            # can't SIGKILL to force the EOF: the child PID may have been recycled
-            # (test_posix_kill_signals_only). So run close() on a throwaway daemon
-            # and stop waiting after a bound — normally it returns instantly; in the
-            # stuck case this reap still completes and the fd leaks only until
-            # process exit (reclaimed by the OS), instead of hanging forever. (#9)
+            # The owned process group was checked/escalated above, but a
+            # process-group-escaping grandchild can still retain the slave.
+            # Run close() on a tracked helper and stop waiting after a bound —
+            # normally it returns instantly; in the stuck case this reap still
+            # completes and the fd is reclaimed at process exit. (#9)
             _closed = threading.Event()
 
             def _do_close(_p=pty):
@@ -4129,6 +5830,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # one that escapes the join-everything invariant and leaks silently.
             _track_reap(_ct)
             _closed.wait(timeout=2.0)
+        AgentTerminal._join_writer_worker(writer)
 
     # ── messages ────────────────────────────────────────────────────────────────
     if events is not None:  # only define when textual present
@@ -4272,6 +5974,7 @@ class LiveSessionManager:
             except Exception:
                 pass
         self._reaps = [t for t in self._reaps if t.is_alive()]
+        join_all_pty_writers(timeout=max(0.0, deadline - time.monotonic()))
 
     def kill_all(self, wait: bool = False) -> None:
         # Start every kill FIRST so the taskkills run IN PARALLEL, then

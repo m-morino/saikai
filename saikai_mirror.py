@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import base64
 import collections
+import hashlib
 import hmac
+import html
 import http.server
 import ipaddress
 import json
@@ -20,7 +22,23 @@ import socketserver
 import sys
 import threading
 import pyte
+from functools import lru_cache
 from typing import Optional
+
+
+@lru_cache(maxsize=16)
+def _static_asset_version(name: str) -> str:
+    """Return a short content hash for one bundled browser asset."""
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "saikai_mirror_static",
+        os.path.basename(name),
+    )
+    digest = hashlib.sha256()
+    with open(path, "rb") as asset:
+        for block in iter(lambda: asset.read(65536), b""):
+            digest.update(block)
+    return digest.hexdigest()[:12]
 
 
 # A control frame travels over the SAME per-client queue as output frames, but
@@ -63,6 +81,123 @@ _PANE_INFLIGHT_CAP = 128
 # give a split target query a larger reassembly hold than a passed-through
 # sixel. (#review-dcs-bound)
 _DCS_TARGET_RE = re.compile(r"\x1bP[0-9;]*[$+]q")
+_RICH_WIDTH_BUILD_LOCK = threading.Lock()
+
+
+@lru_cache(maxsize=1)
+def _build_rich_width_payload() -> dict:
+    """Return the exact cell-width data used by this process's Rich renderer.
+
+    The browser mirror parses the child stream independently with xterm.js.
+    Its bundled Unicode-15 grapheme data cannot be assumed to match whichever
+    Rich table Textual is actually using (currently Unicode 17), so the page
+    receives this compact table and installs a matching xterm provider.
+    """
+    from rich.cells import load_cell_table
+    import regex
+
+    # Build compact current-Unicode property ranges with regex's public
+    # property engine. Scan 64K-codepoint blocks instead of materializing one
+    # 1.1M-character subject: ``str.join`` otherwise retains over a million
+    # temporary one-character strings and caused an 80+ MiB first-page spike.
+    grapheme_specs = (
+        (1, "gcb=Control"),
+        (2, "gcb=LF"),
+        (3, "gcb=CR"),
+        (4, "gcb=Extend"),
+        (5, "gcb=Prepend"),
+        (6, "gcb=SpacingMark"),
+        (7, "gcb=L"),
+        (8, "gcb=V"),
+        (9, "gcb=T"),
+        (10, "gcb=ZWJ"),
+        (11, "gcb=LV"),
+        (12, "gcb=LVT"),
+        (13, "gcb=Regional_Indicator"),
+    )
+    indic_specs = (
+        (1, "InCB=Extend"),
+        (2, "InCB=Consonant"),
+        (3, "InCB=Linker"),
+    )
+    all_specs = (
+        ("extendedPictographic", None, "Extended_Pictographic"),
+        *(("graphemeBreak", value, expression)
+          for value, expression in grapheme_specs),
+        *(("indicConjunctBreak", value, expression)
+          for value, expression in indic_specs),
+    )
+    patterns = [
+        (bucket, value, rf"\p{{{expression}}}+")
+        for bucket, value, expression in all_specs
+    ]
+    ranges = {
+        "extendedPictographic": [],
+        "graphemeBreak": [],
+        "indicConjunctBreak": [],
+    }
+
+    def append_range(bucket: str, start: int, end: int, value) -> None:
+        result = ranges[bucket]
+        item = [start, end] if value is None else [start, end, value]
+        if (result and result[-1][1] + 1 == start
+                and result[-1][2:] == item[2:]):
+            result[-1][1] = end
+        else:
+            result.append(item)
+
+    block_size = 65536
+    for block_start in range(0, 0x110000, block_size):
+        block_end = min(block_start + block_size, 0x110000)
+        codepoints = "".join(map(chr, range(block_start, block_end)))
+        for bucket, value, pattern in patterns:
+            for match in regex.finditer(pattern, codepoints):
+                append_range(
+                    bucket,
+                    block_start + match.start(),
+                    block_start + match.end() - 1,
+                    value,
+                )
+
+    # Multiple properties share the GCB/InCB result buckets. Scanning each
+    # property within a block leaves those buckets grouped by property rather
+    # than codepoint; the browser uses binary search, so restore global order
+    # and join adjacent equal ranges before sending them.
+    for bucket, items in ranges.items():
+        items.sort(key=lambda item: item[0])
+        merged = []
+        for item in items:
+            if (merged and merged[-1][1] + 1 == item[0]
+                    and merged[-1][2:] == item[2:]):
+                merged[-1][1] = item[1]
+            else:
+                merged.append(item)
+        ranges[bucket] = merged
+
+    table = load_cell_table("auto")
+    return {
+        "version": str(table.unicode_version),
+        "widths": [list(item) for item in table.widths],
+        "narrowToWide": sorted(ord(char) for char in table.narrow_to_wide),
+        **ranges,
+    }
+
+
+def _rich_width_payload() -> dict:
+    """Single-flight access to the process-wide browser Unicode tables."""
+    with _RICH_WIDTH_BUILD_LOCK:
+        return _build_rich_width_payload()
+
+
+def _clear_rich_width_payload_cache() -> None:
+    with _RICH_WIDTH_BUILD_LOCK:
+        _build_rich_width_payload.cache_clear()
+
+
+# Preserve the small cache API used by diagnostics/tests without exposing the
+# implementation cache (whose lock is what makes a concurrent cold miss safe).
+_rich_width_payload.cache_clear = _clear_rich_width_payload_cache
+
 
 # Brute-force throttle for the SSE write-key: after this many bad attempts,
 # refuse input for a cooldown so a lost/guessed key can't be hammered. (#audit-mirror-ratecap)
@@ -173,7 +308,8 @@ def _color_sgr(value: str, fg: bool) -> list[int]:
 
 def _cell_attrs(ch: "pyte.screens.Char") -> tuple:
     """Return a hashable key of all visual attributes for a pyte Char."""
-    return (ch.bold, ch.italics, ch.underscore, ch.reverse, ch.fg, ch.bg)
+    return (ch.bold, ch.italics, ch.underscore, ch.blink, ch.reverse,
+            ch.strikethrough, ch.fg, ch.bg)
 
 
 def _attrs_to_sgr(attrs: tuple) -> str:
@@ -182,7 +318,7 @@ def _attrs_to_sgr(attrs: tuple) -> str:
     Emits ESC[0m to reset, then each non-default attribute as its own minimal
     escape so that, for example, a red foreground appears as the literal
     substring ESC[31m rather than being merged into a multi-param sequence."""
-    bold, italics, underscore, reverse, fg, bg = attrs
+    bold, italics, underscore, blink, reverse, strikethrough, fg, bg = attrs
     parts = ["\x1b[0m"]   # always reset first
     if bold:
         parts.append("\x1b[1m")
@@ -190,8 +326,12 @@ def _attrs_to_sgr(attrs: tuple) -> str:
         parts.append("\x1b[3m")
     if underscore:
         parts.append("\x1b[4m")
+    if blink:
+        parts.append("\x1b[5m")
     if reverse:
         parts.append("\x1b[7m")
+    if strikethrough:
+        parts.append("\x1b[9m")
     fg_codes = _color_sgr(fg, True)
     if fg_codes != [39]:               # 39 already covered by the reset
         parts.append("\x1b[" + ";".join(str(c) for c in fg_codes) + "m")
@@ -201,43 +341,183 @@ def _attrs_to_sgr(attrs: tuple) -> str:
     return "".join(parts)
 
 
-def _synth_full_frame(screen: "pyte.Screen", cols: int, rows: int) -> str:
+def _normalise_hyperlink(value) -> "tuple[str, str] | None":
+    """Normalise terminal-owned OSC 8 metadata into a safe serializer value."""
+    if not value:
+        return None
+    if isinstance(value, dict):
+        params = value.get("params", "")
+        uri = value.get("uri", "")
+    elif isinstance(value, (tuple, list)) and len(value) == 2:
+        params, uri = value
+    else:
+        params, uri = "", value
+    params, uri = str(params or ""), str(uri or "")
+    if not uri or len(params) + len(uri) > 65536:
+        return None
+    # OSC payloads cannot contain a string terminator.  Metadata originates in
+    # a parsed child OSC, but reject controls again at the serialization edge
+    # so a malformed custom screen cannot inject an extra seed command.
+    if any(mark in params or mark in uri
+           for mark in ("\x07", "\x1b", "\x9c")):
+        return None
+    return params, uri
+
+
+def _cell_hyperlink(screen: "pyte.Screen", row: int, col: int):
+    links = getattr(screen, "_saikai_hyperlinks", None)
+    if not links:
+        return None
+    try:
+        return _normalise_hyperlink(links.get((row, col)))
+    except (AttributeError, TypeError):
+        return None
+
+
+def _osc8(link) -> str:
+    normalised = _normalise_hyperlink(link)
+    if normalised is None:
+        return "\x1b]8;;\x1b\\"
+    params, uri = normalised
+    return f"\x1b]8;{params};{uri}\x1b\\"
+
+
+def _synth_cursor_state(
+        screen: "pyte.Screen", cols: int, rows: int,
+        *, respect_origin: bool = False) -> str:
+    """Restore cursor position, wrap-pending state, and current rendition."""
+    if cols <= 0 or rows <= 0:
+        return ""
+    cy = min(max(int(screen.cursor.y), 0), rows - 1)
+    cx = int(screen.cursor.x)
+    cup_row = cy + 1
+    if respect_origin and pyte.modes.DECOM in screen.mode:
+        margins = getattr(screen, "margins", None)
+        if margins is None:
+            top = 0
+        else:
+            try:
+                top = int(margins.top)
+            except AttributeError:
+                top = int(margins[0])
+        cup_row = max(1, cy - top + 1)
+    cursor_sgr = _attrs_to_sgr(_cell_attrs(screen.cursor.attrs))
+    if cx < cols:
+        return f"\x1b[{cup_row};{max(cx, 0) + 1}H" + cursor_sgr
+
+    # CUP clamps an x==columns cursor back onto the last cell and loses the
+    # terminal's pending-autowrap bit. Repaint the existing right-edge glyph
+    # in place to recreate that bit without changing the visible grid. A wide
+    # glyph stores empty continuation cells, so walk left to its leader.
+    line = screen.buffer[cy]
+    leader = cols - 1
+    while leader > 0 and line[leader].data == "":
+        leader -= 1
+    ch = line[leader]
+    if not ch.data:
+        leader = cols - 1
+        ch = line[leader]
+    glyph = ch.data or " "
+    link = _cell_hyperlink(screen, cy, leader)
+    linked_glyph = (_osc8(link) + glyph + _osc8(None)) if link else glyph
+    return (
+        f"\x1b[{cup_row};{leader + 1}H"
+        + _attrs_to_sgr(_cell_attrs(ch))
+        + linked_glyph
+        + cursor_sgr
+    )
+
+
+def _synth_charset_state(g0_charset, g1_charset, charset) -> str:
+    """Restore DEC G0/G1 designations and the active character set."""
+    inverse_maps = {value: key for key, value in pyte.charsets.MAPS.items()}
+    g0 = inverse_maps.get(g0_charset, "B")
+    g1 = inverse_maps.get(g1_charset, "B")
+    return f"\x1b({g0}\x1b){g1}" + ("\x0e" if charset else "\x0f")
+
+
+def _synth_tabstops(screen: "pyte.Screen", cols: int) -> str:
+    """Restore the per-buffer DEC tab-stop layout without relying on defaults."""
+    stops = sorted(int(stop) for stop in screen.tabstops if 0 <= int(stop) < cols)
+    return "\x1b[3g" + "".join(
+        f"\x1b[1;{stop + 1}H\x1bH" for stop in stops)
+
+
+def _synth_savepoint(screen: "pyte.Screen", cols: int, rows: int) -> str:
+    """Recreate the effective DECSC slot used by a future DECRC."""
+    savepoints = getattr(screen, "savepoints", ())
+    if not savepoints or cols <= 0 or rows <= 0:
+        return ""
+    point = savepoints[-1]
+    cursor = point.cursor
+    cy = min(max(int(cursor.y), 0), rows - 1)
+    cx = min(max(int(cursor.x), 0), cols - 1)
+    margins = getattr(screen, "margins", None)
+    if point.origin and margins is not None:
+        try:
+            top = int(margins.top)
+        except AttributeError:
+            top = int(margins[0])
+        cup_row = max(1, cy - top + 1)
+    else:
+        cup_row = cy + 1
+    return (
+        f"\x1b[?6{'h' if point.origin else 'l'}"
+        + f"\x1b[?7{'h' if point.wrap else 'l'}"
+        + _synth_charset_state(point.g0_charset, point.g1_charset, point.charset)
+        + f"\x1b[{cup_row};{cx + 1}H"
+        + _attrs_to_sgr(_cell_attrs(cursor.attrs))
+        + "\x1b7"
+    )
+
+
+def _synth_full_frame(
+        screen: "pyte.Screen", cols: int, rows: int,
+        *, restore_cursor: bool = True) -> str:
     """Render a pyte screen to a self-contained full-repaint ANSI string so a
     late-joining browser gets complete state before the live diff stream.
 
     Characters with identical attributes are grouped into runs so that plain
     text appears as contiguous substrings and color SGRs are emitted once per
     run rather than once per cell."""
-    out = ["\x1b[2J\x1b[H"]   # clear + home
+    # Close a stale live hyperlink first; a repaint must be self-contained even
+    # when applied over an already-running browser terminal.
+    out = [_osc8(None), "\x1b[2J\x1b[H"]   # clear + home
+    current_link = None
     for y in range(rows):
         line = screen.buffer[y]
         out.append(f"\x1b[{y + 1};1H")   # absolute row, col 1
-        run_attrs: tuple | None = None
+        run_key: tuple | None = None
         run_text: list[str] = []
         for x in range(cols):
             ch = line[x]
             if ch.data == "":
-                continue            # wide-char (CJK) continuation cell: the
-                                    # preceding 2-wide glyph already covers this
+                continue            # multi-cell EGC continuation: its leader
+                                    # already accounts for this column
                                     # column. Emitting a space here would shift
                                     # the rest of the line right (garbled JP rows).
             attrs = _cell_attrs(ch)
             glyph = ch.data or " "
-            if attrs != run_attrs:
+            link = _cell_hyperlink(screen, y, x)
+            key = (attrs, link)
+            if key != run_key:
                 # Flush previous run.
                 if run_text:
                     out.append("".join(run_text))
+                if link != current_link:
+                    out.append(_osc8(link))
+                    current_link = link
                 # Emit SGR for new run.
                 out.append(_attrs_to_sgr(attrs))
-                run_attrs = attrs
+                run_key = key
                 run_text = [glyph]
             else:
                 run_text.append(glyph)
         if run_text:
             out.append("".join(run_text))
-    out.append("\x1b[0m")
-    cy, cx = screen.cursor.y, screen.cursor.x
-    out.append(f"\x1b[{cy + 1};{cx + 1}H")
+    out.extend([_osc8(None), "\x1b[0m"])
+    if restore_cursor:
+        out.append(_synth_cursor_state(screen, cols, rows))
     return "".join(out)
 
 
@@ -269,20 +549,114 @@ def _synth_pane_seed(screen: "pyte.Screen", cols: int, rows: int,
         if modes.get(flag):
             mouse = f"\x1b[?{seq}h"
             break
+    main_screen = modes.get("_main_screen")
+    alt_screen = modes.get("_alt_screen")
+    active_alt = bool(modes.get("alt"))
+    if (main_screen is not None and alt_screen is not None
+            and main_screen is not alt_screen):
+        # Paint the inactive buffer first, then the active buffer. In
+        # particular, a client attaching while ALT is active must receive the
+        # saved MAIN grid/cursor that a later ?1049l will reveal.
+        ordered = (
+            ((main_screen, False), (alt_screen, True))
+            if active_alt else
+            ((alt_screen, True), (main_screen, False))
+        )
+    else:
+        ordered = ((screen, active_alt),)
+
+    def _canonical_paint_modes() -> str:
+        # Absolute CUP and row-by-row replacement below require a full-screen,
+        # origin-free, autowrapping, non-insert canvas.
+        return "\x1b[?6l\x1b[r\x1b[4l\x1b[?7h"
+
+    def _buffer_modes(buffer_screen) -> str:
+        margins_state = getattr(buffer_screen, "margins", None)
+        if margins_state is None:
+            top, bottom = 0, rows - 1
+        else:
+            try:
+                top, bottom = (
+                    int(margins_state.top),
+                    int(margins_state.bottom),
+                )
+            except AttributeError:
+                top, bottom = map(int, margins_state)
+        full = top == 0 and bottom == rows - 1
+        margins = "\x1b[r" if full else f"\x1b[{top + 1};{bottom + 1}r"
+        origin = pyte.modes.DECOM in buffer_screen.mode
+        insert = pyte.modes.IRM in buffer_screen.mode
+        autowrap = pyte.modes.DECAWM in buffer_screen.mode
+        lnm = pyte.modes.LNM in buffer_screen.mode
+        return (
+            margins
+            + f"\x1b[?6{'h' if origin else 'l'}"
+            + f"\x1b[4{'h' if insert else 'l'}"
+            + f"\x1b[?7{'h' if autowrap else 'l'}"
+            + f"\x1b[20{'h' if lnm else 'l'}"
+            + _synth_charset_state(
+                buffer_screen.g0_charset,
+                buffer_screen.g1_charset,
+                buffer_screen.charset,
+            )
+        )
+
+    try:
+        kitty_keyboard = int(modes.get("kitty_keyboard", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        kitty_keyboard = 0
+    if kitty_keyboard < 0:
+        kitty_keyboard = 0
+    # The mirror currently advertises/implements only progressive flag 1.
+    kitty_keyboard &= 1
     parts = [
-        # Alt-screen FIRST: the paint below must land in the buffer the child
-        # is actually drawing into.
-        _m("alt", "1049"),
-        _synth_full_frame(screen, cols, rows),
+        f"\x1b]777;saikai-kitty-keyboard={kitty_keyboard}\x1b\\",
+    ]
+    for index, (buffer_screen, use_alt) in enumerate(ordered):
+        parts.append(f"\x1b[?1049{'h' if use_alt else 'l'}")
+        parts.append(_canonical_paint_modes())
+        parts.append(_synth_full_frame(
+            buffer_screen, cols, rows, restore_cursor=False))
+        parts.append(_buffer_modes(buffer_screen))
+        parts.append(_synth_tabstops(buffer_screen, cols))
+        savepoint = _synth_savepoint(buffer_screen, cols, rows)
+        parts.append(savepoint)
+        if savepoint:
+            # Synthesizing DECSC temporarily applies the SAVED origin/wrap,
+            # charset and rendition. Return to the buffer's CURRENT parser
+            # state before any live bytes arrive; the slot itself remains.
+            parts.append(_buffer_modes(buffer_screen))
+        # Preserve the inactive buffer's own cursor before switching away.
+        if index + 1 < len(ordered):
+            parts.append(_synth_cursor_state(
+                buffer_screen, cols, rows, respect_origin=True))
+
+    style = modes.get("cursor_style", 0)
+    try:
+        style = int(style)
+    except (TypeError, ValueError):
+        style = 0
+    if not 0 <= style <= 6:
+        style = 0
+
+    parts.extend([
         _m("app_cursor", "1"),             # DECCKM — arrow keys SS3 vs CSI
         "\x1b[?1000l\x1b[?1002l\x1b[?1003l",   # clear the protocol slot…
         mouse,                                  # …then the strongest enable
         _m("focus_reporting", "1004"),
         _m("mouse_sgr", "1006"),
         _m("bracketed_paste", "2004"),
-        # Cursor visibility LAST (the paint above ends on a cursor move).
+        f"\x1b[{style} q",
         "\x1b[?25l" if modes.get("cursor_hidden") else "\x1b[?25h",
-    ]
+        # Restore active cursor and wrap-pending LAST: a later cursor-control
+        # sequence would otherwise collapse x==columns onto the final cell.
+        _synth_cursor_state(
+            screen, cols, rows, respect_origin=True),
+    ])
+    # OSC 8 is parser state, not merely a painted-cell attribute.  Restore an
+    # open link last so the child's next printable byte inherits it.
+    parts.append(_osc8(getattr(
+        screen, "_saikai_active_hyperlink", None)))
     return "".join(parts)
 
 
@@ -365,6 +739,14 @@ class MirrorHub:
         self._pane_lost = False             # ingest overflow flushed pane frames
         self._pane_strip = None             # child-query strip regex (drain-side)
         self._pane_strip_carry = ""         # trailing split DCS held across chunks
+        # xterm stores cells no wider than two columns, while saikai's
+        # canonical Rich grid can contain one EGC spanning three or more.  It
+        # also keeps a detached combining mark that saikai deliberately drops.
+        # Watch only on the drain thread (pane_feed may run under the terminal
+        # lock) and request a canonical seed after a representational gap.
+        self._pane_risk_tokenizer = None
+        self._pane_egc_tail = ""
+        self._pane_has_oversize_egc = False
         self._pane_inflight = 0             # _PaneData currently in the ingest queue
         self._pane_count_lock = threading.Lock()
 
@@ -604,7 +986,8 @@ class MirrorHub:
     def _strip_pane_chunk(self, strip, text: str) -> str:
         """Strip child terminal queries from a pane chunk, HOLDING a DCS split
         across the chunk boundary. The reader thread already reassembles a split
-        CSI/OSC query via _esc_carry (so those never arrive halved here), but not
+        CSI/OSC query via the incremental VT tokenizer (so those never arrive
+        halved here), but not
         a DCS (ESC P … ST) — DECRQSS / XTGETTCAP could land split, sail past the
         stateless regex, and let the browser xterm auto-answer the child. Carry
         the trailing unterminated DCS to the next chunk. A STRIP-TARGET DCS
@@ -624,6 +1007,62 @@ class MirrorHub:
                     self._pane_strip_carry = tail
                     text = text[:p]
         return strip.sub("", text)
+
+    def _reset_pane_risk_state(self) -> None:
+        """Start divergence observation at a canonical pane-stream boundary."""
+        self._pane_risk_tokenizer = None
+        self._pane_egc_tail = ""
+        self._pane_has_oversize_egc = False
+
+    def _observe_pane_risk(self, text: str, *, canonical_seed=False) -> bool:
+        """Return whether raw xterm state may differ from the canonical grid.
+
+        Control units are tokenized incrementally so text on opposite sides of
+        a cursor/rendition command is never treated as one EGC.  The final text
+        cluster is carried across PTY chunks because Hangul and combining
+        sequences may be split arbitrarily by a read.
+        """
+        if not text:
+            return False
+        # Keep this dependency lazy: a read-only app mirror never needs the
+        # pane tokenizer, and importing the terminal module pulls optional PTY
+        # backends into what is otherwise a small HTTP helper.
+        if self._pane_risk_tokenizer is None:
+            from saikai_terminal import VTTokenizer
+            self._pane_risk_tokenizer = VTTokenizer()
+        import regex
+        from rich.cells import cell_len
+
+        risk = False
+        for token in self._pane_risk_tokenizer.feed(text):
+            if token.kind != "text":
+                # A VT control is an opaque presentation boundary.  In
+                # particular, a following combining-only cluster is detached
+                # in saikai even if xterm associates it with an earlier cell.
+                self._pane_egc_tail = ""
+                continue
+            clusters = regex.findall(r"\X", self._pane_egc_tail + token.raw)
+            if not clusters:
+                self._pane_egc_tail = ""
+                continue
+            for cluster in clusters:
+                width = cell_len(cluster)
+                if width > 2:
+                    self._pane_has_oversize_egc = True
+                    if not canonical_seed:
+                        risk = True
+                elif width == 0 and not canonical_seed:
+                    risk = True
+            # Only the most recent EGC can be extended by the next read.  Keep
+            # it bounded even for a malicious never-ending combining sequence.
+            self._pane_egc_tail = clusters[-1][-256:]
+
+        # Once a canonical seed contains a >2-cell EGC, xterm's internal cell
+        # representation is lossy.  The next live update may address any of its
+        # continuation columns, so heal from the authoritative screen after it.
+        if self._pane_has_oversize_egc and not canonical_seed:
+            risk = True
+        return risk
 
     @staticmethod
     def _offer_sentinel(cq) -> None:
@@ -701,6 +1140,20 @@ class MirrorHub:
             # can't prefix the new pane's first bytes and swallow them into a
             # bogus unterminated query. (#review-carry-boundary)
             self._pane_strip_carry = ""
+            self._reset_pane_risk_state()
+            try:
+                self._observe_pane_risk(data.seed, canonical_seed=True)
+            except Exception:
+                # Divergence observation is a recovery aid, never a reason to
+                # drop the authoritative seed itself.
+                self._reset_pane_risk_state()
+        divergence = False
+        if isinstance(data, _PaneData):
+            try:
+                divergence = self._observe_pane_risk(data.data)
+            except Exception:
+                # A detector failure must not interrupt the raw stream.
+                divergence = False
         with self._clients_lock:
             targets = list(self._pane_clients)
         if not targets:
@@ -725,7 +1178,7 @@ class MirrorHub:
                         cq.put_nowait(data)   # newer than any meta the flush kept
                     except queue.Full:
                         pass
-        if need_reseed:
+        if need_reseed or divergence:
             self._request_pane_reseed()
 
     def _drain_overflow_recovery(self) -> None:
@@ -1601,17 +2054,24 @@ flex:0 0 auto;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 #kb-arrows>[data-k="up"]{grid-area:up}#kb-arrows>[data-k="down"]{grid-area:down}
 #kb-arrows>[data-k="left"]{grid-area:left}#kb-arrows>[data-k="right"]{grid-area:right}
 #kb-arrows>button{min-width:58px;padding:13px 0;flex:0 0 auto}</style></head>
-<body data-cols="__COLS__" data-rows="__ROWS__"><div id="t"></div>
+<body data-cols="__COLS__" data-rows="__ROWS__"
+ data-rich-width='__RICH_WIDTH_DATA__'><div id="t"></div>
 <script src="/xterm.min.js"></script>
 <script src="/addon-canvas.js"></script>
+<script src="/addon-saikai-rich-graphemes.js?v=__RICH_ADDON_VERSION__"></script>
 <script>
 const term = new Terminal({cols: parseInt(document.body.dataset.cols, 10),
                            rows: parseInt(document.body.dataset.rows, 10),
-                           scrollback:0, convertEol:false});
+                           scrollback:0, convertEol:false, allowProposedApi:true});
 term.open(document.getElementById('t'));
 try {
   const _CA = (window.CanvasAddon && window.CanvasAddon.CanvasAddon) || window.CanvasAddon;
   term.loadAddon(new _CA());     // crisp box/block borders; falls back to DOM
+} catch (e) {}
+try {
+  const richWidthData = JSON.parse(document.body.dataset.richWidth);
+  const _RG = (window.SaikaiRichGraphemesAddon && window.SaikaiRichGraphemesAddon.SaikaiRichGraphemesAddon) || window.SaikaiRichGraphemesAddon;
+  term.loadAddon(new _RG(richWidthData));
 } catch (e) {}
 // Keep the keyboard wired to saikai: focus the terminal on load, and re-focus on
 // every tap. Without this the xterm textarea can lose focus (mouse tracking eats
@@ -1766,6 +2226,12 @@ function syncFlush() {
   syncOn = false;
   if (syncBuf) { const b = syncBuf; syncBuf = ''; writeBin(b); }
 }
+function resetPaneSyncState() {
+  if (syncT) clearTimeout(syncT);
+  syncT = null;
+  syncBuf = '';
+  syncOn = false;
+}
 function paneSyncWrite(bin) {
   let s = syncBuf + bin;   // carry: an ESC[?2026x split across messages
   syncBuf = '';
@@ -1903,7 +2369,29 @@ panePh.style.cssText = 'position:fixed;top:40%;left:0;right:0;z-index:8;'+
 panePh.textContent = 'no live pane - open a split pane at the host, or switch to App view';
 document.body.appendChild(panePh);
 let paneGen = null;
+let paneKittyKeyboard = 0;
 let seedRetryTimer = null;
+// pane seed mode helper begin
+function decodePaneSeedModes(bin) {
+  const prefix = ESC + ']777;saikai-kitty-keyboard=';
+  if (!bin.startsWith(prefix)) {
+    return {data: bin, kittyKeyboard: 0};
+  }
+  const terminator = ESC + String.fromCharCode(92);
+  const end = bin.indexOf(terminator, prefix.length);
+  if (end < 0) {
+    // Never feed a malformed private OSC into xterm: it would retain parser
+    // state and could swallow the authoritative repaint that follows.
+    return {data: '', kittyKeyboard: 0};
+  }
+  const raw = bin.slice(prefix.length, end);
+  const flags = /^[01]$/.test(raw) ? Number(raw) : 0;
+  return {
+    data: bin.slice(end + terminator.length),
+    kittyKeyboard: flags
+  };
+}
+// pane seed mode helper end
 // The reseed request is fire-and-forget server-side (a marshal lost to app
 // teardown is swallowed), and until the CURRENT generation's seed arrives every
 // pane frame is dropped — so an unseeded-but-open pane view would stay blank
@@ -1927,9 +2415,13 @@ function armSeedRetry() {
 es.addEventListener('pane-reset', (e) => {
   if (!paneView) return;
   try {
-    const bin = atob(JSON.parse(e.data).seed);
+    let bin = atob(JSON.parse(e.data).seed);
+    const seedModes = decodePaneSeedModes(bin);
+    paneKittyKeyboard = seedModes.kittyKeyboard;
+    bin = seedModes.data;
     const bytes = new Uint8Array(bin.length);
     for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+    resetPaneSyncState();
     term.reset();                    // deterministic base for the mode replay
     term.write(bytes);
     paneSeeded = true;
@@ -1949,10 +2441,17 @@ es.addEventListener('pane-meta', (e) => {
     // re-arm the blank-view backstop, so a lost seed can't leave a stale screen
     // treated as current. (#review-pane-gen)
     if (m.gen !== undefined && m.gen !== paneGen) {
+      resetPaneSyncState();
+      paneKittyKeyboard = 0;
       paneGen = m.gen;
       paneSeeded = false;
       try { sessionStorage.removeItem('saikai-seed-retry'); } catch (_) {}
       armSeedRetry();
+    }
+    if (Object.prototype.hasOwnProperty.call(m, 'kitty_keyboard')) {
+      const kittyFlags = Number(m.kitty_keyboard);
+      paneKittyKeyboard = Number.isFinite(kittyFlags) && kittyFlags >= 0
+        ? (Math.floor(kittyFlags) & 1) : 0;
     }
     if (paneOpen && m.cols > 0 && m.rows > 0
         && (m.cols !== term.cols || m.rows !== term.rows)) {
@@ -2041,6 +2540,116 @@ function sendRaw(d) {
   }
 }
 
+// kitty input helpers begin
+function kittyModifierValue(event) {
+  let bits = 0;
+  if (event.shiftKey) bits |= 1;
+  if (event.altKey) bits |= 2;
+  if (event.ctrlKey) bits |= 4;
+  if (event.metaKey) bits |= 8;       // DOM Meta is Kitty's Super modifier
+  return bits + 1;
+}
+
+function kittyBaseCodepoint(event) {
+  const code = String(event.code || '');
+  if (/^Key[A-Z]$/.test(code)) return code.charCodeAt(3) + 32;
+  if (/^Digit[0-9]$/.test(code)) return code.charCodeAt(5);
+  const asciiByCode = {
+    Backquote: 96, Minus: 45, Equal: 61,
+    BracketLeft: 91, BracketRight: 93, Backslash: 92,
+    Semicolon: 59, Quote: 39, Comma: 44, Period: 46, Slash: 47,
+    Space: 32
+  };
+  if (Object.prototype.hasOwnProperty.call(asciiByCode, code)) {
+    return asciiByCode[code];
+  }
+  const key = String(event.key || '');
+  if (Array.from(key).length === 1) {
+    const cp = key.codePointAt(0);
+    if (cp >= 32 && cp <= 126) return cp;
+  }
+  return null;
+}
+
+function kittyParameter(code, modifier, final) {
+  return ESC + '[' + code + (modifier === 1 ? '' : ';' + modifier) + final;
+}
+
+function kittyFunctionalSequence(event, modifier) {
+  const key = String(event.key || '');
+  const finalKeys = {
+    ArrowUp: 'A', ArrowDown: 'B', ArrowRight: 'C', ArrowLeft: 'D',
+    Home: 'H', End: 'F', F1: 'P', F2: 'Q', F4: 'S'
+  };
+  if (Object.prototype.hasOwnProperty.call(finalKeys, key)) {
+    const final = finalKeys[key];
+    return modifier === 1
+      ? ESC + '[' + final
+      : ESC + '[1;' + modifier + final;
+  }
+  const tildeKeys = {
+    Insert: 2, Delete: 3, PageUp: 5, PageDown: 6,
+    F3: 13, F5: 15, F6: 17, F7: 18, F8: 19,
+    F9: 20, F10: 21, F11: 23, F12: 24
+  };
+  if (Object.prototype.hasOwnProperty.call(tildeKeys, key)) {
+    return kittyParameter(tildeKeys[key], modifier, '~');
+  }
+  const functionMatch = /^F([0-9]{1,2})$/.exec(key);
+  if (functionMatch) {
+    const number = Number(functionMatch[1]);
+    if (number >= 13 && number <= 35) {
+      return kittyParameter(57363 + number, modifier, 'u');
+    }
+  }
+  return null;
+}
+
+function kittySequenceForKeyboardEvent(event, flags) {
+  if (!(Number(flags) & 1) || event.type !== 'keydown'
+      || event.isComposing || event.keyCode === 229) return null;
+  // AltGraph is exposed as Ctrl+Alt on several layouts. It produces text and
+  // must reach xterm's normal input path, not be mistaken for a shortcut.
+  if (typeof event.getModifierState === 'function'
+      && event.getModifierState('AltGraph')) return null;
+  const modifier = kittyModifierValue(event);
+  if (event.key === 'Escape') {
+    return kittyParameter(27, modifier, 'u');
+  }
+  const functional = kittyFunctionalSequence(event, modifier);
+  if (functional !== null) return functional;
+  // xterm's onData has already collapsed Ctrl+Enter to CR, losing the
+  // modifier.  Capture modified Enter while the DOM event still has it.
+  if (event.key === 'Enter') {
+    return modifier === 1 ? null : ESC + '[13;' + modifier + 'u';
+  }
+  const cp = kittyBaseCodepoint(event);
+  if (cp === null) return null;
+  // Plain and shift-only ASCII still produces text under flag 1.  Ctrl, Alt
+  // and Super combinations are the ambiguous legacy encodings flag 1 fixes.
+  if (!event.ctrlKey && !event.altKey && !event.metaKey) return null;
+  return ESC + '[' + cp + ';' + modifier + 'u';
+}
+
+function encodeKittyFlag1Data(data, flags) {
+  if (!(Number(flags) & 1)) return data;
+  // Physical keyboards are handled above before xterm destroys modifier
+  // information.  Keep the Ctrl+C fallback for software/mobile input whose
+  // only observable form is the legacy ETX byte.
+  if (data === String.fromCharCode(3)) return ESC + '[99;5u';
+  return data;
+}
+// kitty input helpers end
+
+term.attachCustomKeyEventHandler((event) => {
+  if (!paneView || !controlOn || fatal) return true;
+  const sequence = kittySequenceForKeyboardEvent(
+    event, paneKittyKeyboard);
+  if (sequence === null) return true;
+  sendRaw(sequence);
+  return false;                         // suppress xterm's legacy duplicate
+});
+
 // ── Phase C: single-flight senders for /mouse and /key ──────────────────────
 //    Each mirrors pump()'s gate (controlOn/fatal/writeKey) + the write-key
 //    header + the 409->banner-off / 403->fatal reactions. One in-flight POST
@@ -2124,7 +2733,7 @@ term.onData((d) => {
     // too: pane-view selection IS the child's own smart selection (claude
     // highlights, edge-scrolls its transcript, and copies via OSC 52) — not
     // the local block overlay. (#pane-native-select)
-    sendRaw(d);
+    sendRaw(encodeKittyFlag1Data(d, paneKittyKeyboard));
     return;
   }
   const mm = d.match(sgrMouseRe);
@@ -3177,6 +3786,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     _STATIC = {"/xterm.min.js": "application/javascript",
                "/addon-canvas.js": "application/javascript",
+               "/addon-saikai-rich-graphemes.js": "application/javascript",
                "/xterm.min.css": "text/css"}
 
     def do_GET(self):
@@ -3195,9 +3805,23 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/":
             hub = self.server.hub
+            rich_width_data = html.escape(
+                json.dumps(
+                    _rich_width_payload(),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ),
+                quote=True,
+            )
             body = (_PAGE_HTML
                     .replace("__COLS__", str(hub._cols))
                     .replace("__ROWS__", str(hub._rows))
+                    .replace(
+                        "__RICH_ADDON_VERSION__",
+                        _static_asset_version(
+                            "addon-saikai-rich-graphemes.js"),
+                    )
+                    .replace("__RICH_WIDTH_DATA__", rich_width_data)
                     .encode("utf-8"))
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3223,7 +3847,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "max-age=86400")
+        # Asset URLs are stable except for the custom content-hash query. Force
+        # revalidation so an upgraded xterm/core asset can never be combined
+        # with yesterday's adapter from a non-versioned browser cache.
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
