@@ -411,6 +411,13 @@ except Exception:  # pragma: no cover - exercised only when dep absent
     pyte = None  # type: ignore
     _HistoryScreenBase = None  # type: ignore
 
+# Origin mode (DECOM) marker as pyte stores it in Screen.mode — a cursor report is
+# margin-relative while it is set. None when pyte is absent. (#term-queries)
+try:
+    from pyte.modes import DECOM as _PYTE_DECOM  # type: ignore
+except Exception:  # pragma: no cover - exercised only when dep absent
+    _PYTE_DECOM = None  # type: ignore
+
 _PTY_IMPORT_ERROR: Optional[str] = None
 PtyProcess = None  # type: ignore
 try:
@@ -843,6 +850,19 @@ _SYNC_BUFFER_MAX_AGE = 0.2
 # actually hidden. Above the stager's max age so a fail-open frame's transient
 # hidden state can't trip it. (#ime-midframe)
 _NATIVE_CURSOR_HIDE_SETTLE = 0.5
+
+
+# Private modes saikai tracks, mapped to the attribute holding their current state,
+# for DECRQM. ?25 / ?2026 / the alt-screen family are derived instead. (#term-queries)
+_DECRQM_TRACKED = {
+    "1": "_app_cursor",              # DECCKM (application cursor keys)
+    "1000": "_mouse_click",
+    "1002": "_mouse_btn_motion",
+    "1003": "_mouse_any_motion",
+    "1006": "_mouse_sgr",
+    "2004": "_bracketed_paste",
+}
+_DECRQM_ALT_SCREEN = ("47", "1047", "1049")
 
 
 def _has_cursor_query(text: str) -> bool:
@@ -2151,15 +2171,56 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             pass
 
     def _cursor_rowcol(self) -> tuple:
-        """Current pyte cursor as 1-based (row, col), for a Cursor-Position reply."""
+        """Current pyte cursor as 1-based (row, col), for a Cursor-Position reply.
+
+        Two adjustments a raw +1 gets wrong. Text that exactly fills a row leaves
+        pyte in the PENDING-WRAP state with cursor.x == columns, which would report
+        a column that does not exist — real terminals report the last column until
+        the wrap happens. And with origin mode (DECOM) set the report is relative to
+        the scroll region, so an app with a region would otherwise be told it sits
+        outside its own margins. (#term-queries)"""
         with self._lock:
             scr = self._screen
             if scr is None:
                 return 1, 1
             try:
-                return int(scr.cursor.y) + 1, int(scr.cursor.x) + 1
+                row = int(scr.cursor.y) + 1
+                col = int(scr.cursor.x) + 1
+                cols = int(getattr(scr, "columns", 0) or 0)
+                if cols:
+                    col = min(col, cols)
+                if _PYTE_DECOM is not None and _PYTE_DECOM in getattr(scr, "mode", ()):
+                    margins = getattr(scr, "margins", None)
+                    if margins is not None:
+                        row = max(1, row - int(margins.top))
+                return row, col
             except Exception:
                 return 1, 1
+
+    def _decrqm_report(self, mode: str) -> int:
+        """DECRQM answer for a private *mode*: 1 = set, 2 = reset, 0 = not recognised.
+
+        A pane that answers Primary DA as Windows Terminal must not report "not
+        recognised" for modes it honours: a child using the set-then-verify pattern
+        then refuses to enable bracketed paste (so a multi-line paste submits line by
+        line) or SGR mouse encoding, even though saikai tracks both. (#term-queries)"""
+        if mode == "2026":
+            stager = getattr(self, "_sync_output", None)
+            return 1 if (stager is not None and stager.active) else 2
+        if mode in _DECRQM_ALT_SCREEN:
+            return 1 if getattr(getattr(self, "_alt", None), "in_alt", False) else 2
+        if mode == "25":                                    # DECTCEM
+            try:
+                with self._lock:
+                    scr = self._screen
+                    hidden = bool(getattr(scr.cursor, "hidden", False)) if scr is not None else False
+            except Exception:
+                return 0
+            return 2 if hidden else 1
+        attr = _DECRQM_TRACKED.get(mode)
+        if attr is None:
+            return 0
+        return 1 if getattr(self, attr, False) else 2
 
     def _answer_static_queries(self, chunk: str) -> None:
         """Answer terminal queries that do not depend on pyte's cursor state."""
@@ -2182,9 +2243,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             if _kind == "5":
                 out.append("\x1b[0n")                    # device status: OK
         for _mode in _DECRQM_RE.findall(chunk):
-            # saikai honours synchronized output (?2026) → "reset but recognised" (2);
-            # any other mode → "not recognised" (0).
-            out.append(f"\x1b[?{_mode};{'2' if _mode == '2026' else '0'}$y")
+            out.append(f"\x1b[?{_mode};{self._decrqm_report(_mode)}$y")
         # XTVERSION (ESC[>q): the outer Windows Terminal sends NO reply (probed on-
         # device). Answering with a name ("saikai") made Claude Code see an unknown
         # terminal and skip its WT cursor-tracking path. Stay silent, exactly like WT.

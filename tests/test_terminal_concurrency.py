@@ -1502,6 +1502,77 @@ def test_cursor_report_uses_the_cursor_at_the_querys_stream_position():
     assert sent == ["\x1b[1;2R\x1b[5;6R"], sent  # each query at its own position
 
 
+def test_decrqm_reports_the_modes_saikai_actually_implements():
+    """A pane that answers DA1 as Windows Terminal must not tell a child 'mode not
+    recognised' for modes it honours. A child using the set-then-verify pattern reads
+    ?2004;0 and never enables bracketed paste — so a multi-line paste is submitted
+    line by line, the exact hazard the paste wrapper exists to prevent — and reads
+    ?1006;0 and falls back to legacy mouse encoding. Report the tracked state
+    instead, and keep 0 for modes we genuinely do not implement. (#term-queries)"""
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(20, 5, history=20)
+    t._stream = pyte.Stream(t._screen)
+    t._sync_output = rt._SynchronizedOutputStager()
+    sent = []
+    t._send_to_child = lambda data: sent.append(data)
+    t._marshal = lambda fn: fn()
+
+    def _reply(query):
+        sent.clear()
+        t._answer_static_queries(query)
+        return sent[-1] if sent else None
+
+    assert _reply("\x1b[?2004$p") == "\x1b[?2004;2$y"      # implemented, reset
+    t._consume("\x1b[?2004h")                              # child enables it
+    assert t._bracketed_paste is True
+    assert _reply("\x1b[?2004$p") == "\x1b[?2004;1$y"      # implemented, SET
+    t._consume("\x1b[?1006h\x1b[?1002h")
+    assert _reply("\x1b[?1006$p") == "\x1b[?1006;1$y"
+    assert _reply("\x1b[?1002$p") == "\x1b[?1002;1$y"
+    assert _reply("\x1b[?1003$p") == "\x1b[?1003;2$y"
+    assert _reply("\x1b[?25$p") == "\x1b[?25;1$y"          # DECTCEM: cursor visible
+    t._consume("\x1b[?25l")
+    assert _reply("\x1b[?25$p") == "\x1b[?25;2$y"
+    assert _reply("\x1b[?9999$p") == "\x1b[?9999;0$y"      # genuinely unknown
+
+    # ?2026 is SET while a frame is staged — a child that verifies its BSU took
+    # effect must not be told the mode is reset while we are holding its frame.
+    assert _reply("\x1b[?2026$p") == "\x1b[?2026;2$y"
+    t._consume("\x1b[?2026hmid-frame")
+    assert t._sync_output.active is True
+    assert _reply("\x1b[?2026$p") == "\x1b[?2026;1$y"
+
+
+def test_cursor_report_clamps_pending_wrap_and_honours_origin_mode():
+    """Two CPR coordinate bugs a child can act on.
+
+    (1) After text exactly fills a row pyte parks the cursor at column == columns
+        (the pending-wrap state), so a raw +1 reports a column that does not exist;
+        real terminals report the LAST column until the wrap actually happens.
+    (2) With origin mode (DECOM) set the report is margin-relative — that is the
+        whole point of DECOM — so a full-screen app with a scroll region gets told
+        it is outside its own region and repositions its status line one row off.
+    (#term-queries)"""
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(10, 6, history=20)
+    t._stream = pyte.Stream(t._screen)
+    t._sync_output = rt._SynchronizedOutputStager()
+    t._marshal = lambda fn: None
+
+    t._consume("\x1b[1;1H" + "x" * 10)               # row exactly full -> pending wrap
+    assert t._screen.cursor.x == 10, "precondition: pyte parks at columns"
+    assert t._cursor_rowcol() == (1, 10)
+
+    t._consume("\x1b[3;5r\x1b[?6h\x1b[H")            # region rows 3..5, origin mode
+    assert t._cursor_rowcol() == (1, 1), "DECOM makes the report margin-relative"
+    t._consume("\x1b[2;3H")
+    assert t._cursor_rowcol() == (2, 3)
+
+
 def test_cursor_query_fail_open_only_for_a_RETAINED_query():
     """The fail-open that releases a staged frame early must fire only when the query
     is inside the RETAINED text. A ?6n that arrives BEFORE the ?2026h in the same PTY
@@ -1891,8 +1962,9 @@ def test_answer_queries_responds_to_terminal_probes():
     assert _one("\x1b[?6n") == "\x1b[?3;7R"       # private cursor-position reply
     assert _one("\x1b[6n") == "\x1b[3;7R"         # standard cursor-position reply
     assert _one("\x1b[5n") == "\x1b[0n"           # device status OK
-    assert _one("\x1b[?2026$p") == "\x1b[?2026;2$y"    # synchronized output supported
-    assert _one("\x1b[?1000$p") == "\x1b[?1000;0$y"    # other mode: not recognised
+    assert _one("\x1b[?2026$p") == "\x1b[?2026;2$y"    # synchronized output, not in a block
+    assert _one("\x1b[?1000$p") == "\x1b[?1000;2$y"    # implemented, currently reset
+    assert _one("\x1b[?9999$p") == "\x1b[?9999;0$y"    # genuinely unknown mode
     assert _one("\x1b[>0q") is None               # XTVERSION: silent, exactly like WT
     assert _one("\x1b]11;?\x07") == "\x1b]11;rgb:1e1e/1e1e/1e1e\x07"  # bg (dark)
     assert _one("\x1b]10;?\x07") == "\x1b]10;rgb:c0c0/c0c0/c0c0\x07"  # fg (light)
@@ -2420,6 +2492,10 @@ if __name__ == "__main__":
     print("PASS test_cursor_query_fail_opens_sync_block_then_reports_new_cursor")
     test_cursor_report_uses_the_cursor_at_the_querys_stream_position()
     print("PASS test_cursor_report_uses_the_cursor_at_the_querys_stream_position")
+    test_cursor_report_clamps_pending_wrap_and_honours_origin_mode()
+    print("PASS test_cursor_report_clamps_pending_wrap_and_honours_origin_mode")
+    test_decrqm_reports_the_modes_saikai_actually_implements()
+    print("PASS test_decrqm_reports_the_modes_saikai_actually_implements")
     test_cursor_query_fail_open_only_for_a_RETAINED_query()
     print("PASS test_cursor_query_fail_open_only_for_a_RETAINED_query")
     test_sync_output_eof_flushes_retained_frame_once()
