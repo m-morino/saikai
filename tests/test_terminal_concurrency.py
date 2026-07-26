@@ -1502,6 +1502,47 @@ def test_cursor_report_uses_the_cursor_at_the_querys_stream_position():
     assert sent == ["\x1b[1;2R\x1b[5;6R"], sent  # each query at its own position
 
 
+def test_dcs_payloads_never_reach_the_grid():
+    """A DCS string (sixel image, DECRQSS, XTGETTCAP) must not print as text.
+
+    pyte has no DCS handler, so it draws the payload body into the grid — and the
+    pane now advertises sixel in its Windows-Terminal Primary DA reply, so any
+    auto-detecting image tool (chafa, timg, img2sixel, lsix) will send one and fill
+    the pane and its scrollback with garbage. Strip complete strings, and hold the
+    'inside a DCS' state across read boundaries so a payload split by the PTY can't
+    leak its tail. (#dcs-scrub)"""
+    import pyte
+
+    def _mk():
+        t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+        t._screen = rt._HistoryScreenBase(30, 4, history=20)
+        t._stream = pyte.Stream(t._screen)
+        t._sync_output = rt._SynchronizedOutputStager()
+        t._marshal = lambda fn: None
+        return t
+
+    def _text(t):
+        return "".join(rt._pyte_grid_lines(t._screen)).strip()
+
+    t = _mk()
+    t._consume("A\x1bPq#0;2;0;0;0#0~~@@vv@@~~\x1b\\B")
+    assert _text(t) == "AB", _text(t)
+
+    t = _mk()                                     # split across PTY reads
+    t._consume("C\x1bPq#0;2;0;0;0")
+    t._consume("~~@@vv@@~~")
+    t._consume("\x1b\\D")
+    assert _text(t) == "CD", _text(t)
+
+    t = _mk()                                     # BEL-terminated DCS
+    t._consume("E\x1bP+q544e\x07F")
+    assert _text(t) == "EF", _text(t)
+
+    t = _mk()                                     # a lone ESC P mid-text stays inert
+    t._consume("plain text only")
+    assert _text(t) == "plain text only", _text(t)
+
+
 def test_decrqm_reports_the_modes_saikai_actually_implements():
     """A pane that answers DA1 as Windows Terminal must not tell a child 'mode not
     recognised' for modes it honours. A child using the set-then-verify pattern reads
@@ -1968,6 +2009,11 @@ def test_answer_queries_responds_to_terminal_probes():
     assert _one("\x1b[>0q") is None               # XTVERSION: silent, exactly like WT
     assert _one("\x1b]11;?\x07") == "\x1b]11;rgb:1e1e/1e1e/1e1e\x07"  # bg (dark)
     assert _one("\x1b]10;?\x07") == "\x1b]10;rgb:c0c0/c0c0/c0c0\x07"  # fg (light)
+    # The reply must carry the terminator the child ASKED with: an ST-terminated
+    # query answered with BEL leaves a strict parser waiting for its ST (and the
+    # stray BEL rings the bell). (#term-queries)
+    assert _one("\x1b]11;?\x1b\\") == "\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\"
+    assert _one("\x1b]10;?\x1b\\") == "\x1b]10;rgb:c0c0/c0c0/c0c0\x1b\\"
     # Secondary DA (vim's t_RV, tmux). A pane that claims to BE Windows Terminal must
     # answer it — WT does. Leaving it silent stalls the child's probe until it times
     # out and it then mis-detects version-gated features. (#wt-da2)
@@ -2496,6 +2542,8 @@ if __name__ == "__main__":
     print("PASS test_cursor_report_clamps_pending_wrap_and_honours_origin_mode")
     test_decrqm_reports_the_modes_saikai_actually_implements()
     print("PASS test_decrqm_reports_the_modes_saikai_actually_implements")
+    test_dcs_payloads_never_reach_the_grid()
+    print("PASS test_dcs_payloads_never_reach_the_grid")
     test_cursor_query_fail_open_only_for_a_RETAINED_query()
     print("PASS test_cursor_query_fail_open_only_for_a_RETAINED_query")
     test_sync_output_eof_flushes_retained_frame_once()

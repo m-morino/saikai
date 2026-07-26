@@ -816,7 +816,7 @@ _DA2_RE = re.compile(r"\x1b\[>0?c")                      # Secondary DA (vim t_R
 _DSR_RE = re.compile(r"\x1b\[(\??)([56])n")             # DSR: 5=status, 6=cursor position
 _DECRQM_RE = re.compile(r"\x1b\[\?(\d+)\$p")            # DECRQM (mode support query)
 _XTVERSION_RE = re.compile(r"\x1b\[>0?q")               # XTVERSION (terminal name/version)
-_OSC_COLOR_Q_RE = re.compile(r"\x1b\](1[01]);\?(?:\x07|\x1b\\)")  # OSC 10/11 fg/bg color query
+_OSC_COLOR_Q_RE = re.compile(r"\x1b\](1[01]);\?(\x07|\x1b\\)")  # OSC 10/11 fg/bg color query
 # Queries stripped from the mirror pane stream (#pane-direct): saikai (the PTY
 # owner) answers them in _answer_queries; the browser xterm fed the raw stream
 # would ALSO auto-answer via onData, and with pane-view input wired the child
@@ -863,6 +863,45 @@ _DECRQM_TRACKED = {
     "2004": "_bracketed_paste",
 }
 _DECRQM_ALT_SCREEN = ("47", "1047", "1049")
+
+
+# DCS strings (ESC P … ST): sixel images, DECRQSS/XTGETTCAP replies. pyte has no
+# DCS handler and DRAWS the payload body into the grid, and the pane advertises
+# sixel in its Windows-Terminal DA reply, so an auto-detecting image tool would
+# fill the pane with garbage. Strip them before pyte and the mirror. (#dcs-scrub)
+_DCS_END_RE = re.compile(r"\x07|\x1b\\")
+_DCS_MAX_DROP = 4 * 1024 * 1024
+
+
+def _strip_dcs(text: str, inside: bool = False, dropped: int = 0):
+    """Remove DCS strings from *text*, carrying the 'inside a DCS' state.
+
+    Returns (clean_text, inside, dropped). A payload split across PTY reads keeps
+    being dropped until its terminator arrives; past _DCS_MAX_DROP the strip gives
+    up and passes text through, so a malformed stream degrades to garbage rather
+    than blackholing the pane forever."""
+    out = []
+    pos = 0
+    while pos < len(text):
+        if inside:
+            match = _DCS_END_RE.search(text, pos)
+            if match is None:
+                dropped += len(text) - pos
+                if dropped > _DCS_MAX_DROP:
+                    out.append(text[pos:])
+                    inside, dropped = False, 0
+                return "".join(out), inside, dropped
+            inside, dropped = False, 0
+            pos = match.end()
+            continue
+        start = text.find("\x1bP", pos)
+        if start < 0:
+            out.append(text[pos:])
+            break
+        out.append(text[pos:start])
+        inside = True
+        pos = start + 2
+    return "".join(out), inside, dropped
 
 
 def _has_cursor_query(text: str) -> bool:
@@ -1237,6 +1276,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                                      # (the reader keeps mutating screen.buffer, so
                                      # render + copy must read the FROZEN frame)
         self._esc_carry = ""         # trailing partial escape held across read()s
+        self._dcs_inside = False     # mid-DCS across read()s (sixel payload scrub)
+        self._dcs_dropped = 0        # chars swallowed by the current DCS (runaway cap)
         self._sync_output = _SynchronizedOutputStager()
         self._osc52_carry = ""       # partial OSC 52 clipboard write held across read()s (base64 can span chunks)
         self._app_cursor = False     # ?1 DECCKM — replayed in the mirror seed so a
@@ -2248,11 +2289,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # device). Answering with a name ("saikai") made Claude Code see an unknown
         # terminal and skip its WT cursor-tracking path. Stay silent, exactly like WT.
         # (#agents-cursor #wt-da)
-        for _code in _OSC_COLOR_Q_RE.findall(chunk):
+        for _code, _term in _OSC_COLOR_Q_RE.findall(chunk):
             # Report a dark background (11) / light foreground (10) so the child picks
-            # a dark theme, matching a typical terminal.
+            # a dark theme, matching a typical terminal. Answer with the terminator the
+            # child ASKED with: an ST-terminated query answered with BEL leaves a strict
+            # parser waiting for its ST, and the stray BEL rings the bell.
             _rgb = "1e1e/1e1e/1e1e" if _code == "11" else "c0c0/c0c0/c0c0"
-            out.append(f"\x1b]{_code};rgb:{_rgb}\x07")
+            out.append(f"\x1b]{_code};rgb:{_rgb}{_term}")
         if out:
             resp = "".join(out)
             self._marshal(lambda r=resp: self._send_to_child(r))
@@ -2301,6 +2344,14 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # it on every backend would silently corrupt a child that legitimately
             # prints that string (a log line, a hex dump, a test fixture). (#12)
             chunk = chunk.replace("0011Ignore", "")
+        # Drop DCS strings (sixel payloads, DECRQSS/XTGETTCAP replies) BEFORE any
+        # other scan: pyte would print the body into the grid, and a payload must not
+        # be able to spoof an OSC 52 clipboard write or a notification either. The
+        # 'inside' state carries across reads. (#dcs-scrub)
+        if "\x1bP" in chunk or getattr(self, "_dcs_inside", False):
+            chunk, self._dcs_inside, self._dcs_dropped = _strip_dcs(
+                chunk, getattr(self, "_dcs_inside", False),
+                getattr(self, "_dcs_dropped", 0))
         chunk = _PRIVATE_SGR_RE.sub("", chunk)   # drop XTMODKEYS \x1b[>4;2m etc. (pyte misreads as SGR-4 underline)
         chunk = _KITTY_KBD_RE.sub("", chunk)     # drop Kitty-keyboard CSI-u (pyte leaks the trailing 'u' into the grid)
         _bp = _BRACKETED_RE.findall(chunk)       # track claude's bracketed-paste mode for on_paste (last h/l wins)
