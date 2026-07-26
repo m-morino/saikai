@@ -916,9 +916,22 @@ def _normalize_paste_newlines(text: str) -> str:
     return text.replace("\r\n", "\n")
 
 
+def _strip_paste_markers(text: str) -> str:
+    """Strip embedded paste markers to a FIXED POINT. One sub() pass scans the
+    original string, so overlapping fragments ("\\x1b[20" + "\\x1b[201~" + "1~")
+    lose the inner marker and let the surviving halves concatenate into a fresh
+    marker at the deletion seam — the breakout the strip exists to block. Loop
+    until the text stops changing (saikai_mirror.py does the same browser-side)."""
+    while True:
+        stripped = _PASTE_MARKER_RE.sub("", text)
+        if stripped == text:
+            return text
+        text = stripped
+
+
 def _wrap_bracketed_paste(text: str) -> str:
     """Wrap text in bracketed-paste markers after stripping any embedded ones."""
-    return "\x1b[200~" + _PASTE_MARKER_RE.sub("", text) + "\x1b[201~"
+    return "\x1b[200~" + _strip_paste_markers(text) + "\x1b[201~"
 
 
 def _scroll_row_index(hist_len: int, scroll: int, y: int) -> int:
@@ -2548,9 +2561,19 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         while has_focus is still False → the anchor bailed → the ×/ON IME flicker on
         alt-tab). screen.focused is set synchronously by set_focus, so it's already
         this pane when on_focus / app-refocus runs. Falls back to has_focus if the
-        screen isn't reachable. (#ime-appfocus)"""
+        screen isn't reachable. (#ime-appfocus)
+
+        A pushed ModalScreen is only SUSPENDED by Textual — the base screen keeps
+        its ``focused`` — so screen.focused alone still names this pane while a
+        modal owns the keyboard, and the anchor would steal app.cursor_position
+        (and force ?25h) from the modal's Input mid-composition. Require this
+        pane's screen to BE the app's active screen. (#ime-modal)"""
         try:
-            return self.screen.focused is self
+            screen = self.screen
+            app = self.app
+            if app is not None and app.screen is not screen:
+                return False
+            return screen.focused is self
         except Exception:
             return bool(self.has_focus)
 
@@ -2745,7 +2768,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     # ── thread → UI marshaling (defensive) ─────────────────────────────────────
     def _marshal(self, fn: Callable) -> None:
         """call_from_thread that never raises on the reader thread (the app may
-        be shutting down / the widget already unmounted)."""
+        be shutting down / the widget already unmounted).
+
+        Textual REJECTS call_from_thread from the app's own thread, so a marshal
+        issued on the UI thread (the 1.5s status poll flipping busy->idle, an
+        input handler) used to be swallowed here and silently lost — the 'settle'
+        anchor sync never ran on a quiet turn end. On that thread the callback is
+        already in the right context, so run it inline. (#ime-settle)"""
         app = None
         try:
             app = self.app
@@ -2753,6 +2782,15 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         if app is None:
             return
+        try:
+            if getattr(app, "_thread_id", None) == threading.get_ident():
+                try:
+                    fn()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
         try:
             app.call_from_thread(fn)
         except Exception:

@@ -507,6 +507,83 @@ def test_native_cursor_follows_dectcem_regardless_of_screen():
         rt._IS_WIN, rt._IME_ANCHOR, rt.Offset = old_win, old_anchor, old_offset
 
 
+def test_marshal_runs_inline_on_the_apps_own_thread():
+    """A marshal issued FROM the UI thread must still run the callback.
+
+    Textual's call_from_thread raises when the caller is the app's own thread, and
+    _marshal swallows it — so every UI-thread-originated marshal was a silent no-op.
+    The busy->idle flip is detected by the 1.5s UI-thread status poll in the common
+    'claude finished quietly' case, which dropped the 'settle' anchor sync and left
+    the IME anchored at the frozen mid-turn cell. Run it inline instead; a callback
+    that raises must still not escape. (#ime-settle)"""
+    import threading as _th
+
+    class _SameThreadApp:
+        def __init__(self):
+            self._thread_id = _th.get_ident()
+        def call_from_thread(self, fn):
+            raise RuntimeError("must run in a different thread from the app")
+
+    class _ReaderThreadApp:
+        _thread_id = -1
+        def __init__(self):
+            self.posted = []
+        def call_from_thread(self, fn):
+            self.posted.append(fn)
+
+    class _Shim(rt.AgentTerminal):
+        app = property(lambda self: self._app)
+
+    t = _Shim.__new__(_Shim)
+    ran = []
+    t._app = _SameThreadApp()
+    t._marshal(lambda: ran.append("settle"))
+    assert ran == ["settle"], "a UI-thread marshal must not be dropped"
+
+    def _boom():
+        raise ValueError("callback blew up")
+    t._marshal(_boom)                       # must not escape _marshal
+
+    t._app = _ReaderThreadApp()             # reader thread: still posted, not inline
+    t._marshal(lambda: ran.append("reader"))
+    assert ran == ["settle"], "an off-thread marshal must go through call_from_thread"
+    assert len(t._app.posted) == 1
+
+
+def test_focus_gate_yields_to_a_modal_screen_on_top():
+    """A pushed ModalScreen must silence the pane's IME anchoring.
+
+    Textual only SUSPENDS the base screen on push_screen — it never clears its
+    .focused — so ``screen.focused is self`` still names this pane while a modal
+    owns the keyboard. The anchor then steals app.cursor_position (and forces
+    ?25h) away from the modal's Input, and a CJK composition in a rename box
+    jumps to the pane's prompt cell. Gate on the app's ACTIVE screen too.
+    (#ime-modal)"""
+    class _Screen:
+        focused = None
+
+    class _App:
+        def __init__(self, screen):
+            self.screen = screen
+
+    class _Shim(rt.AgentTerminal):
+        app = property(lambda self: self._app)
+        screen = property(lambda self: self._screen_node)
+
+    t = _Shim.__new__(_Shim)
+    base = _Screen()
+    base.focused = t
+    t._screen_node = base
+    t._app = _App(base)
+    assert t._is_focused_pane() is True          # pane owns the live focus
+
+    t._app.screen = _Screen()                    # modal pushed; base keeps .focused
+    assert t._is_focused_pane() is False, "a modal on top must silence the anchor"
+
+    t._app.screen = base                         # modal popped -> anchoring resumes
+    assert t._is_focused_pane() is True
+
+
 def test_child_pty_env_hides_outer_terminal_identity_from_child():
     """The pane child renders into saikai, not directly into Windows Terminal.
 
@@ -1217,6 +1294,26 @@ def test_paste_text_wraps_and_submits():
     writes.clear(); t.is_dead = True
     t.paste_text("x"); t.submit()
     assert writes == [], writes
+
+
+def test_bracketed_paste_strip_is_idempotent_across_seams():
+    """Overlapping marker fragments must not re-form a marker at the deletion seam.
+    A single sub() pass scans the ORIGINAL string, so '\\x1b[20' + '\\x1b[201~' + '1~'
+    loses the inner marker and the surviving halves concatenate into a brand-new
+    ESC[201~ — paste mode ends early and the rest runs as typed-and-submitted
+    input (the breakout). Strip to a fixed point, as saikai_mirror.py already
+    does on the browser side. (#H3)"""
+    evil = "\x1b[20" + "\x1b[201~" + "1~rm -rf /\r"
+    wrapped = rt._wrap_bracketed_paste(evil)
+    assert wrapped.count("\x1b[201~") == 1, wrapped        # only the closing one
+    assert wrapped.endswith("\x1b[201~"), wrapped          # and it is LAST
+    assert wrapped.startswith("\x1b[200~"), wrapped
+    assert "\x1b[200~" not in wrapped[6:], wrapped         # no re-formed opener
+    # A seam that re-forms the OPENING marker is equally fatal (the child sees a
+    # second paste start and the bytes before it leave paste mode).
+    assert rt._wrap_bracketed_paste("\x1b[20" + "\x1b[200~" + "0~x") == "\x1b[200~x\x1b[201~"
+    # Non-overlapping content is unchanged (no over-stripping regression).
+    assert rt._wrap_bracketed_paste("safe\x1b[201~\rok") == "\x1b[200~safe\rok\x1b[201~"
 
 
 def test_forward_wheel_only_when_mouse_reporting():
@@ -2010,6 +2107,10 @@ if __name__ == "__main__":
     print("PASS test_show_hw_cursor_native_cursor_dec_bytes")
     test_native_cursor_follows_dectcem_regardless_of_screen()
     print("PASS test_native_cursor_follows_dectcem_regardless_of_screen")
+    test_marshal_runs_inline_on_the_apps_own_thread()
+    print("PASS test_marshal_runs_inline_on_the_apps_own_thread")
+    test_focus_gate_yields_to_a_modal_screen_on_top()
+    print("PASS test_focus_gate_yields_to_a_modal_screen_on_top")
     test_child_pty_env_hides_outer_terminal_identity_from_child()
     print("PASS test_child_pty_env_hides_outer_terminal_identity_from_child")
     test_cursor_sync_freezes_while_busy_and_settles_on_transition()
@@ -2070,6 +2171,8 @@ if __name__ == "__main__":
     print("PASS test_copy_to_host_clipboard_picks_tool_and_reports")
     test_paste_text_wraps_and_submits()
     print("PASS test_paste_text_wraps_and_submits")
+    test_bracketed_paste_strip_is_idempotent_across_seams()
+    print("PASS test_bracketed_paste_strip_is_idempotent_across_seams")
     test_forward_wheel_only_when_mouse_reporting()
     print("PASS test_forward_wheel_only_when_mouse_reporting")
     test_sync_output_stager_holds_split_frame_until_close()
