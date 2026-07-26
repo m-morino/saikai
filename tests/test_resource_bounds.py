@@ -812,6 +812,18 @@ def test_memory_safety_presets_and_override():
                 os.environ[k] = v
 
 
+def test_vt_tokenizer_string_carry_is_bounded():
+    """Malformed OSC/DCS streams fail open under a cap instead of retaining a
+    whole unbounded PTY stream in tokenizer carry state."""
+    import saikai_terminal as _terminal
+    for opener in ("\x1b]", "\x1bP", "\x9d", "\x90"):
+        tokenizer = _terminal.VTTokenizer(max_carry=32, max_dropped_string=48)
+        emitted = tokenizer.feed(opener + "x" * 1_000)
+        assert emitted, f"{opener!r} remained wholly buffered"
+        assert len(tokenizer.carry) <= 32
+        assert tokenizer.dropped_string_chars <= 48
+
+
 
 def test_parse_session_extracts_agent_lineage():
     """Agent lineage (#agent-lineage): parse_session pulls parentSessionId /
@@ -863,6 +875,8 @@ if __name__ == "__main__":
     print("PASS test_no_unguarded_jsonl_record_loops")
     test_memory_safety_presets_and_override()
     print("PASS test_memory_safety_presets_and_override")
+    test_vt_tokenizer_string_carry_is_bounded()
+    print("PASS test_vt_tokenizer_string_carry_is_bounded")
     test_na_cache_is_bounded()
     print("PASS test_na_cache_is_bounded")
     test_load_severity_bands()

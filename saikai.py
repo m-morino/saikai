@@ -4,9 +4,12 @@
 # dependencies = [
 #   "textual>=0.50",
 #   "pyte>=0.8",                          # PTY byte-stream -> screen grid (split-live)
+#   "regex>=2024.11.6",                   # Unicode grapheme segmentation (terminal rendering)
 #   "pywinpty>=2.0 ; sys_platform == 'win32'",   # Windows ConPTY backend
 #   "ptyprocess>=0.7 ; sys_platform != 'win32'", # POSIX PTY backend
 #   "platformdirs>=3.6",                  # cross-platform config dir (textual transitive)
+#   "segno>=1.6.6",                        # QR code generation (mirror join URL)
+#   "cryptography>=41",                    # in-process TLS certificates (LAN mirror)
 # ]
 # ///
 """

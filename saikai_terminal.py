@@ -51,6 +51,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 # Platform branch as a module flag (not inline sys.platform checks) so the
@@ -888,6 +889,197 @@ _DECRQM_ALT_SCREEN = ("47", "1047", "1049")
 # fill the pane with garbage. Strip them before pyte and the mirror. (#dcs-scrub)
 _DCS_END_RE = re.compile(r"\x07|\x1b\\")
 _DCS_MAX_DROP = 4 * 1024 * 1024
+_VT_TOKENIZER_MAX_CARRY = 64 * 1024
+
+
+@dataclass(frozen=True)
+class VTToken:
+    """One decoded VT protocol unit, retaining the original characters exactly."""
+
+    kind: str
+    raw: str
+    parameters: str = ""
+    intermediates: str = ""
+    final: str = ""
+
+
+class VTTokenizer:
+    """Provider-neutral incremental tokenizer for decoded terminal text.
+
+    The tokenizer does not interpret a sequence; it only identifies its VT
+    grammar and preserves its raw characters. Incomplete units are retained for
+    the next PTY read. A malformed or overlong unit is emitted as ordinary data
+    rather than being retained forever.
+    """
+
+    def __init__(self, max_carry=_VT_TOKENIZER_MAX_CARRY,
+                 max_dropped_string=_DCS_MAX_DROP):
+        self.max_carry = max(1, int(max_carry))
+        self.max_dropped_string = max(0, int(max_dropped_string))
+        self.carry = ""
+        # Bounded accounting for malformed OSC/DCS strings that have failed open.
+        # It is diagnostic state only; the raw data is emitted, never discarded.
+        self.dropped_string_chars = 0
+
+    @staticmethod
+    def _is_parameter(ch: str) -> bool:
+        return "\x30" <= ch <= "\x3f"
+
+    @staticmethod
+    def _is_intermediate(ch: str) -> bool:
+        return "\x20" <= ch <= "\x2f"
+
+    @staticmethod
+    def _is_final(ch: str) -> bool:
+        return "\x40" <= ch <= "\x7e"
+
+    @staticmethod
+    def _is_escape_final(ch: str) -> bool:
+        return "\x30" <= ch <= "\x7e"
+
+    @staticmethod
+    def _is_control(ch: str) -> bool:
+        return ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f
+
+    def _retain_or_fail_open(self, raw: str, out: list[VTToken], *, string=False):
+        """Carry *raw* only while it is bounded; otherwise expose it as text."""
+        if len(raw) <= self.max_carry:
+            self.carry = raw
+            return
+        if string:
+            self.dropped_string_chars = min(
+                self.max_dropped_string, self.dropped_string_chars + len(raw))
+        out.append(VTToken("text", raw))
+
+    def _parse_csi(self, text: str, start: int, body: int,
+                   out: list[VTToken]) -> int | None:
+        """Emit a CSI at *start*, or retain an incomplete unit and return None."""
+        pos = body
+        params_start = pos
+        while pos < len(text) and self._is_parameter(text[pos]):
+            pos += 1
+        params = text[params_start:pos]
+        inter_start = pos
+        while pos < len(text) and self._is_intermediate(text[pos]):
+            pos += 1
+        intermediates = text[inter_start:pos]
+        if pos == len(text):
+            self._retain_or_fail_open(text[start:], out)
+            return None
+        if self._is_final(text[pos]):
+            pos += 1
+            out.append(VTToken("csi", text[start:pos], params, intermediates,
+                               text[pos - 1]))
+            return pos
+        # A control or an invalid byte cannot complete this CSI. Keep no poison
+        # for a later PTY read: return its raw prefix as ordinary data instead.
+        out.append(VTToken("text", text[start:pos]))
+        return pos
+
+    def _parse_string(self, text: str, start: int, body: int, kind: str,
+                      out: list[VTToken]) -> int | None:
+        """Emit OSC/DCS through BEL, ESC-ST, or C1-ST; else carry it bounded."""
+        pos = body
+        while pos < len(text):
+            ch = text[pos]
+            if ch in ("\x07", "\x9c"):
+                pos += 1
+                out.append(VTToken(kind, text[start:pos]))
+                return pos
+            if ch == "\x1b":
+                if pos + 1 == len(text):
+                    self._retain_or_fail_open(text[start:], out, string=True)
+                    return None
+                if text[pos + 1] == "\\":
+                    pos += 2
+                    out.append(VTToken(kind, text[start:pos]))
+                    return pos
+            pos += 1
+        self._retain_or_fail_open(text[start:], out, string=True)
+        return None
+
+    def _parse_escape(self, text: str, start: int,
+                      out: list[VTToken]) -> int | None:
+        """Parse ESC plus its optional intermediate bytes and final byte."""
+        pos = start + 1
+        if pos == len(text):
+            self._retain_or_fail_open(text[start:], out)
+            return None
+        leader = text[pos]
+        if leader == "[":
+            return self._parse_csi(text, start, pos + 1, out)
+        if leader == "]":
+            return self._parse_string(text, start, pos + 1, "osc", out)
+        if leader == "P":
+            return self._parse_string(text, start, pos + 1, "dcs", out)
+        while pos < len(text) and self._is_intermediate(text[pos]):
+            pos += 1
+        if pos == len(text):
+            self._retain_or_fail_open(text[start:], out)
+            return None
+        if self._is_escape_final(text[pos]):
+            pos += 1
+            out.append(VTToken("esc", text[start:pos],
+                               intermediates=text[start + 1:pos - 1],
+                               final=text[pos - 1]))
+            return pos
+        out.append(VTToken("text", text[start:pos]))
+        return pos
+
+    def feed(self, text: str) -> list[VTToken]:
+        """Tokenize one decoded PTY chunk, retaining only an incomplete suffix."""
+        if not text and not self.carry:
+            return []
+        text = self.carry + (text or "")
+        self.carry = ""
+        out: list[VTToken] = []
+        pos = 0
+        text_start = 0
+
+        def emit_text(end: int) -> None:
+            nonlocal text_start
+            if end > text_start:
+                out.append(VTToken("text", text[text_start:end]))
+
+        while pos < len(text):
+            ch = text[pos]
+            if ch == "\x1b":
+                emit_text(pos)
+                next_pos = self._parse_escape(text, pos, out)
+                if next_pos is None:
+                    break
+                pos = text_start = next_pos
+                continue
+            if ch == "\x9b":
+                emit_text(pos)
+                next_pos = self._parse_csi(text, pos, pos + 1, out)
+                if next_pos is None:
+                    break
+                pos = text_start = next_pos
+                continue
+            if ch == "\x9d":
+                emit_text(pos)
+                next_pos = self._parse_string(text, pos, pos + 1, "osc", out)
+                if next_pos is None:
+                    break
+                pos = text_start = next_pos
+                continue
+            if ch == "\x90":
+                emit_text(pos)
+                next_pos = self._parse_string(text, pos, pos + 1, "dcs", out)
+                if next_pos is None:
+                    break
+                pos = text_start = next_pos
+                continue
+            if self._is_control(ch):
+                emit_text(pos)
+                out.append(VTToken("control", ch))
+                pos = text_start = pos + 1
+                continue
+            pos += 1
+        else:
+            emit_text(len(text))
+        return out
 
 
 def _strip_dcs(text: str, inside: bool = False, dropped: int = 0):

@@ -23,6 +23,7 @@ classifiers = [
 dependencies = [
     "textual>=0.50",
     "pyte>=0.8",
+    "regex>=2024.11.6",
     "pywinpty>=2.0 ; sys_platform == 'win32'",
     "ptyprocess>=0.7 ; sys_platform != 'win32'",
     "platformdirs>=3.6",
