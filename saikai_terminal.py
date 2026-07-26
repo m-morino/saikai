@@ -50,6 +50,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from typing import Callable, Optional
 
 # Platform branch as a module flag (not inline sys.platform checks) so the
@@ -175,14 +176,9 @@ _HOST_TERMINAL_ENV_STRIP = {
     # take host-specific paths such as WT full repaint / terminal private
     # protocols that are correct for direct stdout but wrong behind saikai.
     #
-    # NOTE: WT_SESSION is deliberately NOT stripped. MEASURED on-device: with WT_SESSION
-    # present (real WT, direct claude) the input cursor tracks the caret correctly; with
-    # it stripped (behind saikai) Claude falls back to a renderer that PARKS the terminal
-    # cursor at a fixed base cell (row33/col3) and never moves it to the caret, so the
-    # IME/native cursor can't follow typing. Keeping WT_SESSION lets Claude use the WT
-    # cursor path that tracks. The WT full-repaint hazard is handled separately by
-    # stripping CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT + CLAUDE_CODE_FORCE_SYNC_OUTPUT.
-    # (#agents-cursor #wt-session)
+    # WT_SESSION is handled by _child_pty_env, not stripped here: on Windows the
+    # pane PRESENTS itself as Windows Terminal (see the byte-identical Primary DA
+    # reply), so the env must agree. (#wt-session)
     "TERM_PROGRAM",
     "TERM_PROGRAM_VERSION",
     "LC_TERMINAL",
@@ -192,22 +188,61 @@ _HOST_TERMINAL_ENV_STRIP = {
     "KONSOLE_VERSION",
     "VTE_VERSION",
     "ZED_TERM",
-    "WEZTERM_EXECUTABLE",
-    "WEZTERM_PANE",
     # Claude sets this for Windows/WT fleet views; saikai's pane is neither.
+    # NOTE: CLAUDE_CODE_FORCE_SYNC_OUTPUT is deliberately NOT stripped — an
+    # explicit user override stays explicit, and saikai now presents ?2026 frames
+    # atomically instead of needing the child to avoid them.
     "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT",
 }
+# The whole WEZTERM_* family, not a hand-listed pair: WEZTERM_UNIX_SOCKET is a live
+# mux socket, so leaking it lets a pane child drive the REAL outer window through
+# `wezterm cli`, and WEZTERM_CONFIG_* re-identifies the host we just masked.
+_HOST_TERMINAL_ENV_STRIP_PREFIXES = ("WEZTERM_",)
+
+# Opt out of presenting the pane as Windows Terminal (env side): SAIKAI_WT_IDENTITY=0
+# leaves WT_SESSION exactly as the host set it. (#wt-session-optout)
+_WT_IDENTITY = str(os.environ.get("SAIKAI_WT_IDENTITY", "1")).strip().lower() not in (
+    "0", "false", "no", "off")
+# One synthesized session id per saikai PROCESS: real WT gives every pane in a
+# window the same WT_SESSION, and a per-pane id would look like N terminals.
+_WT_SESSION_SYNTH = ""
 
 
-def _child_pty_env(base_env) -> dict:
+def _wt_session_id() -> str:
+    """Stable synthetic WT session id for this saikai process."""
+    global _WT_SESSION_SYNTH
+    if not _WT_SESSION_SYNTH:
+        _WT_SESSION_SYNTH = str(uuid.uuid4())
+    return _WT_SESSION_SYNTH
+
+
+def _child_pty_env(base_env, is_win: Optional[bool] = None) -> dict:
     """Environment advertised by saikai's PTY renderer to the child.
 
     The child talks to saikai's virtual terminal. Keep the capability contract
     explicit and deterministic instead of inheriting the outer terminal's brand
-    probes (WT_SESSION, TERM_PROGRAM, etc.)."""
+    probes (TERM_PROGRAM, WEZTERM_*, KITTY_WINDOW_ID, …).
+
+    WT_SESSION is the one identity saikai ASSERTS rather than inherits, because
+    the pane emulates Windows Terminal (the Primary DA reply is byte-identical).
+    MEASURED on-device: with WT_SESSION present Claude tracks the input caret with
+    the terminal cursor — which is what the IME anchor follows; without it Claude
+    PARKS the cursor at a fixed base cell and the anchor pins composition there.
+    Inheriting it made that a lottery on the outer host (broken under WezTerm and
+    conhost), so synthesize one on Windows. On POSIX the anchor is _IS_WIN-gated,
+    so a WT identity buys nothing and WSL — where Windows Terminal exports
+    WT_SESSION into Linux — would take WT redraw paths behind pyte for free.
+    (#agents-cursor #wt-session #wsl)"""
     env = dict(base_env)
     for key in _HOST_TERMINAL_ENV_STRIP:
         env.pop(key, None)
+    for key in [k for k in env if k.startswith(_HOST_TERMINAL_ENV_STRIP_PREFIXES)]:
+        env.pop(key, None)
+    if _WT_IDENTITY:
+        if _IS_WIN if is_win is None else is_win:
+            env.setdefault("WT_SESSION", _wt_session_id())
+        else:
+            env.pop("WT_SESSION", None)
     env["TERM"] = "xterm-256color"
     env["COLORTERM"] = "truecolor"
     return env
@@ -804,6 +839,10 @@ _OSC99_RE = re.compile(r"\x1b\]99;[^;]*;([^\x1b\x07]*)(?:\x07|\x1b\\)") # kitty:
 # presentation boundary and fails open on bounded exceptional paths.
 _SYNC_BUFFER_MAX_CHARS = 4 * 1024 * 1024
 _SYNC_BUFFER_MAX_AGE = 0.2
+# How long a ?25l may look like a mid-redraw blink before the native cursor is
+# actually hidden. Above the stager's max age so a fail-open frame's transient
+# hidden state can't trip it. (#ime-midframe)
+_NATIVE_CURSOR_HIDE_SETTLE = 0.5
 
 
 class _SynchronizedOutputStager:
@@ -817,10 +856,25 @@ class _SynchronizedOutputStager:
         self._parts = []
         self._chars = 0
         self._opened_at = 0.0
+        self._complete_frames = 0
 
     @property
     def active(self):
         return self._state == "staging"
+
+    @property
+    def torn(self):
+        """True while a fail-open is in flight: a partial frame already reached pyte
+        and the rest streams through until the block closes, so pyte's cursor can be
+        a mid-frame intermediate."""
+        return self._state == "bypass"
+
+    @property
+    def atomic(self):
+        """True when pyte only ever holds frame-FINAL state: the child brackets its
+        frames (at least one closed cleanly) and no fail-open is in flight. The IME
+        anchor uses this to keep tracking the caret through an output storm."""
+        return self._complete_frames > 0 and self._state != "bypass"
 
     @staticmethod
     def _is_sync(match):
@@ -843,6 +897,8 @@ class _SynchronizedOutputStager:
         self._chars = 0
         self._opened_at = 0.0
         self._state = "bypass" if bypass else "outside"
+        if reason is None and text:
+            self._complete_frames += 1
         return (text, reason) if text else None
 
     def flush(self, reason):
@@ -1149,6 +1205,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                                      # pane-view browser encodes arrows correctly (#pane-direct)
         self._hw_cursor_visible: Optional[bool] = None  # last ?25 visibility we wrote
         self._anchored_xy = None  # last IME anchor cell we set (freeze/flush bookkeeping)
+        self._cursor_hidden_since = 0.0  # monotonic ts the child hid its cursor (?25l settle)
         # Mirror pane-direct tee (#pane-direct): tee(str) forwards a scrubbed
         # chunk to the mirror hub's pane channel; reset(str) enqueues a full-
         # state seed; synth(screen, cols, rows, modes) serializes one. All three
@@ -2623,7 +2680,23 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             pass
 
-    def _sync_terminal_cursor(self, reason: str = "repaint") -> None:
+    def _cursor_may_be_midframe(self) -> bool:
+        """True when pyte's cursor is NOT trustworthy as the input caret.
+
+        A torn ?2026 block (fail-open on timeout/overflow/cursor-query, then bypass
+        until the block closes) feeds pyte the cursor-hidden/Home intermediate the
+        stager exists to hide. Otherwise only an unbracketed 'busy' storm sweeps the
+        cursor across the screen every frame — once the child brackets its frames the
+        pane only ever holds frame-final state, so tracking stays correct through a
+        storm and CJK typed into a generating pane keeps its anchor. (#ime-midframe)"""
+        stager = getattr(self, "_sync_output", None)
+        if stager is not None and stager.torn:
+            return True
+        if getattr(self, "_status", None) != "busy":
+            return False
+        return not (stager is not None and stager.atomic)
+
+    def _sync_terminal_cursor(self, reason: str = "repaint", now=None) -> None:
         """Anchor the real (hidden) terminal cursor at claude's cursor cell so the
         host terminal's IME / composition popup appears at the claude prompt — not
         wherever Textual last parked the cursor (e.g. the search box, which owns the
@@ -2670,20 +2743,32 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             scols = int(getattr(screen, "columns", 0) or 0)
             slines = int(getattr(screen, "lines", 0) or 0)
             in_alt = bool(getattr(getattr(self, "_alt", None), "in_alt", False))
-        # Freeze a per-repaint sync only while the pane is 'busy' (an agent-mode storm
-        # moves the pyte cursor across the whole screen every frame → the anchor would
-        # fly) or while the child HID its cursor (?25l — mid-redraw / no-cursor state,
-        # not a real caret). OTHERWISE FOLLOW the cursor: claude moves the terminal
-        # cursor to the real input caret (e.g. +2 columns per CJK char), and following it
-        # every repaint is exactly what makes the IME anchor TRACK typing. An earlier
-        # cell-stability freeze here also froze that legitimate tracking, so the cursor
-        # "didn't follow input". "focus"/"settle" are definitive and skip the gate.
-        # (#agents-cursor)
-        if reason == "repaint" and (getattr(self, "_status", None) == "busy" or cursor_hidden):
-            if _IME_DEBUG:
-                _ime_dbg(f"sync reason=repaint FREEZE cur=({cx},{cy}) "
-                         f"busy={getattr(self, '_status', None) == 'busy'} hidden={cursor_hidden}")
-            return
+        # A per-repaint sync FOLLOWS the cursor: claude moves the terminal cursor to
+        # the real input caret (e.g. +2 columns per CJK char), and following it every
+        # repaint is exactly what makes the IME anchor TRACK typing. It freezes only
+        # while the cursor we'd read is NOT a caret:
+        #   - mid-frame (an unbracketed agent-mode storm, or a torn ?2026 frame) —
+        #     see _cursor_may_be_midframe; a stager delivering ATOMIC frames is safe
+        #     to follow even during a storm, because pyte holds frame-final state.
+        #   - freshly hidden (?25l): hold briefly so a redraw's ?25l/?25h can't
+        #     flicker the anchor, but SETTLE — a child that stays in a no-cursor view
+        #     must actually get the native cursor hidden, not left blinking at the
+        #     stale cell. "focus"/"settle" are definitive and skip the gate.
+        # (#agents-cursor #ime-midframe)
+        now = time.monotonic() if now is None else float(now)
+        if cursor_hidden:
+            if not getattr(self, "_cursor_hidden_since", 0.0):
+                self._cursor_hidden_since = now
+        else:
+            self._cursor_hidden_since = 0.0
+        if reason == "repaint":
+            hidden_since = getattr(self, "_cursor_hidden_since", 0.0)
+            hiding = bool(hidden_since) and (now - hidden_since) < _NATIVE_CURSOR_HIDE_SETTLE
+            if hiding or self._cursor_may_be_midframe():
+                if _IME_DEBUG:
+                    _ime_dbg(f"sync reason=repaint FREEZE cur=({cx},{cy}) "
+                             f"midframe={self._cursor_may_be_midframe()} hiding={hiding}")
+                return
         if not _native_cursor_should_show(cursor_hidden, in_alt):
             self._show_hw_cursor(False)
             self._anchored_xy = None

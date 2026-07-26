@@ -601,7 +601,7 @@ def test_child_pty_env_hides_outer_terminal_identity_from_child():
         "KITTY_WINDOW_ID": "1",
         "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT": "1",
         "CLAUDE_CODE_FORCE_SYNC_OUTPUT": "1",
-    })
+    }, is_win=True)
     assert env["PATH"] == "/bin"
     assert env["TERM"] == "xterm-256color"
     assert env["COLORTERM"] == "truecolor"
@@ -615,6 +615,45 @@ def test_child_pty_env_hides_outer_terminal_identity_from_child():
     # Explicit user/developer override remains explicit; only host identity leaks
     # and Claude's derived WT full-repaint flag are scrubbed.
     assert env["CLAUDE_CODE_FORCE_SYNC_OUTPUT"] == "1"
+
+
+def test_child_pty_env_presents_one_windows_terminal_identity_per_platform():
+    """The pane's WT identity is saikai's OWN presentation, not the outer host's.
+
+    saikai answers Primary DA byte-identically to Windows Terminal, so the env
+    must agree on every Windows host — inheriting WT_SESSION only under a real WT
+    made the caret-tracking fix a lottery: under WezTerm/conhost the child gets no
+    WT identity, falls back to parking its cursor at a fixed base cell, and the
+    anchor faithfully pins the IME there. Synthesize it on Windows instead.
+
+    On POSIX the reverse holds: the anchor is _IS_WIN-gated so a WT identity buys
+    nothing, while WSL DOES export WT_SESSION into Linux — a pure downside, and the
+    exact host-path leak the strip set exists to stop. (#wt-session #wsl)"""
+    outer = {"PATH": "/bin", "WT_SESSION": "outer-wt"}
+
+    # Windows under a real WT: the host's session id passes through untouched.
+    assert rt._child_pty_env(outer, is_win=True)["WT_SESSION"] == "outer-wt"
+
+    # Windows under WezTerm / conhost: synthesized, stable across panes.
+    synth = rt._child_pty_env({"PATH": "/bin"}, is_win=True)["WT_SESSION"]
+    assert synth, "a Windows pane must always present a WT identity"
+    assert rt._child_pty_env({"PATH": "/bin"}, is_win=True)["WT_SESSION"] == synth
+
+    # POSIX (incl. WSL, where WT exports WT_SESSION into Linux): stripped.
+    assert "WT_SESSION" not in rt._child_pty_env(outer, is_win=False)
+
+    # The WezTerm scrub covers the WHOLE family, not two hand-listed keys: a leaked
+    # WEZTERM_UNIX_SOCKET lets the child drive the REAL outer window via `wezterm cli`.
+    wez = rt._child_pty_env({
+        "PATH": "/bin",
+        "WEZTERM_EXECUTABLE": "/usr/bin/wezterm",
+        "WEZTERM_PANE": "3",
+        "WEZTERM_UNIX_SOCKET": "/tmp/wezterm-sock",
+        "WEZTERM_CONFIG_FILE": "/home/u/.wezterm.lua",
+        "WEZTERM_CONFIG_DIR": "/home/u/.config/wezterm",
+        "WEZTERM_EXECUTABLE_DIR": "/usr/bin",
+    }, is_win=False)
+    assert [k for k in wez if k.startswith("WEZTERM")] == [], wez
 
 
 def test_cursor_sync_freezes_while_busy_and_settles_on_transition():
@@ -2005,6 +2044,121 @@ def test_busy_storm_throttles_reclassify():
     assert len(calls) == 2, "a busy frame after the interval must re-classify"
 
 
+def test_cursor_anchor_settles_hidden_and_tracks_atomic_frames():
+    """Three anchor-gating rules the flat busy-or-hidden freeze got wrong.
+
+    (1) A hidden cursor may only freeze the anchor TRANSIENTLY. The freeze returns
+        before the hide path, so a child that parks in a no-cursor view (htop, a
+        picker) while its status stays 'idle' never gets ?25l — the native cursor
+        blinks on at the stale anchored cell indefinitely. Settle after a beat.
+    (2) 'busy' must not freeze tracking while the ?2026 stager presents ATOMIC
+        frames: every repaint then observes frame-final state, i.e. the real
+        caret, so CJK typed into a generating pane must still move the anchor.
+    (3) A TORN stager (fail-open on timeout/overflow/cursor-query, then bypass
+        until the block closes) leaks exactly the mid-frame Home/header cursor
+        the stager exists to hide — freeze then, even when NOT busy.
+    (#agents-cursor #ime-midframe)"""
+    import threading as _th
+
+    class _Cursor:
+        def __init__(self):
+            self.x = 3; self.y = 2; self.hidden = False
+
+    class _Screen:
+        def __init__(self):
+            self.cursor = _Cursor(); self.columns = 80; self.lines = 24
+
+    class _Alt:
+        in_alt = False
+
+    class _Region:
+        x = 40; y = 5; width = 80; height = 24
+
+    class _Drv:
+        def __init__(self, w): self._w = w
+        def write(self, s): self._w.append(s)
+
+    class _App:
+        def __init__(self, w): self._driver = _Drv(w)
+
+    class _Shim(rt.AgentTerminal):
+        app = property(lambda self: self._app)
+        content_region = property(lambda self: _Region())
+
+    def _term(status="idle"):
+        writes = []
+        t = _Shim.__new__(_Shim)
+        t.sid = "x"
+        t._app = _App(writes)
+        t._lock = _th.Lock()
+        t._screen = _Screen()
+        t._alt = _Alt()
+        t._scroll = 0
+        t.is_dead = False
+        t._status = status
+        t._hw_cursor_visible = None
+        t._anchored_xy = None
+        t._cursor_hidden_since = 0.0
+        t._sync_output = rt._SynchronizedOutputStager()
+        t._is_focused_pane = lambda: True
+        t.refresh = lambda *a, **k: None
+        return t, writes
+
+    old_win, old_anchor, old_offset = rt._IS_WIN, rt._IME_ANCHOR, rt.Offset
+    rt._IS_WIN = True
+    rt._IME_ANCHOR = True
+    if rt.Offset is None:
+        rt.Offset = lambda x, y: (x, y)
+    try:
+        # (1) hidden: transient freeze, then a settled hide that drops the anchor.
+        t, writes = _term()
+        t._sync_terminal_cursor(now=100.0)
+        assert writes == ["\x1b[?25h"] and t._anchored_xy == (43, 7), writes
+        writes.clear()
+        t._screen.cursor.hidden = True
+        t._sync_terminal_cursor(now=100.05)           # mid-redraw ?25l -> hold
+        assert writes == [], writes
+        assert t._anchored_xy == (43, 7), "a transient hide must not drop the anchor"
+        t._sync_terminal_cursor(now=100.6)            # still hidden -> real no-cursor
+        assert writes == ["\x1b[?25l"], writes
+        assert t._anchored_xy is None
+        # coming back visible re-arms the settle window
+        writes.clear()
+        t._screen.cursor.hidden = False
+        t._sync_terminal_cursor(now=100.7)
+        assert writes == ["\x1b[?25h"], writes
+
+        # (2) busy + atomic frames -> the anchor still TRACKS the caret.
+        t, writes = _term(status="busy")
+        t._sync_output.push("\x1b[?2026hA\x1b[?2026l", now=1.0)   # one complete frame
+        assert t._sync_output.atomic is True and t._sync_output.torn is False
+        t._sync_terminal_cursor(now=200.0)
+        assert t._app.cursor_position == rt.Offset(43, 7)
+        t._screen.cursor.x = 9
+        t._sync_terminal_cursor(now=200.1)
+        assert t._app.cursor_position == rt.Offset(49, 7), "atomic frames must track"
+
+        # (2b) busy WITHOUT bracketed frames -> the storm freeze still applies.
+        t, writes = _term(status="busy")
+        assert t._sync_output.atomic is False
+        t._sync_terminal_cursor(now=200.0)
+        assert getattr(t._app, "cursor_position", None) is None
+
+        # (3) torn stager while merely 'waiting' -> freeze (mid-frame cursor).
+        t, writes = _term(status="waiting")
+        t._sync_output.push("\x1b[?2026hA\x1b[?2026l", now=1.0)
+        t._sync_terminal_cursor(now=200.0)            # atomic: anchors normally
+        assert t._app.cursor_position == rt.Offset(43, 7)
+        t._sync_output.push("\x1b[?2026hpartial", now=2.0)
+        t._sync_output.push("more", now=2.5)          # > max_age -> fail-open -> bypass
+        assert t._sync_output.torn is True
+        t._screen.cursor.x = 0; t._screen.cursor.y = 0        # mid-frame Home
+        t._sync_terminal_cursor(now=200.1)
+        assert t._app.cursor_position == rt.Offset(43, 7), "a torn frame must not move it"
+    finally:
+        rt._IS_WIN, rt._IME_ANCHOR, rt.Offset = old_win, old_anchor, old_offset
+
+
 def test_cursor_anchor_freezes_on_busy_or_hidden_follows_visible():
     """Anti-fly WITHOUT breaking tracking: a per-repaint sync FREEZES while the pane is
     'busy' (an agent-mode storm sweeps the pyte cursor Home->prompt across ~170k frames)
@@ -2020,8 +2174,10 @@ def test_cursor_anchor_freezes_on_busy_or_hidden_follows_visible():
     assert "_schedule_terminal_cursor_sync" not in refresh_src, \
         "the debounce timer indirection must be gone (it starved + never flushed)"
     sync_src = inspect.getsource(rt.AgentTerminal._sync_terminal_cursor)
-    assert '"busy"' in sync_src and "cursor_hidden" in sync_src, \
-        "the repaint freeze must gate on busy OR cursor_hidden, not cell-stability"
+    midframe_src = inspect.getsource(rt.AgentTerminal._cursor_may_be_midframe)
+    assert "_cursor_may_be_midframe" in sync_src and "cursor_hidden" in sync_src, \
+        "the repaint freeze must gate on mid-frame OR a hidden cursor, not cell-stability"
+    assert '"busy"' in midframe_src, "the storm freeze must still key on 'busy'"
     assert "_prev_repaint_cell" not in sync_src, \
         "the cell-stability gate (which froze legitimate input tracking) must be gone"
     assert not hasattr(rt.AgentTerminal, "_schedule_terminal_cursor_sync"), \
@@ -2113,6 +2269,8 @@ if __name__ == "__main__":
     print("PASS test_focus_gate_yields_to_a_modal_screen_on_top")
     test_child_pty_env_hides_outer_terminal_identity_from_child()
     print("PASS test_child_pty_env_hides_outer_terminal_identity_from_child")
+    test_child_pty_env_presents_one_windows_terminal_identity_per_platform()
+    print("PASS test_child_pty_env_presents_one_windows_terminal_identity_per_platform")
     test_cursor_sync_freezes_while_busy_and_settles_on_transition()
     print("PASS test_cursor_sync_freezes_while_busy_and_settles_on_transition")
     test_autoscroll_tick_pins_anchor_to_content()
@@ -2195,6 +2353,8 @@ if __name__ == "__main__":
     print("PASS test_input_snaps_scrolled_back_pane_to_live")
     test_busy_storm_throttles_reclassify()
     print("PASS test_busy_storm_throttles_reclassify")
+    test_cursor_anchor_settles_hidden_and_tracks_atomic_frames()
+    print("PASS test_cursor_anchor_settles_hidden_and_tracks_atomic_frames")
     test_cursor_anchor_freezes_on_busy_or_hidden_follows_visible()
     print("PASS test_cursor_anchor_freezes_on_busy_or_hidden_follows_visible")
     test_ime_anchor_default_on_keeps_windows_caret_render_guard()
