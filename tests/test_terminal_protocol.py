@@ -107,6 +107,34 @@ def test_incomplete_sequences_carry_across_calls_and_fail_open_when_bounded():
         assert emitted, f"{opener!r} stayed buffered after the carry cap"
 
 
+def test_completed_oversize_sequences_fail_open_at_every_split_boundary():
+    """An over-cap VT unit stays text whether its terminator shares a PTY read."""
+    cases = {
+        "CSI": b"\x1b[" + b"?" * 50 + b"p",
+        "simple ESC": b"\x1b" + b" " * 50 + b"7",
+        "OSC": b"\x1b]" + b"x" * 50 + b"\x07",
+        "DCS": b"\x1bP" + b"x" * 50 + b"\x1b\\",
+    }
+    for name, data in cases.items():
+        raw = data.decode("latin-1")
+        one_shot = rt.VTTokenizer(max_carry=16, max_dropped_string=24)
+        assert [(token.kind, token.raw) for token in one_shot.feed(raw)] == [
+            ("text", raw)
+        ], name
+        for split_at in range(len(data) + 1):
+            tokenizer = rt.VTTokenizer(max_carry=16, max_dropped_string=24)
+            tokens = tokenizer.feed(data[:split_at].decode("latin-1"))
+            tokens += tokenizer.feed(data[split_at:].decode("latin-1"))
+            assert all(token.kind == "text" for token in tokens), \
+                f"{name} split at {split_at}: {tokens!r}"
+            assert "".join(token.raw for token in tokens) == raw
+            assert len(tokenizer.carry) <= 16
+            assert tokenizer.dropped_string_chars <= 24
+            assert [(token.kind, token.raw) for token in tokenizer.feed("\x1b[31m")] == [
+                ("csi", "\x1b[31m")
+            ], f"{name} split at {split_at} left fail-open state behind"
+
+
 def test_dependency_lists_have_runtime_parity():
     """Direct-script installation must include every runtime package dependency."""
     root = Path(__file__).parent.parent
@@ -141,5 +169,7 @@ if __name__ == "__main__":
     print("PASS test_dcs_payload_does_not_create_nested_osc_or_csi_tokens")
     test_incomplete_sequences_carry_across_calls_and_fail_open_when_bounded()
     print("PASS test_incomplete_sequences_carry_across_calls_and_fail_open_when_bounded")
+    test_completed_oversize_sequences_fail_open_at_every_split_boundary()
+    print("PASS test_completed_oversize_sequences_fail_open_at_every_split_boundary")
     test_dependency_lists_have_runtime_parity()
     print("PASS test_dependency_lists_have_runtime_parity")

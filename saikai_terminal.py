@@ -920,6 +920,10 @@ class VTTokenizer:
         # Bounded accounting for malformed OSC/DCS strings that have failed open.
         # It is diagnostic state only; the raw data is emitted, never discarded.
         self.dropped_string_chars = 0
+        # An over-cap unit has already been exposed as text. Retain only its
+        # grammar kind so a following chunk's terminator remains text too.
+        self._fail_open_kind: str | None = None
+        self._fail_open_pending_esc = False
 
     @staticmethod
     def _is_parameter(ch: str) -> bool:
@@ -941,7 +945,15 @@ class VTTokenizer:
     def _is_control(ch: str) -> bool:
         return ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f
 
-    def _retain_or_fail_open(self, raw: str, out: list[VTToken], *, string=False):
+    def _emit_or_fail_open(self, token: VTToken, out: list[VTToken]) -> None:
+        """Emit a complete protocol token only when its raw text is bounded."""
+        if len(token.raw) > self.max_carry:
+            out.append(VTToken("text", token.raw))
+        else:
+            out.append(token)
+
+    def _retain_or_fail_open(self, raw: str, out: list[VTToken], *, string=False,
+                             kind: str) -> None:
         """Carry *raw* only while it is bounded; otherwise expose it as text."""
         if len(raw) <= self.max_carry:
             self.carry = raw
@@ -950,6 +962,57 @@ class VTTokenizer:
             self.dropped_string_chars = min(
                 self.max_dropped_string, self.dropped_string_chars + len(raw))
         out.append(VTToken("text", raw))
+        self._fail_open_kind = kind
+        self._fail_open_pending_esc = kind in ("osc", "dcs") and raw.endswith("\x1b")
+
+    def _drain_fail_open(self, text: str, out: list[VTToken]) -> int:
+        """Emit text through the terminator of an already fail-open unit.
+
+        The original prefix was emitted before this call, so this stores only a
+        small grammar marker. That prevents a later BEL/ST/final byte from being
+        reinterpreted as a fresh control sequence without retaining the prefix.
+        """
+        kind = self._fail_open_kind
+        if not kind:
+            return 0
+        if kind in ("osc", "dcs") and self._fail_open_pending_esc:
+            if text.startswith("\\"):
+                out.append(VTToken("text", "\\"))
+                self._fail_open_kind = None
+                self._fail_open_pending_esc = False
+                return 1
+            if text:
+                self._fail_open_pending_esc = False
+        pos = 0
+        end = None
+        while pos < len(text):
+            ch = text[pos]
+            if kind == "csi":
+                if self._is_final(ch) or self._is_control(ch):
+                    end = pos + 1
+                    break
+            elif kind == "esc":
+                if self._is_escape_final(ch) or self._is_control(ch):
+                    end = pos + 1
+                    break
+            else:  # OSC / DCS strings
+                if ch in ("\x07", "\x9c"):
+                    end = pos + 1
+                    break
+                if ch == "\x1b" and pos + 1 < len(text) and text[pos + 1] == "\\":
+                    end = pos + 2
+                    break
+            pos += 1
+        if end is None:
+            if text:
+                out.append(VTToken("text", text))
+                self._fail_open_pending_esc = (
+                    kind in ("osc", "dcs") and text.endswith("\x1b"))
+            return len(text)
+        out.append(VTToken("text", text[:end]))
+        self._fail_open_kind = None
+        self._fail_open_pending_esc = False
+        return end
 
     def _parse_csi(self, text: str, start: int, body: int,
                    out: list[VTToken]) -> int | None:
@@ -964,12 +1027,12 @@ class VTTokenizer:
             pos += 1
         intermediates = text[inter_start:pos]
         if pos == len(text):
-            self._retain_or_fail_open(text[start:], out)
+            self._retain_or_fail_open(text[start:], out, kind="csi")
             return None
         if self._is_final(text[pos]):
             pos += 1
-            out.append(VTToken("csi", text[start:pos], params, intermediates,
-                               text[pos - 1]))
+            self._emit_or_fail_open(VTToken(
+                "csi", text[start:pos], params, intermediates, text[pos - 1]), out)
             return pos
         # A control or an invalid byte cannot complete this CSI. Keep no poison
         # for a later PTY read: return its raw prefix as ordinary data instead.
@@ -984,18 +1047,18 @@ class VTTokenizer:
             ch = text[pos]
             if ch in ("\x07", "\x9c"):
                 pos += 1
-                out.append(VTToken(kind, text[start:pos]))
+                self._emit_or_fail_open(VTToken(kind, text[start:pos]), out)
                 return pos
             if ch == "\x1b":
                 if pos + 1 == len(text):
-                    self._retain_or_fail_open(text[start:], out, string=True)
+                    self._retain_or_fail_open(text[start:], out, string=True, kind=kind)
                     return None
                 if text[pos + 1] == "\\":
                     pos += 2
-                    out.append(VTToken(kind, text[start:pos]))
+                    self._emit_or_fail_open(VTToken(kind, text[start:pos]), out)
                     return pos
             pos += 1
-        self._retain_or_fail_open(text[start:], out, string=True)
+        self._retain_or_fail_open(text[start:], out, string=True, kind=kind)
         return None
 
     def _parse_escape(self, text: str, start: int,
@@ -1003,7 +1066,7 @@ class VTTokenizer:
         """Parse ESC plus its optional intermediate bytes and final byte."""
         pos = start + 1
         if pos == len(text):
-            self._retain_or_fail_open(text[start:], out)
+            self._retain_or_fail_open(text[start:], out, kind="esc")
             return None
         leader = text[pos]
         if leader == "[":
@@ -1015,13 +1078,13 @@ class VTTokenizer:
         while pos < len(text) and self._is_intermediate(text[pos]):
             pos += 1
         if pos == len(text):
-            self._retain_or_fail_open(text[start:], out)
+            self._retain_or_fail_open(text[start:], out, kind="esc")
             return None
         if self._is_escape_final(text[pos]):
             pos += 1
-            out.append(VTToken("esc", text[start:pos],
-                               intermediates=text[start + 1:pos - 1],
-                               final=text[pos - 1]))
+            self._emit_or_fail_open(VTToken(
+                "esc", text[start:pos], intermediates=text[start + 1:pos - 1],
+                final=text[pos - 1]), out)
             return pos
         out.append(VTToken("text", text[start:pos]))
         return pos
@@ -1033,8 +1096,8 @@ class VTTokenizer:
         text = self.carry + (text or "")
         self.carry = ""
         out: list[VTToken] = []
-        pos = 0
-        text_start = 0
+        pos = self._drain_fail_open(text, out)
+        text_start = pos
 
         def emit_text(end: int) -> None:
             nonlocal text_start
