@@ -169,11 +169,16 @@ Run commands from the worktree root with:
 **Requirements:**
 
 - Segment printable presentation with `regex` `\X`.
-- Retain only the potentially extensible trailing cluster; commit it at a
-  control/query/frame/snapshot/resize/EOF boundary or one short
-  generation-checked idle deadline.
+- Present every complete current cluster immediately; do not delay the final
+  printable character. Retain bounded metadata for only the most recently drawn
+  cluster and retrospectively replace it if the next adjacent draw extends it.
+- Invalidate that continuation candidate on any control/cursor operation,
+  reset, resize, buffer switch, non-adjacent cursor, or leader-cell overwrite.
 - Store one complete grapheme in its leading cell, compute the same cell advance
-  as Rich's renderer, and maintain deterministic continuation cells.
+  as Rich's renderer, adjust the cursor by retrospective width deltas, and
+  maintain deterministic continuation cells.
+- Remove the global `pyte.screens.wcwidth` monkey-patch; grapheme width policy is
+  local to saikai's screen.
 - Cover combining marks, VS15/VS16, emoji modifiers, ZWJ families, regional-
   indicator flags, and keycaps, including read splits and the right margin.
 - Ensure native Textual cursor position and CPR observe committed graphemes.
@@ -196,6 +201,9 @@ Run commands from the worktree root with:
 - For `A❤️B`, `A1️⃣B`, `A👨‍👩‍👧‍👦B`, `A🇯🇵B`, skin-tone emoji, and decomposed
   combining text, assert pyte cursor advance equals `rich.cells.cell_len`.
 - Repeat each case split at every codepoint/read boundary and at the final column.
+- A standalone final printable character is visible immediately with no timer.
+- Control/cursor/reset/resize boundaries prevent a later extender from modifying
+  an earlier cluster.
 - MAIN -> ALT -> MAIN restores MAIN content/history/cursor; combined/repeated
   47/1047/1049 transitions do not erase it.
 - DECSCUSR shape follows focused visible cursor and resets on every exit path.

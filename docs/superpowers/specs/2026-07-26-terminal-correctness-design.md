@@ -105,24 +105,29 @@ cursor, dies, or unmounts.
 ### 3. Grapheme-correct presentation
 
 Add the `regex` dependency and segment printable text using Unicode `\X`.
-Grapheme presentation is incremental and bounded:
+Do not retain the final printable cluster: every Unicode base can legally gain a
+later combining mark, variation selector, emoji modifier, or ZWJ continuation,
+and `partial=True` correctly regards the base alone as a complete `\X`. Holding
+every final cluster would therefore either hide quiet output indefinitely or
+introduce a heuristic timer.
 
-- adjacent text fragments are joined before segmentation;
-- the potentially extensible trailing cluster is retained across PTY reads;
-- any control token, cursor query, synchronized-frame boundary, render snapshot,
-  resize, EOF, or short idle deadline commits the pending cluster;
-- the idle deadline prevents a quiet child from hiding its last printable
-  character.
+Instead, `_SaikaiHistoryScreen` presents each cluster immediately and retains
+bounded metadata only for the last presented cluster: its text, leading cell,
+cell width, and cursor position. If the next adjacent draw extends that cluster,
+the screen re-segments `old_cluster + new_text`, rewrites the same leading cell,
+clears/rebuilds continuation cells, and adjusts the cursor by the width delta.
+Any control/cursor operation, reset, resize, buffer switch, non-adjacent cursor,
+or overwritten leader invalidates the continuation candidate. The ordered VT
+dispatcher supplies these boundaries before feeding pyte.
 
-`_SaikaiHistoryScreen` writes one extended grapheme per leading cell. Width is
-computed for the cluster as rendered by Rich/wcwidth, regional-indicator pairs
-remain a two-cell flag, and continuation cells are cleared deterministically.
-The pyte cursor therefore advances by the same number of terminal cells that
-Textual renders. Combining marks, variation selectors, emoji modifiers, ZWJ
-families, flags, and keycaps work even when decoded PTY reads split them.
+Width is computed for the complete cluster with the same Rich cell-width
+function used by Textual. The global `pyte.screens.wcwidth` function is not
+monkey-patched. Combining marks, variation selectors, emoji modifiers, ZWJ
+families, regional-indicator flags, and keycaps therefore work across decoded
+PTY reads without delaying ordinary final characters.
 
-The native cursor anchor is always derived from the committed screen cursor. A
-pending grapheme is committed before an IME anchor or CPR is published.
+The native cursor anchor and CPR are derived from the screen cursor after any
+eligible retrospective extension has been applied.
 
 ### 4. Real main/alternate buffers
 
