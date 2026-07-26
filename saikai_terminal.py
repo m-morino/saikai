@@ -673,6 +673,73 @@ _MODIFIED_CSI_FINALS = {
 _MODIFIED_TILDE_KEYS = {
     "insert": "2", "delete": "3", "pageup": "5", "pagedown": "6",
 }
+# Canonical Kitty keyboard encodings. These follow the protocol's functional
+# key table rather than the legacy terminfo spellings (notably F1/F2/F4 use CSI
+# and F3 is CSI 13~); capability masking below limits which entries are emitted.
+_KITTY_FINAL_KEYS = {
+    **_MODIFIED_CSI_FINALS,
+    "f1": "P", "f2": "Q", "f4": "S",
+}
+_KITTY_TILDE_KEYS = {
+    **_MODIFIED_TILDE_KEYS,
+    "f3": "13",
+    "f5": "15", "f6": "17", "f7": "18", "f8": "19",
+    "f9": "20", "f10": "21", "f11": "23", "f12": "24",
+}
+_KITTY_U_KEYS = {
+    "escape": 27, "enter": 13, "return": 13, "tab": 9, "backspace": 127,
+    "caps_lock": 57358, "scroll_lock": 57359, "num_lock": 57360,
+    "print_screen": 57361, "pause": 57362, "menu": 57363,
+    **{f"f{number}": 57363 + number for number in range(13, 36)},
+    "kp_0": 57399, "kp_1": 57400, "kp_2": 57401, "kp_3": 57402,
+    "kp_4": 57403, "kp_5": 57404, "kp_6": 57405, "kp_7": 57406,
+    "kp_8": 57407, "kp_9": 57408, "kp_decimal": 57409,
+    "kp_divide": 57410, "kp_multiply": 57411, "kp_subtract": 57412,
+    "kp_add": 57413, "kp_enter": 57414, "kp_equal": 57415,
+    "kp_separator": 57416, "kp_left": 57417, "kp_right": 57418,
+    "kp_up": 57419, "kp_down": 57420, "kp_pageup": 57421,
+    "kp_pagedown": 57422, "kp_home": 57423, "kp_end": 57424,
+    "kp_insert": 57425, "kp_delete": 57426,
+    "media_play": 57428, "media_pause": 57429,
+    "media_play_pause": 57430, "media_reverse": 57431,
+    "media_stop": 57432, "media_fast_forward": 57433,
+    "media_rewind": 57434, "media_track_next": 57435,
+    "media_track_previous": 57436, "media_record": 57437,
+    "lower_volume": 57438, "raise_volume": 57439, "mute_volume": 57440,
+    "left_shift": 57441, "left_control": 57442, "left_alt": 57443,
+    "left_super": 57444, "left_hyper": 57445, "left_meta": 57446,
+    "right_shift": 57447, "right_control": 57448, "right_alt": 57449,
+    "right_super": 57450, "right_hyper": 57451, "right_meta": 57452,
+    "iso_level3_shift": 57453, "iso_level5_shift": 57454,
+}
+_KITTY_MODIFIER_KEYS = {
+    name for name in _KITTY_U_KEYS
+    if name.endswith(("_shift", "_control", "_alt", "_super", "_hyper", "_meta"))
+    or name.startswith("iso_level")
+}
+
+
+def _kitty_parameter(code: int, modifier: int, final: str = "u") -> str:
+    """Encode one canonical Kitty key, omitting the default modifier."""
+    suffix = str(code) if modifier == 1 else f"{code};{modifier}"
+    return f"\x1b[{suffix}{final}"
+
+
+def _kitty_functional_key(base: str, modifier: int) -> Optional[str]:
+    """Return a negotiated Kitty encoding for one non-text key."""
+    if base in _KITTY_FINAL_KEYS:
+        final = _KITTY_FINAL_KEYS[base]
+        return f"\x1b[{final}" if modifier == 1 else f"\x1b[1;{modifier}{final}"
+    if base in _KITTY_TILDE_KEYS:
+        return _kitty_parameter(int(_KITTY_TILDE_KEYS[base]), modifier, "~")
+    code = _KITTY_U_KEYS.get(base)
+    if code is None:
+        return None
+    if base in ("enter", "return", "tab", "backspace"):
+        return None
+    if base in _KITTY_MODIFIER_KEYS:
+        return None
+    return _kitty_parameter(code, modifier)
 
 
 def _normalize_key(spec: str) -> str:
@@ -716,22 +783,50 @@ for _rk in ("f2", "f3", "f4"):
     _KEYMAP.pop(_rk, None)
 
 
-def encode_key(key: str, character: Optional[str]) -> Optional[str]:
+def encode_key(key: str, character: Optional[str], *,
+               application_cursor: bool = False,
+               kitty_flags: int = 0) -> Optional[str]:
     """Translate a Textual key event into the byte string to write to the PTY,
     or None if the key carries nothing the child should receive.
 
-    Pure + table-driven so it is unit-testable without a TTY.
+    Defaults preserve the legacy API. DECCKM changes only unmodified cursor,
+    Home, and End keys; negotiated Kitty flags encode keys this terminal can
+    describe truthfully from a Textual press event.
     """
+    parts = key.split("+")
+    base, modifiers = parts[-1], set(parts[:-1])
+    mod = 1 + ("shift" in modifiers) + 2 * ("alt" in modifiers) + 4 * ("ctrl" in modifiers)
+    negotiated = int(kitty_flags or 0) & _KITTY_KBD_SUPPORTED_FLAGS
+    if negotiated:
+        functional = _kitty_functional_key(base, mod)
+        if functional is not None:
+            return functional
+
+    # DECCKM applies only to the legacy protocol.  Negotiated Kitty functional
+    # keys use their canonical CSI form and must not regress to SS3.
+    if application_cursor and not modifiers and base in _MODIFIED_CSI_FINALS:
+        return f"\x1bO{_MODIFIED_CSI_FINALS[base]}"
+
+    codepoint = None
+    if base in ("enter", "return"):
+        codepoint = 13
+    elif len(base) == 1 and base.isprintable():
+        codepoint = ord(base)
+    elif character and len(character) == 1 and character.isprintable():
+        codepoint = ord(character)
+    if negotiated and codepoint is not None:
+        if modifiers and (
+                modifiers.intersection({"alt", "ctrl"})
+                or base in ("enter", "return")):
+            return f"\x1b[{codepoint};{mod}u"
+
     mapped = _KEYMAP.get(key)
     if mapped is not None:
         return mapped
-    parts = key.split("+")
-    base, modifiers = parts[-1], set(parts[:-1])
     if modifiers and modifiers <= {"shift", "alt", "ctrl"}:
         # Textual normalizes host-terminal input; emit the standard xterm
         # modifier form expected by interactive children, independent of the
         # outer terminal emulator. Modifier parameter: 1 + Shift + 2*Alt + 4*Ctrl.
-        mod = 1 + ("shift" in modifiers) + 2 * ("alt" in modifiers) + 4 * ("ctrl" in modifiers)
         if base in _MODIFIED_CSI_FINALS:
             return f"\x1b[1;{mod}{_MODIFIED_CSI_FINALS[base]}"
         if base in _MODIFIED_TILDE_KEYS:
@@ -750,6 +845,8 @@ def encode_key(key: str, character: Optional[str]) -> Optional[str]:
         rest = key[4:]
         if rest == "backspace":
             return "\x1b\x7f"
+        if character and character.isprintable():
+            return "\x1b" + character
         if len(rest) == 1:
             return "\x1b" + rest
         return None   # alt+<named> (arrows etc.) aren't readline word ops
@@ -767,9 +864,13 @@ def encode_key(key: str, character: Optional[str]) -> Optional[str]:
 # alt-reset below is now a dormant SAFETY NET: if some tool DOES swap buffers,
 # resetting pyte's single buffer at the boundary keeps a pre-alt prompt from
 # bleeding under its UI and stops the last frame lingering after it exits.
-_ALT_ENTER_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)h")
-_ALT_LEAVE_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)l")
-_ALT_ANY_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)[hl]")
+_ALT_PRIVATE_LIST = (
+    r"(?:\x1b\[|\x9b)\?"
+    r"(?=(?:[0-9]+;)*(?:47|1047|1049)(?:;|[hl]))[0-9;]+"
+)
+_ALT_ENTER_RE = re.compile(_ALT_PRIVATE_LIST + "h")
+_ALT_LEAVE_RE = re.compile(_ALT_PRIVATE_LIST + "l")
+_ALT_ANY_RE = re.compile(_ALT_PRIVATE_LIST + "[hl]")
 # Private-intro CSI sequences that END in 'm' but are NOT SGR: XTMODKEYS
 # (\x1b[>4;2m = modifyOtherKeys) and friends. pyte ignores the >/</= private
 # marker and misapplies the params as SGR — '>4;2m' becomes underline(4)+faint(2),
@@ -784,6 +885,14 @@ _PRIVATE_SGR_RE = re.compile(r"\x1b\[[<>=][0-9;:]*m")
 # regardless, so dropping the negotiation is display-only and harmless. (Plain
 # CSI u = SCO restore-cursor has no private marker, so it is NOT stripped.)
 _KITTY_KBD_RE = re.compile(r"\x1b\[[<>=?][0-9;:]*u")
+_KITTY_KBD_STACK_MAX = 16
+# Textual supplies press events, a delivered character, and modifier names, so
+# saikai can implement disambiguation (1). Its public Key event deliberately
+# collapses keypad codes to their non-keypad names (for example keypad 0 -> "0"
+# and keypad Enter -> "enter"), so advertising report-all-keys (8) would promise
+# physical-key identity that encode_key cannot reconstruct. Event types (2),
+# alternate keys (4), report-all (8), and associated text (16) stay masked.
+_KITTY_KBD_SUPPORTED_FLAGS = 1
 # Bracketed-paste mode (CSI ?2004 h/l): claude enables it so it can distinguish a
 # PASTE from typed input. pyte doesn't expose the mode, so we track it from the
 # output stream and re-wrap pastes (\x1b[200~ … \x1b[201~) in on_paste — otherwise
@@ -799,7 +908,7 @@ _BRACKETED_RE = re.compile(r"\x1b\[\?2004([hl])")
 # COMBINES params (e.g. \x1b[?1002;1006h) is parsed — a per-mode regex misses that
 # form. We act on the mouse-tracking + SGR-encoding params; others are ignored here
 # (bracketed paste / sync-update keep their own trackers below). (#faithful-mouse)
-_DEC_PRIVATE_RE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
+_DEC_PRIVATE_RE = re.compile(r"(?:\x1b\[|\x9b)\?([0-9;]+)([hl])")
 # OSC 52 clipboard WRITE from the child (\x1b]52;<sel>;<base64>\x07 or …ST). claude's
 # fullscreen renderer copies a mouse selection this way; saikai consumes the child's
 # output (the real terminal never sees it) and pyte ignores OSC 52, so without this
@@ -812,12 +921,16 @@ _OSC52_RE = re.compile(r"\x1b\]52;[^;]*;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)")
 # (Primary-DA sentinel, no local timeout) silently disables rich features (OSC 8 /
 # 133 / notifications / theme / synchronized output) and its alt-screen redraw probe
 # (private ?6n) can block. See _answer_queries. (#term-queries)
-_DA_RE = re.compile(r"\x1b\[0?c")                        # Primary Device Attributes
-_DA2_RE = re.compile(r"\x1b\[>0?c")                      # Secondary DA (vim t_RV, tmux)
-_DSR_RE = re.compile(r"\x1b\[(\??)([56])n")             # DSR: 5=status, 6=cursor position
-_DECRQM_RE = re.compile(r"\x1b\[\?(\d+)\$p")            # DECRQM (mode support query)
-_XTVERSION_RE = re.compile(r"\x1b\[>0?q")               # XTVERSION (terminal name/version)
-_OSC_COLOR_Q_RE = re.compile(r"\x1b\](1[01]);\?(\x07|\x1b\\)")  # OSC 10/11 fg/bg color query
+_CSI_INTRO_RE = r"(?:\x1b\[|\x9b)"
+_OSC_INTRO_RE = r"(?:\x1b\]|\x9d)"
+_OSC_TERM_RE = r"(?:\x07|\x1b\\|\x9c)"
+_DA_RE = re.compile(_CSI_INTRO_RE + r"0?c")              # Primary Device Attributes
+_DA2_RE = re.compile(_CSI_INTRO_RE + r">0?c")            # Secondary DA (vim t_RV, tmux)
+_DSR_RE = re.compile(_CSI_INTRO_RE + r"(\??)([56])n")    # DSR: 5=status, 6=cursor position
+_DECRQM_RE = re.compile(_CSI_INTRO_RE + r"\?(\d+)\$p")   # DECRQM (mode support query)
+_XTVERSION_RE = re.compile(_CSI_INTRO_RE + r">0?q")      # XTVERSION (terminal name/version)
+_OSC_COLOR_Q_RE = re.compile(                            # OSC 10/11 fg/bg color query
+    _OSC_INTRO_RE + r"(1[01]);\?(" + _OSC_TERM_RE + r")")
 # Queries stripped from the mirror pane stream (#pane-direct): saikai (the PTY
 # owner) answers them in _answer_queries; the browser xterm fed the raw stream
 # would ALSO auto-answer via onData, and with pane-view input wired the child
@@ -832,7 +945,7 @@ _OSC_COLOR_Q_RE = re.compile(r"\x1b\](1[01]);\?(\x07|\x1b\\)")  # OSC 10/11 fg/b
 _MIRROR_QUERY_STRIP_RE = re.compile("|".join(
     [p.pattern for p in (_DA_RE, _DA2_RE, _DSR_RE, _DECRQM_RE, _XTVERSION_RE,
                          _OSC_COLOR_Q_RE)]
-    + [r"\x1b\[=0?c",                       # tertiary DA
+    + [_CSI_INTRO_RE + r"=0?c",             # tertiary DA
        r"\x1bP\$q[^\x07\x1b]*(?:\x07|\x1b\\)",   # DECRQSS
        r"\x1bP\+q[0-9a-fA-F;]*(?:\x07|\x1b\\)"]  # XTGETTCAP
 ))
@@ -877,6 +990,7 @@ _DECRQM_TRACKED = {
     "1000": "_mouse_click",
     "1002": "_mouse_btn_motion",
     "1003": "_mouse_any_motion",
+    "1004": "_focus_reporting",
     "1006": "_mouse_sgr",
     "2004": "_bracketed_paste",
 }
@@ -901,6 +1015,10 @@ class VTToken:
     parameters: str = ""
     intermediates: str = ""
     final: str = ""
+    # True when an invalid/over-cap control unit failed open as data. Feeding
+    # its raw ESC/C0 bytes back into pyte/xterm would reinterpret the control and
+    # defeat fail-open, so the presentation layer renders those bytes visibly.
+    literal: bool = False
 
 
 class VTTokenizer:
@@ -948,7 +1066,7 @@ class VTTokenizer:
     def _emit_or_fail_open(self, token: VTToken, out: list[VTToken]) -> None:
         """Emit a complete protocol token only when its raw text is bounded."""
         if len(token.raw) > self.max_carry:
-            out.append(VTToken("text", token.raw))
+            out.append(VTToken("text", token.raw, literal=True))
         else:
             out.append(token)
 
@@ -961,7 +1079,7 @@ class VTTokenizer:
         if string:
             self.dropped_string_chars = min(
                 self.max_dropped_string, self.dropped_string_chars + len(raw))
-        out.append(VTToken("text", raw))
+        out.append(VTToken("text", raw, literal=True))
         self._fail_open_kind = kind
         self._fail_open_pending_esc = kind in ("osc", "dcs") and raw.endswith("\x1b")
 
@@ -977,7 +1095,7 @@ class VTTokenizer:
             return 0
         if kind in ("osc", "dcs") and self._fail_open_pending_esc:
             if text.startswith("\\"):
-                out.append(VTToken("text", "\\"))
+                out.append(VTToken("text", "\\", literal=True))
                 self._fail_open_kind = None
                 self._fail_open_pending_esc = False
                 return 1
@@ -1005,11 +1123,11 @@ class VTTokenizer:
             pos += 1
         if end is None:
             if text:
-                out.append(VTToken("text", text))
+                out.append(VTToken("text", text, literal=True))
                 self._fail_open_pending_esc = (
                     kind in ("osc", "dcs") and text.endswith("\x1b"))
             return len(text)
-        out.append(VTToken("text", text[:end]))
+        out.append(VTToken("text", text[:end], literal=True))
         self._fail_open_kind = None
         self._fail_open_pending_esc = False
         return end
@@ -1036,7 +1154,7 @@ class VTTokenizer:
             return pos
         # A control or an invalid byte cannot complete this CSI. Keep no poison
         # for a later PTY read: return its raw prefix as ordinary data instead.
-        out.append(VTToken("text", text[start:pos]))
+        out.append(VTToken("text", text[start:pos], literal=True))
         return pos
 
     def _parse_string(self, text: str, start: int, body: int, kind: str,
@@ -1086,7 +1204,7 @@ class VTTokenizer:
                 "esc", text[start:pos], intermediates=text[start + 1:pos - 1],
                 final=text[pos - 1]), out)
             return pos
-        out.append(VTToken("text", text[start:pos]))
+        out.append(VTToken("text", text[start:pos], literal=True))
         return pos
 
     def feed(self, text: str) -> list[VTToken]:
@@ -1143,6 +1261,38 @@ class VTTokenizer:
         else:
             emit_text(len(text))
         return out
+
+
+def _literalize_control_data(text: str) -> str:
+    """Make fail-open VT bytes visible without executing them a second time."""
+    out = []
+    for char in text:
+        code = ord(char)
+        if code < 0x20:
+            out.append(chr(0x2400 + code))
+        elif code == 0x7f:
+            out.append("\u2421")
+        elif 0x80 <= code <= 0x9f:
+            out.append(f"<{code:02X}>")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def _osc_parts(token: VTToken) -> tuple[str, str, str]:
+    """Return (code, payload, terminator) for one complete OSC token."""
+    raw = token.raw
+    body = raw[2:] if raw.startswith("\x1b]") else raw[1:]
+    if body.endswith("\x1b\\"):
+        body, terminator = body[:-2], "\x1b\\"
+    elif body.endswith("\x9c"):
+        body, terminator = body[:-1], "\x9c"
+    elif body.endswith("\x07"):
+        body, terminator = body[:-1], "\x07"
+    else:
+        return "", "", ""
+    code, sep, payload = body.partition(";")
+    return (code, payload if sep else "", terminator)
 
 
 def _strip_dcs(text: str, inside: bool = False, dropped: int = 0):
@@ -1587,6 +1737,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._mouse_btn_motion = False # ?1002 motion while a button is held (drag)
         self._mouse_any_motion = False # ?1003 motion always (hover)
         self._focus_reporting = False  # ?1004: child wants \x1b[I / \x1b[O on focus change
+        self._bracketed_paste = False  # ?2004: wrap multi-line paste input
         self._fwd_buttons = set()      # forwarded buttons currently held (a drag in progress)
         self._fwd_captured = False     # captured the mouse for the current forwarded gesture?
         self._fwd_last = (1, 1)        # last forwarded (col,row) — for a synthetic release
@@ -1596,16 +1747,30 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._frozen_buf = None      # snapshot of the displayed rows while frozen
                                      # (the reader keeps mutating screen.buffer, so
                                      # render + copy must read the FROZEN frame)
-        self._esc_carry = ""         # trailing partial escape held across read()s
-        self._dcs_inside = False     # mid-DCS across read()s (sixel payload scrub)
-        self._dcs_dropped = 0        # chars swallowed by the current DCS (runaway cap)
+        self._vt_tokenizer = VTTokenizer()  # the only decoded-stream carry/parser
         self._write_lock = threading.Lock()  # guards the PTY write queue below
         self._write_q: list = []     # oversized writes waiting for the writer thread
         self._writer = None          # daemon draining _write_q in order (#paste-block)
         self._sync_output = _SynchronizedOutputStager()
-        self._osc52_carry = ""       # partial OSC 52 clipboard write held across read()s (base64 can span chunks)
+        # The reader and one persistent deadline worker share only the stager.
+        # This lock is never nested with self._lock; units are fed after release.
+        self._sync_lock = threading.RLock()
+        # Serializes reader batches, deadline expiry, and EOF flush so a timeout
+        # cannot overtake presentation already extracted by the reader.
+        self._sync_dispatch_lock = threading.RLock()
+        self._sync_deadline_condition = threading.Condition()
+        self._sync_deadline_generation = 0
+        self._sync_deadline_at: Optional[float] = None
+        self._sync_deadline_opened_at: Optional[float] = None
+        self._sync_deadline_stop = False
+        self._sync_deadline_worker: Optional[threading.Thread] = None
+        self._sync_deadline_workers_started = 0
         self._app_cursor = False     # ?1 DECCKM — replayed in the mirror seed so a
                                      # pane-view browser encodes arrows correctly (#pane-direct)
+        self._cursor_visible = True  # ?25 DECTCEM, explicit so held sync frames query truthfully
+        self._alt_screen_mode = False  # ?47/?1047/?1049 DECRQM state at stream position
+        self._kitty_keyboard_flags = {False: 0, True: 0}
+        self._kitty_keyboard_stacks = {False: [], True: []}
         self._hw_cursor_visible: Optional[bool] = None  # last ?25 visibility we wrote
         self._anchored_xy = None  # last IME anchor cell we set (freeze/flush bookkeeping)
         self._cursor_hidden_since = 0.0  # monotonic ts the child hid its cursor (?25l settle)
@@ -1840,7 +2005,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         if self._frozen:
             self.toggle_freeze()   # any key = done selecting → resume live updates
-        data = encode_key(event.key, getattr(event, "character", None))
+        data = encode_key(
+            event.key,
+            getattr(event, "character", None),
+            application_cursor=getattr(self, "_app_cursor", False),
+            kitty_flags=self._kitty_flags(),
+        )
         if data is None:
             return
         self.last_input_ts = time.monotonic()   # (#linux-state-regroup)
@@ -2402,17 +2572,192 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self.refresh()
 
     # ── (4) background reader -> feed pyte -> repaint on the UI thread ─────────
+    def _ensure_sync_deadline_state(self) -> None:
+        """Initialize deadline fields for legacy/minimal `__new__` test objects."""
+        if not hasattr(self, "_sync_lock"):
+            self._sync_lock = threading.RLock()
+        if not hasattr(self, "_sync_dispatch_lock"):
+            self._sync_dispatch_lock = threading.RLock()
+        if not hasattr(self, "_sync_deadline_condition"):
+            self._sync_deadline_condition = threading.Condition()
+            self._sync_deadline_generation = 0
+            self._sync_deadline_at = None
+            self._sync_deadline_opened_at = None
+            self._sync_deadline_stop = False
+            self._sync_deadline_worker = None
+            self._sync_deadline_workers_started = 0
+
+    def _arm_sync_deadline(self, max_age: float, opened_at: float) -> int:
+        """Set one generation-checked deadline on the pane's persistent worker."""
+        self._ensure_sync_deadline_state()
+        condition = self._sync_deadline_condition
+        with condition:
+            if self._sync_deadline_stop:
+                return self._sync_deadline_generation
+            self._sync_deadline_generation += 1
+            generation = self._sync_deadline_generation
+            self._sync_deadline_at = time.monotonic() + max(0.0, float(max_age))
+            self._sync_deadline_opened_at = float(opened_at)
+            worker = self._sync_deadline_worker
+            if worker is None or not worker.is_alive():
+                worker = self._sync_deadline_worker = threading.Thread(
+                    target=self._sync_deadline_loop,
+                    name=f"sync-deadline-{getattr(self, 'sid', None) or 'new'}",
+                    daemon=True,
+                )
+                self._sync_deadline_workers_started += 1
+                worker.start()
+            condition.notify()
+            return generation
+
+    def _cancel_sync_deadline(self) -> None:
+        """Invalidate the current deadline without retiring the persistent worker."""
+        self._ensure_sync_deadline_state()
+        condition = self._sync_deadline_condition
+        with condition:
+            self._sync_deadline_generation += 1
+            self._sync_deadline_at = None
+            self._sync_deadline_opened_at = None
+            condition.notify()
+
+    def _retire_sync_deadline(self) -> None:
+        """Retire the deadline and fence any already-authorized presentation.
+
+        The dispatch lock is re-entrant because EOF flush already owns it.  Taking
+        the same lock here gives retirement one linearization point with timeout
+        extraction, pyte feed, and repaint scheduling: once this method returns,
+        an old deadline cannot present anything later.
+        """
+        self._ensure_sync_deadline_state()
+        condition = self._sync_deadline_condition
+        # Publish cancellation first, so an expiry blocked on either ordering
+        # lock loses as soon as it reaches its final generation check.
+        with condition:
+            self._sync_deadline_generation += 1
+            self._sync_deadline_at = None
+            self._sync_deadline_opened_at = None
+            self._sync_deadline_stop = True
+            condition.notify_all()
+
+        # A test/exception path may retire while it already owns the stager
+        # lock.  Waiting for dispatch there would invert expiry's
+        # dispatch->stager order.  It is safe to return: an expiry cannot have
+        # passed the final check while this thread owns the stager lock, and the
+        # cancellation above will reject it after the lock is released.
+        try:
+            owns_stager = self._sync_lock._is_owned()
+        except Exception:
+            owns_stager = False
+        if owns_stager:
+            return
+
+        # Otherwise fence an expiry which had already been authorized.  It
+        # either completes feed/repaint first or observes cancellation; in both
+        # cases no old deadline can present after this acquisition returns.
+        with self._sync_dispatch_lock:
+            pass
+
+    def _sync_deadline_loop(self) -> None:
+        condition = self._sync_deadline_condition
+        while True:
+            with condition:
+                while (not self._sync_deadline_stop
+                       and self._sync_deadline_at is None):
+                    condition.wait()
+                if self._sync_deadline_stop:
+                    return
+                generation = self._sync_deadline_generation
+                remaining = self._sync_deadline_at - time.monotonic()
+                if remaining > 0:
+                    condition.wait(remaining)
+                    continue
+            self._expire_sync_output(generation)
+
+    def _present_sync_unit(self, text: str, deferred_ui=None) -> None:
+        """Call the built-in presenter with deferral, preserving test/subclass APIs."""
+        presenter = self._consume_ready
+        if getattr(presenter, "__func__", None) is AgentTerminal._consume_ready:
+            presenter(text, deferred_ui=deferred_ui)
+        else:
+            presenter(text)
+
+    def _consume_sync_units(self, units, deferred_ui=None) -> bool:
+        """Feed extracted stager units after its lock has been released."""
+        changed = False
+        for text, fail_reason in units:
+            if fail_reason:
+                _log(f"sync-output fail-open: reason={fail_reason} chars={len(text)}")
+            self._present_sync_unit(text, deferred_ui=deferred_ui)
+            changed = True
+        return changed
+
+    def _expire_sync_output(self, generation: int) -> bool:
+        """Fail open one still-current quiet frame, then repaint through coalescing."""
+        self._ensure_sync_deadline_state()
+        condition = self._sync_deadline_condition
+        deferred_ui = []
+        with condition:
+            deadline = self._sync_deadline_at
+            opened_at = self._sync_deadline_opened_at
+            if (self._sync_deadline_stop
+                    or generation != self._sync_deadline_generation
+                    or deadline is None
+                    or opened_at is None
+                    or time.monotonic() < deadline):
+                return False
+            self._sync_deadline_at = None
+            self._sync_deadline_opened_at = None
+        # Reader batches and expiry feed have one presentation-order owner.
+        # Revalidate retirement/generation after waiting for that owner.
+        with self._sync_dispatch_lock:
+            with condition:
+                if (self._sync_deadline_stop
+                        or generation != self._sync_deadline_generation):
+                    return False
+            # Never hold the deadline condition or stager lock while feeding
+            # pyte, marshalling callbacks, or scheduling UI work.
+            with self._sync_lock:
+                # Retirement/new-generation can happen while expiry waits for
+                # the stager lock, so this is the final authorization point.
+                with condition:
+                    if (self._sync_deadline_stop
+                            or generation != self._sync_deadline_generation):
+                        return False
+                now = time.monotonic()
+                stager = self._sync_output
+                if (not stager.active
+                        or stager._opened_at != opened_at
+                        or stager._opened_at + stager.max_age > now):
+                    units = []
+                else:
+                    units = stager.flush("timeout", now=now)
+            changed = self._consume_sync_units(units, deferred_ui=deferred_ui)
+            if (changed and getattr(self, "_scroll", 0) == 0
+                    and not getattr(self, "_frozen", False)):
+                self._schedule_pane_refresh()
+        if not getattr(self, "_stop", threading.Event()).is_set():
+            for callback in deferred_ui:
+                self._marshal(callback)
+        return changed
+
     def _flush_sync_output(self, reason: str) -> bool:
         """Release one retained frame on the reader thread, at most once."""
-        changed = False
+        self._ensure_sync_deadline_state()
         sync_output = getattr(self, "_sync_output", None)
         if sync_output is None:
             return False
-        for text, fail_reason in sync_output.flush(reason):
-            if fail_reason:
-                _log(f"sync-output fail-open: reason={fail_reason} chars={len(text)}")
-            self._consume_ready(text)
-            changed = True
+        deferred_ui = []
+        with self._sync_dispatch_lock:
+            if reason == "eof":
+                self._retire_sync_deadline()
+            else:
+                self._cancel_sync_deadline()
+            with self._sync_lock:
+                units = sync_output.flush(reason)
+            changed = self._consume_sync_units(units, deferred_ui=deferred_ui)
+        if not getattr(self, "_stop", threading.Event()).is_set():
+            for callback in deferred_ui:
+                self._marshal(callback)
         return changed
 
     def _read_loop(self) -> None:
@@ -2459,7 +2804,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 pass
             self._finalize()
 
-    def _honor_osc52(self, b64: str) -> None:
+    def _honor_osc52(self, b64: str, deferred_ui=None) -> None:
         """Put an OSC 52 clipboard-write payload from the child onto the HOST
         clipboard (a fullscreen child that DOES track the mouse copies via
         OSC 52). Ignores a "?"/empty payload (a read query). Runs on the reader
@@ -2473,7 +2818,30 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             return
         if text:
-            self._marshal(lambda t=text: self._copy_text(t))
+            self._queue_or_marshal(
+                lambda t=text: self._copy_osc52_if_allowed(t), deferred_ui)
+
+    def _osc52_copy_allowed(self) -> bool:
+        """Fail closed unless this pane exclusively owns visible active focus."""
+        try:
+            app = self.app
+            screen = self.screen
+            return bool(
+                self._pty is not None
+                and not self.is_dead
+                and self.is_attached
+                and self.display
+                and app.app_focus
+                and screen.is_active
+                and self._is_focused_pane()
+            )
+        except Exception:
+            return False
+
+    def _copy_osc52_if_allowed(self, text: str) -> None:
+        """UI-thread half of OSC 52: re-check focus before host/mirror writes."""
+        if text and self._osc52_copy_allowed():
+            self._copy_text(text)
 
     def _write_child(self, data: str) -> None:
         """Write to the PTY without ever blocking the UI thread on a full pty buffer.
@@ -2596,13 +2964,21 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             pass
 
-    def _notify_host(self, msg: str) -> None:
+    def _queue_or_marshal(self, callback: Callable, deferred_ui=None) -> None:
+        """Defer UI work until the presentation-order lock has been released."""
+        if deferred_ui is None:
+            self._marshal(callback)
+        else:
+            deferred_ui.append(callback)
+
+    def _notify_host(self, msg: str, deferred_ui=None) -> None:
         """Surface a child desktop-notification (OSC 9/777/99) as a saikai toast.
         Reader thread → marshal the toast onto the UI thread. (#osc-notify)"""
         msg = (msg or "").strip()
         if not msg:
             return
-        self._marshal(lambda m=msg[:200]: self._safe_notify(m))
+        self._queue_or_marshal(
+            lambda m=msg[:200]: self._safe_notify(m), deferred_ui)
 
     def _safe_notify(self, msg: str) -> None:
         try:
@@ -2646,98 +3022,230 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         line) or SGR mouse encoding, even though saikai tracks both. (#term-queries)"""
         if mode == "2026":
             stager = getattr(self, "_sync_output", None)
-            return 1 if (stager is not None and stager.in_block) else 2
+            if stager is None:
+                return 2
+            self._ensure_sync_deadline_state()
+            with self._sync_lock:
+                in_block = stager.in_block
+            return 1 if in_block else 2
         if mode in _DECRQM_ALT_SCREEN:
-            return 1 if getattr(getattr(self, "_alt", None), "in_alt", False) else 2
-        if mode == "25":                                    # DECTCEM
-            try:
-                with self._lock:
-                    scr = self._screen
-                    hidden = bool(getattr(scr.cursor, "hidden", False)) if scr is not None else False
-            except Exception:
-                return 0
-            return 2 if hidden else 1
+            return 1 if getattr(
+                self, "_alt_screen_mode",
+                getattr(getattr(self, "_alt", None), "in_alt", False)) else 2
+        if mode == "25":
+            return 1 if getattr(self, "_cursor_visible", True) else 2
         attr = _DECRQM_TRACKED.get(mode)
         if attr is None:
             return 0
         return 1 if getattr(self, attr, False) else 2
 
-    def _answer_static_queries(self, chunk: str) -> None:
-        """Answer terminal queries whose reply does not depend on live state.
+    def _apply_dec_private(self, token: VTToken) -> None:
+        """Apply every DECSET/DECRST parameter in stream order."""
+        if (token.kind != "csi" or token.intermediates
+                or token.final not in ("h", "l")
+                or not token.parameters.startswith("?")):
+            return
+        enabled = token.final == "h"
+        for mode in token.parameters[1:].split(";"):
+            if mode == "1":
+                self._app_cursor = enabled
+            elif mode == "25":
+                self._cursor_visible = enabled
+            elif mode in _DECRQM_ALT_SCREEN:
+                self._alt_screen_mode = enabled
+            elif mode in ("1000", "1002", "1003"):
+                # Mouse tracking is one exclusive protocol slot. Enabling one
+                # replaces the slot; resetting any family member clears it.
+                self._mouse_click = enabled and mode == "1000"
+                self._mouse_btn_motion = enabled and mode == "1002"
+                self._mouse_any_motion = enabled and mode == "1003"
+            elif mode == "1004":
+                self._focus_reporting = enabled
+            elif mode == "1006":
+                self._mouse_sgr = enabled
+            elif mode == "2004":
+                self._bracketed_paste = enabled
+        self._mouse_reporting = (
+            getattr(self, "_mouse_click", False)
+            or getattr(self, "_mouse_btn_motion", False)
+            or getattr(self, "_mouse_any_motion", False)
+        )
 
-        Replies go out in the order the child ASKED, not in the order this method
-        happens to check: a probe batch that ends with CSI c — "answer what you know,
-        then this sentinel" — must not get the sentinel first. (#term-queries)"""
-        out = []                      # (position in chunk, reply) — sorted before send
-        _m = _DA_RE.search(chunk)
-        if _m is not None:
-            # Primary DA — reply BYTE-IDENTICAL to the outer Windows Terminal (probed
-            # on-device: ESC[?61;...c, a VT500-class terminal with feature extensions).
-            # The old minimal "?6c" (VT102) made Claude Code treat the pane as a basic
-            # terminal and fall back to a renderer that parks the cursor at a base cell
-            # instead of tracking the input caret. Looking exactly like WT (which Claude
-            # tracks correctly when run directly) is the fix. (#agents-cursor #wt-da)
-            out.append((_m.start(), "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c"))
-        _m = _DA2_RE.search(chunk)
-        if _m is not None:
-            # Secondary DA. A terminal that answers DA1 as WT must answer this too:
-            # vim's t_RV and tmux's handshake serialize DA1 then DA2, and silence
-            # stalls them for a probe timeout and then mis-detects version-gated
-            # features. WT's reply is "VT100, firmware 10, no cartridge". (#wt-da2)
-            out.append((_m.start(), "\x1b[>0;10;1c"))
-        for _m in _DSR_RE.finditer(chunk):
-            if _m.group(2) == "5":
-                out.append((_m.start(), "\x1b[0n"))      # device status: OK
-        # DECRQM is NOT answered here: it reports live mode state, so it has to be
-        # answered at its own stream position once the bytes before it reached pyte
-        # (see _feed_presentation_unit). Everything above is state-free.
-        # XTVERSION (ESC[>q): the outer Windows Terminal sends NO reply (probed on-
-        # device). Answering with a name ("saikai") made Claude Code see an unknown
-        # terminal and skip its WT cursor-tracking path. Stay silent, exactly like WT.
-        # (#agents-cursor #wt-da)
-        for _m in _OSC_COLOR_Q_RE.finditer(chunk):
-            # Report a dark background (11) / light foreground (10) so the child picks
-            # a dark theme, matching a typical terminal. Answer with the terminator the
-            # child ASKED with: an ST-terminated query answered with BEL leaves a strict
-            # parser waiting for its ST, and the stray BEL rings the bell.
-            _code = _m.group(1)
-            _rgb = "1e1e/1e1e/1e1e" if _code == "11" else "c0c0/c0c0/c0c0"
-            out.append((_m.start(), f"\x1b]{_code};rgb:{_rgb}{_m.group(2)}"))
-        if out:
-            out.sort(key=lambda pair: pair[0])
-            resp = "".join(reply for _pos, reply in out)
-            self._marshal(lambda r=resp: self._send_to_child(r))
+    def _ensure_kitty_keyboard_state(self) -> None:
+        if not hasattr(self, "_kitty_keyboard_flags"):
+            self._kitty_keyboard_flags = {False: 0, True: 0}
+            self._kitty_keyboard_stacks = {False: [], True: []}
 
-    def _answer_cursor_queries(self, chunk: str) -> None:
-        """Answer cursor-position DSR after the relevant output reached pyte."""
-        out = []
-        for private, kind in _DSR_RE.findall(chunk):
+    def _kitty_flags(self) -> int:
+        self._ensure_kitty_keyboard_state()
+        alternate = bool(getattr(self, "_alt_screen_mode", False))
+        return self._kitty_keyboard_flags[alternate]
+
+    def _apply_kitty_keyboard(self, token: VTToken) -> Optional[str]:
+        """Apply/query Kitty keyboard state for the current main/alt buffer."""
+        if (token.kind != "csi" or token.final != "u"
+                or token.intermediates
+                or token.parameters[:1] not in "<>=?"):
+            return None
+        self._ensure_kitty_keyboard_state()
+        prefix = token.parameters[0]
+        fields = token.parameters[1:].split(";") if token.parameters[1:] else []
+
+        def number(index: int, default: int) -> int:
+            if index >= len(fields) or fields[index] == "":
+                return default
+            try:
+                return max(0, int(fields[index]))
+            except ValueError:
+                return default
+
+        alternate = bool(getattr(self, "_alt_screen_mode", False))
+        current = self._kitty_keyboard_flags[alternate]
+        stack = self._kitty_keyboard_stacks[alternate]
+        if prefix == "?":
+            return f"\x1b[?{current}u"
+        if prefix == "=":
+            flags = number(0, 0) & _KITTY_KBD_SUPPORTED_FLAGS
+            mode = number(1, 1)
+            if mode == 1:
+                current = flags
+            elif mode == 2:
+                current |= flags
+            elif mode == 3:
+                current &= ~flags
+            else:
+                return None
+        elif prefix == ">":
+            if len(stack) >= _KITTY_KBD_STACK_MAX:
+                del stack[0]
+            stack.append(current)
+            current = number(0, 0) & _KITTY_KBD_SUPPORTED_FLAGS
+        else:  # "<": pop one (default) or N states; over-pop returns to 0.
+            for _ in range(max(1, number(0, 1))):
+                current = stack.pop() if stack else 0
+        self._kitty_keyboard_flags[alternate] = current
+        return None
+
+    def _csi_query_reply(self, token: VTToken) -> Optional[str]:
+        """Return one reply for one CSI query token, or None."""
+        if token.kind != "csi":
+            return None
+        params = token.parameters
+        if token.final == "c" and not token.intermediates:
+            if params in ("", "0"):
+                # VT500 class plus ANSI colour only. Do not claim sixel (4),
+                # selective erase (6), UDK/DRCS/macros (8), or rectangular
+                # editing (28), none of which the pane implements.
+                return "\x1b[?62;22c"
+            if params in (">", ">0"):
+                return "\x1b[>0;10;1c"
+        if token.final == "n" and not token.intermediates:
+            private = "?" if params.startswith("?") else ""
+            kind = params[1:] if private else params
+            if kind == "5":
+                return "\x1b[0n"
             if kind == "6":
                 row, col = self._cursor_rowcol()
-                out.append(f"\x1b[{private}{row};{col}R")
-        if out:
-            response = "".join(out)
-            self._marshal(lambda r=response: self._send_to_child(r))
+                return f"\x1b[{private}{row};{col}R"
+        if (token.final == "p" and token.intermediates == "$"
+                and params.startswith("?") and params[1:].isdigit()):
+            mode = params[1:]
+            return f"\x1b[?{mode};{self._decrqm_report(mode)}$y"
+        if (token.final == "q" and not token.intermediates
+                and params in (">", ">0")):
+            return "\x1bP>|saikai\x1b\\"
+        return None
 
-    def _answer_mode_queries(self, chunk: str) -> None:
-        """Answer DECRQM for a chunk that already reached pyte."""
-        out = [f"\x1b[?{mode};{self._decrqm_report(mode)}$y"
-               for mode in _DECRQM_RE.findall(chunk)]
-        if out:
-            response = "".join(out)
-            self._marshal(lambda r=response: self._send_to_child(r))
+    @staticmethod
+    def _is_cursor_query(token: VTToken) -> bool:
+        return (token.kind == "csi" and token.final == "n"
+                and not token.intermediates
+                and token.parameters in ("6", "?6"))
+
+    @staticmethod
+    def _is_csi_query(token: VTToken) -> bool:
+        if token.kind != "csi":
+            return False
+        params = token.parameters
+        if not token.intermediates and token.final == "c":
+            return params in ("", "0", ">", ">0")
+        if not token.intermediates and token.final == "n":
+            return params in ("5", "?5", "6", "?6")
+        if token.intermediates == "$" and token.final == "p":
+            return params.startswith("?") and params[1:].isdigit()
+        return (not token.intermediates and token.final == "q"
+                and params in (">", ">0"))
+
+    def _osc_side_effect(self, token: VTToken, deferred_ui=None) -> Optional[str]:
+        """Dispatch a complete OSC and return its query reply, if any."""
+        code, payload, terminator = _osc_parts(token)
+
+        def side_effect(method, value):
+            # Tests and subclasses may replace these one-argument hooks.  Queue
+            # the call itself instead of passing an internal deferral keyword.
+            builtin = getattr(method, "__func__", None)
+            if builtin in (AgentTerminal._honor_osc52, AgentTerminal._notify_host):
+                method(value, deferred_ui=deferred_ui)
+                return
+            if deferred_ui is None:
+                method(value)
+            else:
+                deferred_ui.append(lambda m=method, v=value: m(v))
+
+        if code in ("10", "11") and payload == "?":
+            rgb = "1e1e/1e1e/1e1e" if code == "11" else "c0c0/c0c0/c0c0"
+            return f"\x1b]{code};rgb:{rgb}{terminator}"
+        if code == "52":
+            _selection, sep, b64 = payload.partition(";")
+            if sep:
+                side_effect(self._honor_osc52, b64)
+        elif code == "9" and not payload.startswith("4;"):
+            side_effect(self._notify_host, payload)
+        elif code == "777" and payload.startswith("notify;"):
+            side_effect(
+                self._notify_host,
+                payload.removeprefix("notify;").replace(";", ": ", 1),
+            )
+        elif code == "99":
+            _metadata, sep, message = payload.partition(";")
+            if sep:
+                side_effect(self._notify_host, message)
+        return None
 
     def _answer_queries(self, chunk: str) -> None:
-        """Answer every query in *chunk* for a caller that already fed it to pyte.
+        """Answer already-presented queries once each, in token order."""
+        replies = []
+        for token in VTTokenizer().feed(chunk):
+            reply = (self._osc_side_effect(token) if token.kind == "osc"
+                     else self._csi_query_reply(token))
+            if reply is not None:
+                replies.append(reply)
+        if replies:
+            response = "".join(replies)
+            self._marshal(lambda r=response: self._send_to_child(r))
 
-        _consume does not use this: it answers the state-free queries up front (a
-        child can block on them mid-frame) and the state-dependent ones at their own
-        stream position."""
-        self._answer_static_queries(chunk)
-        self._answer_mode_queries(chunk)
-        self._answer_cursor_queries(chunk)
+    def _answer_static_queries(self, chunk: str) -> None:
+        """Compatibility wrapper; ordered callers use `_consume` directly."""
+        self._answer_queries(chunk)
+
+    def _answer_cursor_queries(self, chunk: str) -> None:
+        self._answer_queries(chunk)
+
+    def _answer_mode_queries(self, chunk: str) -> None:
+        self._answer_queries(chunk)
 
     def _consume(self, chunk: str) -> bool:
+        """Serialize reader dispatch against deadline/EOF presentation."""
+        self._ensure_sync_deadline_state()
+        deferred_ui = []
+        with self._sync_dispatch_lock:
+            changed = self._consume_ordered(chunk, deferred_ui=deferred_ui)
+        if not getattr(self, "_stop", threading.Event()).is_set():
+            for callback in deferred_ui:
+                self._marshal(callback)
+        return changed
+
+    def _consume_ordered(self, chunk: str, deferred_ui=None) -> bool:
         """Stage decoded output and feed only complete units to pyte."""
         if _PTY_CAPTURE:
             try:
@@ -2745,137 +3253,116 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                     _cf.write(repr(chunk) + "\n")   # raw chunk, escape seqs visible
             except Exception:
                 pass
-        # pywinpty already decoded to str → feed pyte.Stream directly (no
-        # re-encode round-trip). Scrub pywinpty 3.x's "0011Ignore" keepalive
-        # sentinel, then split the feed at each alt-screen enter/leave boundary,
-        # reset()-ing pyte's single buffer there (it has no second buffer) so a
-        # pre-alt shell prompt and claude's frames never share one buffer.
-        # Reassemble an escape sequence cut at the read() boundary: the pre-pyte
-        # scrubs below are stateless, so a split \x1b[>4;2m / \x1b[?1049h would
-        # slip through. Hold a SHORT trailing partial-escape for the next chunk.
-        chunk = self._esc_carry + chunk
-        self._esc_carry = ""
-        _m = re.search(r"\x1b(?:[\[\]][0-9;:<>=?]*)?$", chunk)
-        if _m is not None and (len(chunk) - _m.start()) < 32:
-            self._esc_carry = chunk[_m.start():]
-            chunk = chunk[:_m.start()]
         if _IS_WIN:
             # pywinpty 3.x keepalive sentinel — Windows-only noise. On the POSIX
             # (ptyprocess) byte stream "0011Ignore" is ordinary output, so scrubbing
             # it on every backend would silently corrupt a child that legitimately
             # prints that string (a log line, a hex dump, a test fixture). (#12)
             chunk = chunk.replace("0011Ignore", "")
-        # Drop DCS strings (sixel payloads, DECRQSS/XTGETTCAP replies) BEFORE any
-        # other scan: pyte would print the body into the grid, and a payload must not
-        # be able to spoof an OSC 52 clipboard write or a notification either. The
-        # 'inside' state carries across reads. (#dcs-scrub)
-        if "\x1bP" in chunk or getattr(self, "_dcs_inside", False):
-            chunk, self._dcs_inside, self._dcs_dropped = _strip_dcs(
-                chunk, getattr(self, "_dcs_inside", False),
-                getattr(self, "_dcs_dropped", 0))
-        chunk = _PRIVATE_SGR_RE.sub("", chunk)   # drop XTMODKEYS \x1b[>4;2m etc. (pyte misreads as SGR-4 underline)
-        chunk = _KITTY_KBD_RE.sub("", chunk)     # drop Kitty-keyboard CSI-u (pyte leaks the trailing 'u' into the grid)
-        _bp = _BRACKETED_RE.findall(chunk)       # track claude's bracketed-paste mode for on_paste (last h/l wins)
-        if _bp:
-            self._bracketed_paste = (_bp[-1] == "h")
-        _dec = _DEC_PRIVATE_RE.findall(chunk)    # DEC private-mode sets (mouse / SGR / …)
-        if _dec:
-            for _params, _hl in _dec:
-                _on = (_hl == "h")
-                for _p in _params.split(";"):    # handle COMBINED params (?1002;1006h)
-                    if _p == "1":
-                        self._app_cursor = _on         # DECCKM (#pane-direct seed replay)
-                    elif _p in ("1000", "1002", "1003"):
-                        # Mouse tracking is ONE exclusive protocol slot in both
-                        # real xterm and xterm.js: a DECSET replaces the active
-                        # protocol, and a DECRST of ANY family member turns
-                        # tracking off entirely. Three independent booleans left
-                        # a stale flag behind ("1000h…1003h…1003l" kept click
-                        # tracking True) and the mirror seed then re-armed mouse
-                        # reporting on a child that had turned it off — browser
-                        # SGR reports typed into its stdin. (#review-mouse-slot)
-                        self._mouse_click = _on and _p == "1000"
-                        self._mouse_btn_motion = _on and _p == "1002"   # drag motion
-                        self._mouse_any_motion = _on and _p == "1003"   # hover motion
-                    elif _p == "1004":
-                        self._focus_reporting = _on    # child wants focus in/out events
-                    elif _p == "1006":
-                        self._mouse_sgr = _on          # SGR extended encoding
-            # any tracking on ⇒ the child owns the mouse (incl. wheel + drag-select)
-            self._mouse_reporting = (getattr(self, "_mouse_click", False)
-                                     or getattr(self, "_mouse_btn_motion", False)
-                                     or getattr(self, "_mouse_any_motion", False))
-        # Honor the child's OSC 52 clipboard writes (e.g. claude's fullscreen 'copy
-        # selection'): saikai consumes the child's output and pyte ignores OSC 52, so
-        # decode + set the HOST clipboard ourselves. Reassemble across reads — a large
-        # selection's base64 can span chunks. (#osc52-clipboard)
-        if "\x1b]52;" in chunk or getattr(self, "_osc52_carry", ""):
-            _clip = getattr(self, "_osc52_carry", "") + chunk
-            self._osc52_carry = ""
-            _last = 0
-            for _mo in _OSC52_RE.finditer(_clip):
-                self._honor_osc52(_mo.group(1))
-                _last = _mo.end()
-            _open = _clip.rfind("\x1b]52;")
-            if _open >= _last and _OSC52_RE.search(_clip[_open:]) is None:
-                self._osc52_carry = _clip[_open:][-131072:]   # unterminated tail (capped)
-        # Surface the child's desktop notifications (OSC 9 / 777 / 99) as a saikai
-        # toast. (#osc-notify)
-        if "\x1b]9;" in chunk or "\x1b]777;" in chunk or "\x1b]99;" in chunk:
-            for _msg in _OSC9_NOTIFY_RE.findall(chunk):
-                self._notify_host(_msg)
-            for _msg in _OSC777_RE.findall(chunk):
-                self._notify_host(_msg.replace(";", ": ", 1))
-            for _msg in _OSC99_RE.findall(chunk):
-                self._notify_host(_msg)
-        # Query side channels must stay live while a synchronized-output frame is
-        # retained. In particular, a child can wait for a capability response
-        # before it emits ?2026l.
-        self._answer_static_queries(chunk)
+        tokenizer = getattr(self, "_vt_tokenizer", None)
+        if tokenizer is None:                       # minimal __new__ test objects
+            tokenizer = self._vt_tokenizer = VTTokenizer()
         sync_output = getattr(self, "_sync_output", None)
-        if sync_output is None:                 # compatibility with minimal test objects
+        if sync_output is None:
             sync_output = self._sync_output = _SynchronizedOutputStager()
-        units = sync_output.push(chunk)
-        if sync_output.active and sync_output.pending_query:
-            units.extend(sync_output.flush("pending-query"))
-
+        self._ensure_sync_deadline_state()
+        ready = []
+        replies = []
         changed = False
-        for text, fail_reason in units:
-            if fail_reason:
-                _log(f"sync-output fail-open: reason={fail_reason} chars={len(text)}")
-            self._feed_presentation_unit(text)
-            changed = True
+
+        def stage(text):
+            if text:
+                with self._sync_lock:
+                    was_active = sync_output.active
+                    opened_at = sync_output._opened_at
+                    units = sync_output.push(text)
+                    is_active = sync_output.active
+                    new_opened_at = sync_output._opened_at
+                closed = was_active and not is_active
+                for index, (unit, reason) in enumerate(units):
+                    ready.append((unit, reason, closed and index == len(units) - 1))
+                if is_active and (
+                        not was_active or new_opened_at != opened_at):
+                    self._arm_sync_deadline(sync_output.max_age, new_opened_at)
+                elif was_active and not is_active:
+                    self._cancel_sync_deadline()
+
+        def flush_stager(reason):
+            with self._sync_lock:
+                was_active = sync_output.active
+                units = sync_output.flush(reason)
+            if was_active:
+                self._cancel_sync_deadline()
+            for index, (unit, fail_reason) in enumerate(units):
+                ready.append((unit, fail_reason, index == len(units) - 1))
+
+        def present_ready():
+            nonlocal changed
+            if not ready:
+                return
+            groups = []
+            parts = []
+            reasons = []
+            for unit, reason, boundary in ready:
+                parts.append(unit)
+                if reason:
+                    reasons.append((reason, len(unit)))
+                if boundary:
+                    groups.append("".join(parts))
+                    parts.clear()
+            if parts:
+                groups.append("".join(parts))
+            ready.clear()
+            for reason, chars in reasons:
+                _log(f"sync-output fail-open: reason={reason} chars={chars}")
+            for text in groups:
+                if text:
+                    self._present_sync_unit(text, deferred_ui=deferred_ui)
+                    changed = True
+
+        for token in tokenizer.feed(chunk):
+            # A tokenizer fail-open is DATA, not another chance to interpret ESC.
+            raw = _literalize_control_data(token.raw) if token.literal else token.raw
+            if token.kind == "dcs":
+                continue                         # opaque DCS never reaches pyte/mirror
+            if (token.kind == "csi" and token.final == "m"
+                    and token.parameters[:1] in "<>="):
+                continue                         # private SGR negotiation, display-inert
+            if (token.kind == "csi" and token.final == "u"
+                    and token.parameters[:1] in "<>=?"):
+                kitty_reply = self._apply_kitty_keyboard(token)
+                if kitty_reply is not None:
+                    replies.append(kitty_reply)
+                continue                         # effect first; never leak trailing "u"
+
+            csi_query = self._is_csi_query(token)
+            if token.kind == "csi" and not csi_query:
+                self._apply_dec_private(token)
+            osc_reply = (
+                self._osc_side_effect(token, deferred_ui=deferred_ui)
+                if token.kind == "osc" else None
+            )
+            # Keep the reader-side tee byte-faithful.  Host-owned queries are
+            # removed by the mirror hub's drain-side C1-aware strip regex.
+            stage(raw)
+
+            # A cursor report must include all preceding presentation, including a
+            # retained synchronized frame, but never trailing presentation.
+            if self._is_cursor_query(token):
+                flush_stager("pending-query")
+                present_ready()
+            reply = osc_reply if osc_reply is not None else self._csi_query_reply(token)
+            if reply is not None:
+                replies.append(reply)
+
+        present_ready()
+        if replies:
+            response = "".join(replies)
+            self._queue_or_marshal(
+                lambda r=response: self._send_to_child(r), deferred_ui)
         return changed
 
-    def _feed_presentation_unit(self, chunk: str) -> None:
-        """Feed one complete unit to pyte, answering each DSR-6 AT ITS POSITION.
-
-        A real terminal replies with the cursor as of the query. Answering once the
-        whole unit is drawn reports wherever the trailing output left the cursor, so
-        a shell-integration wrap probe followed by buffered output in the same PTY
-        write computes the wrong prompt row. Splitting the feed is invisible to the
-        UI: the pane repaint and the IME anchor observe pyte only after _consume
-        returns, so the unit still lands atomically as far as they can tell.
-        (#term-queries)"""
-        replies = []
-        pos = 0
-        for _m in _POSITIONAL_QUERY_RE.finditer(chunk):
-            _mode = _m.group(3)
-            if _mode is None and _m.group(2) != "6":
-                continue                       # DSR-5 is state-free, answered early
-            self._consume_ready(chunk[pos:_m.end()])
-            if _mode is None:
-                row, col = self._cursor_rowcol()
-                replies.append(f"\x1b[{_m.group(1)}{row};{col}R")
-            else:
-                replies.append(f"\x1b[?{_mode};{self._decrqm_report(_mode)}$y")
-            pos = _m.end()
-        self._consume_ready(chunk[pos:])
-        if replies:
-            resp = "".join(replies)
-            self._marshal(lambda r=resp: self._send_to_child(r))
-
-    def _consume_ready(self, chunk: str) -> None:
+    def _consume_ready(self, chunk: str, deferred_ui=None) -> None:
         """Feed one complete presentation unit to pyte and its mirror."""
         if not chunk:
             return
@@ -2963,7 +3450,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 and (_now - getattr(self, "_last_classify_ts", 0.0)) < _CLASSIFY_MIN_INTERVAL):
             self._last_classify_ts = _now
             _txt, _title = self._current_screen()
-            self._update_status(self._classify(_txt, _title))
+            status = self._classify(_txt, _title)
+            updater = self._update_status
+            if getattr(updater, "__func__", None) is AgentTerminal._update_status:
+                updater(status, deferred_ui=deferred_ui)
+            else:
+                updater(status)
         # A real BEL from the child (pyte distinguishes it from an OSC terminator):
         # ring the host bell — claude's attention signal / notification fallback.
         # Gated by SAIKAI_NO_BELL. (#bell)
@@ -2971,7 +3463,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if _scr is not None and getattr(_scr, "_bell_rang", False):
             _scr._bell_rang = False
             if not os.environ.get("SAIKAI_NO_BELL"):
-                self._marshal(lambda: self._ring_bell())
+                self._queue_or_marshal(self._ring_bell, deferred_ui)
 
     def _current_screen(self) -> tuple:
         """(visible text, title) under the lock. `title` is claude's OSC-0 title
@@ -3051,7 +3543,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         txt, title = self._current_screen()
         self._update_status(self._classify(txt, title))
 
-    def _update_status(self, new: str) -> None:
+    def _update_status(self, new: str, deferred_ui=None) -> None:
         """Debounce: a new status must persist >=2 ticks (reader OR host poll)
         before it flips (spinners momentarily clear the line and would otherwise
         flicker Idle<->Busy). Busy is reported immediately (responsiveness); the
@@ -3083,14 +3575,16 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                     self._pending_ticks = 0
                     fire = new
         if fire is not None and self._on_status and self.sid:
-            self._marshal(lambda: self._safe_status_cb(fire))   # marshal OUTSIDE the lock
+            self._queue_or_marshal(
+                lambda: self._safe_status_cb(fire), deferred_ui)
         # Leaving 'busy' = the agent storm ended and the prompt is stable. The
         # per-repaint anchor sync FROZE while busy (anti-fly), so settle it now onto
         # the resting prompt and flush. Marshalled to the UI thread (this runs on the
         # reader thread or the host poll); the sync no-ops off the focused/live pane.
         # (#agents-cursor)
         if fire is not None and fire not in ("busy", "dead"):
-            self._marshal(lambda: self._sync_terminal_cursor(reason="settle"))
+            self._queue_or_marshal(
+                lambda: self._sync_terminal_cursor(reason="settle"), deferred_ui)
 
     def _set_status(self, status: str) -> None:
         self._status = status
@@ -3106,6 +3600,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     def _finalize(self) -> None:
         """Reader-thread teardown: mark dead, notify the host (on the UI
         thread), repaint once more so the final frame is shown."""
+        self._retire_sync_deadline()
         if not self.is_dead:
             _log(f"exit: sid={(getattr(self, 'sid', None) or '?')[:8]} (agent ended)")
         self.is_dead = True
@@ -3143,6 +3638,26 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if getattr(self, "_refresh_pending", False):
             return
         self._refresh_pending = True
+        # Timeout expiry must schedule its repaint before relinquishing the
+        # presentation-order fence, so retirement can linearize after it.  A
+        # blocking call_from_thread here would deadlock if the UI thread were
+        # simultaneously in kill()/retire waiting for that fence.  Textual's
+        # call_later is backed by thread-safe post_message and does not wait for
+        # the UI callback to run.
+        dispatch_lock = getattr(self, "_sync_dispatch_lock", None)
+        try:
+            dispatch_owned = bool(
+                dispatch_lock is not None and dispatch_lock._is_owned())
+        except Exception:
+            dispatch_owned = False
+        if dispatch_owned:
+            try:
+                if self.call_later(self._do_pane_refresh):
+                    return
+            except Exception:
+                pass
+            self._refresh_pending = False
+            return
         self._marshal(self._do_pane_refresh)
 
     def _do_pane_refresh(self) -> None:   # runs on the UI thread
@@ -3282,11 +3797,17 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         pane only ever holds frame-final state, so tracking stays correct through a
         storm and CJK typed into a generating pane keeps its anchor. (#ime-midframe)"""
         stager = getattr(self, "_sync_output", None)
-        if stager is not None and stager.torn_at(now):
+        torn = atomic = False
+        if stager is not None:
+            self._ensure_sync_deadline_state()
+            with self._sync_lock:
+                torn = stager.torn_at(now)
+                atomic = stager.atomic_at(now)
+        if torn:
             return True
         if getattr(self, "_status", None) != "busy":
             return False
-        return not (stager is not None and stager.atomic_at(now))
+        return not (stager is not None and atomic)
 
     def _sync_terminal_cursor(self, reason: str = "repaint", now=None) -> None:
         """Anchor the real (hidden) terminal cursor at claude's cursor cell so the
@@ -3509,6 +4030,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         thread below escalates to SIGKILL if needed and closes the pty safely
         off-thread."""
         self._stop.set()
+        self._retire_sync_deadline()
         # Drop anything still queued for the writer: the pane is going away, and a
         # writer blocked on a dying pty should retire instead of draining. (#paste-block)
         lock = getattr(self, "_write_lock", None)

@@ -824,6 +824,52 @@ def test_encode_key_meta_and_release():
         assert rt.RELEASE_FOCUS_KEY == "ctrl+right_square_bracket"
 
 
+def test_encode_key_honours_decckm_kitty_and_legacy_alt_character():
+    """Negotiated input state changes encoding without changing legacy defaults."""
+    app = {"application_cursor": True}
+    assert rt.encode_key("up", None, **app) == "\x1bOA"
+    assert rt.encode_key("down", None, **app) == "\x1bOB"
+    assert rt.encode_key("right", None, **app) == "\x1bOC"
+    assert rt.encode_key("left", None, **app) == "\x1bOD"
+    assert rt.encode_key("home", None, **app) == "\x1bOH"
+    assert rt.encode_key("end", None, **app) == "\x1bOF"
+    assert rt.encode_key("ctrl+left", None, **app) == "\x1b[1;5D"
+
+    assert rt.encode_key("ctrl+a", None, kitty_flags=1) == "\x1b[97;5u"
+    assert rt.encode_key(
+        "alt+exclamation_mark", "!", kitty_flags=1) == "\x1b[33;3u"
+    assert rt.encode_key("x", "x", kitty_flags=8) == "x"
+    assert rt.encode_key("shift+enter", None, kitty_flags=1) == "\x1b[13;2u"
+
+    # Without negotiation, Meta uses the delivered character rather than the
+    # Textual key name so punctuation and shifted symbols survive.
+    assert rt.encode_key("alt+exclamation_mark", "!") == "\x1b!"
+    assert rt.encode_key("alt+question_mark", "?") == "\x1b?"
+
+
+def test_kitty_disambiguate_encodes_supported_key_classes_canonically():
+    """Flag 1 covers keys Textual preserves without claiming report-all."""
+    disambiguate = {"kitty_flags": 1}
+    assert rt.encode_key("escape", None, **disambiguate) == "\x1b[27u"
+    assert rt.encode_key("enter", None, **disambiguate) == "\r"
+    assert rt.encode_key("tab", None, **disambiguate) == "\t"
+    assert rt.encode_key("backspace", None, **disambiguate) == "\x7f"
+
+    assert rt.encode_key("up", None, **disambiguate) == "\x1b[A"
+    assert rt.encode_key(
+        "up", None, application_cursor=True, **disambiguate) == "\x1b[A"
+    assert rt.encode_key("f1", None, **disambiguate) == "\x1b[P"
+    assert rt.encode_key("f3", None, **disambiguate) == "\x1b[13~"
+    assert rt.encode_key("f5", None, **disambiguate) == "\x1b[15~"
+    assert rt.encode_key("f13", None, **disambiguate) == "\x1b[57376u"
+
+    assert rt.encode_key("x", "x", **disambiguate) == "x"
+    assert rt.encode_key("shift+x", "X", **disambiguate) == "X"
+    assert rt.encode_key("ctrl+a", None, **disambiguate) == "\x1b[97;5u"
+    assert rt.encode_key(
+        "alt+exclamation_mark", "!", **disambiguate) == "\x1b[33;3u"
+
+
 def test_configure_release_focus_key_restores_old_key():
     old = rt.RELEASE_FOCUS_KEY
     try:
@@ -1440,6 +1486,340 @@ def test_sync_output_stager_bounds_and_flushes_once():
     assert s.flush("eof") == []
 
 
+def test_quiet_sync_frame_expires_without_another_push_and_repaints_once():
+    """A child can go quiet after BSU; timeout must not depend on a later read."""
+    import pyte
+
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    terminal._screen = rt._HistoryScreenBase(30, 4, history=20)
+    terminal._stream = pyte.Stream(terminal._screen)
+    terminal._sync_output = rt._SynchronizedOutputStager(max_age=0.03)
+    terminal._marshal = lambda fn: fn()
+    repainted = threading.Event()
+    repaints = []
+    original_consume_ready = terminal._consume_ready
+
+    def consume_ready_outside_sync_lock(text):
+        acquired = terminal._sync_lock.acquire(blocking=False)
+        assert acquired, "deadline fed pyte while holding the stager lock"
+        terminal._sync_lock.release()
+        original_consume_ready(text)
+
+    def repaint_outside_sync_lock():
+        acquired = terminal._sync_lock.acquire(blocking=False)
+        assert acquired, "deadline scheduled UI work while holding the stager lock"
+        terminal._sync_lock.release()
+        repaints.append(True)
+        repainted.set()
+
+    terminal._consume_ready = consume_ready_outside_sync_lock
+    terminal._schedule_pane_refresh = repaint_outside_sync_lock
+    try:
+        assert terminal._consume("\x1b[?2026hquiet") is False
+        assert repainted.wait(1.0), "quiet synchronized frame never failed open"
+        assert "quiet" in "\n".join(rt._pyte_grid_lines(terminal._screen))
+        assert terminal._sync_output.active is False
+        time.sleep(0.08)
+        assert repaints == [True], "one deadline must repaint exactly once"
+    finally:
+        terminal._retire_sync_deadline()
+
+
+def test_sync_deadline_generation_prevents_close_timeout_double_feed():
+    """A stale deadline loses both sides of the close/timeout race."""
+    import pyte
+
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    terminal._screen = rt._HistoryScreenBase(30, 4, history=20)
+    terminal._stream = pyte.Stream(terminal._screen)
+    terminal._sync_output = rt._SynchronizedOutputStager(max_age=60.0)
+    terminal._marshal = lambda fn: fn()
+    fed = []
+    terminal._consume_ready = fed.append
+    terminal._schedule_pane_refresh = lambda: None
+    try:
+        terminal._consume("\x1b[?2026hA")
+        stale_generation = terminal._sync_deadline_generation
+        terminal._consume("B\x1b[?2026l")
+        assert len(fed) == 1 and "AB" in fed[0]
+        assert terminal._expire_sync_output(stale_generation) is False
+        assert len(fed) == 1, "stale timeout fed the clean frame twice"
+
+        terminal._sync_output = rt._SynchronizedOutputStager(max_age=60.0)
+        fed.clear()
+        terminal._consume("\x1b[?2026hC")
+        due_generation = terminal._sync_deadline_generation
+        # Make the explicit race leg due without sleeping for the real max age.
+        with terminal._sync_lock:
+            terminal._sync_output._opened_at = time.monotonic() - 61.0
+        with terminal._sync_deadline_condition:
+            terminal._sync_deadline_at = time.monotonic() - 1.0
+            terminal._sync_deadline_opened_at = terminal._sync_output._opened_at
+        assert terminal._expire_sync_output(due_generation) is True
+        terminal._consume("D\x1b[?2026l")
+        assert len(fed) == 2
+        assert "".join(fed).count("C") == 1 and "".join(fed).count("D") == 1
+        assert terminal._expire_sync_output(due_generation) is False
+    finally:
+        terminal._retire_sync_deadline()
+
+
+def test_old_sync_deadline_cannot_flush_a_newly_opened_frame():
+    """Revalidate frame identity after the deadline waits for the stager lock."""
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    terminal._sync_output = rt._SynchronizedOutputStager(max_age=60.0)
+    terminal._consume_ready = lambda _text: None
+    terminal._schedule_pane_refresh = lambda: None
+    terminal._marshal = lambda fn: fn()
+    terminal._consume("\x1b[?2026hold")
+    old_generation = terminal._sync_deadline_generation
+    old_opened_at = terminal._sync_output._opened_at
+    result = []
+
+    # Hold the stager lock, let the deadline pass its condition check, then
+    # replace the old frame with a new one before the deadline can acquire it.
+    terminal._sync_lock.acquire()
+    try:
+        with terminal._sync_deadline_condition:
+            terminal._sync_deadline_at = time.monotonic() - 1.0
+            terminal._sync_deadline_opened_at = old_opened_at
+        expirer = threading.Thread(
+            target=lambda: result.append(
+                terminal._expire_sync_output(old_generation)))
+        expirer.start()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with terminal._sync_deadline_condition:
+                if terminal._sync_deadline_at is None:
+                    break
+            time.sleep(0.001)
+        else:
+            raise AssertionError("deadline did not reach the stager-lock barrier")
+
+        terminal._sync_output.push("\x1b[?2026l")
+        terminal._sync_output.push("\x1b[?2026hnew")
+        with terminal._sync_deadline_condition:
+            terminal._sync_deadline_generation += 1
+            terminal._sync_deadline_at = time.monotonic() + 60.0
+            terminal._sync_deadline_opened_at = terminal._sync_output._opened_at
+    finally:
+        terminal._sync_lock.release()
+    expirer.join(timeout=1.0)
+    try:
+        assert result == [False]
+        assert terminal._sync_output.active is True
+        assert "new" in "".join(terminal._sync_output._parts)
+    finally:
+        terminal._retire_sync_deadline()
+
+
+def test_sync_deadline_cannot_overtake_reader_local_presentation():
+    """Timeout presentation and reader presentation share one ordering owner."""
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    terminal._sync_output = rt._SynchronizedOutputStager(max_age=0.03)
+    terminal._marshal = lambda fn: fn()
+    terminal._schedule_pane_refresh = lambda: None
+    fed = []
+
+    def consume_ready(text):
+        fed.append(text)
+
+    original_osc = terminal._osc_side_effect
+
+    def slow_osc(token, deferred_ui=None):
+        time.sleep(0.08)
+        return original_osc(token, deferred_ui=deferred_ui)
+
+    terminal._consume_ready = consume_ready
+    terminal._osc_side_effect = slow_osc
+    try:
+        terminal._consume(
+            "\x1b[?2026hA\x1b[?2026l"
+            "\x1b[?2026hB"
+            "\x1b]9;notice\x07"
+        )
+        assert fed[0] == "\x1b[?2026hA\x1b[?2026l", fed
+    finally:
+        terminal._retire_sync_deadline()
+
+
+def test_retired_sync_deadline_cannot_feed_or_repaint_in_flight():
+    """Retirement is revalidated after an expiry waits for `_sync_lock`."""
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    terminal._sync_output = rt._SynchronizedOutputStager(max_age=60.0)
+    fed, repaints, result = [], [], []
+    terminal._consume_ready = fed.append
+    terminal._schedule_pane_refresh = lambda: repaints.append(True)
+    terminal._marshal = lambda fn: fn()
+    terminal._consume("\x1b[?2026hpartial")
+    generation = terminal._sync_deadline_generation
+
+    with terminal._sync_lock:
+        terminal._sync_output._opened_at = time.monotonic() - 61.0
+        with terminal._sync_deadline_condition:
+            terminal._sync_deadline_at = time.monotonic() - 1.0
+            terminal._sync_deadline_opened_at = terminal._sync_output._opened_at
+        expirer = threading.Thread(
+            target=lambda: result.append(
+                terminal._expire_sync_output(generation)))
+        expirer.start()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with terminal._sync_deadline_condition:
+                if terminal._sync_deadline_at is None:
+                    break
+            time.sleep(0.001)
+        else:
+            raise AssertionError("expiry did not reach the sync-lock barrier")
+        terminal._retire_sync_deadline()
+
+    expirer.join(timeout=1.0)
+    assert result == [False]
+    assert fed == []
+    assert repaints == []
+
+
+def test_sync_deadline_retire_linearizes_with_authorized_flush():
+    """If expiry already owns dispatch, retirement waits through feed/repaint."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    class GateStager(rt._SynchronizedOutputStager):
+        gate_active = False
+
+        @property
+        def active(self):
+            if self.gate_active:
+                entered.set()
+                assert release.wait(1.0), "test did not release the active barrier"
+            return super().active
+
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    terminal._sync_output = GateStager(max_age=60.0)
+    order, result = [], []
+    terminal._consume_ready = lambda _text: order.append("feed")
+    terminal._schedule_pane_refresh = lambda: order.append("repaint")
+    terminal._marshal = lambda fn: fn()
+    terminal._consume("\x1b[?2026hpartial")
+    generation = terminal._sync_deadline_generation
+    with terminal._sync_lock:
+        terminal._sync_output._opened_at = time.monotonic() - 61.0
+        terminal._sync_output.gate_active = True
+        with terminal._sync_deadline_condition:
+            terminal._sync_deadline_at = time.monotonic() - 1.0
+            terminal._sync_deadline_opened_at = terminal._sync_output._opened_at
+
+    expirer = threading.Thread(
+        target=lambda: result.append(terminal._expire_sync_output(generation)))
+    expirer.start()
+    assert entered.wait(1.0), "expiry did not reach the final active check"
+
+    retired = threading.Event()
+
+    def retire():
+        terminal._retire_sync_deadline()
+        order.append("retired")
+        retired.set()
+
+    retire_thread = threading.Thread(target=retire)
+    retire_thread.start()
+    assert not retired.wait(0.05), (
+        "retirement returned while an authorized expiry could still present")
+    release.set()
+    expirer.join(timeout=1.0)
+    retire_thread.join(timeout=1.0)
+
+    assert not expirer.is_alive() and not retire_thread.is_alive()
+    assert result == [True]
+    assert order == ["feed", "repaint", "retired"], order
+
+
+def test_protocol_marshalling_runs_after_sync_dispatch_unlocks():
+    """A UI-thread kill may wait for dispatch only if dispatch never marshals."""
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    sent, lock_owned = [], []
+    terminal._send_to_child = sent.append
+    terminal._consume_ready = lambda _text: None
+
+    def marshal(fn):
+        lock_owned.append(terminal._sync_dispatch_lock._is_owned())
+        fn()
+
+    terminal._marshal = marshal
+    notes = []
+    terminal._safe_notify = notes.append
+    terminal._consume("\x1b[5n\x1b]9;done\x07")
+    terminal._retire_sync_deadline()
+
+    assert sent == ["\x1b[0n"]
+    assert notes == ["done"]
+    assert lock_owned and not any(lock_owned), lock_owned
+
+
+def test_deadline_repaint_posts_without_blocking_under_dispatch_lock():
+    """Expiry may fence repaint scheduling, but must not call_from_thread there."""
+    terminal = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    terminal._sync_dispatch_lock = threading.RLock()
+    terminal._refresh_pending = False
+    queued = []
+    terminal.call_later = lambda callback: queued.append(callback) or True
+    terminal._marshal = lambda _fn: (_ for _ in ()).throw(
+        AssertionError("blocking marshal under dispatch lock"))
+    terminal._do_pane_refresh = lambda: None
+
+    with terminal._sync_dispatch_lock:
+        terminal._schedule_pane_refresh()
+        terminal._schedule_pane_refresh()
+
+    assert queued == [terminal._do_pane_refresh]
+
+
+def test_c1_sync_markers_stage_until_close():
+    """Task 1 recognizes C1 CSI, so DEC 2026 must not depend on 7-bit spelling."""
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    fed = []
+    terminal._consume_ready = fed.append
+    terminal._schedule_pane_refresh = lambda: None
+    terminal._marshal = lambda fn: fn()
+    try:
+        assert terminal._consume("\x9b?2026hpartial") is False
+        assert terminal._sync_output.active is True
+        assert fed == []
+        assert terminal._consume("done\x9b?2026l") is True
+        assert "partialdone" in fed[-1]
+    finally:
+        terminal._retire_sync_deadline()
+
+
+def test_sync_deadline_uses_one_worker_for_170k_frames():
+    """A normal agent session's frame count must not create Timer/thread churn."""
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    terminal._sync_output = rt._SynchronizedOutputStager(max_age=60.0)
+    terminal._consume_ready = lambda _text: None
+    terminal._marshal = lambda fn: fn()
+    try:
+        for _ in range(170_000):
+            terminal._consume("\x1b[?2026h\x1b[?2026l")
+        worker = terminal._sync_deadline_worker
+        assert worker is not None and worker.is_alive()
+        assert terminal._sync_deadline_workers_started == 1
+    finally:
+        terminal._retire_sync_deadline()
+        worker = getattr(terminal, "_sync_deadline_worker", None)
+        if worker is not None:
+            worker.join(timeout=1.0)
+            assert not worker.is_alive()
+
+
 def test_sync_output_bypass_rearms_and_atomicity_decays():
     """Neither 'this pane delivers atomic frames' nor 'this pane is mid-tear' may be
     a permanent latch — the IME anchor's freeze decision reads both.
@@ -1512,7 +1892,7 @@ def test_static_query_answers_before_sync_block_closes():
     t._marshal = lambda fn: fn()
 
     assert t._consume("\x1b[?2026h\x1b[c") is False
-    assert sent == ["\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c"]
+    assert sent == ["\x1b[?62;22c"]
 
 
 def test_cursor_query_fail_opens_sync_block_then_reports_new_cursor():
@@ -2153,12 +2533,81 @@ def test_honor_osc52_decodes_and_copies():
     import base64
     t = rt.AgentTerminal.__new__(rt.AgentTerminal)
     copied = []
-    t._copy_text = lambda s: copied.append(s)
+    t._copy_osc52_if_allowed = copied.append
     t._marshal = lambda fn: fn()                 # run the marshalled copy inline
     t._honor_osc52(base64.b64encode("hello ぺ".encode()).decode())
     assert copied == ["hello ぺ"], copied
     t._honor_osc52("?"); t._honor_osc52("")      # read query / empty → no copy
     assert copied == ["hello ぺ"], copied
+
+
+class _OSC52GatePane(rt.AgentTerminal):
+    @property
+    def app(self):
+        return self._test_app
+
+    @property
+    def screen(self):
+        return self._test_screen
+
+    @property
+    def is_attached(self):
+        return self._test_attached
+
+    @property
+    def display(self):
+        return self._test_display
+
+
+def _osc52_gate_pane():
+    pane = _OSC52GatePane.__new__(_OSC52GatePane)
+    pane._pty = object()
+    pane.is_dead = False
+    pane._test_attached = True
+    pane._test_display = True
+    pane._test_screen = type(
+        "Screen", (), {"focused": pane, "is_active": True})()
+    pane._test_app = type(
+        "App", (), {"screen": pane._test_screen, "app_focus": True})()
+    pane._vt_tokenizer = rt.VTTokenizer()
+    pane._sync_output = rt._SynchronizedOutputStager()
+    pane._consume_ready = lambda _text: None
+    pane._marshal = lambda fn: fn()
+    pane.copied = []
+    pane._copy_text = pane.copied.append
+    return pane
+
+
+def test_osc52_split_write_is_gated_by_live_visible_active_focus():
+    """Only the active, attached, visible, focused live pane may write clipboard."""
+    import base64
+
+    b64 = base64.b64encode("clip".encode()).decode()
+    for terminator in ("\x07", "\x1b\\"):
+        raw = f"\x1b]52;c;{b64}{terminator}"
+        for split_at in range(len(raw) + 1):
+            pane = _osc52_gate_pane()
+            pane._consume(raw[:split_at])
+            pane._consume(raw[split_at:])
+            assert pane.copied == ["clip"], (terminator, split_at, pane.copied)
+
+    cases = {
+        "background": lambda pane: setattr(
+            pane._test_screen, "focused", object()),
+        "hidden": lambda pane: setattr(pane, "_test_display", False),
+        "detached": lambda pane: setattr(pane, "_test_attached", False),
+        "dead": lambda pane: setattr(pane, "is_dead", True),
+        "inactive-screen": lambda pane: setattr(
+            pane._test_screen, "is_active", False),
+        "inactive-app": lambda pane: setattr(
+            pane._test_app, "app_focus", False),
+        "not-live": lambda pane: setattr(pane, "_pty", None),
+    }
+    for name, mutate in cases.items():
+        pane = _osc52_gate_pane()
+        mutate(pane)
+        pane._consume(f"\x1b]52;c;{b64}\x07")
+        assert pane.copied == [], f"{name} pane wrote host/mirror clipboard"
 
 
 def test_osc52_re_extracts_payload_and_needs_terminator():
@@ -2182,18 +2631,16 @@ def test_answer_queries_responds_to_terminal_probes():
     t._cursor_rowcol = lambda: (3, 7)
     def _one(q):
         sent.clear(); t._answer_queries(q); return sent[-1] if sent else None
-    # Primary DA: reply byte-identical to the outer Windows Terminal (VT500-class),
-    # so Claude Code sees the same terminal it does when run directly and uses its
-    # cursor-tracking path instead of parking the cursor. (#agents-cursor #wt-da)
-    assert _one("\x1b[c") == "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c"
-    assert _one("\x1b[0c") == "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c"
+    # Primary DA advertises only capabilities saikai actually implements.
+    assert _one("\x1b[c") == "\x1b[?62;22c"
+    assert _one("\x1b[0c") == "\x1b[?62;22c"
     assert _one("\x1b[?6n") == "\x1b[?3;7R"       # private cursor-position reply
     assert _one("\x1b[6n") == "\x1b[3;7R"         # standard cursor-position reply
     assert _one("\x1b[5n") == "\x1b[0n"           # device status OK
     assert _one("\x1b[?2026$p") == "\x1b[?2026;2$y"    # synchronized output, not in a block
     assert _one("\x1b[?1000$p") == "\x1b[?1000;2$y"    # implemented, currently reset
     assert _one("\x1b[?9999$p") == "\x1b[?9999;0$y"    # genuinely unknown mode
-    assert _one("\x1b[>0q") is None               # XTVERSION: silent, exactly like WT
+    assert _one("\x1b[>0q") == "\x1bP>|saikai\x1b\\"
     assert _one("\x1b]11;?\x07") == "\x1b]11;rgb:1e1e/1e1e/1e1e\x07"  # bg (dark)
     assert _one("\x1b]10;?\x07") == "\x1b]10;rgb:c0c0/c0c0/c0c0\x07"  # fg (light)
     # The reply must carry the terminator the child ASKED with: an ST-terminated
@@ -2211,7 +2658,7 @@ def test_answer_queries_responds_to_terminal_probes():
     # "answer everything you know, then this sentinel" shape — got the sentinel
     # first and a strict parser mismatched every reply after it. (#term-queries)
     assert _one("\x1b]11;?\x07\x1b[>c\x1b[c") == (
-        "\x1b]11;rgb:1e1e/1e1e/1e1e\x07" "\x1b[>0;10;1c" "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c")
+        "\x1b]11;rgb:1e1e/1e1e/1e1e\x07" "\x1b[>0;10;1c" "\x1b[?62;22c")
     sent.clear(); t._answer_queries("plain \x1b[1m bold \x1b[0m"); assert sent == []
 
 
@@ -2228,6 +2675,29 @@ def test_osc_notification_parsing_and_notify_host():
     t._marshal = lambda fn: fn()
     t._notify_host("  hi  "); assert notes == ["hi"]
     t._notify_host("   "); assert notes == ["hi"]                       # empty → no toast
+
+
+def test_osc_notifications_dispatch_once_at_every_bel_st_split():
+    """Complete OSC assembly, not the PTY chunk boundary, controls notification."""
+    cases = (
+        ("\x1b]9;Task done{term}", "Task done"),
+        ("\x1b]777;notify;Title;Body{term}", "Title: Body"),
+        ("\x1b]99;i=1:d=0:p=title;Hello{term}", "Hello"),
+    )
+    for template, expected in cases:
+        for terminator in ("\x07", "\x1b\\"):
+            raw = template.format(term=terminator)
+            for split_at in range(len(raw) + 1):
+                terminal = rt.AgentTerminal(
+                    ["agent"], status_classifier=lambda _text, _title: "idle")
+                terminal._consume_ready = lambda _text: None
+                terminal._marshal = lambda fn: fn()
+                notes = []
+                terminal._notify_host = notes.append
+                terminal._consume(raw[:split_at])
+                terminal._consume(raw[split_at:])
+                assert notes == [expected], (
+                    template, terminator, split_at, notes)
 
 
 
@@ -2274,6 +2744,40 @@ def test_mirror_tee_orders_seed_before_stream_verbatim():
     term.detach_mirror()
     term._consume("after-detach")
     assert events == [], "detach must stop the tee"
+
+
+def test_c1_queries_reply_once_and_never_reach_mirror_presentation():
+    """C1 queries tee raw, then the mirror drain removes them before xterm."""
+    import pyte
+
+    terminal = rt.AgentTerminal(
+        ["agent"], status_classifier=lambda _text, _title: "idle")
+    terminal._screen = rt._HistoryScreenBase(40, 8, history=20)
+    terminal._stream = pyte.Stream(terminal._screen)
+    terminal._sync_output = rt._SynchronizedOutputStager()
+    sent, mirrored = [], []
+    terminal._send_to_child = sent.append
+    terminal._marshal = lambda fn: fn()
+    terminal._mirror_tee = mirrored.append
+    terminal._consume(
+        "\x9b3;7H"
+        "\x9b6n"
+        "\x9b?2026$p"
+        "\x9d11;?\x9c"
+    )
+    assert "".join(sent) == (
+        "\x1b[3;7R"
+        "\x1b[?2026;2$y"
+        "\x1b]11;rgb:1e1e/1e1e/1e1e\x9c"
+    )
+    tee_stream = "".join(mirrored)
+    assert tee_stream == (
+        "\x9b3;7H"
+        "\x9b6n"
+        "\x9b?2026$p"
+        "\x9d11;?\x9c"
+    )
+    assert rt._MIRROR_QUERY_STRIP_RE.sub("", tee_stream) == "\x9b3;7H"
 
 
 def test_mirror_seed_and_tee_are_lock_consistent():
@@ -2627,10 +3131,14 @@ def test_ime_anchor_default_on_keeps_windows_caret_render_guard():
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
     print("PASS test_osc_notification_parsing_and_notify_host")
+    test_osc_notifications_dispatch_once_at_every_bel_st_split()
+    print("PASS test_osc_notifications_dispatch_once_at_every_bel_st_split")
     test_answer_queries_responds_to_terminal_probes()
     print("PASS test_answer_queries_responds_to_terminal_probes")
     test_honor_osc52_decodes_and_copies()
     print("PASS test_honor_osc52_decodes_and_copies")
+    test_osc52_split_write_is_gated_by_live_visible_active_focus()
+    print("PASS test_osc52_split_write_is_gated_by_live_visible_active_focus")
     test_osc52_re_extracts_payload_and_needs_terminator()
     print("PASS test_osc52_re_extracts_payload_and_needs_terminator")
     test_consume_collapses_alt_screen_reset_amplification()
@@ -2705,6 +3213,10 @@ if __name__ == "__main__":
     print("PASS test_status_classifier_profiles_and_injection")
     test_encode_key_meta_and_release()
     print("PASS test_encode_key_meta_and_release")
+    test_encode_key_honours_decckm_kitty_and_legacy_alt_character()
+    print("PASS test_encode_key_honours_decckm_kitty_and_legacy_alt_character")
+    test_kitty_disambiguate_encodes_supported_key_classes_canonically()
+    print("PASS test_kitty_disambiguate_encodes_supported_key_classes_canonically")
     test_configure_release_focus_key_restores_old_key()
     print("PASS test_configure_release_focus_key_restores_old_key")
     test_copy_text_uses_pbcopy_on_macos_before_osc52()
@@ -2723,6 +3235,8 @@ if __name__ == "__main__":
     print("PASS test_kitty_keyboard_csi_u_is_scrubbed")
     test_mirror_tee_orders_seed_before_stream_verbatim()
     print("PASS test_mirror_tee_orders_seed_before_stream_verbatim")
+    test_c1_queries_reply_once_and_never_reach_mirror_presentation()
+    print("PASS test_c1_queries_reply_once_and_never_reach_mirror_presentation")
     test_mirror_seed_and_tee_are_lock_consistent()
     print("PASS test_mirror_seed_and_tee_are_lock_consistent")
     test_mouse_tracking_is_one_exclusive_protocol_slot()
@@ -2763,6 +3277,26 @@ if __name__ == "__main__":
     print("PASS test_paste_marker_strip_is_linear_not_quadratic")
     test_sync_output_stager_bounds_and_flushes_once()
     print("PASS test_sync_output_stager_bounds_and_flushes_once")
+    test_quiet_sync_frame_expires_without_another_push_and_repaints_once()
+    print("PASS test_quiet_sync_frame_expires_without_another_push_and_repaints_once")
+    test_sync_deadline_generation_prevents_close_timeout_double_feed()
+    print("PASS test_sync_deadline_generation_prevents_close_timeout_double_feed")
+    test_old_sync_deadline_cannot_flush_a_newly_opened_frame()
+    print("PASS test_old_sync_deadline_cannot_flush_a_newly_opened_frame")
+    test_sync_deadline_cannot_overtake_reader_local_presentation()
+    print("PASS test_sync_deadline_cannot_overtake_reader_local_presentation")
+    test_retired_sync_deadline_cannot_feed_or_repaint_in_flight()
+    print("PASS test_retired_sync_deadline_cannot_feed_or_repaint_in_flight")
+    test_sync_deadline_retire_linearizes_with_authorized_flush()
+    print("PASS test_sync_deadline_retire_linearizes_with_authorized_flush")
+    test_protocol_marshalling_runs_after_sync_dispatch_unlocks()
+    print("PASS test_protocol_marshalling_runs_after_sync_dispatch_unlocks")
+    test_deadline_repaint_posts_without_blocking_under_dispatch_lock()
+    print("PASS test_deadline_repaint_posts_without_blocking_under_dispatch_lock")
+    test_c1_sync_markers_stage_until_close()
+    print("PASS test_c1_sync_markers_stage_until_close")
+    test_sync_deadline_uses_one_worker_for_170k_frames()
+    print("PASS test_sync_deadline_uses_one_worker_for_170k_frames")
     test_sync_output_next_open_frame_cannot_mutate_queued_complete_frame()
     print("PASS test_sync_output_next_open_frame_cannot_mutate_queued_complete_frame")
     test_static_query_answers_before_sync_block_closes()
