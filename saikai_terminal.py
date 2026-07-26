@@ -850,6 +850,10 @@ _SYNC_BUFFER_MAX_AGE = 0.2
 # actually hidden. Above the stager's max age so a fail-open frame's transient
 # hidden state can't trip it. (#ime-midframe)
 _NATIVE_CURSOR_HIDE_SETTLE = 0.5
+# Above this a PTY write is handed to the pane's writer thread instead of running on
+# the UI thread, where a full pty input queue would freeze the event loop. Keystrokes,
+# mouse reports and query replies are far below it and stay inline. (#paste-block)
+_PTY_INLINE_WRITE_MAX = 4096
 
 
 # Private modes saikai tracks, mapped to the attribute holding their current state,
@@ -1278,6 +1282,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._esc_carry = ""         # trailing partial escape held across read()s
         self._dcs_inside = False     # mid-DCS across read()s (sixel payload scrub)
         self._dcs_dropped = 0        # chars swallowed by the current DCS (runaway cap)
+        self._write_lock = threading.Lock()  # guards the PTY write queue below
+        self._write_q: list = []     # oversized writes waiting for the writer thread
+        self._writer = None          # daemon draining _write_q in order (#paste-block)
         self._sync_output = _SynchronizedOutputStager()
         self._osc52_carry = ""       # partial OSC 52 clipboard write held across read()s (base64 can span chunks)
         self._app_cursor = False     # ?1 DECCKM — replayed in the mirror seed so a
@@ -1522,7 +1529,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self.last_input_ts = time.monotonic()   # (#linux-state-regroup)
         self._snap_to_live()   # typing returns the view to the live bottom
         try:
-            self._pty.write(data)
+            self._write_child(data)
         except Exception:
             # Child went away between isalive() checks — mark dead, let the
             # reader's EOF path finalize.
@@ -1575,7 +1582,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 text = _wrap_bracketed_paste(text)
             self._snap_to_live()   # pasting returns the view to the live bottom
             try:
-                self._pty.write(text)
+                self._write_child(text)
             except Exception:
                 pass
             event.stop()
@@ -1591,7 +1598,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self.last_input_ts = time.monotonic()    # (#linux-state-regroup)
         self._snap_to_live()   # injected input returns the view to the live bottom
         try:
-            self._pty.write(text)
+            self._write_child(text)
         except Exception:
             pass
 
@@ -1601,7 +1608,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         self._snap_to_live()   # submitting returns the view to the live bottom
         try:
-            self._pty.write("\r")
+            self._write_child("\r")
         except Exception:
             pass
 
@@ -1614,7 +1621,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if self._pty is None or self.is_dead:
             return
         try:
-            self._pty.write("\x15")
+            self._write_child("\x15")
         except Exception:
             pass
 
@@ -1657,7 +1664,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         try:
             col, row = self._event_cell(event)
             btn = 64 if up else 65                           # wheel: 64 = up, 65 = down
-            self._pty.write(self._mouse_seq(btn, col, row, "M"))
+            self._write_child(self._mouse_seq(btn, col, row, "M"))
             return True
         except Exception:
             return False
@@ -1848,10 +1855,10 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._fwd_last = (col, row)                     # for a synthetic release on cancel
             if self._mouse_sgr:                             # SGR: real button + 'm' on release
                 cb = base + motion + mods
-                self._pty.write(self._mouse_seq(cb, col, row, "m" if kind == "up" else "M"))
+                self._write_child(self._mouse_seq(cb, col, row, "m" if kind == "up" else "M"))
             else:                                           # X10: a release is button code 3
                 lb = (3 if kind == "up" else base) + motion + mods
-                self._pty.write(self._mouse_seq(lb, col, row, "M"))
+                self._write_child(self._mouse_seq(lb, col, row, "M"))
         except Exception:
             pass
 
@@ -2133,13 +2140,64 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if text:
             self._marshal(lambda t=text: self._copy_text(t))
 
+    def _write_child(self, data: str) -> None:
+        """Write to the PTY without ever blocking the UI thread on a full pty buffer.
+
+        A POSIX pty input queue is a few KiB, so a large paste into a child that is
+        momentarily not reading stdin blocks write() — and with it the whole Textual
+        event loop. Oversized writes go to a daemon writer instead; while that queue
+        drains every later write joins it, so the child still receives the bytes in
+        order. Small writes (keystrokes, mouse reports, query replies) stay inline,
+        which is the overwhelmingly common case. (#paste-block)"""
+        if not data or self._pty is None or self.is_dead:
+            return
+        lock = getattr(self, "_write_lock", None)
+        queue = getattr(self, "_write_q", None)
+        if lock is not None and queue is not None:
+            with lock:
+                # Queue while a writer is ALIVE, not merely while the queue is
+                # non-empty: it holds the popped item outside the queue for the whole
+                # blocking write, and an inline write during that window would reach
+                # the child first.
+                if (queue or getattr(self, "_writer", None) is not None
+                        or len(data) > _PTY_INLINE_WRITE_MAX):
+                    queue.append(data)
+                    if getattr(self, "_writer", None) is None:
+                        self._writer = threading.Thread(
+                            target=self._writer_loop,
+                            name=f"saikai-pty-write-{getattr(self, 'sid', '?')}",
+                            daemon=True)
+                        self._writer.start()
+                    return
+        try:
+            self._pty.write(data)
+        except Exception:
+            pass
+
+    def _writer_loop(self) -> None:
+        """Drain queued PTY writes off the UI thread, in order. (#paste-block)"""
+        while True:
+            with self._write_lock:
+                if not self._write_q:
+                    self._writer = None
+                    return
+                data = self._write_q.pop(0)
+            pty = self._pty
+            if pty is None:
+                continue
+            try:
+                pty.write(data)
+            except Exception:
+                pass
+
     def _send_to_child(self, data: str) -> None:
         """Write bytes to the child PTY (guarded). Called on the UI thread (via
-        _marshal) so a query reply can't interleave a concurrent keystroke."""
+        _marshal) so a query reply can't interleave a concurrent keystroke —
+        _write_child keeps that ordering even when a paste is still draining."""
         if self._pty is None or self.is_dead:
             return
         try:
-            self._pty.write(data)
+            self._write_child(data)
         except Exception:
             pass
 
@@ -2983,9 +3041,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 base = ((btn - 1) & 3) if btn else 3
                 try:
                     if self._mouse_sgr:
-                        self._pty.write(self._mouse_seq(base, col, row, "m"))
+                        self._write_child(self._mouse_seq(base, col, row, "m"))
                     else:                                 # X10 release = button 3
-                        self._pty.write(self._mouse_seq(3, col, row, "M"))
+                        self._write_child(self._mouse_seq(3, col, row, "M"))
                 except Exception:
                     pass
         self._fwd_buttons.clear()

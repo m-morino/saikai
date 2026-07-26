@@ -1502,6 +1502,60 @@ def test_cursor_report_uses_the_cursor_at_the_querys_stream_position():
     assert sent == ["\x1b[1;2R\x1b[5;6R"], sent  # each query at its own position
 
 
+def test_large_paste_never_blocks_the_ui_thread_and_keeps_order():
+    """A big paste must not freeze the whole TUI.
+
+    on_paste/paste_text write to the PTY synchronously on the UI thread, and a POSIX
+    pty input queue is a few KiB — so pasting tens of KiB into a pane whose child is
+    momentarily not reading stdin blocks write() and with it the Textual event loop:
+    no keys, no repaints, no other pane, until the child drains. Hand oversized
+    writes to a daemon writer, and queue everything behind it while it drains so the
+    child still receives the bytes in order. Small writes stay inline. (#paste-block)"""
+    import threading as _th
+    import time as _time
+
+    blocking = _th.Event()
+    release = _th.Event()
+    order = []
+
+    class _P:
+        def write(self, data):
+            if len(data) > 100:
+                blocking.set()
+                release.wait(3.0)
+            order.append(data)
+
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t._pty = _P()
+    t.is_dead = False
+    t._write_lock = _th.Lock()
+    t._write_q = []
+    t._writer = None
+
+    # small write: straight out, no thread, observable immediately
+    t._write_child("a")
+    assert order == ["a"], order
+
+    big = "x" * 20000
+    t0 = _time.monotonic()
+    t._write_child(big)
+    assert _time.monotonic() - t0 < 0.5, "an oversized write must not block the caller"
+    assert blocking.wait(3.0), "the writer thread must be draining the queue"
+
+    t._write_child("\r")          # arrives while the big write is stuck
+    release.set()
+    deadline = _time.monotonic() + 3.0
+    while len(order) < 3 and _time.monotonic() < deadline:
+        _time.sleep(0.01)
+    assert order == ["a", big, "\r"], [len(x) for x in order]
+
+    # queue drained -> the writer retires and small writes are inline again
+    deadline = _time.monotonic() + 3.0
+    while t._writer is not None and _time.monotonic() < deadline:
+        _time.sleep(0.01)
+    assert t._writer is None and t._write_q == []
+
+
 def test_dcs_payloads_never_reach_the_grid():
     """A DCS string (sixel image, DECRQSS, XTGETTCAP) must not print as text.
 
@@ -2544,6 +2598,8 @@ if __name__ == "__main__":
     print("PASS test_decrqm_reports_the_modes_saikai_actually_implements")
     test_dcs_payloads_never_reach_the_grid()
     print("PASS test_dcs_payloads_never_reach_the_grid")
+    test_large_paste_never_blocks_the_ui_thread_and_keeps_order()
+    print("PASS test_large_paste_never_blocks_the_ui_thread_and_keeps_order")
     test_cursor_query_fail_open_only_for_a_RETAINED_query()
     print("PASS test_cursor_query_fail_open_only_for_a_RETAINED_query")
     test_sync_output_eof_flushes_retained_frame_once()
