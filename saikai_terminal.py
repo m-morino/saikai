@@ -805,6 +805,7 @@ _OSC52_RE = re.compile(r"\x1b\]52;[^;]*;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)")
 # 133 / notifications / theme / synchronized output) and its alt-screen redraw probe
 # (private ?6n) can block. See _answer_queries. (#term-queries)
 _DA_RE = re.compile(r"\x1b\[0?c")                        # Primary Device Attributes
+_DA2_RE = re.compile(r"\x1b\[>0?c")                      # Secondary DA (vim t_RV, tmux)
 _DSR_RE = re.compile(r"\x1b\[(\??)([56])n")             # DSR: 5=status, 6=cursor position
 _DECRQM_RE = re.compile(r"\x1b\[\?(\d+)\$p")            # DECRQM (mode support query)
 _XTVERSION_RE = re.compile(r"\x1b\[>0?q")               # XTVERSION (terminal name/version)
@@ -821,10 +822,9 @@ _OSC_COLOR_Q_RE = re.compile(r"\x1b\](1[01]);\?(?:\x07|\x1b\\)")  # OSC 10/11 fg
 # saikai). Applied on the mirror hub's DRAIN thread via set_pane_strip — not on
 # the reader thread under the terminal lock.
 _MIRROR_QUERY_STRIP_RE = re.compile("|".join(
-    [p.pattern for p in (_DA_RE, _DSR_RE, _DECRQM_RE, _XTVERSION_RE,
+    [p.pattern for p in (_DA_RE, _DA2_RE, _DSR_RE, _DECRQM_RE, _XTVERSION_RE,
                          _OSC_COLOR_Q_RE)]
-    + [r"\x1b\[>0?c",                       # secondary DA (vim t_RV, tmux)
-       r"\x1b\[=0?c",                       # tertiary DA
+    + [r"\x1b\[=0?c",                       # tertiary DA
        r"\x1bP\$q[^\x07\x1b]*(?:\x07|\x1b\\)",   # DECRQSS
        r"\x1bP\+q[0-9a-fA-F;]*(?:\x07|\x1b\\)"]  # XTGETTCAP
 ))
@@ -845,6 +845,11 @@ _SYNC_BUFFER_MAX_AGE = 0.2
 _NATIVE_CURSOR_HIDE_SETTLE = 0.5
 
 
+def _has_cursor_query(text: str) -> bool:
+    """True if *text* contains a cursor-position report request (DSR 6)."""
+    return any(kind == "6" for _priv, kind in _DSR_RE.findall(text))
+
+
 class _SynchronizedOutputStager:
     """Hold DEC 2026 output until a complete frame is available."""
 
@@ -857,6 +862,7 @@ class _SynchronizedOutputStager:
         self._chars = 0
         self._opened_at = 0.0
         self._complete_frames = 0
+        self._cursor_query = False
 
     @property
     def active(self):
@@ -876,6 +882,14 @@ class _SynchronizedOutputStager:
         anchor uses this to keep tracking the caret through an output storm."""
         return self._complete_frames > 0 and self._state != "bypass"
 
+    @property
+    def pending_cursor_query(self):
+        """True when the RETAINED text holds a DSR-6. The child may be waiting for
+        that reply before it emits ?2026l, so the frame has to fail open — but only
+        for a query we are actually holding: a ?6n that arrived before the block
+        opened is answerable from the plain prefix and must not tear the frame."""
+        return self._cursor_query
+
     @staticmethod
     def _is_sync(match):
         return "2026" in match.group(1).split(";")
@@ -885,17 +899,21 @@ class _SynchronizedOutputStager:
         self._parts = [marker]
         self._chars = len(marker)
         self._opened_at = now
+        self._cursor_query = False
 
     def _append(self, text):
         if text:
             self._parts.append(text)
             self._chars += len(text)
+            if not self._cursor_query and _has_cursor_query(text):
+                self._cursor_query = True
 
     def _release(self, reason=None, bypass=False):
         text = "".join(self._parts)
         self._parts = []
         self._chars = 0
         self._opened_at = 0.0
+        self._cursor_query = False
         self._state = "bypass" if bypass else "outside"
         if reason is None and text:
             self._complete_frames += 1
@@ -2154,6 +2172,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # instead of tracking the input caret. Looking exactly like WT (which Claude
             # tracks correctly when run directly) is the fix. (#agents-cursor #wt-da)
             out.append("\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c")
+        if _DA2_RE.search(chunk):
+            # Secondary DA. A terminal that answers DA1 as WT must answer this too:
+            # vim's t_RV and tmux's handshake serialize DA1 then DA2, and silence
+            # stalls them for a probe timeout and then mis-detects version-gated
+            # features. WT's reply is "VT100, firmware 10, no cartridge". (#wt-da2)
+            out.append("\x1b[>0;10;1c")
         for _priv, _kind in _DSR_RE.findall(chunk):
             if _kind == "5":
                 out.append("\x1b[0n")                    # device status: OK
@@ -2281,19 +2305,40 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if sync_output is None:                 # compatibility with minimal test objects
             sync_output = self._sync_output = _SynchronizedOutputStager()
         units = sync_output.push(chunk)
-        cursor_query = any(kind == "6" for _private, kind in _DSR_RE.findall(chunk))
-        if cursor_query and sync_output.active:
+        if sync_output.active and sync_output.pending_cursor_query:
             units.extend(sync_output.flush("cursor-query"))
 
         changed = False
         for text, fail_reason in units:
             if fail_reason:
                 _log(f"sync-output fail-open: reason={fail_reason} chars={len(text)}")
-            self._consume_ready(text)
+            self._feed_presentation_unit(text)
             changed = True
-        if cursor_query:
-            self._answer_cursor_queries(chunk)
         return changed
+
+    def _feed_presentation_unit(self, chunk: str) -> None:
+        """Feed one complete unit to pyte, answering each DSR-6 AT ITS POSITION.
+
+        A real terminal replies with the cursor as of the query. Answering once the
+        whole unit is drawn reports wherever the trailing output left the cursor, so
+        a shell-integration wrap probe followed by buffered output in the same PTY
+        write computes the wrong prompt row. Splitting the feed is invisible to the
+        UI: the pane repaint and the IME anchor observe pyte only after _consume
+        returns, so the unit still lands atomically as far as they can tell.
+        (#term-queries)"""
+        replies = []
+        pos = 0
+        for _m in _DSR_RE.finditer(chunk):
+            if _m.group(2) != "6":
+                continue
+            self._consume_ready(chunk[pos:_m.end()])
+            row, col = self._cursor_rowcol()
+            replies.append(f"\x1b[{_m.group(1)}{row};{col}R")
+            pos = _m.end()
+        self._consume_ready(chunk[pos:])
+        if replies:
+            resp = "".join(replies)
+            self._marshal(lambda r=resp: self._send_to_child(r))
 
     def _consume_ready(self, chunk: str) -> None:
         """Feed one complete presentation unit to pyte and its mirror."""
@@ -2722,7 +2767,15 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         holding self._lock)."""
         if not _IME_ANCHOR:
             return
-        if Offset is None or self.is_dead or not self._is_focused_pane() or self._scroll != 0:
+        if Offset is None or self.is_dead or not self._is_focused_pane():
+            return
+        if self._scroll != 0:
+            # Scrolled back: the live prompt is off-view and the anchored cell now
+            # sits on unrelated history, so a bare return would leave the native
+            # cursor blinking there (and the IME opening there). Typing snaps the
+            # pane back to live and re-anchors. (#ime-scrollback)
+            self._show_hw_cursor(False)
+            self._anchored_xy = None
             return
         try:
             app = self.app

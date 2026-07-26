@@ -1478,6 +1478,60 @@ def test_cursor_query_fail_opens_sync_block_then_reports_new_cursor():
     assert t._sync_output.active is False
 
 
+def test_cursor_report_uses_the_cursor_at_the_querys_stream_position():
+    """A DSR-6 is answered with the cursor AS OF THE QUERY, not after the rest of the
+    chunk was drawn. One PTY write can carry 'prompt \\x1b[6n' plus the next lines of
+    buffered output; replying with the post-chunk position makes a shell-integration
+    wrap probe compute the wrong prompt row. Multiple queries in one chunk must each
+    get their own position. (#term-queries)"""
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(40, 8, history=20)
+    t._stream = pyte.Stream(t._screen)
+    t._sync_output = rt._SynchronizedOutputStager()
+    sent = []
+    t._send_to_child = lambda data: sent.append(data)
+    t._marshal = lambda fn: fn()
+
+    t._consume("\x1b[3;7HAB\x1b[6n\r\nnext line spills onto another row")
+    assert sent == ["\x1b[3;9R"], sent          # at the probe, not after 'next line'
+
+    sent.clear()
+    t._consume("\x1b[1;1HX\x1b[6n\x1b[5;5HY\x1b[6n")
+    assert sent == ["\x1b[1;2R\x1b[5;6R"], sent  # each query at its own position
+
+
+def test_cursor_query_fail_open_only_for_a_RETAINED_query():
+    """The fail-open that releases a staged frame early must fire only when the query
+    is inside the RETAINED text. A ?6n that arrives BEFORE the ?2026h in the same PTY
+    write is already answerable from the plain prefix, so tearing the just-opened
+    frame for it re-exposes the mid-frame state the stager exists to hide — and
+    claude's private-?6n redraw probe emits exactly probe-then-frame. (#2026)"""
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(40, 8, history=20)
+    t._stream = pyte.Stream(t._screen)
+    t._sync_output = rt._SynchronizedOutputStager()
+    sent = []
+    t._send_to_child = lambda data: sent.append(data)
+    t._marshal = lambda fn: fn()
+
+    # probe THEN a frame opens: answer the probe, keep staging (no tear).
+    t._consume("\x1b[2;3HP\x1b[6n\x1b[?2026h\x1b[?25l\x1b[Hpartial")
+    assert sent == ["\x1b[2;4R"], sent
+    assert t._sync_output.active is True, "the new frame must still be staged"
+    assert t._sync_output.torn is False
+
+    # a query INSIDE the retained frame still fails open (the child may be waiting
+    # on the reply before it emits ?2026l).
+    sent.clear()
+    t._consume("\x1b[6n")
+    assert sent and sent[0].endswith("R"), sent
+    assert t._sync_output.torn is True
+
+
 def test_sync_output_eof_flushes_retained_frame_once():
     import pyte
 
@@ -1842,6 +1896,11 @@ def test_answer_queries_responds_to_terminal_probes():
     assert _one("\x1b[>0q") is None               # XTVERSION: silent, exactly like WT
     assert _one("\x1b]11;?\x07") == "\x1b]11;rgb:1e1e/1e1e/1e1e\x07"  # bg (dark)
     assert _one("\x1b]10;?\x07") == "\x1b]10;rgb:c0c0/c0c0/c0c0\x07"  # fg (light)
+    # Secondary DA (vim's t_RV, tmux). A pane that claims to BE Windows Terminal must
+    # answer it — WT does. Leaving it silent stalls the child's probe until it times
+    # out and it then mis-detects version-gated features. (#wt-da2)
+    assert _one("\x1b[>c") == "\x1b[>0;10;1c"
+    assert _one("\x1b[>0c") == "\x1b[>0;10;1c"
     sent.clear(); t._answer_queries("plain \x1b[1m bold \x1b[0m"); assert sent == []
 
 
@@ -1888,11 +1947,13 @@ def test_mirror_tee_orders_seed_before_stream_verbatim():
     term._consume("plain \x1b[6n text \x1b[0c and \x1b[?2026$p done")
     tees = [d for k, d in events if k == "tee"]
     assert tees[0] == "\x1b[?1h"
-    # the tee passes the chunk VERBATIM — the child-query strip runs on the
-    # mirror hub's drain thread (set_pane_strip), never on the reader thread
-    # under the terminal lock (#review-strip-offload)
-    assert tees[1] == "plain \x1b[6n text \x1b[0c and \x1b[?2026$p done", \
-        f"tee must be verbatim (strip is drain-side): {tees[1]!r}"
+    # the tee passes the chunk's BYTES verbatim and in order — the child-query strip
+    # runs on the mirror hub's drain thread (set_pane_strip), never on the reader
+    # thread under the terminal lock (#review-strip-offload). Write boundaries are
+    # not part of the contract: a DSR-6 splits the pyte feed so the reply reports the
+    # cursor at the query, and the tee rides that feed. (#term-queries)
+    assert "".join(tees[1:]) == "plain \x1b[6n text \x1b[0c and \x1b[?2026$p done", \
+        f"tee must be verbatim (strip is drain-side): {tees[1:]!r}"
     assert term._app_cursor is True
     events.clear()
     term.mirror_reseed()                       # hub-requested reseed
@@ -2155,6 +2216,18 @@ def test_cursor_anchor_settles_hidden_and_tracks_atomic_frames():
         t._screen.cursor.x = 0; t._screen.cursor.y = 0        # mid-frame Home
         t._sync_terminal_cursor(now=200.1)
         assert t._app.cursor_position == rt.Offset(43, 7), "a torn frame must not move it"
+
+        # (4) scrolled back: the anchored cell now sits on unrelated history, so the
+        # native cursor must be HIDDEN and the anchor dropped — not left blinking
+        # mid-scrollback with the IME opening there. (#ime-scrollback)
+        t, writes = _term()
+        t._sync_terminal_cursor(now=300.0)
+        assert writes == ["\x1b[?25h"] and t._anchored_xy == (43, 7), writes
+        writes.clear()
+        t._scroll = 4
+        t._sync_terminal_cursor(now=300.1)
+        assert writes == ["\x1b[?25l"], writes
+        assert t._anchored_xy is None
     finally:
         rt._IS_WIN, rt._IME_ANCHOR, rt.Offset = old_win, old_anchor, old_offset
 
@@ -2345,6 +2418,10 @@ if __name__ == "__main__":
     print("PASS test_static_query_answers_before_sync_block_closes")
     test_cursor_query_fail_opens_sync_block_then_reports_new_cursor()
     print("PASS test_cursor_query_fail_opens_sync_block_then_reports_new_cursor")
+    test_cursor_report_uses_the_cursor_at_the_querys_stream_position()
+    print("PASS test_cursor_report_uses_the_cursor_at_the_querys_stream_position")
+    test_cursor_query_fail_open_only_for_a_RETAINED_query()
+    print("PASS test_cursor_query_fail_open_only_for_a_RETAINED_query")
     test_sync_output_eof_flushes_retained_frame_once()
     print("PASS test_sync_output_eof_flushes_retained_frame_once")
     test_sync_output_mirror_gets_closed_block_once_in_order()
