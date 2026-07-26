@@ -7,6 +7,7 @@ fields under test. Run:  python tests/test_terminal_concurrency.py
 import os
 import sys
 import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Headless harness: no terminal to watch, and the watchdog's os._exit on a
@@ -1335,6 +1336,24 @@ def test_paste_text_wraps_and_submits():
     assert writes == [], writes
 
 
+def test_paste_marker_strip_is_linear_not_quadratic():
+    """Reaching the fixed point must not cost a pass per marker.
+
+    Re-running the regex until the text stops changing removes only ONE marker per
+    pass for a nested chain (ESC[20 ESC[20 … 0~ 0~), so a 240KB clipboard of them is
+    O(n^2) — and the strip runs on the UI thread inside on_paste, freezing the whole
+    TUI for minutes. Strip in one scan instead. (#H3)"""
+    import time as _time
+
+    k = 40000
+    evil = "\x1b[20" * k + "0~" * k
+    t0 = _time.monotonic()
+    out = rt._strip_paste_markers(evil)
+    elapsed = _time.monotonic() - t0
+    assert "\x1b[200~" not in out and "\x1b[201~" not in out, "fixed point not reached"
+    assert elapsed < 2.0, f"quadratic strip: {len(evil)} chars took {elapsed:.1f}s"
+
+
 def test_bracketed_paste_strip_is_idempotent_across_seams():
     """Overlapping marker fragments must not re-form a marker at the deletion seam.
     A single sub() pass scans the ORIGINAL string, so '\\x1b[20' + '\\x1b[201~' + '1~'
@@ -1419,6 +1438,40 @@ def test_sync_output_stager_bounds_and_flushes_once():
     assert s.push("\x1b[?2026hlast", now=5.0) == []
     assert s.flush("eof") == [("\x1b[?2026hlast", "eof")]
     assert s.flush("eof") == []
+
+
+def test_sync_output_bypass_rearms_and_atomicity_decays():
+    """Neither 'this pane delivers atomic frames' nor 'this pane is mid-tear' may be
+    a permanent latch — the IME anchor's freeze decision reads both.
+
+    atomic said 'one frame ever closed cleanly', so a pane that ran claude once kept
+    the anti-fly freeze disabled for later UNBRACKETED output that pyte really does
+    hold mid-frame. torn was cleared only by a literal ?2026l, so an abandoned block
+    froze the anchor forever. Age both, and let a fresh ?2026h during a fail-open
+    restart staging: if the child really is re-setting an open block the remainder is
+    still released at the real close, and if it abandoned the old one the new frame
+    is staged properly. (#ime-midframe #2026)"""
+    s = rt._SynchronizedOutputStager(max_chars=1024, max_age=0.2)
+    assert s.push("\x1b[?2026hA\x1b[?2026l", now=1.0) == [("\x1b[?2026hA\x1b[?2026l", None)]
+    assert s.atomic_at(1.0) is True
+    assert s.atomic_at(1.0 + rt._SYNC_ATOMIC_TTL + 0.1) is False, "atomicity must age out"
+
+    assert s.push("\x1b[?2026hpartial", now=2.0) == []
+    torn_units = s.push("more", now=2.5)                  # > max_age -> fail-open
+    assert torn_units and torn_units[0][1] == "timeout", torn_units
+    assert s.torn_at(2.5) is True
+
+    units = s.push("\x1b[?2026hnext-frame", now=2.6)      # child starts a fresh frame
+    assert units == [], units
+    assert s.active is True, "a new BSU during bypass must re-arm staging"
+    assert s.torn_at(2.6) is False
+    closed = s.push("\x1b[?2026l", now=2.65)
+    assert closed and closed[0][1] is None, closed
+
+    s2 = rt._SynchronizedOutputStager(max_chars=8, max_age=5.0)
+    s2.push("\x1b[?2026habcdefghij", now=3.0)             # overflow fail-open
+    assert s2.torn_at(3.0) is True
+    assert s2.torn_at(3.0 + rt._SYNC_BYPASS_TTL + 0.1) is False, "bypass must age out"
 
 
 def test_sync_output_next_open_frame_cannot_mutate_queued_complete_frame():
@@ -1738,14 +1791,14 @@ def test_cursor_query_fail_open_only_for_a_RETAINED_query():
     t._consume("\x1b[2;3HP\x1b[6n\x1b[?2026h\x1b[?25l\x1b[Hpartial")
     assert sent == ["\x1b[2;4R"], sent
     assert t._sync_output.active is True, "the new frame must still be staged"
-    assert t._sync_output.torn is False
+    assert t._sync_output.torn_at(time.monotonic()) is False
 
     # a query INSIDE the retained frame still fails open (the child may be waiting
     # on the reply before it emits ?2026l).
     sent.clear()
     t._consume("\x1b[6n")
     assert sent and sent[0].endswith("R"), sent
-    assert t._sync_output.torn is True
+    assert t._sync_output.torn_at(time.monotonic()) is True
 
 
 def test_sync_output_eof_flushes_retained_frame_once():
@@ -2413,8 +2466,9 @@ def test_cursor_anchor_settles_hidden_and_tracks_atomic_frames():
 
         # (2) busy + atomic frames -> the anchor still TRACKS the caret.
         t, writes = _term(status="busy")
-        t._sync_output.push("\x1b[?2026hA\x1b[?2026l", now=1.0)   # one complete frame
-        assert t._sync_output.atomic is True and t._sync_output.torn is False
+        t._sync_output.push("\x1b[?2026hA\x1b[?2026l", now=199.9)  # one complete frame
+        assert t._sync_output.atomic_at(200.0) is True
+        assert t._sync_output.torn_at(200.0) is False
         t._sync_terminal_cursor(now=200.0)
         assert t._app.cursor_position == rt.Offset(43, 7)
         t._screen.cursor.x = 9
@@ -2423,26 +2477,29 @@ def test_cursor_anchor_settles_hidden_and_tracks_atomic_frames():
 
         # (2b) busy WITHOUT bracketed frames -> the storm freeze still applies.
         t, writes = _term(status="busy")
-        assert t._sync_output.atomic is False
+        assert t._sync_output.atomic_at(200.0) is False
         t._sync_terminal_cursor(now=200.0)
         assert getattr(t._app, "cursor_position", None) is None
 
         # (3) torn stager while merely 'waiting' -> freeze (mid-frame cursor).
         t, writes = _term(status="waiting")
-        t._sync_output.push("\x1b[?2026hA\x1b[?2026l", now=1.0)
-        t._sync_terminal_cursor(now=200.0)            # atomic: anchors normally
+        t._sync_output.push("\x1b[?2026hA\x1b[?2026l", now=199.5)
+        t._sync_terminal_cursor(now=199.6)            # atomic: anchors normally
         assert t._app.cursor_position == rt.Offset(43, 7)
-        t._sync_output.push("\x1b[?2026hpartial", now=2.0)
-        t._sync_output.push("more", now=2.5)          # > max_age -> fail-open -> bypass
-        assert t._sync_output.torn is True
+        t._sync_output.push("\x1b[?2026hpartial", now=199.7)
+        t._sync_output.push("more", now=200.0)        # > max_age -> fail-open -> bypass
+        assert t._sync_output.torn_at(200.05) is True
         t._screen.cursor.x = 0; t._screen.cursor.y = 0        # mid-frame Home
-        t._sync_terminal_cursor(now=200.1)
+        t._sync_terminal_cursor(now=200.05)
         assert t._app.cursor_position == rt.Offset(43, 7), "a torn frame must not move it"
 
         # (4) scrolled back: the anchored cell now sits on unrelated history, so the
         # native cursor must be HIDDEN and the anchor dropped — not left blinking
-        # mid-scrollback with the IME opening there. (#ime-scrollback)
+        # mid-scrollback with the IME opening there. Coming back to live must RESTORE
+        # it without waiting for output: the reader suppresses repaints while
+        # scrolled, so an idle pane would otherwise stay IME-dead. (#ime-scrollback)
         t, writes = _term()
+        t._screen.history = type("H", (), {"top": [0] * 50})()
         t._sync_terminal_cursor(now=300.0)
         assert writes == ["\x1b[?25h"] and t._anchored_xy == (43, 7), writes
         writes.clear()
@@ -2450,6 +2507,21 @@ def test_cursor_anchor_settles_hidden_and_tracks_atomic_frames():
         t._sync_terminal_cursor(now=300.1)
         assert writes == ["\x1b[?25l"], writes
         assert t._anchored_xy is None
+
+        writes.clear()
+        t._snap_to_live()                             # typing / paste returns to live
+        assert writes == ["\x1b[?25h"], writes
+        assert t._anchored_xy == (43, 7)
+
+        writes.clear()                                # wheeling back down, no input
+        t._scroll = 3
+        t._sync_terminal_cursor(now=300.2)
+        assert writes == ["\x1b[?25l"], writes
+        writes.clear()
+        ev = type("E", (), {"stop": lambda self: None})()
+        for _ in range(2):
+            t.on_mouse_scroll_down(ev)
+        assert t._scroll == 0 and writes == ["\x1b[?25h"], (t._scroll, writes)
     finally:
         rt._IS_WIN, rt._IME_ANCHOR, rt.Offset = old_win, old_anchor, old_offset
 
@@ -2632,6 +2704,10 @@ if __name__ == "__main__":
     print("PASS test_sync_output_stager_holds_split_frame_until_close")
     test_sync_output_stager_orders_back_to_back_and_combined_markers()
     print("PASS test_sync_output_stager_orders_back_to_back_and_combined_markers")
+    test_sync_output_bypass_rearms_and_atomicity_decays()
+    print("PASS test_sync_output_bypass_rearms_and_atomicity_decays")
+    test_paste_marker_strip_is_linear_not_quadratic()
+    print("PASS test_paste_marker_strip_is_linear_not_quadratic")
     test_sync_output_stager_bounds_and_flushes_once()
     print("PASS test_sync_output_stager_bounds_and_flushes_once")
     test_sync_output_next_open_frame_cannot_mutate_queued_complete_frame()

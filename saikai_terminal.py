@@ -850,6 +850,11 @@ _SYNC_BUFFER_MAX_AGE = 0.2
 # actually hidden. Above the stager's max age so a fail-open frame's transient
 # hidden state can't trip it. (#ime-midframe)
 _NATIVE_CURSOR_HIDE_SETTLE = 0.5
+# How long a pane counts as "delivering atomic frames" after its last clean frame
+# close, and how long a fail-open counts as "mid-tear". Both feed the IME anchor's
+# freeze decision, and neither may latch for the pane's lifetime. (#ime-midframe)
+_SYNC_ATOMIC_TTL = 2.0
+_SYNC_BYPASS_TTL = 2.0
 # Above this a PTY write is handed to the pane's writer thread instead of running on
 # the UI thread, where a full pty input queue would freeze the event loop. Keystrokes,
 # mouse reports and query replies are far below it and stay inline. (#paste-block)
@@ -929,25 +934,37 @@ class _SynchronizedOutputStager:
         self._chars = 0
         self._opened_at = 0.0
         self._complete_frames = 0
+        self._last_frame_at = 0.0    # monotonic ts of the last CLEAN frame close
+        self._bypass_at = 0.0        # monotonic ts the current fail-open started
+        self._now = 0.0              # clock of the push/flush in progress
         self._cursor_query = False
 
     @property
     def active(self):
         return self._state == "staging"
 
-    @property
-    def torn(self):
+    def torn_at(self, now):
         """True while a fail-open is in flight: a partial frame already reached pyte
         and the rest streams through until the block closes, so pyte's cursor can be
-        a mid-frame intermediate."""
-        return self._state == "bypass"
+        a mid-frame intermediate. Ages out — the closing ?2026l may never arrive, and
+        a permanently 'torn' pane would freeze the IME anchor forever."""
+        if self._state != "bypass":
+            return False
+        return (now - self._bypass_at) <= _SYNC_BYPASS_TTL
 
-    @property
-    def atomic(self):
-        """True when pyte only ever holds frame-FINAL state: the child brackets its
-        frames (at least one closed cleanly) and no fail-open is in flight. The IME
-        anchor uses this to keep tracking the caret through an output storm."""
-        return self._complete_frames > 0 and self._state != "bypass"
+    def atomic_at(self, now):
+        """True when pyte only ever holds frame-FINAL state: the child is bracketing
+        its frames right now and no fail-open is in flight. The IME anchor uses this
+        to keep tracking the caret through an output storm.
+
+        Recency matters: 'this pane closed a frame once' would keep the anti-fly
+        freeze disabled for the pane's whole life, including for later unbracketed
+        output that really does leave pyte mid-frame."""
+        if self._state == "bypass":
+            return False
+        if self._state == "staging":
+            return True                 # pyte still holds the last complete frame
+        return bool(self._last_frame_at) and (now - self._last_frame_at) <= _SYNC_ATOMIC_TTL
 
     @property
     def pending_cursor_query(self):
@@ -982,21 +999,25 @@ class _SynchronizedOutputStager:
         self._opened_at = 0.0
         self._cursor_query = False
         self._state = "bypass" if bypass else "outside"
+        if bypass:
+            self._bypass_at = self._now
         if reason is None and text:
             self._complete_frames += 1
+            self._last_frame_at = self._now
         return (text, reason) if text else None
 
-    def flush(self, reason):
+    def flush(self, reason, now=None):
         if not self.active:
             return []
+        self._now = time.monotonic() if now is None else float(now)
         unit = self._release(reason, bypass=True)
         return [unit] if unit else []
 
     def push(self, chunk, now=None):
-        now = time.monotonic() if now is None else float(now)
+        now = self._now = time.monotonic() if now is None else float(now)
         out = []
         if self.active and now - self._opened_at > self.max_age:
-            out.extend(self.flush("timeout"))
+            out.extend(self.flush("timeout", now=now))
 
         pos = 0
         plain = []
@@ -1022,21 +1043,25 @@ class _SynchronizedOutputStager:
                         out.append(unit)
             else:
                 plain.append(before)
-                plain.append(marker if self._state == "bypass" or mode == "l" else "")
-                if self._state == "bypass":
-                    if mode == "l":
-                        self._state = "outside"
-                elif mode == "h":
-                    plain.pop()
+                if mode == "h":
+                    # Start staging — including from a fail-open bypass. If the child
+                    # is merely re-setting a still-open block the remainder is still
+                    # released at the real close; if it ABANDONED that block (which is
+                    # why the fail-open happened) the new frame gets staged properly
+                    # instead of streaming through torn until some later ?2026l.
                     emit_plain()
                     self._start(marker, now)
+                else:
+                    plain.append(marker)     # closing/stray ESU: pass it through
+                    if self._state == "bypass":
+                        self._state = "outside"
             pos = match.end()
 
         tail = chunk[pos:]
         if self._state == "staging":
             self._append(tail)
             if self._chars > self.max_chars:
-                out.extend(self.flush("overflow"))
+                out.extend(self.flush("overflow", now=now))
         else:
             plain.append(tail)
         emit_plain()
@@ -1046,6 +1071,7 @@ class _SynchronizedOutputStager:
 # typed-and-submitted input (the classic bracketed-paste breakout). Strip both
 # markers from the content first, exactly as real terminals sanitize a paste.
 _PASTE_MARKER_RE = re.compile(r"\x1b\[20[01]~")
+_PASTE_MARKERS = ("\x1b[200~", "\x1b[201~")
 
 
 def _normalize_paste_newlines(text: str) -> str:
@@ -1058,16 +1084,24 @@ def _normalize_paste_newlines(text: str) -> str:
 
 
 def _strip_paste_markers(text: str) -> str:
-    """Strip embedded paste markers to a FIXED POINT. One sub() pass scans the
-    original string, so overlapping fragments ("\\x1b[20" + "\\x1b[201~" + "1~")
-    lose the inner marker and let the surviving halves concatenate into a fresh
-    marker at the deletion seam — the breakout the strip exists to block. Loop
-    until the text stops changing (saikai_mirror.py does the same browser-side)."""
-    while True:
-        stripped = _PASTE_MARKER_RE.sub("", text)
-        if stripped == text:
-            return text
-        text = stripped
+    """Strip embedded paste markers so none survives, in ONE scan.
+
+    Overlapping fragments ("\\x1b[20" + "\\x1b[201~" + "1~") lose the inner marker to
+    a plain sub() and let the surviving halves concatenate into a fresh marker at the
+    deletion seam — the breakout the strip exists to block. Re-running sub() until
+    the text stops changing closes that seam but removes only one marker per pass for
+    a nested chain, which is quadratic: a 240KB crafted clipboard took ~7s on the UI
+    thread inside on_paste. Emit character by character instead and drop a marker the
+    moment the tail completes one, so a seam is caught by the same scan. Output can
+    never contain a marker, so no second pass is needed. (#H3)"""
+    if "\x1b[20" not in text:                # overwhelmingly the common case
+        return text
+    out: list = []
+    for ch in text:
+        out.append(ch)
+        if ch == "~" and len(out) >= 6 and "".join(out[-6:]) in _PASTE_MARKERS:
+            del out[-6:]
+    return "".join(out)
 
 
 def _wrap_bracketed_paste(text: str) -> str:
@@ -1701,8 +1735,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             moved = self._scroll > 0
             if moved:
                 self._scroll = max(0, self._scroll - 3)
+            back_at_live = moved and self._scroll == 0
         if moved:
             self.refresh()
+        if back_at_live:
+            # Wheeling back to live re-anchors even with no input and no output —
+            # the scrolled-back sync hid the native cursor. (#ime-scrollback)
+            self._sync_terminal_cursor(reason="focus")
         try:
             event.stop()
         except Exception:
@@ -1725,6 +1764,10 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 self.refresh()
             except Exception:
                 pass
+            # Leaving scrollback must RE-ANCHOR: the sync hid the native cursor on the
+            # way up, and a repaint-driven sync can't undo that on a quiet pane (the
+            # reader only schedules repaints for new output). (#ime-scrollback)
+            self._sync_terminal_cursor(reason="focus")
 
     # ── saikai-owned text selection (drag) ─────────────────────────────────────
     # The host terminal's native Shift+drag can't anchor to a TUI widget — saikai
@@ -2858,7 +2901,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 return False
             return screen.focused is self
         except Exception:
-            return bool(self.has_focus)
+            # The fallback must not raise either: this is a guard on the input path
+            # (_snap_to_live re-anchors through it), and has_focus is a reactive that
+            # throws on a not-fully-constructed widget.
+            try:
+                return bool(self.has_focus)
+            except Exception:
+                return False
 
     def _show_hw_cursor(self, show: bool, *, force: bool = False) -> None:
         """Show/hide the REAL terminal cursor (Windows).
@@ -2906,7 +2955,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception:
             pass
 
-    def _cursor_may_be_midframe(self) -> bool:
+    def _cursor_may_be_midframe(self, now: float) -> bool:
         """True when pyte's cursor is NOT trustworthy as the input caret.
 
         A torn ?2026 block (fail-open on timeout/overflow/cursor-query, then bypass
@@ -2916,11 +2965,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         pane only ever holds frame-final state, so tracking stays correct through a
         storm and CJK typed into a generating pane keeps its anchor. (#ime-midframe)"""
         stager = getattr(self, "_sync_output", None)
-        if stager is not None and stager.torn:
+        if stager is not None and stager.torn_at(now):
             return True
         if getattr(self, "_status", None) != "busy":
             return False
-        return not (stager is not None and stager.atomic)
+        return not (stager is not None and stager.atomic_at(now))
 
     def _sync_terminal_cursor(self, reason: str = "repaint", now=None) -> None:
         """Anchor the real (hidden) terminal cursor at claude's cursor cell so the
@@ -2998,10 +3047,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if reason == "repaint":
             hidden_since = getattr(self, "_cursor_hidden_since", 0.0)
             hiding = bool(hidden_since) and (now - hidden_since) < _NATIVE_CURSOR_HIDE_SETTLE
-            if hiding or self._cursor_may_be_midframe():
+            midframe = self._cursor_may_be_midframe(now)
+            if hiding or midframe:
                 if _IME_DEBUG:
                     _ime_dbg(f"sync reason=repaint FREEZE cur=({cx},{cy}) "
-                             f"midframe={self._cursor_may_be_midframe()} hiding={hiding}")
+                             f"midframe={midframe} hiding={hiding}")
                 return
         if not _native_cursor_should_show(cursor_hidden, in_alt):
             self._show_hw_cursor(False)
