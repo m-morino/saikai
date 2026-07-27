@@ -457,6 +457,7 @@ def test_native_cursor_follows_dectcem_regardless_of_screen():
         t._scroll = 0
         t.is_dead = False
         t._hw_cursor_visible = None
+        t._cursor_hidden_since = 0.0
         t._is_focused_pane = lambda: True
         t.refresh = lambda *a, **k: None
         return t, writes
@@ -705,6 +706,7 @@ def test_cursor_sync_freezes_while_busy_and_settles_on_transition():
         t._scroll = 0
         t.is_dead = False
         t._hw_cursor_visible = None
+        t._cursor_hidden_since = 0.0
         t._anchored_xy = None
         t._is_focused_pane = lambda: True
         t.refresh = lambda *a, **k: refreshes.append(k.get("repaint", False))
@@ -2792,6 +2794,7 @@ def test_cursor_anchor_settles_hidden_and_tracks_atomic_frames():
         t.is_dead = False
         t._status = status
         t._hw_cursor_visible = None
+        t._cursor_hidden_since = 0.0
         t._anchored_xy = None
         t._cursor_hidden_since = 0.0
         t._sync_output = rt._SynchronizedOutputStager()

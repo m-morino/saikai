@@ -234,13 +234,14 @@ def _child_pty_env(base_env, is_win: Optional[bool] = None) -> dict:
     so a WT identity buys nothing and WSL — where Windows Terminal exports
     WT_SESSION into Linux — would take WT redraw paths behind pyte for free.
     (#agents-cursor #wt-session #wsl)"""
+    platform_is_win = _IS_WIN if is_win is None else is_win
     env = dict(base_env)
     for key in _HOST_TERMINAL_ENV_STRIP:
         env.pop(key, None)
     for key in [k for k in env if k.startswith(_HOST_TERMINAL_ENV_STRIP_PREFIXES)]:
         env.pop(key, None)
     if _WT_IDENTITY:
-        if _IS_WIN if is_win is None else is_win:
+        if platform_is_win:
             env.setdefault("WT_SESSION", _wt_session_id())
         else:
             env.pop("WT_SESSION", None)
@@ -832,9 +833,9 @@ _OSC_COLOR_Q_RE = re.compile(r"\x1b\](1[01]);\?(\x07|\x1b\\)")  # OSC 10/11 fg/b
 _MIRROR_QUERY_STRIP_RE = re.compile("|".join(
     [p.pattern for p in (_DA_RE, _DA2_RE, _DSR_RE, _DECRQM_RE, _XTVERSION_RE,
                          _OSC_COLOR_Q_RE)]
-    + [r"\x1b\[=0?c",                       # tertiary DA
-       r"\x1bP\$q[^\x07\x1b]*(?:\x07|\x1b\\)",   # DECRQSS
-       r"\x1bP\+q[0-9a-fA-F;]*(?:\x07|\x1b\\)"]  # XTGETTCAP
+    # DCS strings (DECRQSS, XTGETTCAP) are not listed: _strip_dcs removes every
+    # ESC P … ST before the tee, so a pattern here could never match.
+    + [r"\x1b\[=0?c"]                       # tertiary DA
 ))
 # Desktop notifications the child may emit. claude usually falls back to a BEL in
 # saikai (it isn't a recognised rich-notification terminal), but honour these too.
@@ -981,7 +982,6 @@ class _SynchronizedOutputStager:
         self._parts = []
         self._chars = 0
         self._opened_at = 0.0
-        self._complete_frames = 0
         self._last_frame_at = 0.0    # monotonic ts of the last CLEAN frame close
         self._bypass_at = 0.0        # monotonic ts the current fail-open started
         self._now = 0.0              # clock of the push/flush in progress
@@ -1056,25 +1056,25 @@ class _SynchronizedOutputStager:
             if not self._cursor_query and _has_positional_query(text):
                 self._cursor_query = True
 
-    def _release(self, reason=None, bypass=False):
+    def _release(self, reason=None, bypass=False, now=None):
         text = "".join(self._parts)
         self._parts = []
         self._chars = 0
         self._opened_at = 0.0
         self._cursor_query = False
         self._state = "bypass" if bypass else "outside"
+        now = self._now if now is None else now
         if bypass:
-            self._bypass_at = self._now
+            self._bypass_at = now
         if reason is None and text:
-            self._complete_frames += 1
-            self._last_frame_at = self._now
+            self._last_frame_at = now
         return (text, reason) if text else None
 
     def flush(self, reason, now=None):
         if not self.active:
             return []
         self._now = time.monotonic() if now is None else float(now)
-        unit = self._release(reason, bypass=True)
+        unit = self._release(reason, bypass=True, now=self._now)
         return [unit] if unit else []
 
     def push(self, chunk, now=None):
@@ -1102,7 +1102,7 @@ class _SynchronizedOutputStager:
             if self._state == "staging":
                 self._append(before + marker)
                 if mode == "l":
-                    unit = self._release()
+                    unit = self._release(now=now)
                     if unit:
                         out.append(unit)
             else:
@@ -1139,7 +1139,6 @@ class _SynchronizedOutputStager:
 # embedded ESC[201~ would END paste mode early so the bytes after it run as
 # typed-and-submitted input (the classic bracketed-paste breakout). Strip both
 # markers from the content first, exactly as real terminals sanitize a paste.
-_PASTE_MARKER_RE = re.compile(r"\x1b\[20[01]~")
 _PASTE_MARKERS = ("\x1b[200~", "\x1b[201~")
 
 
@@ -2365,13 +2364,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     def _send_to_child(self, data: str) -> None:
         """Write bytes to the child PTY (guarded). Called on the UI thread (via
         _marshal) so a query reply can't interleave a concurrent keystroke —
-        _write_child keeps that ordering even when a paste is still draining."""
-        if self._pty is None or self.is_dead:
-            return
-        try:
-            self._write_child(data)
-        except Exception:
-            pass
+        _write_child keeps that ordering even when a paste is still draining, and
+        owns the dead-pane guard and the exception swallowing."""
+        self._write_child(data)
 
     # ── Mirror pane-direct view (#pane-direct) ────────────────────────────────
     def attach_mirror(self, tee, reset, synth) -> None:
@@ -2549,34 +2544,32 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             resp = "".join(reply for _pos, reply in out)
             self._marshal(lambda r=resp: self._send_to_child(r))
 
-    def _answer_cursor_queries(self, chunk: str) -> None:
-        """Answer cursor-position DSR after the relevant output reached pyte."""
-        out = []
-        for private, kind in _DSR_RE.findall(chunk):
-            if kind == "6":
-                row, col = self._cursor_rowcol()
-                out.append(f"\x1b[{private}{row};{col}R")
-        if out:
-            response = "".join(out)
-            self._marshal(lambda r=response: self._send_to_child(r))
-
-    def _answer_mode_queries(self, chunk: str) -> None:
-        """Answer DECRQM for a chunk that already reached pyte."""
-        out = [f"\x1b[?{mode};{self._decrqm_report(mode)}$y"
-               for mode in _DECRQM_RE.findall(chunk)]
-        if out:
-            response = "".join(out)
-            self._marshal(lambda r=response: self._send_to_child(r))
-
     def _answer_queries(self, chunk: str) -> None:
         """Answer every query in *chunk* for a caller that already fed it to pyte.
 
-        _consume does not use this: it answers the state-free queries up front (a
-        child can block on them mid-frame) and the state-dependent ones at their own
-        stream position."""
-        self._answer_static_queries(chunk)
-        self._answer_mode_queries(chunk)
-        self._answer_cursor_queries(chunk)
+        _consume does not use this — it answers each query at its own stream
+        position while walking the chunk — so this exists for a caller holding a
+        chunk pyte has already seen in full. It shares the reply builders with
+        that path so the two cannot drift."""
+        out = self._static_query_replies(chunk)
+        for match in _DECRQM_RE.finditer(chunk):
+            out.append((match.start(), self._decrqm_reply(match.group(1))))
+        for match in _DSR_RE.finditer(chunk):
+            if match.group(2) == "6":
+                out.append((match.start(), self._dsr6_reply(match.group(1))))
+        if out:
+            out.sort(key=lambda pair: pair[0])
+            resp = "".join(reply for _pos, reply in out)
+            self._marshal(lambda r=resp: self._send_to_child(r))
+
+    def _dsr6_reply(self, private: str) -> str:
+        """One cursor-position report for the CURRENT pyte cursor."""
+        row, col = self._cursor_rowcol()
+        return f"\x1b[{private}{row};{col}R"
+
+    def _decrqm_reply(self, mode: str, so_far: Optional[dict] = None) -> str:
+        """One DECRQM report for *mode*, as of the position `so_far` describes."""
+        return f"\x1b[?{mode};{self._decrqm_report(mode, so_far)}$y"
 
     def _consume(self, chunk: str) -> bool:
         """Stage decoded output and feed only complete units to pyte."""
@@ -2648,7 +2641,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         replies = self._static_query_replies(chunk) + mode_replies
         sync_output = self._sync_output
         units = sync_output.push(chunk)
-        if sync_output.pending_query:
+        if sync_output.pending_query:   # implies staging; flush no-ops otherwise
             units.extend(sync_output.flush("pending-query"))
 
         changed = False
@@ -2690,9 +2683,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             query_mode = match.group(3)
             if query_mode is not None:
                 replies.append(
-                    (match.start(),
-                     f"\x1b[?{query_mode};"
-                     f"{self._decrqm_report(query_mode, so_far)}$y"))
+                    (match.start(), self._decrqm_reply(query_mode, so_far)))
                 continue
             params, final = match.group(1), match.group(2)
             enabled = (final == "h")
@@ -2760,8 +2751,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             if _m.group(2) != "6":
                 continue                       # DSR-5 is state-free, answered early
             self._consume_ready(chunk[pos:_m.end()], present=False)
-            row, col = self._cursor_rowcol()
-            replies.append(f"\x1b[{_m.group(1)}{row};{col}R")
+            replies.append(self._dsr6_reply(_m.group(1)))
             pos = _m.end()
         # Present the WHOLE unit once: pyte already has the leading segments, so
         # feed only the tail but hand the mirror every byte in one frame.
@@ -3213,11 +3203,15 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         (and other IMEs) anchor the candidate window to that position.
 
         UI-thread only. Callers pass a `reason`:
-          - "repaint" (default, from _do_pane_refresh): rides the paint. FROZEN while
-            status=='busy' — an agent spinner moves the pyte cursor Home->…->prompt on
-            every one of ~170k frames and a coalesced repaint catches it mid-frame, so
-            moving the anchor then makes the IME/candidate window fly. Freezing keeps
-            it at the last settled cell.
+          - "repaint" (default, from _do_pane_refresh): rides the paint. Frozen only
+            while the pyte cursor may not BE the caret — see _cursor_may_be_midframe
+            (a torn ?2026 frame, or a busy storm from a child that does not bracket
+            its frames) — or during the ?25l settle window. A child delivering atomic
+            frames is tracked through the storm, because every repaint then sees
+            frame-final state.
+          - "scroll" (leaving scrollback): restores visibility unconditionally, but
+            defers the anchor POSITION to the next repaint when that same gate would
+            have rejected the cursor.
           - "settle" (from _update_status when the pane leaves 'busy'): the storm ended
             and the prompt is now stable, so re-anchor at it and force one repaint to
             flush (a settle fires outside the paint path).
@@ -3273,13 +3267,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # (#agents-cursor #ime-midframe)
         now = time.monotonic() if now is None else float(now)
         if cursor_hidden:
-            if not getattr(self, "_cursor_hidden_since", 0.0):
+            if not self._cursor_hidden_since:
                 self._cursor_hidden_since = now
         else:
             self._cursor_hidden_since = 0.0
         move_anchor = True
         if reason in ("repaint", "scroll"):
-            hidden_since = getattr(self, "_cursor_hidden_since", 0.0)
+            hidden_since = self._cursor_hidden_since
             hiding = bool(hidden_since) and (now - hidden_since) < _NATIVE_CURSOR_HIDE_SETTLE
             midframe = self._cursor_may_be_midframe(now)
             if hiding or midframe:
