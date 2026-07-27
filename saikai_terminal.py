@@ -2310,7 +2310,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                         queue.append(data)
                         self._write_q_chars += len(data)
                         self._start_writer_locked()
-                    return
+                        return
+                    # dropped: fall OUT of the lock so the refusal is logged. An
+                    # unconditional return here (both branches) made that _log
+                    # unreachable, so a wedged child silently ate every keystroke
+                    # with nothing in saikai.log to say so. (#paste-block)
         if dropped:
             _log(f"pty write dropped: queue full ({dropped} chars)")
             return

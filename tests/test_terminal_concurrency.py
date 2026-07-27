@@ -1833,6 +1833,46 @@ def test_poll_sync_respects_a_frozen_pane_and_flushes_what_it_anchors():
         (rt._IS_WIN, rt._IME_ANCHOR, rt.Offset) = saved
 
 
+def test_queue_overflow_refuses_the_write_and_says_so_in_the_log():
+    """A refused write must be RECORDED, outside the lock.
+
+    Once the queue hits _PTY_WRITE_QUEUE_MAX (the child has stopped reading stdin for
+    good) _write_child refuses further writes rather than buffering without limit —
+    correct, but an unconditional `return` inside the lock covered BOTH the queued and
+    the dropped branch, so the `pty write dropped` _log was unreachable. A wedged pane
+    then ate every keystroke with nothing in saikai.log to distinguish it from any other
+    "my keys don't go through" report. The refusal must also not fall through to an
+    inline write (that would hand the child bytes out of order). (#paste-block)"""
+    import threading as _th
+
+    written = []
+
+    class _Pty:
+        def write(self, data):
+            written.append(data)
+
+    logged = []
+    _real_log = rt._log
+    rt._log = lambda m: logged.append(m)
+    try:
+        t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+        t._pty = _Pty()
+        t.is_dead = False
+        t._write_lock = _th.Lock()
+        t._write_q = collections.deque()
+        t._writer = object()                       # a writer is alive -> queue path
+        t._write_q_chars = rt._PTY_WRITE_QUEUE_MAX  # ...and the queue is already full
+
+        t._write_child("x" * 100)
+
+        assert list(t._write_q) == [], "an over-cap write must not be buffered"
+        assert t._write_q_chars == rt._PTY_WRITE_QUEUE_MAX, "accounting must not drift"
+        assert written == [], "a refused write must NOT reach the pty inline"
+        assert any("pty write dropped" in m and "100" in m for m in logged), logged
+    finally:
+        rt._log = _real_log
+
+
 def test_small_writes_queue_when_the_pty_cannot_take_them():
     """The write path must not block the UI thread for ANY size.
 
@@ -3244,6 +3284,8 @@ if __name__ == "__main__":
     print("PASS test_dcs_payloads_never_reach_the_grid")
     test_poll_sync_respects_a_frozen_pane_and_flushes_what_it_anchors()
     print("PASS test_poll_sync_respects_a_frozen_pane_and_flushes_what_it_anchors")
+    test_queue_overflow_refuses_the_write_and_says_so_in_the_log()
+    print("PASS test_queue_overflow_refuses_the_write_and_says_so_in_the_log")
     test_small_writes_queue_when_the_pty_cannot_take_them()
     print("PASS test_small_writes_queue_when_the_pty_cannot_take_them")
     test_writer_thread_is_only_latched_once_it_actually_started()
