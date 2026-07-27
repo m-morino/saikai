@@ -1678,6 +1678,53 @@ def test_large_paste_never_blocks_the_ui_thread_and_keeps_order():
     wedge.set()
 
 
+def test_dcs_strip_closes_its_own_seam_and_never_dumps_a_payload():
+    """Two ways the DCS scrub could hand the grid the bytes it exists to remove.
+
+    (1) Deleting a complete string can leave the characters around the cut
+        forming a BRAND NEW ESC P — the same deletion-seam bug the paste-marker
+        strip in this module was rewritten to close — and nothing rescans, so the
+        counterfeit opener reaches pyte and the browser mirror.
+    (2) The runaway cap emitted the rest of the read AND cleared the carried
+        'inside' state, so a legitimate sixel frame past the cap (multi-megapixel
+        photos exceed 4MiB routinely, and the pane advertises sixel in its DA
+        reply) had megabytes drawn into the pane and its scrollback. Keep
+        dropping instead; the cap must bound MEMORY, not the strip itself.
+    (#dcs-scrub)"""
+    seam = "\x1b" + "\x1bPpayload\x1b\\" + "PQR\x1b\\tail"
+    clean, inside, _dropped = rt._strip_dcs(seam)
+    assert "\x1bP" not in clean, repr(clean)
+    assert inside is False
+
+    # Back-to-back strings leave an EMPTY slice between them, so the seam check
+    # must look past it to the last text actually emitted.
+    adjacent = "A\x1b" + "\x1bPone\x1b\\" + "\x1bPtwo\x1b\\" + "Ptail"
+    clean, inside, _dropped = rt._strip_dcs(adjacent)
+    assert "\x1bP" not in clean, repr(clean)
+
+    # A seam that re-forms the opener across the carry boundary is caught too.
+    first, inside, dropped = rt._strip_dcs("text\x1b")
+    second, inside, dropped = rt._strip_dcs("\x1bPhidden\x1b\\after", inside, dropped)
+    assert "\x1bP" not in first + second, repr(first + second)
+
+    # Oversized payload: nothing leaks, and the carry survives so the REST of the
+    # payload in later reads is dropped too.
+    huge = "\x1bPq" + "~" * (rt._DCS_MAX_DROP + 4096)
+    clean, inside, dropped = rt._strip_dcs(huge)
+    assert clean == "", len(clean)
+    assert inside is True, "the cap must not forget that we are inside a DCS"
+    clean2, inside, dropped = rt._strip_dcs("MORE-SIXEL~~~", inside, dropped)
+    assert clean2 == ""
+    assert inside is True
+    # ...and the real terminator still ends it, with the tail kept.
+    clean3, inside, dropped = rt._strip_dcs("\x1b\\tail", inside, dropped)
+    assert clean3 == "tail" and inside is False and dropped == 0
+
+    # Ordinary text is untouched and a complete string still vanishes.
+    assert rt._strip_dcs("A\x1bPq#0;2\x1b\\B")[0] == "AB"
+    assert rt._strip_dcs("plain text only")[0] == "plain text only"
+
+
 def test_dcs_payloads_never_reach_the_grid():
     """A DCS string (sixel image, DECRQSS, XTGETTCAP) must not print as text.
 
@@ -1930,6 +1977,8 @@ def test_consume_collapses_alt_screen_reset_amplification():
     t._scroll = 0
     t._scr_ver = 0
     t._esc_carry = ""
+    t._dcs_inside = False
+    t._dcs_dropped = 0
     t._bracketed_paste = False
     t._mouse_reporting = False
     t._mouse_sgr = False
@@ -2775,6 +2824,8 @@ if __name__ == "__main__":
     print("PASS test_cursor_report_clamps_pending_wrap_and_honours_origin_mode")
     test_decrqm_reports_the_modes_saikai_actually_implements()
     print("PASS test_decrqm_reports_the_modes_saikai_actually_implements")
+    test_dcs_strip_closes_its_own_seam_and_never_dumps_a_payload()
+    print("PASS test_dcs_strip_closes_its_own_seam_and_never_dumps_a_payload")
     test_dcs_payloads_never_reach_the_grid()
     print("PASS test_dcs_payloads_never_reach_the_grid")
     test_large_paste_never_blocks_the_ui_thread_and_keeps_order()

@@ -894,9 +894,15 @@ def _strip_dcs(text: str, inside: bool = False, dropped: int = 0):
     """Remove DCS strings from *text*, carrying the 'inside a DCS' state.
 
     Returns (clean_text, inside, dropped). A payload split across PTY reads keeps
-    being dropped until its terminator arrives; past _DCS_MAX_DROP the strip gives
-    up and passes text through, so a malformed stream degrades to garbage rather
-    than blackholing the pane forever."""
+    being dropped until its terminator arrives.
+
+    Removing a string can leave the characters around the cut forming a BRAND NEW
+    ESC P, the same deletion-seam bug the paste-marker strip closes, so the output
+    tail is re-checked after every deletion instead of trusting one pass.
+
+    _DCS_MAX_DROP bounds MEMORY, not the strip: past it the payload keeps being
+    discarded (and `inside` retained) rather than dumped into the grid, because a
+    legitimate sixel frame routinely exceeds it and the pane advertises sixel."""
     out = []
     pos = 0
     while pos < len(text):
@@ -904,18 +910,23 @@ def _strip_dcs(text: str, inside: bool = False, dropped: int = 0):
             match = _DCS_END_RE.search(text, pos)
             if match is None:
                 dropped += len(text) - pos
-                if dropped > _DCS_MAX_DROP:
-                    out.append(text[pos:])
-                    inside, dropped = False, 0
-                return "".join(out), inside, dropped
+                return "".join(out), inside, min(dropped, _DCS_MAX_DROP)
             inside, dropped = False, 0
             pos = match.end()
+            # The deletion just joined out[-1] to text[pos:]; a "\x1bP" that
+            # straddles that seam has to be recognised by this same scan.
+            if out and out[-1].endswith("\x1b") and text[pos:pos + 1] == "P":
+                out[-1] = out[-1][:-1]
+                inside = True
+                pos += 1
             continue
         start = text.find("\x1bP", pos)
         if start < 0:
-            out.append(text[pos:])
+            if pos < len(text):
+                out.append(text[pos:])
             break
-        out.append(text[pos:start])
+        if start > pos:                  # never append "": back-to-back strings
+            out.append(text[pos:start])  # would hide the seam behind an empty slice
         inside = True
         pos = start + 2
     return "".join(out), inside, dropped
@@ -2500,10 +2511,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # slip through. Hold a SHORT trailing partial-escape for the next chunk.
         chunk = self._esc_carry + chunk
         self._esc_carry = ""
-        _m = re.search(r"\x1b(?:[\[\]][0-9;:<>=?]*)?$", chunk)
-        if _m is not None and (len(chunk) - _m.start()) < 32:
-            self._esc_carry = chunk[_m.start():]
-            chunk = chunk[:_m.start()]
+        chunk = self._hold_partial_escape(chunk)
         if _IS_WIN:
             # pywinpty 3.x keepalive sentinel — Windows-only noise. On the POSIX
             # (ptyprocess) byte stream "0011Ignore" is ordinary output, so scrubbing
@@ -2514,10 +2522,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # other scan: pyte would print the body into the grid, and a payload must not
         # be able to spoof an OSC 52 clipboard write or a notification either. The
         # 'inside' state carries across reads. (#dcs-scrub)
-        if "\x1bP" in chunk or getattr(self, "_dcs_inside", False):
+        if "\x1bP" in chunk or self._dcs_inside:
             chunk, self._dcs_inside, self._dcs_dropped = _strip_dcs(
-                chunk, getattr(self, "_dcs_inside", False),
-                getattr(self, "_dcs_dropped", 0))
+                chunk, self._dcs_inside, self._dcs_dropped)
+            # Removing a string can leave an ESC trailing that was interior
+            # before, so re-hold: otherwise it joins the next read's first byte
+            # into an introducer downstream of every scrub. (#dcs-scrub)
+            chunk = self._hold_partial_escape(chunk)
         chunk = _PRIVATE_SGR_RE.sub("", chunk)   # drop XTMODKEYS \x1b[>4;2m etc. (pyte misreads as SGR-4 underline)
         chunk = _KITTY_KBD_RE.sub("", chunk)     # drop Kitty-keyboard CSI-u (pyte leaks the trailing 'u' into the grid)
         _bp = _BRACKETED_RE.findall(chunk)       # track claude's bracketed-paste mode for on_paste (last h/l wins)
@@ -2591,6 +2602,20 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._feed_presentation_unit(text)
             changed = True
         return changed
+
+    def _hold_partial_escape(self, chunk: str) -> str:
+        """Return *chunk* without its trailing partial escape, holding that for the
+        next read.
+
+        The whole trailing ESC RUN is held, not just the last one: a chunk ending
+        "\\x1b\\x1b" would otherwise feed a bare ESC that joins the next read's
+        first byte into an introducer nothing downstream rescans. Anything already
+        held is stream-ordered AFTER what is held now. (#dcs-scrub)"""
+        match = re.search(r"\x1b+(?:[\[\]][0-9;:<>=?]*)?$", chunk)
+        if match is None or (len(chunk) - match.start()) >= 32:
+            return chunk
+        self._esc_carry = chunk[match.start():] + self._esc_carry
+        return chunk[:match.start()]
 
     def _feed_presentation_unit(self, chunk: str) -> None:
         """Feed one complete unit to pyte, answering each DSR-6 AT ITS POSITION.
