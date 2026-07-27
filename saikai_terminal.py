@@ -43,6 +43,7 @@ error line — it never tears down the host app.
 from __future__ import annotations
 
 import atexit
+import collections
 import os
 import re
 import signal
@@ -863,6 +864,20 @@ _PTY_INLINE_WRITE_MAX = 4096
 # good would otherwise turn the queue into an unbounded buffer that also swallows
 # every later keystroke. Far above any real typing or paste. (#paste-block)
 _PTY_WRITE_QUEUE_MAX = 4 * 1024 * 1024
+
+
+def _fd_writable(fd: int) -> bool:
+    """True when *fd* can take a small write without blocking.
+
+    A POSIX pty master reports not-writable exactly when the child has stopped
+    draining its input queue, which is the state that turns an ordinary keystroke
+    into a frozen UI thread. Unknown or unsupported descriptors answer True: the
+    caller then keeps the historical inline behaviour."""
+    try:
+        import select
+        return bool(select.select([], [fd], [], 0)[1])
+    except Exception:
+        return True
 # Reader buffer. ptyprocess defaults read() to 1024 bytes, which turns a big turn
 # into ~1000 wakeups per MB, each paying the whole per-chunk pipeline. winpty
 # accepts the same argument. (#linux-read-size)
@@ -1356,7 +1371,10 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._dcs_inside = False     # mid-DCS across read()s (sixel payload scrub)
         self._dcs_dropped = 0        # chars swallowed by the current DCS (runaway cap)
         self._write_lock = threading.Lock()  # guards the PTY write queue below
-        self._write_q: list = []     # oversized writes waiting for the writer thread
+        # deque + a running total: a wedged child can queue hundreds of thousands
+        # of keystrokes, where list.pop(0) and a per-write sum() are both O(n).
+        self._write_q: collections.deque = collections.deque()
+        self._write_q_chars = 0      # chars queued, kept in step with _write_q
         self._writer = None          # daemon draining _write_q in order (#paste-block)
         self._sync_output = _SynchronizedOutputStager()
         self._osc52_carry = ""       # partial OSC 52 clipboard write held across read()s (base64 can span chunks)
@@ -2234,13 +2252,16 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     def _write_child(self, data: str) -> None:
         """Write to the PTY without ever blocking the UI thread on a full pty buffer.
 
-        A POSIX pty input queue is a few KiB, so a large paste into a child that is
-        momentarily not reading stdin blocks write() — and with it the whole Textual
-        event loop. Oversized writes go to a daemon writer instead; while that queue
-        drains every later write joins it, so the child still receives the bytes in
-        order. Small writes (keystrokes, mouse reports, query replies) stay inline,
-        which is the overwhelmingly common case. (#paste-block)"""
-        if not data or self._pty is None or self.is_dead:
+        A POSIX pty input queue is a few KiB, so writing to a child that is not
+        draining stdin blocks write() — and with it the whole Textual event loop.
+        The size of the write is not what decides that: once the queue is full an
+        ordinary keystroke blocks just as hard as a paste. So a write goes inline
+        only when it is small AND the backend can take it right now; otherwise it
+        goes to a daemon writer, and while that writer is alive every later write
+        joins its queue so the child still receives the bytes in order.
+        (#paste-block)"""
+        pty = self._pty
+        if not data or pty is None or self.is_dead:
             return
         lock = getattr(self, "_write_lock", None)
         queue = getattr(self, "_write_q", None)
@@ -2250,26 +2271,53 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 # non-empty: it holds the popped item outside the queue for the whole
                 # blocking write, and an inline write during that window would reach
                 # the child first.
-                if (queue or getattr(self, "_writer", None) is not None
-                        or len(data) > _PTY_INLINE_WRITE_MAX):
-                    if sum(len(part) for part in queue) + len(data) > _PTY_WRITE_QUEUE_MAX:
+                if (queue or self._writer is not None
+                        or len(data) > _PTY_INLINE_WRITE_MAX
+                        or not self._pty_can_take(pty)):
+                    if self._write_q_chars + len(data) > _PTY_WRITE_QUEUE_MAX:
                         # The child has stopped reading stdin for good. Refuse rather
                         # than buffer without limit; the pane is already unusable and
                         # the queue would just grow until memory ran out.
                         _log(f"pty write dropped: queue full ({len(data)} chars)")
                         return
                     queue.append(data)
-                    if getattr(self, "_writer", None) is None:
-                        self._writer = threading.Thread(
-                            target=self._writer_loop,
-                            name=f"saikai-pty-write-{getattr(self, 'sid', '?')}",
-                            daemon=True)
-                        self._writer.start()
+                    self._write_q_chars += len(data)
+                    self._start_writer_locked()
                     return
         try:
-            self._pty.write(data)
+            pty.write(data)
         except Exception:
             pass
+
+    @staticmethod
+    def _pty_can_take(pty) -> bool:
+        """True when the backend can accept a small write without blocking."""
+        fd = getattr(pty, "fd", None)
+        if not isinstance(fd, int):
+            return True          # pywinpty is pipe-backed; no readiness to check
+        return _fd_writable(fd)
+
+    def _start_writer_locked(self) -> None:
+        """Start the drain thread if it is not running (write lock held).
+
+        Latch it only once it has actually started: a Thread.start() failure
+        (resource exhaustion, interpreter shutdown) would otherwise leave a
+        never-started thread as the live writer, and the queue-while-alive rule
+        then sends every later write into a queue nobody drains. Track it like
+        every other helper so process exit bounded-joins it."""
+        if self._writer is not None:
+            return
+        worker = threading.Thread(
+            target=self._writer_loop,
+            name=f"saikai-pty-write-{getattr(self, 'sid', '?')}",
+            daemon=True)
+        try:
+            worker.start()
+        except Exception:
+            _log("pty writer thread failed to start")
+            return
+        self._writer = worker
+        _track_reap(worker)
 
     def _writer_loop(self) -> None:
         """Drain queued PTY writes off the UI thread, in order. (#paste-block)"""
@@ -2277,8 +2325,10 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             with self._write_lock:
                 if not self._write_q:
                     self._writer = None
+                    self._write_q_chars = 0
                     return
-                data = self._write_q.pop(0)
+                data = self._write_q.popleft()
+                self._write_q_chars -= len(data)
             pty = self._pty
             if pty is None:
                 continue
@@ -3286,6 +3336,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             with lock:
                 if getattr(self, "_write_q", None):
                     self._write_q.clear()
+                self._write_q_chars = 0
         pty, pid = self._pty, self._pid
         self._pty = None
         self._pid = None        # idempotent: a 2nd kill() must not re-kill a (recycled) PID

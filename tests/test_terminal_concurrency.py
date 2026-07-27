@@ -6,6 +6,7 @@ fields under test. Run:  python tests/test_terminal_concurrency.py
 """
 import os
 import sys
+import collections
 import threading
 import time
 
@@ -1605,6 +1606,131 @@ def test_reader_asks_for_large_reads_and_guards_the_eof_flush():
     assert finalized == [True], "a failing eof flush must still finalize the pane"
 
 
+def test_small_writes_queue_when_the_pty_cannot_take_them():
+    """The write path must not block the UI thread for ANY size.
+
+    Routing only >4KiB writes to the writer thread left the docstring's promise
+    unmet: a child that stops reading stdin fills the few-KiB POSIX pty buffer
+    with ordinary keystrokes, no writer is ever spawned, and the next keystroke
+    freezes the Textual event loop — the bug class the queue exists for. Check
+    readiness instead of size: when the backend cannot take the bytes now, even a
+    single character goes to the writer. (#paste-block)"""
+    import threading as _th
+    import time as _time
+
+    stuck = _th.Event()
+    release = _th.Event()
+    order = []
+
+    class _Pty:
+        fd = 4242                       # POSIX-shaped: readiness is checkable
+        def write(self, data):
+            stuck.set()
+            release.wait(3.0)
+            order.append(data)
+
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t._pty = _Pty()
+    t.is_dead = False
+    t._write_lock = _th.Lock()
+    t._write_q = collections.deque()
+    t._write_q_chars = 0
+    t._writer = None
+
+    saved = rt._fd_writable
+    rt._fd_writable = lambda fd: False          # the child stopped reading stdin
+    try:
+        started = _time.monotonic()
+        t._write_child("k")                     # ONE character
+        assert _time.monotonic() - started < 0.5, "a small write must not block"
+        assert stuck.wait(3.0), "it must have gone to the writer thread"
+        t._write_child("j")                     # and stay in order behind it
+        release.set()
+        deadline = _time.monotonic() + 3.0
+        while len(order) < 2 and _time.monotonic() < deadline:
+            _time.sleep(0.01)
+        assert order == ["k", "j"], order
+    finally:
+        rt._fd_writable = saved
+        release.set()
+
+    # When the backend IS ready, a small write still goes out inline — the common
+    # path, and what the rest of the suite observes synchronously.
+    inline = []
+    t2 = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t2._pty = type("P", (), {"write": lambda self, d: inline.append(d)})()
+    t2.is_dead = False
+    t2._write_lock = _th.Lock()
+    t2._write_q = collections.deque()
+    t2._write_q_chars = 0
+    t2._writer = None
+    t2._write_child("x")
+    assert inline == ["x"] and t2._writer is None
+
+
+def test_writer_thread_is_only_latched_once_it_actually_started():
+    """A failed Thread.start() must not latch a dead writer.
+
+    _write_child assigned self._writer before starting it, so a start failure
+    (resource exhaustion, interpreter shutdown) left a never-started thread as
+    the live writer — and the 'queue while a writer is ALIVE' rule then sent every
+    later write, including single keystrokes, into a queue nobody drains. The
+    writer must also be tracked like every other helper thread so process exit
+    bounded-joins it. (#paste-block)"""
+    import threading as _th
+    import time as _time
+
+    written = []
+
+    class _Pty:
+        def write(self, data):
+            written.append(data)
+
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t._pty = _Pty()
+    t.is_dead = False
+    t._write_lock = _th.Lock()
+    t._write_q = collections.deque()
+    t._write_q_chars = 0
+    t._writer = None
+
+    real_thread = rt.threading.Thread
+
+    class _FailingThread(real_thread):
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    rt.threading.Thread = _FailingThread
+    try:
+        t._write_child("y" * 8192)          # oversized -> wants the writer
+    finally:
+        rt.threading.Thread = real_thread
+    assert t._writer is None, "a writer that never started must not be latched"
+    assert list(t._write_q) == ["y" * 8192], "the data must stay queued, not vanish"
+
+    # ...and the pane recovers: the next write retries the start and drains both,
+    # in order.
+    t._write_child("z")
+    deadline = _time.monotonic() + 3.0
+    while len(written) < 2 and _time.monotonic() < deadline:
+        _time.sleep(0.01)
+    assert written == ["y" * 8192, "z"], [len(x) for x in written]
+
+    # A writer that DOES start is tracked, so join_all_reaps can bound it.
+    blocked = _th.Event()
+    go = _th.Event()
+    t._write_q = collections.deque()
+    t._write_q_chars = 0
+    t._writer = None
+    t._pty = type("P", (), {"write": lambda self, d: (blocked.set(), go.wait(3.0))})()
+    t._write_child("w" * 8192)
+    assert blocked.wait(3.0)
+    with rt._REAP_LOCK:
+        tracked = [th for th in rt._REAP_THREADS if th is t._writer]
+    go.set()
+    assert tracked, "the writer thread must be tracked for the exit join"
+
+
 def test_large_paste_never_blocks_the_ui_thread_and_keeps_order():
     """A big paste must not freeze the whole TUI.
 
@@ -1632,7 +1758,8 @@ def test_large_paste_never_blocks_the_ui_thread_and_keeps_order():
     t._pty = _P()
     t.is_dead = False
     t._write_lock = _th.Lock()
-    t._write_q = []
+    t._write_q = collections.deque()
+    t._write_q_chars = 0
     t._writer = None
 
     # small write: straight out, no thread, observable immediately
@@ -1656,7 +1783,7 @@ def test_large_paste_never_blocks_the_ui_thread_and_keeps_order():
     deadline = _time.monotonic() + 3.0
     while t._writer is not None and _time.monotonic() < deadline:
         _time.sleep(0.01)
-    assert t._writer is None and t._write_q == []
+    assert t._writer is None and not t._write_q
 
     # A child that never drains must not turn the queue into an unbounded buffer:
     # every later keystroke would be swallowed AND retained forever.
@@ -2828,6 +2955,10 @@ if __name__ == "__main__":
     print("PASS test_dcs_strip_closes_its_own_seam_and_never_dumps_a_payload")
     test_dcs_payloads_never_reach_the_grid()
     print("PASS test_dcs_payloads_never_reach_the_grid")
+    test_small_writes_queue_when_the_pty_cannot_take_them()
+    print("PASS test_small_writes_queue_when_the_pty_cannot_take_them")
+    test_writer_thread_is_only_latched_once_it_actually_started()
+    print("PASS test_writer_thread_is_only_latched_once_it_actually_started")
     test_large_paste_never_blocks_the_ui_thread_and_keeps_order()
     print("PASS test_large_paste_never_blocks_the_ui_thread_and_keeps_order")
     test_reader_asks_for_large_reads_and_guards_the_eof_flush()
