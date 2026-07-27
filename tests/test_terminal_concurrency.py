@@ -1213,6 +1213,196 @@ def test_child_pty_env_presents_one_windows_terminal_identity_per_platform():
     assert [k for k in wez if k.startswith("WEZTERM")] == [], wez
 
 
+def test_ime_anchor_backs_off_to_the_grapheme_leader_like_the_software_caret():
+    """The IME anchor must land on the leader cell of a multi-cell grapheme.
+
+    pyte stores a wide cluster at x and empty stubs at x+1.. — render_line already
+    walks back to the leader before drawing its caret, but the anchor used the raw
+    pyte column, so composition opened one (or, for a 3+ cell ZWJ/flag cluster,
+    several) columns to the right of the glyph the user is editing.
+    (#native-cursor #flag-width)"""
+    import threading as _th
+
+    class _Region:
+        x, y, width, height = 4, 2, 40, 6
+
+    class _Drv:
+        def __init__(self, sink):
+            self._sink = sink
+        def write(self, data):
+            self._sink.append(data)
+
+    class _App:
+        def __init__(self, sink):
+            self._driver = _Drv(sink)
+
+    class _Shim(rt.AgentTerminal):
+        app = property(lambda self: self._app)
+        content_region = property(lambda self: _Region())
+
+    saved = (rt._IS_WIN, rt._IME_ANCHOR, rt._NATIVE_CARET_OVERRIDE, rt.Offset)
+    rt._IS_WIN = True
+    rt._IME_ANCHOR = True
+    rt._NATIVE_CARET_OVERRIDE = None
+    if rt.Offset is None:
+        rt.Offset = lambda x, y: (x, y)
+    try:
+        writes = []
+        t = _Shim.__new__(_Shim)
+        t.sid = "x"
+        t._app = _App(writes)
+        t._lock = _th.Lock()
+        t._scroll = 0
+        t.is_dead = False
+        t._status = "idle"
+        t._hw_cursor_visible = None
+        t._hw_cursor_shape = 0
+        t._cursor_style = 0
+        t._anchored_xy = None
+        t._cursor_hidden_since = 0.0
+        t._sync_output = rt._SynchronizedOutputStager()
+        t._is_focused_pane = lambda: True
+        t.refresh = lambda *a, **k: None
+        t._alt = type("A", (), {"in_alt": False})()
+
+        import pyte
+        t._screen = rt._HistoryScreenBase(20, 5, history=20)
+        t._stream = pyte.Stream(t._screen)
+        t._stream.feed("あ")             # wide cluster at column 0, stub at 1
+        assert t._screen.cursor.x == 2
+        t._stream.feed("\x1b[D")             # cursor now sits ON the stub
+        assert t._screen.cursor.x == 1
+        assert t._screen.buffer[0][1].data == ""
+
+        t._sync_terminal_cursor(reason="focus")
+        assert t._app.cursor_position == rt.Offset(_Region.x + 0, _Region.y + 0), \
+            t._app.cursor_position
+    finally:
+        (rt._IS_WIN, rt._IME_ANCHOR, rt._NATIVE_CARET_OVERRIDE, rt.Offset) = saved
+
+
+def test_native_caret_ownership_is_one_predicate_and_covers_wsl_under_wt():
+    """Exactly one component may own the single outer caret.
+
+    On a POSIX host the hardware cursor was never shown, which is right for a
+    plain Linux terminal (Textual hides it and saikai draws a software caret) but
+    wrong inside WSL under Windows Terminal: there the real caret is the IME
+    anchor, and without it composition has nowhere to attach. Both the render
+    guard and the visibility write must read the SAME predicate, so "two carets"
+    and "no caret" are impossible by construction. (#native-cursor #wsl)"""
+    import inspect
+
+    render_src = inspect.getsource(rt.AgentTerminal.render_line)
+    show_src = inspect.getsource(rt.AgentTerminal._show_hw_cursor)
+    assert "_native_caret()" in render_src, "render must gate on the shared predicate"
+    assert "_native_caret()" in show_src, "visibility must gate on the shared predicate"
+    assert "_IS_WIN and _IME_ANCHOR" not in render_src, "the duplicated rule must be gone"
+
+    saved = (rt._IS_WIN, rt._IME_ANCHOR, rt._WT_POSIX_HOST, rt._NATIVE_CARET_OVERRIDE)
+    try:
+        rt._IME_ANCHOR = True
+        rt._NATIVE_CARET_OVERRIDE = None
+        rt._IS_WIN, rt._WT_POSIX_HOST = True, False
+        assert rt._native_caret() is True                      # Windows host
+        rt._IS_WIN, rt._WT_POSIX_HOST = False, False
+        assert rt._native_caret() is False                     # plain Linux/macOS
+        rt._WT_POSIX_HOST = True
+        assert rt._native_caret() is True                       # WSL under WT
+        rt._IME_ANCHOR = False
+        assert rt._native_caret() is False                      # anchor opted out
+        rt._IME_ANCHOR = True
+        rt._NATIVE_CARET_OVERRIDE = False                       # explicit override wins
+        rt._IS_WIN = True
+        assert rt._native_caret() is False
+        rt._NATIVE_CARET_OVERRIDE = True
+        rt._IS_WIN, rt._WT_POSIX_HOST = False, False
+        assert rt._native_caret() is True
+    finally:
+        (rt._IS_WIN, rt._IME_ANCHOR, rt._WT_POSIX_HOST,
+         rt._NATIVE_CARET_OVERRIDE) = saved
+
+    # WSL detection: WT_SESSION alone is not enough (ssh from a WT tab into a
+    # plain Linux box inherits it), and a WSL proof alone says nothing about WT.
+    assert rt._wt_posix_host({}, wsl=True) is False
+    assert rt._wt_posix_host({"WT_SESSION": "x"}, wsl=False) is False
+    assert rt._wt_posix_host({"WT_SESSION": "x"}, wsl=True) is True
+    # A multiplexer owns the caret itself; do not fight it.
+    assert rt._wt_posix_host({"WT_SESSION": "x", "TMUX": "/tmp/t"}, wsl=True) is False
+    assert rt._wt_posix_host({"WT_SESSION": "x", "STY": "1.pts"}, wsl=True) is False
+
+
+def test_dims_only_falls_back_for_an_axis_that_has_no_size():
+    """A real but small pane must be reported at its real size.
+
+    The 80x24 fallback exists for a widget with NO size — an inactive TabbedContent
+    pane (display:none) or pre-layout. Treating anything under 8x4 as "unlaid out"
+    told the child it had 80 columns inside a 7-column pane, so the child wrapped
+    for a screen that does not exist and put its prompt on rows the widget never
+    paints. Fall back per axis, and only when that axis is genuinely 0.
+    (#inactive-pane-size)"""
+    dims = rt.AgentTerminal.__dict__["_dims"]
+
+    class _Size:
+        def __init__(self, width, height):
+            self.width = width
+            self.height = height
+
+    class _Pane:
+        def __init__(self, width, height):
+            self.size = _Size(width, height)
+
+    assert dims(_Pane(0, 0)) == (24, 80)        # inactive tab / pre-layout
+    assert dims(_Pane(0, 12)) == (12, 80)       # per-axis, not all-or-nothing
+    assert dims(_Pane(30, 0)) == (24, 30)
+    assert dims(_Pane(7, 3)) == (3, 7)          # real, tiny, honest
+    assert dims(_Pane(22, 3)) == (3, 22)
+    assert dims(_Pane(1, 1)) == (1, 1)          # pyte's minimum, still honest
+    assert dims(_Pane(120, 40)) == (40, 120)
+    # Never below pyte's 1x1 floor even if a driver reports something negative.
+    assert dims(_Pane(-5, -5)) == (24, 80)
+
+
+def test_child_pty_env_scrubs_the_whole_wt_family_and_rewrites_wslenv():
+    """WT_SESSION is not the only Windows Terminal identifier in the environment.
+
+    WT_PROFILE_ID and WT_SETTINGS_DIR name the outer tab's profile and settings
+    directory, and WT keeps adding to that namespace, so scrub the family by
+    prefix like every other emulator — while keeping the deliberate WT_SESSION
+    exception that presents the Windows pane as Windows Terminal.
+
+    WSLENV is the Win32<->WSL variable-forwarding directive. Dropping it outright
+    would silently break a user's own forwarding, so rewrite it: remove the WT_*
+    entries saikai just stripped and keep everything else, dropping the variable
+    only when nothing is left. (#wt-session #wsl)"""
+    outer = {
+        "PATH": "/bin",
+        "WT_SESSION": "outer-wt",
+        "WT_PROFILE_ID": "{0caa0dad-306e-5eb1-a0a9-9d1a0f8b0c7d}",
+        "WT_SETTINGS_DIR": "C:\\Users\\u\\AppData\\Local\\Packages\\WT\\LocalState",
+        "WSL_DISTRO_NAME": "Ubuntu",
+        "WSLENV": "WT_SESSION::WT_PROFILE_ID:MY_TOKEN/u:PATH/l",
+    }
+
+    posix = rt._child_pty_env(outer, is_win=False)
+    assert [k for k in posix if k.upper().startswith("WT_")] == [], sorted(posix)
+    # The user's own forwarding survives; only the WT entries are removed.
+    assert posix["WSLENV"] == "MY_TOKEN/u:PATH/l"
+    assert posix["WSL_DISTRO_NAME"] == "Ubuntu"   # not a terminal identity
+
+    windows = rt._child_pty_env(outer, is_win=True)
+    assert windows["WT_SESSION"] == "outer-wt", "the WT identity exception must survive"
+    assert "WT_PROFILE_ID" not in windows and "WT_SETTINGS_DIR" not in windows
+    assert windows["WSLENV"] == "MY_TOKEN/u:PATH/l"
+
+    # A WSLENV that only forwarded WT variables is dropped entirely rather than
+    # left as an empty directive.
+    only_wt = rt._child_pty_env(
+        {"PATH": "/bin", "WSLENV": "WT_SESSION::WT_PROFILE_ID"}, is_win=False)
+    assert "WSLENV" not in only_wt
+    # No WSLENV, nothing invented.
+    assert "WSLENV" not in rt._child_pty_env({"PATH": "/bin"}, is_win=False)
+
+
 def test_child_pty_env_scrubs_nested_terminals_and_normalizes_utf8():
     """A pane is a new terminal boundary, not a child of the outer mux/emulator.
 
@@ -5063,15 +5253,17 @@ def test_ime_anchor_default_on_keeps_windows_caret_render_guard():
     """The IME anchor is default ON (opt-OUT) so CJK composition lands at the pane
     prompt, and the render guard must stay the general form that survives BOTH states.
     (1) render_line draws saikai's OWN cursor unless the native hardware cursor is
-    handling it (Windows AND anchor ON): `not (_IS_WIN and _IME_ANCHOR)`. With the
-    anchor ON (default) Windows defers to the native cursor; with SAIKAI_IME_ANCHOR=0
-    the caret is still drawn (the old `not _IS_WIN` guard left NO caret there once
-    _show_hw_cursor went inert). (2) SAIKAI_IME_ANCHOR is parsed opt-OUT: only an
-    explicit 0/false/no/off turns it off. (#native-cursor #agents-cursor)"""
+    handling it — `not native_caret`, the single ownership predicate that also
+    gates the visibility write. With the anchor ON (default) a caret-owning host
+    defers to the native cursor; with SAIKAI_IME_ANCHOR=0 the caret is still drawn
+    (the old `not _IS_WIN` guard left NO caret there once _show_hw_cursor went
+    inert). (2) SAIKAI_IME_ANCHOR is parsed opt-OUT: only an explicit
+    0/false/no/off turns it off. (#native-cursor #agents-cursor)"""
     from pathlib import Path
     src = Path(rt.__file__).read_text(encoding="utf-8")
-    assert "not (_IS_WIN and _IME_ANCHOR)" in src, \
-        "render_line must draw the caret on Windows when the IME anchor is OFF"
+    assert "x == cursor_x and not native_caret:" in src, \
+        "render_line must draw the caret whenever saikai does not own the real one"
+    assert "def _native_caret()" in src, "the ownership predicate must exist"
     assert "x == cursor_x and not _IS_WIN:" not in src, \
         "the old guard that skipped the caret on ALL Windows panes must be gone"
     assert 'SAIKAI_IME_ANCHOR", "1")).strip().lower() not in (' in src, \
@@ -5216,6 +5408,14 @@ if __name__ == "__main__":
     print("PASS test_child_pty_env_hides_outer_terminal_identity_from_child")
     test_child_pty_env_presents_one_windows_terminal_identity_per_platform()
     print("PASS test_child_pty_env_presents_one_windows_terminal_identity_per_platform")
+    test_ime_anchor_backs_off_to_the_grapheme_leader_like_the_software_caret()
+    print("PASS test_ime_anchor_backs_off_to_the_grapheme_leader_like_the_software_caret")
+    test_native_caret_ownership_is_one_predicate_and_covers_wsl_under_wt()
+    print("PASS test_native_caret_ownership_is_one_predicate_and_covers_wsl_under_wt")
+    test_dims_only_falls_back_for_an_axis_that_has_no_size()
+    print("PASS test_dims_only_falls_back_for_an_axis_that_has_no_size")
+    test_child_pty_env_scrubs_the_whole_wt_family_and_rewrites_wslenv()
+    print("PASS test_child_pty_env_scrubs_the_whole_wt_family_and_rewrites_wslenv")
     test_child_pty_env_scrubs_nested_terminals_and_normalizes_utf8()
     print("PASS test_child_pty_env_scrubs_nested_terminals_and_normalizes_utf8")
     test_windows_keepalive_text_inside_normal_output_is_preserved()

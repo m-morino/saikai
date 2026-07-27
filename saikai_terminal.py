@@ -100,6 +100,59 @@ def _log(msg: str) -> None:
 _IME_ANCHOR = str(os.environ.get("SAIKAI_IME_ANCHOR", "1")).strip().lower() not in (
     "0", "false", "no", "off")
 
+
+def _under_wsl() -> bool:
+    """True when this process runs inside WSL.
+
+    WSL_DISTRO_NAME/WSL_INTEROP are the fast path but are absent for non-shell
+    entry points and can be disabled; /proc/version naming Microsoft is the
+    env-independent proof and cannot arrive through inheritance."""
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        with open("/proc/version", "r", encoding="utf-8", errors="replace") as fh:
+            return "microsoft" in fh.read().lower()
+    except Exception:
+        return False
+
+
+def _wt_posix_host(env=None, wsl=None) -> bool:
+    """True when a POSIX saikai is really drawing into a Windows Terminal tab.
+
+    WT_SESSION names Windows Terminal but only says "this process tree started in
+    a WT tab": it survives ssh out of that tab and dotfile exports. A WSL proof
+    alone says nothing about which emulator is on the other side. Require both.
+    A terminal multiplexer owns the caret itself, so defer to it."""
+    env = os.environ if env is None else env
+    if not env.get("WT_SESSION"):
+        return False
+    if env.get("TMUX") or env.get("STY"):
+        return False
+    return _under_wsl() if wsl is None else bool(wsl)
+
+
+_WT_POSIX_HOST = (not _IS_WIN) and _wt_posix_host()
+# SAIKAI_NATIVE_CARET forces caret ownership either way (unset = auto), for a
+# host the detection above cannot name.
+_NATIVE_CARET_OVERRIDE: Optional[bool] = (
+    None if not str(os.environ.get("SAIKAI_NATIVE_CARET", "")).strip()
+    else str(os.environ.get("SAIKAI_NATIVE_CARET", "")).strip().lower() not in (
+        "0", "false", "no", "off"))
+
+
+def _native_caret() -> bool:
+    """True when saikai owns the one real outer caret (and the IME anchors to it).
+
+    The single ownership predicate: the render path must NOT draw a software
+    caret when this is true, and the driver must NOT be told to show/hide the
+    real cursor when it is false. Reading the module flags at call time keeps it
+    monkeypatchable from the platform tests."""
+    if not _IME_ANCHOR:
+        return False
+    if _NATIVE_CARET_OVERRIDE is not None:
+        return _NATIVE_CARET_OVERRIDE
+    return bool(_IS_WIN or _WT_POSIX_HOST)
+
 # Opt-in raw-PTY capture: when SAIKAI_PTY_CAPTURE names a file, every decoded chunk
 # the reader feeds is appended as repr() (escape sequences visible) — for diagnosing
 # how a child renders, e.g. whether an agent TUI drives ?1049 alt-screen, ?2026
@@ -209,7 +262,15 @@ _HOST_TERMINAL_ENV_STRIP_PREFIXES = (
     "KONSOLE_",
     "GNOME_TERMINAL_",
     "TERMINFO",
+    # WT_PROFILE_ID / WT_SETTINGS_DIR name the outer tab's profile and settings
+    # store, and Windows Terminal keeps adding to this namespace. WT_SESSION is
+    # the one deliberate exception and is re-added below, after the strip.
+    "WT_",
 )
+# Windows Terminal forwards its identity into WSL through WSLENV, so a stripped
+# WT_* variable can still be named there. WSLENV also carries the user's OWN
+# forwarding, so it is rewritten rather than dropped. (#wt-session #wsl)
+_WSLENV_STRIP_PREFIXES = ("WT_",)
 
 # Opt out of presenting the pane as Windows Terminal (env side):
 # SAIKAI_WT_IDENTITY=0 leaves WT_SESSION as the host set it on Windows. POSIX/WSL
@@ -264,6 +325,14 @@ def _child_pty_env(base_env, is_win: Optional[bool] = None) -> dict:
     platform_is_win = _IS_WIN if is_win is None else is_win
     env = dict(base_env)
 
+    # Capture the host's WT_SESSION BEFORE the strip loop: the WT_ prefix now
+    # scrubs the whole Windows Terminal namespace, and the identity exception
+    # below has to re-add the outer value rather than a synthesized one.
+    outer_wt = None
+    for key in list(env):
+        if (key.upper() if platform_is_win else key) == "WT_SESSION":
+            outer_wt = env.pop(key)
+
     # os.environ is case-insensitive on Windows, but callers/tests may supply a
     # plain dict. Match the target platform's semantics and remove duplicate
     # spellings before adding canonical saikai values.
@@ -273,10 +342,18 @@ def _child_pty_env(base_env, is_win: Optional[bool] = None) -> dict:
                 or comparable.startswith(_HOST_TERMINAL_ENV_STRIP_PREFIXES)):
             env.pop(key, None)
 
-    outer_wt = None
+    # WSLENV forwards variables across the Win32<->WSL boundary. Remove the
+    # entries naming variables saikai just stripped and keep the user's own; drop
+    # the directive only when nothing is left.
     for key in list(env):
-        if (key.upper() if platform_is_win else key) == "WT_SESSION":
-            outer_wt = env.pop(key)
+        if (key.upper() if platform_is_win else key) != "WSLENV":
+            continue
+        kept = [entry for entry in str(env[key]).split(":")
+                if entry and not entry.upper().startswith(_WSLENV_STRIP_PREFIXES)]
+        if kept:
+            env[key] = ":".join(kept)
+        else:
+            env.pop(key, None)
     if platform_is_win:
         if _WT_IDENTITY:
             env["WT_SESSION"] = outer_wt or _wt_session_id()
@@ -584,6 +661,24 @@ try:
                 # distinct copy or later cursor movement would mutate the slot.
                 persistent = saved._replace(cursor=copy.copy(saved.cursor))
                 super().restore_cursor()
+                # pyte only ever re-SETS origin/wrap, so a mode saved OFF and
+                # restored while ON stayed on. Reconcile both directions through
+                # the mode set directly: set_mode/reset_mode home the cursor on any
+                # DECOM change, and DECRC restores position and mode together.
+                for flag, saved_on in ((_mo.DECOM, saved.origin),
+                                       (_mo.DECAWM, saved.wrap)):
+                    if saved_on:
+                        self.mode.add(flag)
+                    else:
+                        self.mode.discard(flag)
+                # pyte then clamps into the scroll region unconditionally
+                # (ensure_vbounds(use_margins=True)). A savepoint taken with origin
+                # mode OFF holds an ABSOLUTE position that may legitimately sit
+                # outside the margins, so re-apply it under the restored mode.
+                self.cursor.x = persistent.cursor.x
+                self.cursor.y = persistent.cursor.y
+                self.ensure_hbounds()
+                self.ensure_vbounds(use_margins=bool(saved.origin))
                 self.savepoints[:] = [persistent]
 
             def resize(self, lines=None, columns=None) -> None:
@@ -2589,13 +2684,19 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         status classifier can't see "waiting" until the tab is activated and resized
         (the "restored pane isn't flagged needs-input until I select it" bug). 80x24
         lets the child render + be classified while still backgrounded; on_resize
-        corrects to the exact size when the tab is shown. (#inactive-pane-size)"""
+        corrects to the exact size when the tab is shown. (#inactive-pane-size)
+
+        The fallback applies PER AXIS and only to an axis with no size at all. A
+        real but small pane must be reported honestly: telling a child it has 80
+        columns inside a 7-column pane makes it wrap for a screen that does not
+        exist and place its prompt on rows the widget never paints."""
         w = int(self.size.width or 0)
         h = int(self.size.height or 0)
-        if w < 8 or h < 4:                       # inactive/hidden pane or pre-layout
-            w = w if w >= 8 else 80
-            h = h if h >= 4 else 24
-        return max(h, 2), max(w, 2)
+        if w <= 0:                               # inactive/hidden pane or pre-layout
+            w = 80
+        if h <= 0:
+            h = 24
+        return max(h, 1), max(w, 1)              # pyte needs at least one cell
 
     def _create_screen_pair(self, rows: int, cols: int) -> None:
         """Create independent main/alternate grids and select the main grid."""
@@ -2959,6 +3060,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # Cursor only in the live view (it lives at the bottom, not in history).
         show_cursor = (s == 0 and self.has_focus and y == cursor_y
                        and not self.is_dead and not cursor_hidden)
+        native_caret = _native_caret()   # hoisted: one predicate, one owner
         segments = []
         run_chars: list[str] = []
         run_style = None
@@ -2975,14 +3077,14 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # the glyph already carries width 2 (real blank cells hold " ").
             if ch.data == "":
                 continue
-            if show_cursor and x == cursor_x and not (_IS_WIN and _IME_ANCHOR):
+            if show_cursor and x == cursor_x and not native_caret:
                 # Draw saikai's own cursor (cell reversed, keeping the cell's real
-                # fg/bg/bold so a themed prompt isn't flattened). SKIP only on Windows
-                # WHEN the IME anchor is on: there _show_hw_cursor shows the terminal's
-                # NATIVE cursor (thin bar) instead, and drawing here too would stack a
-                # wide reverse-block on it. With the anchor OFF the native cursor is
-                # never shown, so we MUST draw here — else a Windows classic-renderer
-                # pane has NO caret at all (the default-OFF regression). (#native-cursor)
+                # fg/bg/bold so a themed prompt isn't flattened). SKIP exactly when
+                # saikai owns the real outer caret (_native_caret): there
+                # _show_hw_cursor shows the terminal's NATIVE cursor instead, and
+                # drawing here too would stack a wide reverse-block on it. When it
+                # does not — anchor off, or a plain Linux/macOS terminal — we MUST
+                # draw here, else the pane has no caret at all. (#native-cursor)
                 flush(x)
                 run_chars = []
                 segments.append(Segment(ch.data or " ",
@@ -5385,7 +5487,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             int(getattr(self, "_cursor_style", 0) or 0) if show else 0)
         self._set_hw_cursor_shape(
             desired_shape, force=force, _driver=drv)
-        if not _IS_WIN:
+        if not _native_caret():
             if not show:
                 self._release_hw_cursor_owner(drv)
             return
@@ -5502,6 +5604,17 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 cursor_hidden = bool(getattr(screen.cursor, "hidden", False))
             except Exception:
                 return
+            # A multi-cell grapheme lives at its leader with empty stubs after it.
+            # render_line walks back to the leader before drawing the software
+            # caret; the anchor has to agree, or composition opens one — or for a
+            # 3+ cell cluster several — columns right of the glyph being edited.
+            # A refinement, so never let it abort the sync. (#flag-width #native-cursor)
+            try:
+                row = screen.buffer[cy]
+                while cx > 0 and row[cx].data == "":
+                    cx -= 1
+            except Exception:
+                pass
             scols = int(getattr(screen, "columns", 0) or 0)
             slines = int(getattr(screen, "lines", 0) or 0)
             in_alt = bool(getattr(getattr(self, "_alt", None), "in_alt", False))

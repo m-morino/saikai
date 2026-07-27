@@ -349,6 +349,46 @@ def test_combined_dec_private_lists_apply_every_parameter():
     assert terminal._alt.in_alt is False
 
 
+def test_decrc_restores_both_directions_of_decom_and_decawm():
+    """DECRC restores the SAVED mode state, including a saved-off mode.
+
+    pyte's restore_cursor only ever re-SETS origin/wrap when the savepoint had
+    them on, so a sequence that saves with the mode off and restores with it on
+    left the mode stuck on. Both modes also have to be reconciled without pyte's
+    set_mode/reset_mode side effect, which homes the cursor on any DECOM change —
+    DECRC restores the position and the mode together."""
+    from pyte import modes as mo
+
+    terminal = _terminal(cols=20, rows=8)
+    screen = terminal._screen
+
+    # DECAWM: saved OFF, restored while ON -> must come back OFF.
+    terminal._consume("\x1b[?7l\x1b7\x1b[?7h\x1b8")
+    assert mo.DECAWM not in screen.mode
+    # ...and the mirror direction still works: saved ON, restored while OFF.
+    terminal._consume("\x1b[?7h\x1b7\x1b[?7l\x1b8")
+    assert mo.DECAWM in screen.mode
+
+    # DECOM: saved OFF, restored while ON -> must come back OFF.
+    terminal._consume("\x1b[?6l\x1b7\x1b[?6h\x1b8")
+    assert mo.DECOM not in screen.mode
+    terminal._consume("\x1b[?6h\x1b7\x1b[?6l\x1b8")
+    assert mo.DECOM in screen.mode
+
+    # DECRC must not home the cursor while reconciling a mode. Save at an
+    # absolute cell with origin mode off, flip it on, then restore.
+    terminal._consume("\x1b[?6l\x1b[3;5r\x1b[?6l\x1b[2;4H\x1b7\x1b[?6h\x1b8")
+    assert mo.DECOM not in screen.mode
+    assert (screen.cursor.y, screen.cursor.x) == (1, 3)
+
+    # DECRC stays repeatable after the reconcile (xterm keeps the slot), and each
+    # repeat re-applies the same saved-off state.
+    terminal._consume("\x1b[?6l\x1b[?7l\x1b7")
+    for _ in range(2):
+        terminal._consume("\x1b[?6h\x1b[?7h\x1b8")
+        assert mo.DECOM not in screen.mode and mo.DECAWM not in screen.mode
+
+
 def test_split_decrqm_uses_tokenizer_carry_and_never_opens_sync_staging():
     """Every split of CSI ? 2026 $ p is one query, never a false DECSET."""
     query = "\x1b[?2026$p"
@@ -520,6 +560,8 @@ if __name__ == "__main__":
     print("PASS test_decrqm_observes_set_then_reset_at_each_stream_position")
     test_combined_dec_private_lists_apply_every_parameter()
     print("PASS test_combined_dec_private_lists_apply_every_parameter")
+    test_decrc_restores_both_directions_of_decom_and_decawm()
+    print("PASS test_decrc_restores_both_directions_of_decom_and_decawm")
     test_split_decrqm_uses_tokenizer_carry_and_never_opens_sync_staging()
     print("PASS test_split_decrqm_uses_tokenizer_carry_and_never_opens_sync_staging")
     test_da_xtversion_and_repeated_queries_report_only_real_capabilities()
