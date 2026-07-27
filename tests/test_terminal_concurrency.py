@@ -1213,6 +1213,42 @@ def test_child_pty_env_presents_one_windows_terminal_identity_per_platform():
     assert [k for k in wez if k.startswith("WEZTERM")] == [], wez
 
 
+def test_alt_punctuation_keeps_its_meta_prefix_instead_of_being_dropped():
+    """Alt+<punctuation> must reach the child as ESC + the character.
+
+    Textual names a punctuation key after its Unicode character (alt+full_stop,
+    alt+minus), and encode_key only understood a single-character `rest`, so every
+    one of those returned None and the keystroke was swallowed — including
+    readline's alt+. (insert-last-argument), which this function's own docstring
+    promises to forward. The names textual cannot invert through its public
+    key_to_character (plus, minus, slash, at, backslash, underscore) have to work
+    too.
+
+    Scope note: on Windows Terminal these names only arrive when the key is
+    delivered in CSI-u form. The plain conhost/VT-input path rewrites Alt+. to a
+    bare full_stop before saikai sees it, which is a Textual/console boundary loss
+    that no encode_key change can undo — see the boundary notes in docs. This test
+    pins what saikai owns: a correctly delivered alt+<punct> is not dropped."""
+    from textual.keys import _character_to_key
+
+    for character in ".,;'[]`=/-+@\\_ ":
+        name = _character_to_key(character)
+        encoded = rt.encode_key(f"alt+{name}", None)
+        assert encoded == "\x1b" + character, (character, name, encoded)
+
+    # Regressions guarded: alt+letter/digit and alt+backspace keep their meaning,
+    # and a named NON-character key stays unencodable rather than inventing bytes.
+    assert rt.encode_key("alt+b", None) == "\x1bb"
+    assert rt.encode_key("alt+1", None) == "\x1b1"
+    assert rt.encode_key("alt+backspace", None) == "\x1b\x7f"
+    # A named key that stands for no character keeps its own encoding: the
+    # modified-arrow CSI form, not an invented ESC prefix.
+    assert rt.encode_key("alt+up", None) == "\x1b[1;3A"
+    # Modified function keys stay unencodable without a negotiated kitty
+    # protocol; saikai's own UI owns that space (#modified-fkeys).
+    assert rt.encode_key("alt+f5", None) is None
+
+
 def test_software_caret_follows_decscusr_shape():
     """A child's DECSCUSR shape must be visible on hosts saikai draws the caret on.
 
@@ -5460,6 +5496,8 @@ if __name__ == "__main__":
     print("PASS test_child_pty_env_hides_outer_terminal_identity_from_child")
     test_child_pty_env_presents_one_windows_terminal_identity_per_platform()
     print("PASS test_child_pty_env_presents_one_windows_terminal_identity_per_platform")
+    test_alt_punctuation_keeps_its_meta_prefix_instead_of_being_dropped()
+    print("PASS test_alt_punctuation_keeps_its_meta_prefix_instead_of_being_dropped")
     test_software_caret_follows_decscusr_shape()
     print("PASS test_software_caret_follows_decscusr_shape")
     test_ime_anchor_backs_off_to_the_grapheme_leader_like_the_software_caret()

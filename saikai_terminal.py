@@ -1383,6 +1383,33 @@ def _caret_segment(ch, shape: int):  # -> rich.Segment; render_line only
     return Segment(text, base + Style(reverse=True))
 
 
+# Textual names a punctuation key after its Unicode character ("full_stop",
+# "minus"), so a modified binding arrives as alt+full_stop rather than alt+. — and
+# a handful of its own shortened names cannot be inverted through the public
+# key_to_character, which is why the table below is needed at all.
+_KEY_NAME_CHARS = {
+    "plus": "+", "minus": "-", "slash": "/",
+    "at": "@", "backslash": "\\", "underscore": "_",
+}
+
+
+def _key_name_character(name: str) -> Optional[str]:
+    """The single printable character a Textual key name stands for, or None.
+
+    Named keys with no character (arrows, function keys) and control characters
+    (backspace's \\x08) return None: the caller must not invent bytes for them."""
+    resolved = _KEY_NAME_CHARS.get(name)
+    if resolved is None:
+        try:
+            from textual.keys import key_to_character  # type: ignore
+        except Exception:
+            return None
+        resolved = key_to_character(name)
+    if not resolved or len(resolved) != 1 or not resolved.isprintable():
+        return None
+    return resolved
+
+
 # ── Key encoding ──────────────────────────────────────────────────────────────
 # event.key -> exact bytes/escape the PTY child expects. We start from the
 # textual-terminal reference table, then add the control bytes it leaves to
@@ -1633,6 +1660,9 @@ def encode_key(key: str, character: Optional[str], *,
             return "\x1b" + character
         if len(rest) == 1:
             return "\x1b" + rest
+        named = _key_name_character(rest)
+        if named is not None:
+            return "\x1b" + named
         return None   # alt+<named> (arrows etc.) aren't readline word ops
     # Printable single char (letters, digits, punctuation, space, IME unicode).
     if character and character.isprintable():

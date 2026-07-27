@@ -565,6 +565,42 @@ const widthData = input.widthData;
         }
 
 
+def test_pane_seed_sets_the_cursor_shape_before_it_makes_the_cursor_visible():
+    """DECSCUSR must reach a joining browser, and reach it before ?25h.
+
+    The pane's software caret now draws the child's shape, and xterm.js maps
+    1/2 -> block, 3/4 -> underline, 5/6 -> bar. Shape after visibility would show
+    one frame of the wrong caret, and a missing shape leaves a browser that joined
+    after ESC[5 q rendering a block for a child asking for a bar."""
+    import pyte
+
+    screen = pyte.Screen(8, 2)
+    for style in (0, 1, 2, 3, 4, 5, 6):
+        seed = m._synth_pane_seed(
+            screen, 8, 2,
+            {"alt": False, "cursor_hidden": False, "cursor_style": style},
+        )
+        shape = f"\x1b[{style} q"
+        assert shape in seed, (style, seed)
+        assert seed.index(shape) < seed.index("\x1b[?25h"), style
+
+    # A hidden cursor still carries the shape, so unhiding later is correct.
+    hidden = m._synth_pane_seed(
+        screen, 8, 2,
+        {"alt": False, "cursor_hidden": True, "cursor_style": 5},
+    )
+    assert "\x1b[5 q" in hidden and hidden.index("\x1b[5 q") < hidden.index("\x1b[?25l")
+
+    # Out-of-range or malformed shapes fall back to the host default, never a
+    # forged escape.
+    for bogus in (9, -1, "bar", None):
+        seed = m._synth_pane_seed(
+            screen, 8, 2,
+            {"alt": False, "cursor_hidden": False, "cursor_style": bogus},
+        )
+        assert "\x1b[0 q" in seed, bogus
+
+
 def test_seed_sgr_preserves_blink_and_strikethrough():
     """A late joiner must receive pyte blink/strike rendition bits as SGR."""
     import pyte
@@ -1478,6 +1514,8 @@ if __name__ == "__main__":
     test_page_encodes_kitty_flag1_pane_keyboard_input()
     test_pane_seed_carries_and_strips_ordered_kitty_keyboard_mode()
     test_vendored_xterm_grapheme_width_matches_rich_when_node_available()
+    test_pane_seed_sets_the_cursor_shape_before_it_makes_the_cursor_visible()
+    print("PASS test_pane_seed_sets_the_cursor_shape_before_it_makes_the_cursor_visible")
     test_seed_sgr_preserves_blink_and_strikethrough()
     test_seed_serializes_osc8_cell_links_and_active_link_state()
     test_page_injects_terminal_size()

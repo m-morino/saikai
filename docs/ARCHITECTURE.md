@@ -130,6 +130,34 @@ proved and covered by a regression test.
   the same `_color_legend` source of truth.
 - Live busy/waiting/idle state exists only for saikai-hosted panes. Sessions
   running elsewhere use file registry and transcript heuristics.
+- Exactly one component owns the real outer caret, decided by `_native_caret()`:
+  saikai drives `?25h`/`?25l` plus DECSCUSR and `render_line` draws nothing, or
+  Textual keeps the caret hidden and `render_line` draws the software caret in
+  the child's DECSCUSR shape. Both call sites read that one predicate, so "two
+  carets" and "no caret" cannot happen. Ownership is Windows, or a POSIX host
+  proved to be WSL under Windows Terminal (`WT_SESSION` **and** a WSL proof,
+  deferring to `tmux`/`screen`); `SAIKAI_NATIVE_CARET` forces it either way.
+
+### Windows key-boundary limits (not saikai bugs)
+
+Textual's Win32 driver reads the console with `ENABLE_VIRTUAL_TERMINAL_INPUT`
+and keeps only `uChar.UnicodeChar`, so some keystrokes are already merged before
+saikai sees a key name. Measured on Windows Terminal + ConPTY:
+
+| Pressed | Reaches saikai as | Effect |
+| --- | --- | --- |
+| `Shift+Enter`, `Ctrl+Enter` | `enter` / `ctrl+j` | submits like Enter |
+| `Ctrl+Tab` | `tab` | plain Tab |
+| `Alt+1`..`Alt+9`, `Alt+-`, `Alt+=` | `¡ ™ £ ¢ ∞ § ¶ • ª º – ≠` | that character is typed |
+| `Alt+b` / `Alt+f` | `ctrl+left` / `ctrl+right` | cursor word-move, not readline |
+
+`encode_key` already emits the correct bytes for the real names
+(`shift+enter` → `\x1b[13;2u`, `alt+full_stop` → `\x1b.`), so the fix belongs in
+the host, not in saikai: bind the CSI-u form in Windows Terminal's
+`settings.json` (`shift+enter` → `sendInput` `[13;2u`, `alt+1` →
+`[49;3u`, and so on). Turning `ENABLE_VIRTUAL_TERMINAL_INPUT` off would
+recover the records but silently kills mouse reporting and destroys bracketed
+paste framing before the application can read it, so it is not an option.
 
 ## Verification
 
