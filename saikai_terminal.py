@@ -892,6 +892,7 @@ _DECRQM_TRACKED = {
     "1002": "_mouse_btn_motion",
     "1003": "_mouse_any_motion",
     "1006": "_mouse_sgr",
+    "1004": "_focus_reporting",      # the pane really sends \x1b[I / \x1b[O
     "2004": "_bracketed_paste",
 }
 _DECRQM_ALT_SCREEN = ("47", "1047", "1049")
@@ -951,6 +952,11 @@ def _strip_dcs(text: str, inside: bool = False, dropped: int = 0):
 # answered at their own stream position rather than up front: cursor position (DSR 6)
 # and mode state (DECRQM). Groups: 1-2 = DSR privacy/kind, 3 = DECRQM mode.
 _POSITIONAL_QUERY_RE = re.compile("|".join((_DSR_RE.pattern, _DECRQM_RE.pattern)))
+
+# DEC private mode changes and the DECRQM queries that report them, in one pass:
+# a query must see the state the child had written by ITS position, not the state
+# the whole chunk ends in. Groups: 1-2 = DECSET/DECRST params/final, 3 = DECRQM.
+_MODE_STREAM_RE = re.compile("|".join((_DEC_PRIVATE_RE.pattern, _DECRQM_RE.pattern)))
 
 
 def _has_positional_query(text: str) -> bool:
@@ -2443,13 +2449,19 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             except Exception:
                 return 1, 1
 
-    def _decrqm_report(self, mode: str) -> int:
+    def _decrqm_report(self, mode: str, so_far: Optional[dict] = None) -> int:
         """DECRQM answer for a private *mode*: 1 = set, 2 = reset, 0 = not recognised.
 
         A pane that answers Primary DA as Windows Terminal must not report "not
         recognised" for modes it honours: a child using the set-then-verify pattern
         then refuses to enable bracketed paste (so a multi-line paste submits line by
-        line) or SGR mouse encoding, even though saikai tracks both. (#term-queries)"""
+        line) or SGR mouse encoding, even though saikai tracks both.
+
+        `so_far` is the set of modes the chunk being scanned has already changed
+        BEFORE this query. It wins over the live state, which for a mode the same
+        chunk sets later would answer with the child's future. (#term-queries)"""
+        if so_far and mode in so_far:
+            return 1 if so_far[mode] else 2
         if mode == "2026":
             stager = getattr(self, "_sync_output", None)
             return 1 if (stager is not None and stager.in_block) else 2
@@ -2468,15 +2480,15 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return 0
         return 1 if getattr(self, attr, False) else 2
 
-    def _answer_static_queries(self, chunk: str) -> None:
-        """Answer terminal queries whose reply does not depend on live state.
+    def _static_query_replies(self, chunk: str) -> list:
+        """(position, reply) for every query whose answer needs no live state.
 
-        Replies go out in the order the child ASKED, not in the order this method
-        happens to check: a probe batch that ends with CSI c — "answer what you know,
-        then this sentinel" — must not get the sentinel first. (#term-queries)"""
-        out = []                      # (position in chunk, reply) — sorted before send
-        _m = _DA_RE.search(chunk)
-        if _m is not None:
+        Position-tagged rather than emitted: the caller merges these with the mode
+        and cursor answers so the child receives one set of replies in the order it
+        asked. A probe batch that ends with CSI c — "answer what you know, then
+        this sentinel" — must not get the sentinel first. (#term-queries)"""
+        out = []
+        for _m in _DA_RE.finditer(chunk):
             # Primary DA — reply BYTE-IDENTICAL to the outer Windows Terminal (probed
             # on-device: ESC[?61;...c, a VT500-class terminal with feature extensions).
             # The old minimal "?6c" (VT102) made Claude Code treat the pane as a basic
@@ -2484,8 +2496,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # instead of tracking the input caret. Looking exactly like WT (which Claude
             # tracks correctly when run directly) is the fix. (#agents-cursor #wt-da)
             out.append((_m.start(), "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c"))
-        _m = _DA2_RE.search(chunk)
-        if _m is not None:
+        for _m in _DA2_RE.finditer(chunk):
             # Secondary DA. A terminal that answers DA1 as WT must answer this too:
             # vim's t_RV and tmux's handshake serialize DA1 then DA2, and silence
             # stalls them for a probe timeout and then mis-detects version-gated
@@ -2494,9 +2505,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         for _m in _DSR_RE.finditer(chunk):
             if _m.group(2) == "5":
                 out.append((_m.start(), "\x1b[0n"))      # device status: OK
-        # DECRQM is NOT answered here: it reports live mode state, so it has to be
-        # answered at its own stream position once the bytes before it reached pyte
-        # (see _feed_presentation_unit). Everything above is state-free.
+        # DECRQM is NOT answered here: it reports live mode state, so it is
+        # answered by the ordered mode walk in _consume. Everything above is
+        # state-free.
         # XTVERSION (ESC[>q): the outer Windows Terminal sends NO reply (probed on-
         # device). Answering with a name ("saikai") made Claude Code see an unknown
         # terminal and skip its WT cursor-tracking path. Stay silent, exactly like WT.
@@ -2509,6 +2520,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             _code = _m.group(1)
             _rgb = "1e1e/1e1e/1e1e" if _code == "11" else "c0c0/c0c0/c0c0"
             out.append((_m.start(), f"\x1b]{_code};rgb:{_rgb}{_m.group(2)}"))
+        return out
+
+    def _answer_static_queries(self, chunk: str) -> None:
+        """Emit the state-free replies for *chunk* on their own (compat path)."""
+        out = self._static_query_replies(chunk)
         if out:
             out.sort(key=lambda pair: pair[0])
             resp = "".join(reply for _pos, reply in out)
@@ -2581,36 +2597,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             chunk = self._hold_partial_escape(chunk)
         chunk = _PRIVATE_SGR_RE.sub("", chunk)   # drop XTMODKEYS \x1b[>4;2m etc. (pyte misreads as SGR-4 underline)
         chunk = _KITTY_KBD_RE.sub("", chunk)     # drop Kitty-keyboard CSI-u (pyte leaks the trailing 'u' into the grid)
-        _bp = _BRACKETED_RE.findall(chunk)       # track claude's bracketed-paste mode for on_paste (last h/l wins)
-        if _bp:
-            self._bracketed_paste = (_bp[-1] == "h")
-        _dec = _DEC_PRIVATE_RE.findall(chunk)    # DEC private-mode sets (mouse / SGR / …)
-        if _dec:
-            for _params, _hl in _dec:
-                _on = (_hl == "h")
-                for _p in _params.split(";"):    # handle COMBINED params (?1002;1006h)
-                    if _p == "1":
-                        self._app_cursor = _on         # DECCKM (#pane-direct seed replay)
-                    elif _p in ("1000", "1002", "1003"):
-                        # Mouse tracking is ONE exclusive protocol slot in both
-                        # real xterm and xterm.js: a DECSET replaces the active
-                        # protocol, and a DECRST of ANY family member turns
-                        # tracking off entirely. Three independent booleans left
-                        # a stale flag behind ("1000h…1003h…1003l" kept click
-                        # tracking True) and the mirror seed then re-armed mouse
-                        # reporting on a child that had turned it off — browser
-                        # SGR reports typed into its stdin. (#review-mouse-slot)
-                        self._mouse_click = _on and _p == "1000"
-                        self._mouse_btn_motion = _on and _p == "1002"   # drag motion
-                        self._mouse_any_motion = _on and _p == "1003"   # hover motion
-                    elif _p == "1004":
-                        self._focus_reporting = _on    # child wants focus in/out events
-                    elif _p == "1006":
-                        self._mouse_sgr = _on          # SGR extended encoding
-            # any tracking on ⇒ the child owns the mouse (incl. wheel + drag-select)
-            self._mouse_reporting = (getattr(self, "_mouse_click", False)
-                                     or getattr(self, "_mouse_btn_motion", False)
-                                     or getattr(self, "_mouse_any_motion", False))
+        # Mode sets/resets and the DECRQM queries that report them are ONE ordered
+        # stream: applying the whole chunk first and answering afterwards told a
+        # child that asks "is SGR mouse on?" and only then enables it that it was
+        # already on. Walk them together so each query sees the state the child
+        # had written by that point. (#term-queries)
+        mode_replies = self._apply_modes_in_stream_order(chunk)
         # Honor the child's OSC 52 clipboard writes (e.g. claude's fullscreen 'copy
         # selection'): saikai consumes the child's output and pyte ignores OSC 52, so
         # decode + set the HOST clipboard ourselves. Reassemble across reads — a large
@@ -2634,24 +2626,84 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 self._notify_host(_msg.replace(";", ": ", 1))
             for _msg in _OSC99_RE.findall(chunk):
                 self._notify_host(_msg)
-        # Query side channels must stay live while a synchronized-output frame is
-        # retained. In particular, a child can wait for a capability response
-        # before it emits ?2026l.
-        self._answer_static_queries(chunk)
-        sync_output = getattr(self, "_sync_output", None)
-        if sync_output is None:                 # compatibility with minimal test objects
-            sync_output = self._sync_output = _SynchronizedOutputStager()
+        replies = self._static_query_replies(chunk) + mode_replies
+        sync_output = self._sync_output
         units = sync_output.push(chunk)
-        if sync_output.active and sync_output.pending_query:
+        if sync_output.pending_query:
             units.extend(sync_output.flush("pending-query"))
 
         changed = False
+        cursor_replies = []
         for text, fail_reason in units:
             if fail_reason:
                 _log(f"sync-output fail-open: reason={fail_reason} chars={len(text)}")
-            self._feed_presentation_unit(text)
+            cursor_replies.extend(self._feed_presentation_unit(text))
             changed = True
+        # A cursor report can only be produced once its output reached pyte, but
+        # the child asked for it at a known place in THIS chunk, so pair the
+        # answers with those positions in order. Anything left over came from text
+        # retained by an earlier chunk and therefore precedes everything here.
+        positions = [match.start() for match in _DSR_RE.finditer(chunk)
+                     if match.group(2) == "6"]
+        surplus = len(cursor_replies) - len(positions)
+        for index, reply in enumerate(cursor_replies):
+            replies.append((positions[index - surplus] if index >= surplus else -1,
+                            reply))
+        if replies:
+            replies.sort(key=lambda pair: pair[0])
+            resp = "".join(reply for _pos, reply in replies)
+            self._marshal(lambda r=resp: self._send_to_child(r))
         return changed
+
+    def _apply_modes_in_stream_order(self, chunk: str) -> list:
+        """Apply DEC private / bracketed-paste changes and answer DECRQM in order.
+
+        Returns the (position, reply) pairs for the DECRQM queries. Every mode the
+        chunk sets is still applied by the time this returns, so the input paths
+        that read these attributes are unchanged; only the ANSWERS become
+        position-accurate. (#term-queries)"""
+        replies = []
+        # Every private mode this chunk changes, as of the position reached so
+        # far. A query for a mode the chunk has not touched falls through to the
+        # live state, which is still accurate for it.
+        so_far: dict = {}
+        for match in _MODE_STREAM_RE.finditer(chunk):
+            query_mode = match.group(3)
+            if query_mode is not None:
+                replies.append(
+                    (match.start(),
+                     f"\x1b[?{query_mode};"
+                     f"{self._decrqm_report(query_mode, so_far)}$y"))
+                continue
+            params, final = match.group(1), match.group(2)
+            enabled = (final == "h")
+            for param in params.split(";"):      # COMBINED params (?1002;1006h)
+                so_far[param] = enabled
+                if param in _DECRQM_ALT_SCREEN:  # one buffer, three spellings
+                    so_far.update(dict.fromkeys(_DECRQM_ALT_SCREEN, enabled))
+                if param == "1":
+                    self._app_cursor = enabled   # DECCKM (#pane-direct seed replay)
+                elif param in ("1000", "1002", "1003"):
+                    # Mouse tracking is ONE exclusive protocol slot in both real
+                    # xterm and xterm.js: a DECSET replaces the active protocol,
+                    # and a DECRST of ANY family member turns tracking off
+                    # entirely. Three independent booleans left a stale flag
+                    # behind ("1000h…1003h…1003l" kept click tracking True) and
+                    # the mirror seed then re-armed mouse reporting on a child
+                    # that had turned it off. (#review-mouse-slot)
+                    self._mouse_click = enabled and param == "1000"
+                    self._mouse_btn_motion = enabled and param == "1002"
+                    self._mouse_any_motion = enabled and param == "1003"
+                elif param == "1004":
+                    self._focus_reporting = enabled
+                elif param == "1006":
+                    self._mouse_sgr = enabled    # SGR extended encoding
+                elif param == "2004":
+                    self._bracketed_paste = enabled
+            # any tracking on ⇒ the child owns the mouse (wheel + drag-select)
+            self._mouse_reporting = (self._mouse_click or self._mouse_btn_motion
+                                     or self._mouse_any_motion)
+        return replies
 
     def _hold_partial_escape(self, chunk: str) -> str:
         """Return *chunk* without its trailing partial escape, holding that for the
@@ -2667,7 +2719,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._esc_carry = chunk[match.start():] + self._esc_carry
         return chunk[:match.start()]
 
-    def _feed_presentation_unit(self, chunk: str) -> None:
+    def _feed_presentation_unit(self, chunk: str) -> list:
         """Feed one complete unit to pyte, answering each DSR-6 AT ITS POSITION.
 
         A real terminal replies with the cursor as of the query. Answering once the
@@ -2678,22 +2730,19 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         version, the status classifier and the mirror tee still see exactly one
         complete unit — a repaint, a classification or a browser frame taken
         between segments would observe the half-drawn state the presentation
-        boundary exists to hide. (#term-queries #pane-direct)"""
-        if "6n" not in chunk and "$p" not in chunk:
-            self._consume_ready(chunk)         # no positional query: one feed
-            return
+        boundary exists to hide. Returns the replies in order so the caller can
+        merge them with the rest of the chunk's answers. (#term-queries #pane-direct)"""
+        if "6n" not in chunk:
+            self._consume_ready(chunk)         # no cursor query: one feed
+            return []
         replies = []
         pos = 0
-        for _m in _POSITIONAL_QUERY_RE.finditer(chunk):
-            _mode = _m.group(3)
-            if _mode is None and _m.group(2) != "6":
+        for _m in _DSR_RE.finditer(chunk):
+            if _m.group(2) != "6":
                 continue                       # DSR-5 is state-free, answered early
             self._consume_ready(chunk[pos:_m.end()], present=False)
-            if _mode is None:
-                row, col = self._cursor_rowcol()
-                replies.append(f"\x1b[{_m.group(1)}{row};{col}R")
-            else:
-                replies.append(f"\x1b[?{_mode};{self._decrqm_report(_mode)}$y")
+            row, col = self._cursor_rowcol()
+            replies.append(f"\x1b[{_m.group(1)}{row};{col}R")
             pos = _m.end()
         # Present the WHOLE unit once: pyte already has the leading segments, so
         # feed only the tail but hand the mirror every byte in one frame.
@@ -2701,9 +2750,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         with self._lock:
             self._present_locked(chunk)
         self._present_after_lock()
-        if replies:
-            resp = "".join(replies)
-            self._marshal(lambda r=resp: self._send_to_child(r))
+        return replies
 
     def _consume_ready(self, chunk: str, present: bool = True) -> None:
         """Feed one complete presentation unit to pyte and its mirror.

@@ -1532,6 +1532,76 @@ def test_cursor_query_fail_opens_sync_block_then_reports_new_cursor():
     assert t._sync_output.active is False
 
 
+def test_every_query_is_answered_at_its_own_position_and_in_stream_order():
+    """One chunk, one ordered set of replies.
+
+    Three defects met here. (1) DECRQM was answered from mode state _consume had
+    already applied for the WHOLE chunk, so a child that asks "is SGR mouse on?"
+    and only then enables it was told it was already on — and a save/restore child
+    then skips the restore and leaves mouse reporting armed. (2) Replies crossed
+    class boundaries out of order: the static answerer ran before the feed, so
+    `\\x1b[6n\\x1b[c` — the canonical "query, then CSI c as end-of-replies
+    sentinel" probe — answered the sentinel first. (3) Primary/Secondary DA used
+    search(), so a second probe in the same chunk got nothing. (#term-queries)"""
+    import pyte
+
+    def _mk():
+        t = rt.AgentTerminal(["agent"], status_classifier=lambda _t, _title: "idle")
+        t._screen = rt._HistoryScreenBase(30, 6, history=20)
+        t._stream = pyte.Stream(t._screen)
+        t._sync_output = rt._SynchronizedOutputStager()
+        t.sent = []
+        t._send_to_child = t.sent.append
+        t._marshal = lambda fn: fn()
+        return t
+
+    # (1) mode state as of the query, not after the chunk.
+    t = _mk()
+    t._consume("\x1b[?1006$p\x1b[?1006h")
+    assert "".join(t.sent) == "\x1b[?1006;2$y", t.sent
+    assert t._mouse_sgr is True, "the set still applies for the rest of the chunk"
+
+    t = _mk()
+    t._consume("\x1b[?2004h")
+    t.sent.clear()
+    t._consume("\x1b[?2004$p\x1b[?2004l")
+    assert "".join(t.sent) == "\x1b[?2004;1$y", t.sent
+    assert t._bracketed_paste is False
+
+    # ...and a query after the change sees the change.
+    t = _mk()
+    t._consume("\x1b[?1003h\x1b[?1003$p")
+    assert "".join(t.sent) == "\x1b[?1003;1$y", t.sent
+
+    # (2) stream order across query classes.
+    t = _mk()
+    t._consume("\x1b[2;3HP\x1b[6n\x1b[c")
+    assert "".join(t.sent) == "\x1b[2;4R\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c", t.sent
+
+    t = _mk()
+    t._consume("\x1b[c\x1b[6n")          # the other order is preserved too
+    assert "".join(t.sent) == "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c\x1b[1;1R", t.sent
+
+    # (3) every probe answered, not just the first.
+    t = _mk()
+    t._consume("\x1b[c hello \x1b[c")
+    assert t.sent.count("\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c") == 2 or \
+        "".join(t.sent).count("\x1b[?61;") == 2, t.sent
+    t = _mk()
+    t._consume("\x1b[>c aa \x1b[>c")
+    assert "".join(t.sent).count("\x1b[>0;10;1c") == 2, t.sent
+
+    # ?1004 focus reporting is implemented — the pane really sends \x1b[I / \x1b[O
+    # — so DECRQM must not answer "not recognised".
+    t = _mk()
+    t._consume("\x1b[?1004$p")
+    assert "".join(t.sent) == "\x1b[?1004;2$y", t.sent
+    t.sent.clear()
+    t._consume("\x1b[?1004h")
+    t._consume("\x1b[?1004$p")
+    assert "".join(t.sent) == "\x1b[?1004;1$y", t.sent
+
+
 def test_query_split_does_not_classify_or_tee_half_drawn_frames():
     """Splitting the pyte feed at a query must stay invisible above pyte.
 
@@ -2149,7 +2219,15 @@ def test_consume_collapses_alt_screen_reset_amplification():
     t._esc_carry = ""
     t._dcs_inside = False
     t._dcs_dropped = 0
+    t._mouse_click = False
+    t._mouse_btn_motion = False
+    t._mouse_any_motion = False
+    t._app_cursor = False
+    t._focus_reporting = False
     t._bracketed_paste = False
+    t._sync_output = rt._SynchronizedOutputStager()
+    t._marshal = lambda fn: fn()
+    t._send_to_child = lambda data: None
     t._mouse_reporting = False
     t._mouse_sgr = False
     t._current_screen = lambda: ("", "")
@@ -2988,6 +3066,8 @@ if __name__ == "__main__":
     print("PASS test_static_query_answers_before_sync_block_closes")
     test_cursor_query_fail_opens_sync_block_then_reports_new_cursor()
     print("PASS test_cursor_query_fail_opens_sync_block_then_reports_new_cursor")
+    test_every_query_is_answered_at_its_own_position_and_in_stream_order()
+    print("PASS test_every_query_is_answered_at_its_own_position_and_in_stream_order")
     test_query_split_does_not_classify_or_tee_half_drawn_frames()
     print("PASS test_query_split_does_not_classify_or_tee_half_drawn_frames")
     test_cursor_report_uses_the_cursor_at_the_querys_stream_position()
