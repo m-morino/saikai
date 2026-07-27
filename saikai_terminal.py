@@ -1813,7 +1813,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if back_at_live:
             # Wheeling back to live re-anchors even with no input and no output —
             # the scrolled-back sync hid the native cursor. (#ime-scrollback)
-            self._sync_terminal_cursor(reason="focus")
+            self._sync_terminal_cursor(reason="scroll")
         try:
             event.stop()
         except Exception:
@@ -1839,7 +1839,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # Leaving scrollback must RE-ANCHOR: the sync hid the native cursor on the
             # way up, and a repaint-driven sync can't undo that on a quiet pane (the
             # reader only schedules repaints for new output). (#ime-scrollback)
-            self._sync_terminal_cursor(reason="focus")
+            self._sync_terminal_cursor(reason="scroll")
 
     # ── saikai-owned text selection (drag) ─────────────────────────────────────
     # The host terminal's native Shift+drag can't anchor to a TUI widget — saikai
@@ -2198,7 +2198,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # Every path back to live has to re-anchor: the scrolled-back sync hid
             # the native cursor, and on a quiet pane no repaint follows a resize.
             # (#ime-scrollback)
-            self._sync_terminal_cursor(reason="focus")
+            self._sync_terminal_cursor(reason="scroll")
 
     # ── (4) background reader -> feed pyte -> repaint on the UI thread ─────────
     def _flush_sync_output(self, reason: str) -> bool:
@@ -3277,15 +3277,22 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 self._cursor_hidden_since = now
         else:
             self._cursor_hidden_since = 0.0
-        if reason == "repaint":
+        move_anchor = True
+        if reason in ("repaint", "scroll"):
             hidden_since = getattr(self, "_cursor_hidden_since", 0.0)
             hiding = bool(hidden_since) and (now - hidden_since) < _NATIVE_CURSOR_HIDE_SETTLE
             midframe = self._cursor_may_be_midframe(now)
             if hiding or midframe:
                 if _IME_DEBUG:
-                    _ime_dbg(f"sync reason=repaint FREEZE cur=({cx},{cy}) "
+                    _ime_dbg(f"sync reason={reason} FREEZE cur=({cx},{cy}) "
                              f"midframe={midframe} hiding={hiding}")
-                return
+                if reason == "repaint":
+                    return
+                # Leaving scrollback: the pane IS live again, so the native
+                # cursor has to come back — but a cursor the gate rejects must
+                # not become the composition anchor. Restore visibility, leave
+                # the position to the next repaint. (#ime-scrollback)
+                move_anchor = False
         if not _native_cursor_should_show(cursor_hidden, in_alt):
             self._show_hw_cursor(False)
             self._anchored_xy = None
@@ -3307,6 +3314,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # blur→refocus re-asserts ?25h even if visibility looked unchanged.
             self._show_hw_cursor(True, force=(reason != "repaint"))
             if xy is None:
+                return
+            if not move_anchor:
                 return
             moved = xy != getattr(self, "_anchored_xy", None)
             app.cursor_position = Offset(*xy)   # cross-platform IME anchor

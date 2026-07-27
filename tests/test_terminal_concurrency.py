@@ -2889,6 +2889,28 @@ def test_cursor_anchor_settles_hidden_and_tracks_atomic_frames():
         assert t._anchored_xy is None
 
         t, writes = _term()
+        # Leaving scrollback restores the native cursor, but must NOT plant the
+        # anchor on a cursor the mid-frame gate would have rejected: the three
+        # leave-scrollback paths used reason="focus", which skips that gate
+        # entirely, so wheeling back during a torn frame anchored composition on
+        # the frame's Home position. (#ime-scrollback #ime-midframe)
+        t, writes = _term(status="busy")
+        t._screen.history = type("H", (), {"top": [0] * 50})()
+        t._sync_output.push("\x1b[?2026hA\x1b[?2026l", now=599.9)   # atomic so far
+        t._sync_terminal_cursor(now=600.0)
+        anchored = t._app.cursor_position
+        writes.clear()
+        t._scroll = 5
+        t._sync_terminal_cursor(now=600.1)
+        assert writes == ["\x1b[?25l"], writes
+        writes.clear()
+        t._sync_output.push("\x1b[?2026hpartial", now=600.2)
+        t._sync_output.push("more", now=600.9)        # fail-open -> torn
+        t._screen.cursor.x = 0                         # mid-frame Home
+        t._snap_to_live()
+        assert writes == ["\x1b[?25h"], "the pane is live again: show the caret"
+        assert t._app.cursor_position == anchored, "a torn cursor must not move it"
+
         # A resize that leaves scrollback must re-anchor like every other path
         # back to live: _snap_to_live and the wheel handler do, and a pane that
         # only got here by resizing was left with the native cursor hidden until
