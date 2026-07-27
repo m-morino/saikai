@@ -1441,6 +1441,32 @@ def test_sync_output_stager_bounds_and_flushes_once():
     assert s.flush("eof") == []
 
 
+def test_closing_a_failed_open_block_restores_atomicity_and_clears_in_block():
+    """A fail-open must not leave the pane permanently mid-frame.
+
+    The ?2026l that closes a block AFTER a fail-open flipped bypass->outside
+    without going through _release, so the clean-frame timestamp was never
+    stamped: atomic_at stayed False and the IME anchor stopped tracking through a
+    busy storm until some later frame closed cleanly. And in_block reported bypass
+    as "still inside a block" with no aging, so a child that abandoned a ?2026h
+    answered DECRQM ?2026 as SET for the rest of the pane's life. (#2026)"""
+    s = rt._SynchronizedOutputStager(max_chars=1024, max_age=0.2)
+    s.push("\x1b[?2026hpartial", now=1.0)
+    s.push("more", now=2.0)                       # timeout fail-open -> bypass
+    assert s.torn_at(2.0) is True and s.in_block_at(2.0) is True
+
+    s.push("rest\x1b[?2026l", now=2.05)           # the real close finally arrives
+    assert s.torn_at(2.05) is False
+    assert s.in_block_at(2.05) is False, "the block ended; DECRQM must stop saying SET"
+    assert s.atomic_at(2.05) is True, "a closed frame is frame-final state"
+
+    # A bypass whose close never arrives stops claiming the block as well.
+    s2 = rt._SynchronizedOutputStager(max_chars=8, max_age=5.0)
+    s2.push("\x1b[?2026habcdefghij", now=3.0)     # overflow fail-open
+    assert s2.in_block_at(3.0) is True
+    assert s2.in_block_at(3.0 + rt._SYNC_BYPASS_TTL + 0.1) is False
+
+
 def test_sync_output_bypass_rearms_and_atomicity_decays():
     """Neither 'this pane delivers atomic frames' nor 'this pane is mid-tear' may be
     a permanent latch — the IME anchor's freeze decision reads both.
@@ -2863,6 +2889,29 @@ def test_cursor_anchor_settles_hidden_and_tracks_atomic_frames():
         assert t._anchored_xy is None
 
         t, writes = _term()
+        # A resize that leaves scrollback must re-anchor like every other path
+        # back to live: _snap_to_live and the wheel handler do, and a pane that
+        # only got here by resizing was left with the native cursor hidden until
+        # the 1.5s poll happened to tick. (#ime-scrollback)
+        t, writes = _term()
+        t._screen.history = type("H", (), {"top": [0] * 50})()
+        t._sync_terminal_cursor(now=500.0)
+        writes.clear()
+        t._scroll = 6
+        t._sync_terminal_cursor(now=500.1)
+        assert writes == ["\x1b[?25l"], writes
+        writes.clear()
+        t._dims = lambda: (6, 40)
+        t._ensure_screen_pair_locked = lambda: None
+        t._main_screen = t._alt_screen = t._screen
+        t._invalidate_screen_grapheme = lambda _s: None
+        t._pty = None
+        t.on_resize(type("E", (), {})())
+        assert t._scroll == 0
+        assert writes == ["\x1b[?25h"], writes
+
+        t, writes = _term()
+        t._screen.history = type("H", (), {"top": [0] * 50})()
         writes.clear()                                # wheeling back down, no input
         t._scroll = 3
         t._sync_terminal_cursor(now=300.2)
@@ -3054,6 +3103,8 @@ if __name__ == "__main__":
     print("PASS test_sync_output_stager_holds_split_frame_until_close")
     test_sync_output_stager_orders_back_to_back_and_combined_markers()
     print("PASS test_sync_output_stager_orders_back_to_back_and_combined_markers")
+    test_closing_a_failed_open_block_restores_atomicity_and_clears_in_block()
+    print("PASS test_closing_a_failed_open_block_restores_atomicity_and_clears_in_block")
     test_sync_output_bypass_rearms_and_atomicity_decays()
     print("PASS test_sync_output_bypass_rearms_and_atomicity_decays")
     test_paste_marker_strip_is_linear_not_quadratic()

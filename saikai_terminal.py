@@ -1028,7 +1028,15 @@ class _SynchronizedOutputStager:
         """True while the child is inside a BSU/ESU pair, whether we are still
         holding the frame or streaming it through after a fail-open. This is what
         DECRQM ?2026 must report — the child set the mode either way."""
-        return self._state in ("staging", "bypass")
+        return self.in_block_at(time.monotonic())
+
+    def in_block_at(self, now):
+        """in_block as of *now*. A fail-open that never sees its ESU ages out: a
+        child that abandoned a ?2026h would otherwise have the pane answer DECRQM
+        ?2026 as SET for the rest of its life."""
+        if self._state == "staging":
+            return True
+        return self._state == "bypass" and (now - self._bypass_at) <= _SYNC_BYPASS_TTL
 
     @staticmethod
     def _is_sync(match):
@@ -1110,7 +1118,12 @@ class _SynchronizedOutputStager:
                 else:
                     plain.append(marker)     # closing/stray ESU: pass it through
                     if self._state == "bypass":
+                        # The block the fail-open tore is over. pyte now holds a
+                        # complete frame again, so stamp it: without this the
+                        # clean-frame clock stayed at zero and the anchor treated
+                        # the pane as never-atomic. (#2026)
                         self._state = "outside"
+                        self._last_frame_at = now
             pos = match.end()
 
         tail = chunk[pos:]
@@ -2169,6 +2182,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         rows, cols = self._dims()
         with self._lock:
+            left_scrollback = self._scroll != 0
             self._scroll = 0     # geometry changed; drop any scrollback offset
             try:
                 self._screen.resize(rows, cols)     # pyte: (rows, cols)!
@@ -2180,6 +2194,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             except Exception:
                 pass
         self.refresh()
+        if left_scrollback:
+            # Every path back to live has to re-anchor: the scrolled-back sync hid
+            # the native cursor, and on a quiet pane no repaint follows a resize.
+            # (#ime-scrollback)
+            self._sync_terminal_cursor(reason="focus")
 
     # ── (4) background reader -> feed pyte -> repaint on the UI thread ─────────
     def _flush_sync_output(self, reason: str) -> bool:
