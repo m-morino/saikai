@@ -2287,6 +2287,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         pty = self._pty
         if not data or pty is None or self.is_dead:
             return
+        dropped = 0
         lock = getattr(self, "_write_lock", None)
         queue = getattr(self, "_write_q", None)
         if lock is not None and queue is not None:
@@ -2301,13 +2302,18 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                     if self._write_q_chars + len(data) > _PTY_WRITE_QUEUE_MAX:
                         # The child has stopped reading stdin for good. Refuse rather
                         # than buffer without limit; the pane is already unusable and
-                        # the queue would just grow until memory ran out.
-                        _log(f"pty write dropped: queue full ({len(data)} chars)")
-                        return
-                    queue.append(data)
-                    self._write_q_chars += len(data)
-                    self._start_writer_locked()
+                        # the queue would just grow until memory ran out. Log AFTER
+                        # the lock: _log opens, sizes and may rotate a file, and the
+                        # writer needs this lock to make progress.
+                        dropped = len(data)
+                    else:
+                        queue.append(data)
+                        self._write_q_chars += len(data)
+                        self._start_writer_locked()
                     return
+        if dropped:
+            _log(f"pty write dropped: queue full ({dropped} chars)")
+            return
         try:
             pty.write(data)
         except Exception:
@@ -2942,7 +2948,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # sync, and syncs otherwise ride repaints — which the reader schedules only
         # for new output. A child that hid its cursor and then stopped emitting
         # would keep a stale native cursor on screen forever. (#ime-midframe)
-        self._sync_terminal_cursor(reason="repaint")
+        self._sync_terminal_cursor(reason="poll")
         # Skip the screen-join + classify for a STABLE pane that produced no
         # output since the last poll — UNLESS it is still 'busy' (must keep being
         # re-checked so it can flip to idle on the debounce's 2nd tick when claude
@@ -3226,6 +3232,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         if Offset is None or self.is_dead or not self._is_focused_pane():
             return
+        if getattr(self, "_frozen", False):
+            # Mid drag-select: repaints are suppressed so the selection survives,
+            # and the pinned view is not showing the live cursor. Leave the caret
+            # exactly where the user left it. (#click-no-freeze)
+            return
         if self._scroll != 0:
             # Scrolled back: the live prompt is off-view and the anchored cell now
             # sits on unrelated history, so a bare return would leave the native
@@ -3272,7 +3283,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         else:
             self._cursor_hidden_since = 0.0
         move_anchor = True
-        if reason in ("repaint", "scroll"):
+        if reason in ("repaint", "scroll", "poll"):
             hidden_since = self._cursor_hidden_since
             hiding = bool(hidden_since) and (now - hidden_since) < _NATIVE_CURSOR_HIDE_SETTLE
             midframe = self._cursor_may_be_midframe(now)
@@ -3280,7 +3291,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 if _IME_DEBUG:
                     _ime_dbg(f"sync reason={reason} FREEZE cur=({cx},{cy}) "
                              f"midframe={midframe} hiding={hiding}")
-                if reason == "repaint":
+                if reason in ("repaint", "poll"):
                     return
                 # Leaving scrollback: the pane IS live again, so the native
                 # cursor has to come back — but a cursor the gate rejects must

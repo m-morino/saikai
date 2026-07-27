@@ -8027,12 +8027,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def _apply_live_status(self, sid: str, status: str) -> None:
             """The _unread / _busy_seen bookkeeping + tab-glyph repaint a status
-            change implies. Shared by _on_live_status (reader-marshalled, once per
-            transition) AND _poll_live_status: the 1.5s poll runs on the app's OWN
-            thread, where the reader's call_from_thread marshal is a silent no-op,
-            so when the poll is the only thing that noticed a flip (the reader
-            stayed blocked in read() with no final chunk) it must replay these
-            side-effects itself — otherwise the '!' reply-due marker, the !M badge,
+            change implies. Shared by _on_live_status (marshalled, once per
+            transition) AND _poll_live_status, which must replay these
+            side-effects for a flip only it noticed (the reader stayed blocked in
+            read() with no final chunk). Every step is set-based, so applying it
+            twice for one transition is inert — otherwise the '!' reply-due marker, the !M badge,
             and the tab glyph never update for a backgrounded pane that finished
             its turn (exactly the case this poll exists to catch)."""
             # "!" = claude FINISHED its turn (went idle) and you haven't sent input
@@ -9081,12 +9080,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             for term in self._live.all_terms():
                 try:
                     term.refresh_status()
-                    # refresh_status marshals its callback via call_from_thread,
-                    # which Textual REJECTS from the app's own thread (this poll
-                    # runs on it) — so the callback no-ops. Reconcile the manager
-                    # dict directly from the term's freshly classified status here,
-                    # else a pane that went idle/waiting with no new output never
-                    # updates its marker (the whole point of this poll).
+                    # refresh_status marshals its callback; _marshal now runs
+                    # it INLINE on the app's own thread (this poll runs on it)
+                    # rather than dropping it, but reconcile the manager dict from
+                    # the term's freshly classified status anyway: the callback
+                    # only fires on a TRANSITION, and this poll must also correct a
+                    # pane whose status was already right but never propagated.
+                    # _apply_live_status is set-based, so running twice is inert.
                     _ts = getattr(term, "_status", "")
                     # Don't propagate the teardown "dead" sentinel (set by the
                     # reader's _finalize before the marshalled _on_live_exit gets
@@ -9109,11 +9109,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             for sid, st in cur.items():
                 prev_st = prev.get(sid)
                 if st != prev_st:
-                    # The reader marshals _on_live_status once per transition, but
-                    # when this poll is the only thing that noticed the flip (the
-                    # reader stayed blocked in read() with no final chunk), that
-                    # marshal no-ops on our own thread — so replay the
-                    # _unread/_busy_seen/tab-glyph bookkeeping here, else the "!"
+                    # The reader marshals _on_live_status once per transition.
+                    # Replaying the _unread/_busy_seen/tab-glyph bookkeeping here
+                    # is harmless (it is set-based) and still required for a flip
+                    # this poll noticed on its own — a pane whose reader stayed
+                    # blocked in read() with no final chunk — else the "!"
                     # reply-due marker, the !M badge, and the tab glyph never
                     # update for a backgrounded pane that just finished its turn.
                     self._apply_live_status(sid, st)

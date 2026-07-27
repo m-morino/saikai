@@ -1747,6 +1747,92 @@ def test_reader_asks_for_large_reads_and_guards_the_eof_flush():
     assert finalized == [True], "a failing eof flush must still finalize the pane"
 
 
+def test_poll_sync_respects_a_frozen_pane_and_flushes_what_it_anchors():
+    """The 1.5s host poll reconciles the anchor, so it has to play by the rules.
+
+    (1) A FROZEN pane is mid drag-select: repaints are suppressed so the selection
+        survives, so the poll must not move the caret or write to the driver
+        underneath it.
+    (2) app.cursor_position only reaches the terminal on a CompositorUpdate. The
+        poll does not ride one, so a sync that stamps a new anchor and does not
+        force a repaint leaves it unflushed — and the next sync computes the same
+        cell, sees it unchanged and skips the flush too, so it never lands.
+    (#ime-midframe #native-cursor)"""
+    import threading as _th
+
+    class _Region:
+        x, y, width, height = 0, 0, 40, 6
+
+    class _Drv:
+        def __init__(self, sink):
+            self._sink = sink
+        def write(self, data):
+            self._sink.append(data)
+
+    class _App:
+        def __init__(self, sink):
+            self._driver = _Drv(sink)
+
+    class _Shim(rt.AgentTerminal):
+        app = property(lambda self: self._app)
+        content_region = property(lambda self: _Region())
+
+    def _term():
+        writes, refreshes = [], []
+        t = _Shim.__new__(_Shim)
+        t.sid = "x"
+        t._app = _App(writes)
+        t._lock = _th.Lock()
+        t._scroll = 0
+        t._frozen = False
+        t.is_dead = False
+        t._status = "idle"
+        t._hw_cursor_visible = None
+        t._hw_cursor_shape = 0
+        t._cursor_style = 0
+        t._anchored_xy = None
+        t._cursor_hidden_since = 0.0
+        t._sync_output = rt._SynchronizedOutputStager()
+        t._is_focused_pane = lambda: True
+        t.refresh = lambda *a, **k: refreshes.append(k.get("repaint", False))
+        import pyte
+        t._screen = rt._HistoryScreenBase(20, 5, history=10)
+        t._stream = pyte.Stream(t._screen)
+        t._alt = type("A", (), {"in_alt": False})()
+        t._scr_ver = t._last_poll_ver = 3
+        t._pending_status = None
+        return t, writes, refreshes
+
+    saved = (rt._IS_WIN, rt._IME_ANCHOR, rt.Offset)
+    rt._IS_WIN = True
+    rt._IME_ANCHOR = True
+    if rt.Offset is None:
+        rt.Offset = lambda x, y: (x, y)
+    try:
+        # (1) frozen: the poll must leave the caret exactly as it is.
+        t, writes, _refreshes = _term()
+        t._sync_terminal_cursor(reason="focus")
+        anchored, writes_before = t._anchored_xy, list(writes)
+        assert anchored is not None
+        writes.clear()
+        t._frozen = True
+        t._stream.feed("\x1b[3;7H")            # the live cursor moved underneath
+        t.refresh_status()
+        assert writes == [], writes
+        assert t._anchored_xy == anchored, "a frozen pane must keep its anchor"
+
+        # (2) not frozen: an anchor the poll moves is flushed with a repaint.
+        t, writes, refreshes = _term()
+        t._sync_terminal_cursor(reason="focus")
+        refreshes.clear()
+        t._stream.feed("\x1b[4;9H")
+        t.refresh_status()
+        assert t._anchored_xy == (8, 3), t._anchored_xy
+        assert True in refreshes, "a moved anchor needs a repaint to reach the host"
+    finally:
+        (rt._IS_WIN, rt._IME_ANCHOR, rt.Offset) = saved
+
+
 def test_small_writes_queue_when_the_pty_cannot_take_them():
     """The write path must not block the UI thread for ANY size.
 
@@ -3156,6 +3242,8 @@ if __name__ == "__main__":
     print("PASS test_dcs_strip_closes_its_own_seam_and_never_dumps_a_payload")
     test_dcs_payloads_never_reach_the_grid()
     print("PASS test_dcs_payloads_never_reach_the_grid")
+    test_poll_sync_respects_a_frozen_pane_and_flushes_what_it_anchors()
+    print("PASS test_poll_sync_respects_a_frozen_pane_and_flushes_what_it_anchors")
     test_small_writes_queue_when_the_pty_cannot_take_them()
     print("PASS test_small_writes_queue_when_the_pty_cannot_take_them")
     test_writer_thread_is_only_latched_once_it_actually_started()
