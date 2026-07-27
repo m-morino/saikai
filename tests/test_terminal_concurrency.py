@@ -1532,6 +1532,49 @@ def test_cursor_query_fail_opens_sync_block_then_reports_new_cursor():
     assert t._sync_output.active is False
 
 
+def test_query_split_does_not_classify_or_tee_half_drawn_frames():
+    """Splitting the pyte feed at a query must stay invisible above pyte.
+
+    _feed_presentation_unit feeds one unit in segments so each DSR-6 reports the
+    cursor at its own position, but _consume_ready ends by classifying the screen,
+    bumping the cache version and teeing to the browser — so a chunk with two
+    probes classified three half-drawn screens, flipped the pane to 'busy' off a
+    partially erased frame (busy is reported with no debounce), and sent the
+    mirror three frames where one chunk arrived. Do that trailing work once per
+    unit. (#term-queries #pane-direct)"""
+    import pyte
+
+    t = rt.AgentTerminal(["agent"], status_classifier=lambda _txt, _title: "idle")
+    t._screen = rt._HistoryScreenBase(30, 4, history=20)
+    t._stream = pyte.Stream(t._screen)
+    t._sync_output = rt._SynchronizedOutputStager()
+    t._marshal = lambda fn: fn()
+    t._send_to_child = lambda data: None
+
+    seen = []
+    t._classify = lambda text, title: (seen.append(text), "idle")[1]
+    teed = []
+    t._mirror_tee = teed.append
+    versions = []
+
+    chunk = "\x1b[2J\x1b[HHALF\x1b[6n MORE\x1b[6n DONE"
+    before = t._scr_ver
+    t._consume(chunk)
+    versions.append(t._scr_ver - before)
+
+    assert len(seen) == 1, [s.strip()[:20] for s in seen]
+    assert "DONE" in seen[0], seen[0]
+    assert teed == [chunk], teed
+    assert versions == [1], versions
+
+    # The replies still report each query's own position — the reason for the
+    # split in the first place.
+    replies = []
+    t._send_to_child = replies.append
+    t._consume("\x1b[1;1HAB\x1b[6nCD\x1b[6n")
+    assert "".join(replies) == "\x1b[1;3R\x1b[1;5R", replies
+
+
 def test_cursor_report_uses_the_cursor_at_the_querys_stream_position():
     """A DSR-6 is answered with the cursor AS OF THE QUERY, not after the rest of the
     chunk was drawn. One PTY write can carry 'prompt \\x1b[6n' plus the next lines of
@@ -2945,6 +2988,8 @@ if __name__ == "__main__":
     print("PASS test_static_query_answers_before_sync_block_closes")
     test_cursor_query_fail_opens_sync_block_then_reports_new_cursor()
     print("PASS test_cursor_query_fail_opens_sync_block_then_reports_new_cursor")
+    test_query_split_does_not_classify_or_tee_half_drawn_frames()
+    print("PASS test_query_split_does_not_classify_or_tee_half_drawn_frames")
     test_cursor_report_uses_the_cursor_at_the_querys_stream_position()
     print("PASS test_cursor_report_uses_the_cursor_at_the_querys_stream_position")
     test_cursor_report_clamps_pending_wrap_and_honours_origin_mode()

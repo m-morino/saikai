@@ -2673,30 +2673,47 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         A real terminal replies with the cursor as of the query. Answering once the
         whole unit is drawn reports wherever the trailing output left the cursor, so
         a shell-integration wrap probe followed by buffered output in the same PTY
-        write computes the wrong prompt row. Splitting the feed is invisible to the
-        UI: the pane repaint and the IME anchor observe pyte only after _consume
-        returns, so the unit still lands atomically as far as they can tell.
-        (#term-queries)"""
+        write computes the wrong prompt row. The split stays invisible ABOVE pyte:
+        every segment but the last feeds only (present=False), so the screen
+        version, the status classifier and the mirror tee still see exactly one
+        complete unit — a repaint, a classification or a browser frame taken
+        between segments would observe the half-drawn state the presentation
+        boundary exists to hide. (#term-queries #pane-direct)"""
+        if "6n" not in chunk and "$p" not in chunk:
+            self._consume_ready(chunk)         # no positional query: one feed
+            return
         replies = []
         pos = 0
         for _m in _POSITIONAL_QUERY_RE.finditer(chunk):
             _mode = _m.group(3)
             if _mode is None and _m.group(2) != "6":
                 continue                       # DSR-5 is state-free, answered early
-            self._consume_ready(chunk[pos:_m.end()])
+            self._consume_ready(chunk[pos:_m.end()], present=False)
             if _mode is None:
                 row, col = self._cursor_rowcol()
                 replies.append(f"\x1b[{_m.group(1)}{row};{col}R")
             else:
                 replies.append(f"\x1b[?{_mode};{self._decrqm_report(_mode)}$y")
             pos = _m.end()
-        self._consume_ready(chunk[pos:])
+        # Present the WHOLE unit once: pyte already has the leading segments, so
+        # feed only the tail but hand the mirror every byte in one frame.
+        self._consume_ready(chunk[pos:], present=False)
+        with self._lock:
+            self._present_locked(chunk)
+        self._present_after_lock()
         if replies:
             resp = "".join(replies)
             self._marshal(lambda r=resp: self._send_to_child(r))
 
-    def _consume_ready(self, chunk: str) -> None:
-        """Feed one complete presentation unit to pyte and its mirror."""
+    def _consume_ready(self, chunk: str, present: bool = True) -> None:
+        """Feed one complete presentation unit to pyte and its mirror.
+
+        `present=False` feeds pyte ONLY: the caller is delivering one unit in
+        segments (so each query reports the cursor at its own position) and will
+        present once at the end. Classifying, bumping the screen version and
+        teeing per segment would show the browser N frames for one chunk and
+        classify half-drawn screens — the mid-frame observation the whole
+        presentation boundary exists to prevent. (#term-queries #pane-direct)"""
         if not chunk:
             return
         with self._lock:
@@ -2752,24 +2769,37 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 if added > 0:
                     self._scroll = min(self._scroll + added,
                                        len(self._screen.history.top))
-            self._scr_ver += 1   # screen mutated → invalidates the _current_screen cache
-            # Mirror pane-direct tee — INSIDE the lock, after the pyte feed, so
-            # attach_mirror()'s seed (computed under this same lock) strictly
-            # precedes every chunk tee'd after it: a chunk is either in the seed
-            # or in the stream, never both. The tee is a put_nowait into the hub
-            # ingest queue — no marshal, no blocking, no regex (invariant #1
-            # holds; the child-query strip runs on the hub's DRAIN thread via
-            # set_pane_strip(_MIRROR_QUERY_STRIP_RE), so a burst never pays a
-            # regex scan while holding this lock). The FULL scrubbed chunk goes
-            # through: the alt-collapse above may feed pyte only a suffix, but
-            # the browser xterm has both buffers natively and must see every
-            # byte. (#pane-direct)
-            _tee = getattr(self, "_mirror_tee", None)   # getattr: minimal test
-            if _tee is not None:                        # instances skip __init__
-                try:
-                    _tee(chunk)
-                except Exception:
-                    pass
+            if not present:
+                return           # the caller presents the whole unit at the end
+            self._present_locked(chunk)
+        self._present_after_lock()
+
+    def _present_locked(self, chunk: str) -> None:
+        """Publish one complete unit to the cache version and the mirror.
+
+        Lock held by the caller. Paired with _present_after_lock, which must run
+        OUTSIDE the lock because classification can marshal."""
+        self._scr_ver += 1   # screen mutated → invalidates _current_screen
+        # Mirror pane-direct tee — INSIDE the lock, after the pyte feed, so
+        # attach_mirror()'s seed (computed under this same lock) strictly
+        # precedes every chunk tee'd after it: a chunk is either in the seed
+        # or in the stream, never both. The tee is a put_nowait into the hub
+        # ingest queue — no marshal, no blocking, no regex (invariant #1
+        # holds; the child-query strip runs on the hub's DRAIN thread via
+        # set_pane_strip(_MIRROR_QUERY_STRIP_RE), so a burst never pays a
+        # regex scan while holding this lock). The FULL scrubbed chunk goes
+        # through: the alt-collapse above may feed pyte only a suffix, but
+        # the browser xterm has both buffers natively and must see every
+        # byte. (#pane-direct)
+        _tee = getattr(self, "_mirror_tee", None)   # getattr: minimal test
+        if _tee is not None:                        # instances skip __init__
+            try:
+                _tee(chunk)
+            except Exception:
+                pass
+
+    def _present_after_lock(self) -> None:
+        """Classify and ring, once per presented unit. Never under self._lock."""
         # Classify from the CURRENT screen + claude's OSC-0 title (its own state
         # glyph), not a rolling byte tail: a tail keeps stale "esc to interrupt"
         # / answered prompts that scrolled up and would misclassify an idle pane.
