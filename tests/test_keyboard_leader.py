@@ -220,6 +220,60 @@ def test_pilot_space_leader_and_divider():
     assert facts.get("bar_shown"), facts
 
 
+def test_pilot_session_list_disables_mouse_hover_repaint():
+    """The session list must NOT repaint on mouse hover (#wt-hover).
+
+    Textual's DataTable drives a hover cursor on every mouse move (_on_mouse_move ->
+    _set_hover_cursor(True) + hover_coordinate -> refresh). On Windows Terminal each
+    such repaint punches cells in the adjacent split-live pane and re-emits/flickers
+    the pane's native cursor. saikai's list is keyboard-first, so ListTable swallows
+    mouse-move: hovering must leave _show_hover_cursor False (no repaint), while the
+    keyboard row cursor still moves."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_session_list_disables_mouse_hover_repaint (textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                table = self.query_one("#table")
+                facts["is_listtable"] = type(table).__name__ == "ListTable"
+                facts["hover_off_initial"] = table._show_hover_cursor is False
+                await pilot.hover("#table")               # move the mouse onto the list
+                await pilot.pause(0.2)
+                # ListTable swallows the move -> the hover highlight never activates.
+                facts["hover_off_after_hover"] = table._show_hover_cursor is False
+                row_before = table.cursor_coordinate.row
+                await pilot.press("down")                 # keyboard nav must still work
+                await pilot.pause(0.1)
+                facts["kbd_moved"] = table.cursor_coordinate.row != row_before
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+
+    assert facts.get("is_listtable"), f"#table must be the ListTable subclass: {facts}"
+    assert facts.get("hover_off_initial"), facts
+    assert facts.get("hover_off_after_hover"), \
+        f"mouse hover must not activate the hover cursor (it repaints -> WT punch): {facts}"
+    assert facts.get("kbd_moved"), f"keyboard row cursor must still move: {facts}"
+
+
 def test_pilot_search_clear_button():
     """The clear (X) button: hidden when the search box is empty, shown once it
     has text, and clicking it clears the box. Verifies on_click fires on the
@@ -2893,6 +2947,8 @@ if __name__ == "__main__":
     print("PASS test_leader_hint_item_separates_key_from_action")
     test_pilot_space_leader_and_divider()
     print("PASS test_pilot_space_leader_and_divider")
+    test_pilot_session_list_disables_mouse_hover_repaint()
+    print("PASS test_pilot_session_list_disables_mouse_hover_repaint")
     test_pilot_search_clear_button()
     print("PASS test_pilot_search_clear_button")
     test_pilot_custom_leader_does_not_leave_space_as_menu()

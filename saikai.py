@@ -4829,6 +4829,32 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     # when something goes wrong inside the framework's event loop.
     os.environ.setdefault("TEXTUAL_LOG", str(CACHE_DIR / "textual-debug.log"))
 
+    class ListTable(DataTable):
+        """The session list — keyboard-first, with the mouse-HOVER highlight OFF.
+
+        Textual's DataTable repaints on EVERY mouse move: _on_mouse_move drives a hover
+        cursor (_set_hover_cursor(True) + hover_coordinate -> watch_hover_coordinate ->
+        refresh_coordinate). On Windows Terminal each such repaint (a) punches cells in
+        the adjacent split-live pane — a column vanishes until the next pane redraw —
+        and (b) re-emits/flickers the pane's native IME cursor, because every compositor
+        update re-writes the terminal cursor and WT re-renders the hovered region. This
+        is the same WT hover-render artifact _heal_toasts documents, and here the mouse
+        isn't even over the pane. saikai never uses the hover highlight (selection is the
+        keyboard row cursor or a click), so swallow mouse-move before it can repaint.
+        Click / scroll / keyboard paths keep their own handlers and are untouched.
+        (#wt-hover)"""
+        # Neuter the two repaint sources of the hover highlight at the source, so it
+        # doesn't matter which internal path (mouse-move, enter) drives them:
+        #   _set_hover_cursor(True) refreshes the hovered row/column, and
+        #   watch_hover_coordinate refreshes the old+new hovered cells.
+        # Both become no-ops: _show_hover_cursor stays False (never highlighted, never
+        # repainted), while the keyboard row cursor (cursor_coordinate) is untouched.
+        def _set_hover_cursor(self, active: bool) -> None:
+            return
+
+        def watch_hover_coordinate(self, old, value) -> None:
+            return
+
     class SplitGrip(Static):
         """A 1-column draggable divider between the session list and the right
         pane. Mouse-down captures the pointer; subsequent moves resize the list
@@ -5841,7 +5867,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 )
             yield Static("", id="statusbar")
             with Horizontal(id="main", classes=("split" if _LIVE_TERM is not None else "")):
-                yield DataTable(cursor_type="row", zebra_stripes=True, id="table")
+                yield ListTable(cursor_type="row", zebra_stripes=True, id="table")
                 yield SplitGrip("", id="grip")   # draggable list/pane divider
                 if _LIVE_TERM is not None:
                     # Split-live: the preview becomes the first tab; live claude
