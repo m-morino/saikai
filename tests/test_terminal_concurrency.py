@@ -1264,12 +1264,13 @@ def test_software_caret_follows_decscusr_shape():
         def has_focus(self):
             return True
 
-    def _caret_segments(shape, text):
+    def _caret_segments(shape, text, back=1):
         t = _Focused(["agent"], status_classifier=lambda _txt, _title: "idle")
         t._create_screen_pair(3, 8)
         t._cursor_style = shape
         if text:
-            t._stream.feed(text + "\x1b[D")     # caret back onto the glyph
+            # Walk the caret back onto the cell under test.
+            t._stream.feed(text + "\x1b[D" * back)
         return list(t.render_line(0))
 
     saved = (rt._IS_WIN, rt._IME_ANCHOR, rt._NATIVE_CARET_OVERRIDE)
@@ -1295,6 +1296,17 @@ def test_software_caret_follows_decscusr_shape():
         # back to the block rather than destroying the character.
         assert renderings[(3, "A")] != renderings[(0, "A")]
         assert renderings[(5, "A")][0] == "A"
+
+        # A WIDE blank (U+3000) is still a two-cell cell: substituting a one-cell
+        # bar for it would shorten the row and shift every glyph right of the
+        # caret one column left of where pyte holds it — and the browser mirror,
+        # which draws the real cursor, would disagree with the pane.
+        for shape in (0, 3, 5):
+            segments = _caret_segments(shape, "　XY", back=4)
+            assert sum(rt._rich_cell_len(seg.text) for seg in segments) == 8, (
+                shape, [seg.text for seg in segments])
+        assert _caret_segments(5, "　XY", back=4)[0].text == "　"
+
         assert "reverse" in renderings[(0, "")][1]
         assert "underline" in renderings[(3, "")][1]
     finally:
@@ -1364,6 +1376,18 @@ def test_ime_anchor_backs_off_to_the_grapheme_leader_like_the_software_caret():
 
         t._sync_terminal_cursor(reason="focus")
         assert t._app.cursor_position == rt.Offset(_Region.x + 0, _Region.y + 0), \
+            t._app.cursor_position
+
+        # Pending wrap: pyte parks the cursor at columns after a row is exactly
+        # filled, which is one past the last cell. render_line clamps before it
+        # walks back to the leader; without the same clamp the anchor never backs
+        # off and lands on the trailing stub of the final wide glyph.
+        t._screen.reset()
+        t._stream.feed("x" * 18 + "あ")
+        assert t._screen.cursor.x == t._screen.columns
+        t._anchored_xy = None
+        t._sync_terminal_cursor(reason="focus")
+        assert t._app.cursor_position == rt.Offset(_Region.x + 18, _Region.y + 0), \
             t._app.cursor_position
     finally:
         (rt._IS_WIN, rt._IME_ANCHOR, rt._NATIVE_CARET_OVERRIDE, rt.Offset) = saved
@@ -1473,14 +1497,25 @@ def test_child_pty_env_scrubs_the_whole_wt_family_and_rewrites_wslenv():
 
     posix = rt._child_pty_env(outer, is_win=False)
     assert [k for k in posix if k.upper().startswith("WT_")] == [], sorted(posix)
-    # The user's own forwarding survives; only the WT entries are removed.
+    # The user's own forwarding survives; only entries naming a variable saikai
+    # actually removed are dropped.
     assert posix["WSLENV"] == "MY_TOKEN/u:PATH/l"
     assert posix["WSL_DISTRO_NAME"] == "Ubuntu"   # not a terminal identity
 
     windows = rt._child_pty_env(outer, is_win=True)
     assert windows["WT_SESSION"] == "outer-wt", "the WT identity exception must survive"
     assert "WT_PROFILE_ID" not in windows and "WT_SETTINGS_DIR" not in windows
-    assert windows["WSLENV"] == "MY_TOKEN/u:PATH/l"
+    # WT_SESSION SURVIVES on Windows, so its forwarding entry must survive too:
+    # the rewrite drops exactly the names saikai removed, not a fixed list. The
+    # empty element in WT's own "WT_SESSION::WT_PROFILE_ID" spelling is dropped
+    # with the variable it padded.
+    assert windows["WSLENV"] == "WT_SESSION:MY_TOKEN/u:PATH/l"
+
+    # A name the user forwards that is not currently set stays forwarded: WSLENV
+    # is a directive, not a snapshot of the environment.
+    directive = rt._child_pty_env(
+        {"PATH": "/bin", "WSLENV": "NOT_SET_YET/u:PATH/l"}, is_win=False)
+    assert directive["WSLENV"] == "NOT_SET_YET/u:PATH/l"
 
     # A WSLENV that only forwarded WT variables is dropped entirely rather than
     # left as an empty directive.

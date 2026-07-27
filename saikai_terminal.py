@@ -342,18 +342,8 @@ def _child_pty_env(base_env, is_win: Optional[bool] = None) -> dict:
                 or comparable.startswith(_HOST_TERMINAL_ENV_STRIP_PREFIXES)):
             env.pop(key, None)
 
-    # WSLENV forwards variables across the Win32<->WSL boundary. Remove the
-    # entries naming variables saikai just stripped and keep the user's own; drop
-    # the directive only when nothing is left.
-    for key in list(env):
-        if (key.upper() if platform_is_win else key) != "WSLENV":
-            continue
-        kept = [entry for entry in str(env[key]).split(":")
-                if entry and not entry.upper().startswith(_WSLENV_STRIP_PREFIXES)]
-        if kept:
-            env[key] = ":".join(kept)
-        else:
-            env.pop(key, None)
+    _wslenv_keys = [key for key in env
+                    if (key.upper() if platform_is_win else key) == "WSLENV"]
     if platform_is_win:
         if _WT_IDENTITY:
             env["WT_SESSION"] = outer_wt or _wt_session_id()
@@ -361,6 +351,33 @@ def _child_pty_env(base_env, is_win: Optional[bool] = None) -> dict:
             env["WT_SESSION"] = outer_wt
     # POSIX/WSL never inherits WT_SESSION, including when the Windows identity
     # compatibility switch is disabled.
+
+    # WSLENV is the Win32<->WSL variable-forwarding directive, and it also carries
+    # the user's OWN forwarding, so rewrite rather than drop it. An entry goes
+    # only when it names a host-identity variable that this environment does not
+    # provide: WT_SESSION survives on Windows and keeps forwarding, WT_PROFILE_ID
+    # never does, and a name the user forwards that simply is not set right now
+    # is left alone, because WSLENV is a directive rather than a snapshot.
+    # Entries are "VAR" or "VAR/flags".
+    present = {(key.upper() if platform_is_win else key) for key in env}
+
+    def _forwardable(entry: str) -> bool:
+        name = entry.split("/", 1)[0]
+        if not name:
+            return False
+        comparable = name.upper() if platform_is_win else name
+        if comparable in present:
+            return True
+        return not (comparable in _HOST_TERMINAL_ENV_STRIP
+                    or comparable.startswith(_HOST_TERMINAL_ENV_STRIP_PREFIXES))
+
+    for key in _wslenv_keys:
+        kept = [entry for entry in str(env.get(key, "")).split(":")
+                if entry and _forwardable(entry)]
+        if kept:
+            env[key] = ":".join(kept)
+        else:
+            env.pop(key, None)
 
     for key in list(env):
         comparable = key.upper() if platform_is_win else key
@@ -1367,11 +1384,13 @@ def _caret_segment(ch, shape: int):  # -> rich.Segment; render_line only
     """Draw saikai's own caret in the shape the child asked for with DECSCUSR.
 
     A text grid cannot put a sub-cell bar over a glyph, so the bar substitutes a
-    bar character only on an otherwise empty cell and falls back to the block
-    over real text rather than destroying the character. The underline promotes
-    to a double underline on an already-underscored cell so the caret is always a
-    visible CHANGE — the same reason the selection XORs reverse instead of
-    setting it. Every shape stays exactly one cell wide. (#native-cursor)"""
+    bar character only on an otherwise empty ONE-COLUMN cell and falls back to
+    the block over real text rather than destroying the character. Substituting
+    on a wide blank (U+3000 is a two-cell glyph) would shorten the row and shift
+    every glyph right of the caret. The underline promotes to a double underline
+    on an already-underscored cell so the caret is always a visible CHANGE — the
+    same reason the selection XORs reverse instead of setting it. Every shape
+    keeps the cell's own width. (#native-cursor)"""
     base = _cell_style(ch)
     text = ch.data or " "
     if shape in _CARET_UNDERLINE_SHAPES:
@@ -1379,7 +1398,12 @@ def _caret_segment(ch, shape: int):  # -> rich.Segment; render_line only
         return Segment(text, base + Style(underline=not underscored,
                                           underline2=underscored))
     if shape in _CARET_BAR_SHAPES and not text.strip():
-        return Segment(_CARET_BAR_GLYPH, base)
+        try:
+            single_column = int(_rich_cell_len(text)) == 1
+        except Exception:
+            single_column = len(text) == 1
+        if single_column:
+            return Segment(_CARET_BAR_GLYPH, base)
     return Segment(text, base + Style(reverse=True))
 
 
@@ -2866,18 +2890,44 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._scroll_snapshot = None
         return True
 
+    @staticmethod
+    def _is_ris(token: "VTToken") -> bool:
+        """True for RIS (ESC c) in either its 7-bit or intermediate-free form."""
+        return (token.kind == "esc" and token.final == "c"
+                and not token.intermediates and not token.literal)
+
+    def _apply_ris_modes(self) -> None:
+        """Reset the child-owned MODE state a hard reset clears (token position).
+
+        This half has to run where the modes are tracked — _apply_dec_private and
+        _apply_kitty_keyboard both run at the raw token position, while the
+        buffer half below runs later, at the presentation boundary. Applying the
+        modes there too made a single read of "reset, then set everything up
+        again" revert every mode the child set after the RIS. (#ris)"""
+        self._app_cursor = False            # ?1 DECCKM
+        self._cursor_visible = True         # ?25 DECTCEM defaults to SET
+        self._mouse_click = False           # ?1000
+        self._mouse_btn_motion = False      # ?1002
+        self._mouse_any_motion = False      # ?1003
+        self._mouse_sgr = False             # ?1006
+        self._mouse_reporting = False
+        self._focus_reporting = False       # ?1004
+        self._bracketed_paste = False       # ?2004
+        self._kitty_keyboard_flags = {False: 0, True: 0}
+        self._kitty_keyboard_stacks = {False: [], True: []}
+
     def _apply_ris_locked(self) -> None:
-        """Apply RIS (ESC c) to saikai-owned terminal state (lock held).
+        """Apply the BUFFER half of RIS (ESC c) to saikai state (lock held).
 
         pyte's own reset covers the ACTIVE grid: buffer, margins, its mode set,
         charsets, tabstops, title. Everything saikai tracks on the child's behalf
-        is invisible to it, so without this a hard reset left saikai answering
-        DECRQM with modes the child had just cleared, kept the alternate buffer
-        active, and re-seeded a joining browser with the stale modes — while the
-        mirror's xterm.js performed a real full reset on the same byte.
+        is invisible to it, so without this a hard reset kept the alternate buffer
+        active, left the DECSC slot and the pinned scrollback offset behind, and
+        re-seeded a joining browser with stale state — while the mirror's
+        xterm.js performed a real full reset on the same byte.
 
         Runs at the RIS stream position and BEFORE the pyte feed, so the reset
-        lands on the primary buffer. (#ris)"""
+        lands on the primary buffer. The mode half is _apply_ris_modes. (#ris)"""
         # Primary buffer becomes active again, and BOTH grids are cleared. The
         # caller's feed resets the (now primary) active screen; the alternate is
         # never fed, so clear it here.
@@ -2896,18 +2946,10 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._scroll = 0
         self._scroll_snapshot = None
 
-        self._app_cursor = False            # ?1 DECCKM
-        self._cursor_visible = True         # ?25 DECTCEM defaults to SET
-        self._mouse_click = False           # ?1000
-        self._mouse_btn_motion = False      # ?1002
-        self._mouse_any_motion = False      # ?1003
-        self._mouse_sgr = False             # ?1006
-        self._mouse_reporting = False
-        self._focus_reporting = False       # ?1004
-        self._bracketed_paste = False       # ?2004
+        # DECSCUSR and the OSC 8 link are tracked in THIS pipeline
+        # (_apply_cursor_style / _apply_osc8_state run per token here), so they
+        # reset here and stay in stream order with a shape set after the RIS.
         self._cursor_style = 0              # DECSCUSR back to the host default
-        self._kitty_keyboard_flags = {False: 0, True: 0}
-        self._kitty_keyboard_stacks = {False: [], True: []}
         self._osc8_active = None
         for screen in (getattr(self, "_main_screen", None), alternate):
             if screen is None:
@@ -2922,12 +2964,20 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
 
     def _sync_global_screen_state_locked(self, token: "VTToken") -> None:
         """Copy global mode results without moving the inactive saved cursor."""
-        if token.kind != "csi" or token.intermediates:
+        if token.intermediates:
             return
-        sync_modes = (
-            token.final in ("h", "l")
-            and not token.parameters.startswith((">", "<", "="))
-        )
+        if token.kind == "esc":
+            # DECRC restores DECOM/DECAWM as well as the cursor, and RIS clears
+            # them; both are terminal-global here, so the inactive buffer has to
+            # follow or the next 1049h resurrects the old value.
+            sync_modes = token.final in ("8", "c") and not token.literal
+        elif token.kind == "csi":
+            sync_modes = (
+                token.final in ("h", "l")
+                and not token.parameters.startswith((">", "<", "="))
+            )
+        else:
+            return
         if not sync_modes:
             return
         self._ensure_screen_pair_locked()
@@ -5065,6 +5115,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             csi_query = self._is_csi_query(token)
             if token.kind == "csi" and not csi_query:
                 self._apply_dec_private(token)
+            elif self._is_ris(token):
+                self._apply_ris_modes()      # at the RIS position, not chunk end
             osc_reply = (
                 self._osc_side_effect(token, deferred_ui=deferred_ui)
                 if token.kind == "osc" else None
@@ -5134,8 +5186,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                             modes = token.parameters[1:].split(";")
                             if any(mode in _DECRQM_ALT_SCREEN for mode in modes):
                                 self._switch_alt_screen_locked(token.final == "h")
-                        elif (token.kind == "esc" and token.final == "c"
-                              and not token.intermediates):
+                        elif self._is_ris(token):
                             # RIS, at its stream position and BEFORE the pyte feed
                             # below, so the reset lands on the primary buffer.
                             self._apply_ris_locked()
@@ -5723,6 +5774,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # 3+ cell cluster several — columns right of the glyph being edited.
             # A refinement, so never let it abort the sync. (#flag-width #native-cursor)
             try:
+                # Clamp first: in the pending-wrap state pyte parks the cursor at
+                # `columns`, one past the last cell, so an unclamped walk-back
+                # inspects a column that does not exist and never backs off.
+                columns = int(getattr(screen, "columns", 0) or 0)
+                if columns:
+                    cx = max(0, min(cx, columns - 1))
                 row = screen.buffer[cy]
                 while cx > 0 and row[cx].data == "":
                     cx -= 1

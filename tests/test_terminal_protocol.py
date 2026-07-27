@@ -418,6 +418,49 @@ def test_ris_hard_resets_saikai_owned_terminal_state():
     assert terminal._mirror_mode_reseed_pending is True
 
 
+def test_ris_does_not_revert_modes_set_after_it_in_the_same_read():
+    """A RIS resets state at ITS stream position, not at the end of the chunk.
+
+    Modes are tracked when the raw token is parsed, but the buffer/grid half of a
+    reset runs later, at the presentation boundary. Applying the mode half there
+    too made a single PTY read of "reset, then set everything up again" — what a
+    child restarting its UI writes, and what a 64KiB read almost always delivers
+    as one chunk — silently revert every mode set after the RIS. The child then
+    reads back the opposite of what it just set and disables mouse reporting and
+    bracketed paste."""
+    terminal = _terminal(cols=30, rows=6)
+    terminal._consume(
+        "\x1bc\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?1h\x1b[?25l\x1b[>1u")
+
+    assert terminal._mouse_click is True
+    assert terminal._mouse_sgr is True
+    assert terminal._mouse_reporting is True
+    assert terminal._bracketed_paste is True
+    assert terminal._app_cursor is True
+    assert terminal._cursor_visible is False
+    assert terminal._kitty_keyboard_flags[False] == 1
+
+    terminal._protocol_replies.clear()
+    terminal._consume("\x1b[?1000$p\x1b[?1006$p\x1b[?2004$p\x1b[?25$p\x1b[?u")
+    assert "".join(terminal._protocol_replies) == (
+        "\x1b[?1000;1$y\x1b[?1006;1$y\x1b[?2004;1$y\x1b[?25;2$y\x1b[?1u"
+    ), terminal._protocol_replies
+    # The pane's own DECTCEM view must not drift from pyte's.
+    assert terminal._screen.cursor.hidden is True
+
+    # The same holds when the RIS is retained inside a synchronized frame: the
+    # modes that follow it are still the child's final word.
+    terminal = _terminal(cols=30, rows=6)
+    terminal._consume("\x1b[?2026h\x1bc\x1b[?1000h\x1b[?2004h\x1b[?2026l")
+    assert terminal._mouse_click is True and terminal._bracketed_paste is True
+
+    # ...and a mode set BEFORE the RIS in the same read is still cleared by it.
+    terminal = _terminal(cols=30, rows=6)
+    terminal._consume("\x1b[?1000h\x1b[?2004h\x1bc")
+    assert terminal._mouse_click is False and terminal._bracketed_paste is False
+    assert terminal._mouse_reporting is False
+
+
 def test_decrc_restores_both_directions_of_decom_and_decawm():
     """DECRC restores the SAVED mode state, including a saved-off mode.
 
@@ -449,6 +492,17 @@ def test_decrc_restores_both_directions_of_decom_and_decawm():
     terminal._consume("\x1b[?6l\x1b[3;5r\x1b[?6l\x1b[2;4H\x1b7\x1b[?6h\x1b8")
     assert mo.DECOM not in screen.mode
     assert (screen.cursor.y, screen.cursor.x) == (1, 3)
+
+    # DECAWM/DECOM are terminal-global in saikai's model: a CSI h/l propagates
+    # them to the inactive buffer, so DECRC — which now changes them too — has to
+    # propagate as well, or entering the alternate screen resurrects the mode the
+    # restore just cleared.
+    terminal._consume("\x1b[?7l\x1b7\x1b[?7h\x1b8")
+    assert mo.DECAWM not in terminal._main_screen.mode
+    assert mo.DECAWM not in terminal._alt_screen.mode
+    terminal._consume("\x1b[?1049h")
+    assert mo.DECAWM not in terminal._screen.mode, "alt buffer resurrected DECAWM"
+    terminal._consume("\x1b[?1049l")
 
     # DECRC stays repeatable after the reconcile (xterm keeps the slot), and each
     # repeat re-applies the same saved-off state.
@@ -631,6 +685,8 @@ if __name__ == "__main__":
     print("PASS test_combined_dec_private_lists_apply_every_parameter")
     test_ris_hard_resets_saikai_owned_terminal_state()
     print("PASS test_ris_hard_resets_saikai_owned_terminal_state")
+    test_ris_does_not_revert_modes_set_after_it_in_the_same_read()
+    print("PASS test_ris_does_not_revert_modes_set_after_it_in_the_same_read")
     test_decrc_restores_both_directions_of_decom_and_decawm()
     print("PASS test_decrc_restores_both_directions_of_decom_and_decawm")
     test_split_decrqm_uses_tokenizer_carry_and_never_opens_sync_staging()
