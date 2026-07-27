@@ -1356,6 +1356,33 @@ def _cell_style(ch):  # -> rich.Style; only reached from render_line (textual pr
     )
 
 
+# DECSCUSR shapes: 0/1/2 block, 3/4 underline, 5/6 bar (odd = blinking, which the
+# outer terminal would have to animate; saikai does not repaint for it).
+_CARET_UNDERLINE_SHAPES = (3, 4)
+_CARET_BAR_SHAPES = (5, 6)
+_CARET_BAR_GLYPH = "▏"        # LEFT ONE EIGHTH BLOCK — a real one-cell bar
+
+
+def _caret_segment(ch, shape: int):  # -> rich.Segment; render_line only
+    """Draw saikai's own caret in the shape the child asked for with DECSCUSR.
+
+    A text grid cannot put a sub-cell bar over a glyph, so the bar substitutes a
+    bar character only on an otherwise empty cell and falls back to the block
+    over real text rather than destroying the character. The underline promotes
+    to a double underline on an already-underscored cell so the caret is always a
+    visible CHANGE — the same reason the selection XORs reverse instead of
+    setting it. Every shape stays exactly one cell wide. (#native-cursor)"""
+    base = _cell_style(ch)
+    text = ch.data or " "
+    if shape in _CARET_UNDERLINE_SHAPES:
+        underscored = bool(getattr(ch, "underscore", False))
+        return Segment(text, base + Style(underline=not underscored,
+                                          underline2=underscored))
+    if shape in _CARET_BAR_SHAPES and not text.strip():
+        return Segment(_CARET_BAR_GLYPH, base)
+    return Segment(text, base + Style(reverse=True))
+
+
 # ── Key encoding ──────────────────────────────────────────────────────────────
 # event.key -> exact bytes/escape the PTY child expects. We start from the
 # textual-terminal reference table, then add the control bytes it leaves to
@@ -2809,6 +2836,60 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._scroll_snapshot = None
         return True
 
+    def _apply_ris_locked(self) -> None:
+        """Apply RIS (ESC c) to saikai-owned terminal state (lock held).
+
+        pyte's own reset covers the ACTIVE grid: buffer, margins, its mode set,
+        charsets, tabstops, title. Everything saikai tracks on the child's behalf
+        is invisible to it, so without this a hard reset left saikai answering
+        DECRQM with modes the child had just cleared, kept the alternate buffer
+        active, and re-seeded a joining browser with the stale modes — while the
+        mirror's xterm.js performed a real full reset on the same byte.
+
+        Runs at the RIS stream position and BEFORE the pyte feed, so the reset
+        lands on the primary buffer. (#ris)"""
+        # Primary buffer becomes active again, and BOTH grids are cleared. The
+        # caller's feed resets the (now primary) active screen; the alternate is
+        # never fed, so clear it here.
+        self._switch_alt_screen_locked(False)
+        alternate = getattr(self, "_alt_screen", None)
+        if alternate is not None:
+            self._invalidate_screen_grapheme(alternate)
+            try:
+                alternate.reset()
+            except Exception:
+                pass
+        # _switch_alt_screen_locked is idempotent, so it returns early — and
+        # skips this — when the RIS arrived on the primary buffer. The pinned
+        # view must be dropped either way: pyte's reset empties the history the
+        # offset points into.
+        self._scroll = 0
+        self._scroll_snapshot = None
+
+        self._app_cursor = False            # ?1 DECCKM
+        self._cursor_visible = True         # ?25 DECTCEM defaults to SET
+        self._mouse_click = False           # ?1000
+        self._mouse_btn_motion = False      # ?1002
+        self._mouse_any_motion = False      # ?1003
+        self._mouse_sgr = False             # ?1006
+        self._mouse_reporting = False
+        self._focus_reporting = False       # ?1004
+        self._bracketed_paste = False       # ?2004
+        self._cursor_style = 0              # DECSCUSR back to the host default
+        self._kitty_keyboard_flags = {False: 0, True: 0}
+        self._kitty_keyboard_stacks = {False: [], True: []}
+        self._osc8_active = None
+        for screen in (getattr(self, "_main_screen", None), alternate):
+            if screen is None:
+                continue
+            try:
+                screen.savepoints.clear()   # pyte's reset keeps the DECSC slot
+            except Exception:
+                pass
+        # The browser reset itself on the same byte; re-seed so a client that
+        # joins afterwards gets the post-reset modes rather than the old ones.
+        self._mirror_mode_reseed_pending = True
+
     def _sync_global_screen_state_locked(self, token: "VTToken") -> None:
         """Copy global mode results without moving the inactive saved cursor."""
         if token.kind != "csi" or token.intermediates:
@@ -3061,6 +3142,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         show_cursor = (s == 0 and self.has_focus and y == cursor_y
                        and not self.is_dead and not cursor_hidden)
         native_caret = _native_caret()   # hoisted: one predicate, one owner
+        caret_shape = int(getattr(self, "_cursor_style", 0) or 0)
         segments = []
         run_chars: list[str] = []
         run_style = None
@@ -3087,8 +3169,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 # draw here, else the pane has no caret at all. (#native-cursor)
                 flush(x)
                 run_chars = []
-                segments.append(Segment(ch.data or " ",
-                                        _cell_style(ch) + Style(reverse=True)))
+                segments.append(_caret_segment(ch, caret_shape))
                 run_style = None
                 continue
             st = _cell_style(ch)
@@ -5023,6 +5104,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                             modes = token.parameters[1:].split(";")
                             if any(mode in _DECRQM_ALT_SCREEN for mode in modes):
                                 self._switch_alt_screen_locked(token.final == "h")
+                        elif (token.kind == "esc" and token.final == "c"
+                              and not token.intermediates):
+                            # RIS, at its stream position and BEFORE the pyte feed
+                            # below, so the reset lands on the primary buffer.
+                            self._apply_ris_locked()
                         screen = self._screen
                         hazard_serial = int(getattr(
                             screen, "_saikai_mirror_hazard_serial", 0))
@@ -5031,9 +5117,6 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                             mirror_hazard = True
                         if token.kind == "osc":
                             self._apply_osc8_state(token)
-                        elif (token.kind == "esc" and token.final == "c"
-                              and not token.intermediates):
-                            self._osc8_active = None
                         try:
                             screen._saikai_active_hyperlink = getattr(
                                 self, "_osc8_active", None)

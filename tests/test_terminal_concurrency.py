@@ -1213,6 +1213,58 @@ def test_child_pty_env_presents_one_windows_terminal_identity_per_platform():
     assert [k for k in wez if k.startswith("WEZTERM")] == [], wez
 
 
+def test_software_caret_follows_decscusr_shape():
+    """A child's DECSCUSR shape must be visible on hosts saikai draws the caret on.
+
+    ESC[5 q / ESC[3 q are tracked and forwarded to the browser mirror, but the
+    software caret was a fixed reverse block, so on every non-caret-owning host
+    (plain Linux, macOS, and Windows with SAIKAI_IME_ANCHOR=0) a child asking for
+    a bar or an underline got a block. A text grid cannot draw a sub-cell bar over
+    a glyph, so the bar shape substitutes a real bar character on an empty cell and
+    falls back to the block over a glyph. Every shape must stay exactly one cell
+    wide. (#native-cursor)"""
+    class _Focused(rt.AgentTerminal):
+        @property
+        def has_focus(self):
+            return True
+
+    def _caret_segments(shape, text):
+        t = _Focused(["agent"], status_classifier=lambda _txt, _title: "idle")
+        t._create_screen_pair(3, 8)
+        t._cursor_style = shape
+        if text:
+            t._stream.feed(text + "\x1b[D")     # caret back onto the glyph
+        return list(t.render_line(0))
+
+    saved = (rt._IS_WIN, rt._IME_ANCHOR, rt._NATIVE_CARET_OVERRIDE)
+    rt._NATIVE_CARET_OVERRIDE = False          # saikai draws the caret itself
+    try:
+        renderings = {}
+        for shape in (0, 1, 2, 3, 4, 5, 6):
+            for text in ("", "A"):
+                segments = _caret_segments(shape, text)
+                caret = segments[0]
+                assert len(caret.text) == 1, (shape, text, caret)
+                renderings[(shape, text)] = (caret.text, str(caret.style))
+
+        # block (0/1/2), underline (3/4) and bar (5/6) must differ on a blank cell.
+        blank = {renderings[(s, "")] for s in (0, 3, 5)}
+        assert len(blank) == 3, renderings
+        # ...and the two members of each family agree.
+        assert renderings[(1, "")] == renderings[(2, "")] == renderings[(0, "")]
+        assert renderings[(3, "")] == renderings[(4, "")]
+        assert renderings[(5, "")] == renderings[(6, "")]
+
+        # Over a glyph the underline still differs from the block; the bar falls
+        # back to the block rather than destroying the character.
+        assert renderings[(3, "A")] != renderings[(0, "A")]
+        assert renderings[(5, "A")][0] == "A"
+        assert "reverse" in renderings[(0, "")][1]
+        assert "underline" in renderings[(3, "")][1]
+    finally:
+        (rt._IS_WIN, rt._IME_ANCHOR, rt._NATIVE_CARET_OVERRIDE) = saved
+
+
 def test_ime_anchor_backs_off_to_the_grapheme_leader_like_the_software_caret():
     """The IME anchor must land on the leader cell of a multi-cell grapheme.
 
@@ -5408,6 +5460,8 @@ if __name__ == "__main__":
     print("PASS test_child_pty_env_hides_outer_terminal_identity_from_child")
     test_child_pty_env_presents_one_windows_terminal_identity_per_platform()
     print("PASS test_child_pty_env_presents_one_windows_terminal_identity_per_platform")
+    test_software_caret_follows_decscusr_shape()
+    print("PASS test_software_caret_follows_decscusr_shape")
     test_ime_anchor_backs_off_to_the_grapheme_leader_like_the_software_caret()
     print("PASS test_ime_anchor_backs_off_to_the_grapheme_leader_like_the_software_caret")
     test_native_caret_ownership_is_one_predicate_and_covers_wsl_under_wt()

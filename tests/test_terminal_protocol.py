@@ -349,6 +349,75 @@ def test_combined_dec_private_lists_apply_every_parameter():
     assert terminal._alt.in_alt is False
 
 
+def test_ris_hard_resets_saikai_owned_terminal_state():
+    """ESC c is a hard reset of the whole terminal, not just the active pyte grid.
+
+    Everything saikai tracks on the child's behalf — DECCKM, DECTCEM, the mouse
+    family, focus reporting, bracketed paste, DECSCUSR, the kitty keyboard flags
+    and their stack, the saved-cursor slot on BOTH grids — has to return to its
+    power-on default, and the primary buffer has to become the active one again.
+    Otherwise saikai keeps answering DECRQM with modes the child just cleared, a
+    RIS taken on the alternate screen leaves the child rendering into a buffer it
+    believes it left, and a browser joining afterwards is re-seeded with the old
+    modes. The browser's own xterm.js performs a full reset on ESC c, so the two
+    would diverge in both directions."""
+    from pyte import modes as mo
+
+    terminal = _terminal(cols=30, rows=6)
+    terminal._consume(
+        "\x1b[?1h\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h"
+        "\x1b[?1004h\x1b[?2004h\x1b[4 q\x1b[>1u\x1b[=15;1u"
+        "\x1b[2;5r\x1b[3;7H\x1b7\x1b]8;;https://example\x07link")
+    terminal._consume("\x1b[?1049h")            # RIS arrives on the ALTERNATE screen
+    terminal._consume("ALT-TEXT")
+    assert terminal._alt.in_alt is True
+    terminal._protocol_replies.clear()
+    terminal._consume("\x1bc")
+
+    # Buffer selection: back on the primary, with BOTH grids cleared.
+    assert terminal._alt.in_alt is False
+    assert terminal._screen is terminal._main_screen
+    assert "".join(_screen_text(terminal).split()) == ""
+    assert "".join("".join(rt._pyte_grid_lines(terminal._alt_screen)).split()) == ""
+
+    # saikai-owned mode state is back at its power-on default.
+    assert terminal._app_cursor is False
+    assert terminal._cursor_visible is True
+    assert terminal._mouse_click is False and terminal._mouse_btn_motion is False
+    assert terminal._mouse_any_motion is False and terminal._mouse_sgr is False
+    assert terminal._mouse_reporting is False
+    assert terminal._focus_reporting is False
+    assert terminal._bracketed_paste is False
+    assert terminal._cursor_style == 0
+    assert terminal._kitty_keyboard_flags == {False: 0, True: 0}
+    assert terminal._kitty_keyboard_stacks == {False: [], True: []}
+    assert terminal._osc8_active is None
+
+    # The saved-cursor slot is gone on both grids, so DECRC homes.
+    assert terminal._main_screen.savepoints == []
+    assert terminal._alt_screen.savepoints == []
+    terminal._consume("\x1b[4;9H\x1b8")
+    assert (terminal._screen.cursor.y, terminal._screen.cursor.x) == (0, 0)
+
+    # pyte-owned state the reset must also have cleared on the active grid.
+    assert terminal._screen.margins is None
+    assert mo.DECAWM in terminal._screen.mode and mo.DECTCEM in terminal._screen.mode
+
+    # Every query now answers the post-reset truth.
+    terminal._protocol_replies.clear()
+    terminal._consume(
+        "\x1b[?1$p\x1b[?25$p\x1b[?1003$p\x1b[?1006$p\x1b[?1004$p"
+        "\x1b[?2004$p\x1b[?1049$p\x1b[?u")
+    assert "".join(terminal._protocol_replies) == (
+        "\x1b[?1;2$y\x1b[?25;1$y\x1b[?1003;2$y\x1b[?1006;2$y"
+        "\x1b[?1004;2$y\x1b[?2004;2$y\x1b[?1049;2$y\x1b[?0u"
+    ), terminal._protocol_replies
+
+    # A browser attaching after the reset must be re-seeded, not handed the
+    # pre-RIS modes.
+    assert terminal._mirror_mode_reseed_pending is True
+
+
 def test_decrc_restores_both_directions_of_decom_and_decawm():
     """DECRC restores the SAVED mode state, including a saved-off mode.
 
@@ -560,6 +629,8 @@ if __name__ == "__main__":
     print("PASS test_decrqm_observes_set_then_reset_at_each_stream_position")
     test_combined_dec_private_lists_apply_every_parameter()
     print("PASS test_combined_dec_private_lists_apply_every_parameter")
+    test_ris_hard_resets_saikai_owned_terminal_state()
+    print("PASS test_ris_hard_resets_saikai_owned_terminal_state")
     test_decrc_restores_both_directions_of_decom_and_decawm()
     print("PASS test_decrc_restores_both_directions_of_decom_and_decawm")
     test_split_decrqm_uses_tokenizer_carry_and_never_opens_sync_staging()
