@@ -5980,6 +5980,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 pass
 
         def on_mount(self) -> None:
+            # Enable DEC 2026 synchronized output on Windows Terminal. Textual's Windows
+            # driver never probes for ?2026 support (only the linux/web drivers call
+            # _request_terminal_sync_mode_support), so _sync_available stays False and
+            # every frame's cell writes AND its trailing cursor move_to reach WT
+            # unbracketed. With a visible native cursor (our IME anchor) that made the
+            # cursor visibly sweep the pane on every repaint — a mouse-move over the list
+            # produced tens of thousands of CUP writes/10s (measured) and the cursor
+            # flickered at its anchor. WT supports ?2026 (probed: ?2026;2$y), so bracket
+            # frames when we are actually in WT — the same atomic present the linux
+            # driver gets. Gated on WT_SESSION so a non-WT Windows console (no ?2026)
+            # never sees a literal ?2026 escape. (#wt-sync #wt-hover)
+            try:
+                if sys.platform == "win32" and os.environ.get("WT_SESSION"):
+                    self._sync_available = True
+            except Exception:
+                pass
             # WT toast-row self-heal (see _heal_toasts).
             try:
                 self.set_interval(0.4, self._heal_toasts)

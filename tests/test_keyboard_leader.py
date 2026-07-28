@@ -220,6 +220,54 @@ def test_pilot_space_leader_and_divider():
     assert facts.get("bar_shown"), facts
 
 
+def test_pilot_enables_synchronized_output_on_windows_terminal():
+    """On Windows Terminal, frames must be bracketed in DEC 2026 synchronized output.
+
+    Textual's Windows driver never probes for ?2026, so _sync_available stayed False and
+    each frame's trailing cursor move_to reached WT unbracketed — with the visible IME
+    anchor the cursor flickered/swept on every repaint. saikai forces _sync_available on
+    when it is running inside WT (WT_SESSION set)."""
+    import sys as _sys
+    if _sys.platform != "win32":
+        print("SKIP test_pilot_enables_synchronized_output_on_windows_terminal (not win32)")
+        return
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_enables_synchronized_output_on_windows_terminal (textual unavailable)")
+        return
+
+    import asyncio, os as _os
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                facts["sync"] = bool(getattr(self, "_sync_available", False))
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv, orig_wt = sys.argv, _os.environ.get("WT_SESSION")
+    try:
+        _os.environ["WT_SESSION"] = "test-wt-session"   # simulate running inside WT
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+        if orig_wt is None:
+            _os.environ.pop("WT_SESSION", None)
+        else:
+            _os.environ["WT_SESSION"] = orig_wt
+
+    assert facts.get("sync") is True, \
+        f"_sync_available must be forced True under WT so frames are atomic: {facts}"
+
+
 def test_pilot_session_list_disables_mouse_hover_repaint():
     """The session list must NOT repaint on mouse hover (#wt-hover).
 
@@ -2947,6 +2995,8 @@ if __name__ == "__main__":
     print("PASS test_leader_hint_item_separates_key_from_action")
     test_pilot_space_leader_and_divider()
     print("PASS test_pilot_space_leader_and_divider")
+    test_pilot_enables_synchronized_output_on_windows_terminal()
+    print("PASS test_pilot_enables_synchronized_output_on_windows_terminal")
     test_pilot_session_list_disables_mouse_hover_repaint()
     print("PASS test_pilot_session_list_disables_mouse_hover_repaint")
     test_pilot_search_clear_button()
