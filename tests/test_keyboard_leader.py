@@ -220,25 +220,25 @@ def test_pilot_space_leader_and_divider():
     assert facts.get("bar_shown"), facts
 
 
-def test_pilot_enables_synchronized_output_on_windows_terminal():
-    """On Windows Terminal, frames must be bracketed in DEC 2026 synchronized output.
+def test_pilot_synchronized_output_brackets_frames():
+    """Frames must be wrapped in DEC 2026 once the terminal reports ?2026 support.
 
-    Textual's Windows driver never probes for ?2026, so _sync_available stayed False and
-    each frame's trailing cursor move_to reached WT unbracketed — with the visible IME
-    anchor the cursor flickered/swept on every repaint. saikai forces _sync_available on
-    when it is running inside WT (WT_SESSION set)."""
-    import sys as _sys
-    if _sys.platform != "win32":
-        print("SKIP test_pilot_enables_synchronized_output_on_windows_terminal (not win32)")
-        return
+    saikai sends the ?2026 DECRQM probe on Windows (Textual's Windows driver omits the
+    probe its linux/web drivers send); the terminal's positive reply posts
+    TerminalSupportsSynchronizedOutput, Textual sets _sync_available, and _begin_update
+    then brackets every frame in SYNC_START/END. Without that the native cursor sweeps /
+    flickers on every repaint. This verifies the END of that chain — that the supports
+    message actually makes a frame emit ?2026h/?2026l — rather than reading back a flag
+    saikai set itself (which a Textual rename would leave as a dead attribute)."""
     try:
         from textual.app import App  # noqa: F401
     except Exception:
-        print("SKIP test_pilot_enables_synchronized_output_on_windows_terminal (textual unavailable)")
+        print("SKIP test_pilot_synchronized_output_brackets_frames (textual unavailable)")
         return
 
-    import asyncio, os as _os
+    import asyncio
     from textual.app import App
+    from textual import messages
 
     _write_demo_session()
     facts: dict = {}
@@ -247,25 +247,39 @@ def test_pilot_enables_synchronized_output_on_windows_terminal():
         async def go():
             async with self.run_test(size=(110, 30)) as pilot:
                 await pilot.pause(0.4)
-                facts["sync"] = bool(getattr(self, "_sync_available", False))
+                # Simulate the terminal answering our probe: it supports ?2026.
+                self.post_message(messages.TerminalSupportsSynchronizedOutput())
+                await pilot.pause(0.1)
+                facts["flag"] = bool(getattr(self, "_sync_available", False))
+                # With support acknowledged, opening/closing a frame must emit the
+                # DEC 2026 brackets to the driver.
+                writes: list = []
+                drv = self._driver
+                _orig = drv.write
+                try:
+                    drv.write = lambda d, _o=_orig: (writes.append(d), _o(d))[1]
+                    self._begin_update()
+                    self._end_update()
+                finally:
+                    drv.write = _orig
+                joined = "".join(writes)
+                facts["start"] = "\x1b[?2026h" in joined
+                facts["end"] = "\x1b[?2026l" in joined
         asyncio.run(go())
 
     orig_run, App.run = App.run, fake_run
-    orig_argv, orig_wt = sys.argv, _os.environ.get("WT_SESSION")
+    orig_argv = sys.argv
     try:
-        _os.environ["WT_SESSION"] = "test-wt-session"   # simulate running inside WT
         sys.argv = ["saikai", "--all"]
         saikai.main()
     finally:
         App.run = orig_run
         sys.argv = orig_argv
-        if orig_wt is None:
-            _os.environ.pop("WT_SESSION", None)
-        else:
-            _os.environ["WT_SESSION"] = orig_wt
 
-    assert facts.get("sync") is True, \
-        f"_sync_available must be forced True under WT so frames are atomic: {facts}"
+    assert facts.get("flag") is True, \
+        f"the supports message must set _sync_available (Textual path intact): {facts}"
+    assert facts.get("start") and facts.get("end"), \
+        f"a frame must be bracketed in ?2026h/?2026l once sync is available: {facts}"
 
 
 def test_pilot_session_list_disables_mouse_hover_repaint():
@@ -286,7 +300,10 @@ def test_pilot_session_list_disables_mouse_hover_repaint():
     import asyncio
     from textual.app import App
 
-    _write_demo_session()
+    # Write several rows so the keyboard cursor has somewhere to move to; depending on
+    # leaked state from earlier tests would make this red in isolation. (#wt-hover)
+    for _ in range(3):
+        _write_demo_session()
     facts: dict = {}
 
     def fake_run(self, *a, **kw):
@@ -2995,8 +3012,8 @@ if __name__ == "__main__":
     print("PASS test_leader_hint_item_separates_key_from_action")
     test_pilot_space_leader_and_divider()
     print("PASS test_pilot_space_leader_and_divider")
-    test_pilot_enables_synchronized_output_on_windows_terminal()
-    print("PASS test_pilot_enables_synchronized_output_on_windows_terminal")
+    test_pilot_synchronized_output_brackets_frames()
+    print("PASS test_pilot_synchronized_output_brackets_frames")
     test_pilot_session_list_disables_mouse_hover_repaint()
     print("PASS test_pilot_session_list_disables_mouse_hover_repaint")
     test_pilot_search_clear_button()

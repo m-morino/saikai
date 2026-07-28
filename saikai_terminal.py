@@ -3321,15 +3321,16 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # the show behind a successful anchor left the IME disabled (×) on focus
             # into a scrolled/unsettled pane.
             #
-            # force ONLY on a focus sync: that is the one case where WT/Textual may have
-            # dropped our visibility while we still believe it is set, so the ?25h has to
-            # be re-asserted unconditionally. The periodic host poll must NOT force — it
-            # runs every tick forever, so forcing there re-wrote ?25h on every poll even
-            # with nothing changed. While the mouse hovered the session list (focus on the
-            # list -> we hide) that fought the hide, and the native cursor visibly blinked
-            # between the list and the pane. Unforced, the write is suppressed whenever
-            # visibility is already what we want. (#native-cursor #wt-hover)
-            self._show_hw_cursor(True, force=(reason == "focus"))
+            # force on the INFREQUENT, event-driven syncs (focus / settle) so a
+            # visibility that drifted True while WT actually hid the cursor still gets
+            # re-asserted: focus heals it on a window/pane refocus, settle heals it once
+            # at an agent storm's end. The FREQUENT ticks must NOT force — 'poll' runs
+            # every host tick forever and 'repaint' rides every frame, so forcing there
+            # re-wrote ?25h continuously even with nothing changed; while the mouse
+            # hovered the session list (focus on the list -> we hide) that fought the hide
+            # and the native cursor visibly blinked between list and pane. Unforced, the
+            # write is suppressed whenever visibility already matches. (#native-cursor #wt-hover)
+            self._show_hw_cursor(True, force=(reason in ("focus", "settle")))
             if xy is None:
                 return
             if not move_anchor:

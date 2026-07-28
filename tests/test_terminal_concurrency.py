@@ -3102,15 +3102,15 @@ def test_cursor_anchor_freezes_on_busy_or_hidden_follows_visible():
 
 
 def test_only_a_focus_sync_forces_the_cursor_visibility_write():
-    """The periodic host poll must NOT re-assert ?25h on every tick.
+    """The FREQUENT syncs (poll / repaint) must NOT re-assert ?25h on every tick.
 
     force= was `reason != "repaint"`, so the poll — which runs forever — re-wrote ?25h
     on EVERY tick even with nothing changed. Hovering the session list moves focus to the
     list, saikai hides the cursor, and the next poll immediately forced it back on: the
-    native cursor visibly blinked between the list and the pane. Only a "focus" sync may
-    force (that is the one case where WT/Textual can have dropped a visibility we still
-    believe is set); poll/settle/repaint must be suppressed when visibility already
-    matches. (#native-cursor #wt-hover)"""
+    native cursor visibly blinked between the list and the pane. Now only the INFREQUENT
+    event syncs force: 'focus' (window/pane refocus) and 'settle' (agent storm end) — so a
+    visibility that drifted while WT hid the cursor still heals — while 'poll'/'repaint'
+    are suppressed whenever visibility already matches. (#native-cursor #wt-hover)"""
     import threading as _th
 
     class _Cursor:
@@ -3167,13 +3167,17 @@ def test_only_a_focus_sync_forces_the_cursor_visibility_write():
             t._sync_terminal_cursor(reason="poll")
         assert writes == ["\x1b[?25h"], f"poll must not re-assert ?25h: {writes}"
 
-        # A settle sync is likewise suppressed when visibility already matches.
-        t._sync_terminal_cursor(reason="settle")
-        assert writes == ["\x1b[?25h"], f"settle must not re-assert ?25h: {writes}"
+        # A repaint at the same visible cell is likewise suppressed.
+        t._sync_terminal_cursor(reason="repaint")
+        assert writes == ["\x1b[?25h"], f"repaint must not re-assert ?25h: {writes}"
 
-        # A focus sync DOES force one re-assertion (WT may have dropped it).
+        # A settle sync (storm end) DOES force one re-assertion (heals a drifted state).
+        t._sync_terminal_cursor(reason="settle")
+        assert writes == ["\x1b[?25h", "\x1b[?25h"], f"settle must force: {writes}"
+
+        # A focus sync also forces (WT may have dropped visibility on refocus).
         t._sync_terminal_cursor(reason="focus")
-        assert writes == ["\x1b[?25h", "\x1b[?25h"], f"focus must force: {writes}"
+        assert writes == ["\x1b[?25h"] * 3, f"focus must force: {writes}"
     finally:
         rt._IS_WIN, rt._IME_ANCHOR, rt.Offset = old_win, old_anchor, old_offset
 
