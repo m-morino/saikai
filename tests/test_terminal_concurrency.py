@@ -3101,6 +3101,83 @@ def test_cursor_anchor_freezes_on_busy_or_hidden_follows_visible():
         "the debounce timer machinery must be removed"
 
 
+def test_only_a_focus_sync_forces_the_cursor_visibility_write():
+    """The periodic host poll must NOT re-assert ?25h on every tick.
+
+    force= was `reason != "repaint"`, so the poll — which runs forever — re-wrote ?25h
+    on EVERY tick even with nothing changed. Hovering the session list moves focus to the
+    list, saikai hides the cursor, and the next poll immediately forced it back on: the
+    native cursor visibly blinked between the list and the pane. Only a "focus" sync may
+    force (that is the one case where WT/Textual can have dropped a visibility we still
+    believe is set); poll/settle/repaint must be suppressed when visibility already
+    matches. (#native-cursor #wt-hover)"""
+    import threading as _th
+
+    class _Cursor:
+        x = 3; y = 2; hidden = False
+
+    class _Screen:
+        def __init__(self):
+            self.cursor = _Cursor(); self.columns = 80; self.lines = 24
+
+    class _Alt:
+        in_alt = False
+
+    class _Region:
+        x = 40; y = 5; width = 80; height = 24
+
+    class _Drv:
+        def __init__(self, w): self._w = w
+        def write(self, s): self._w.append(s)
+
+    class _App:
+        def __init__(self, w): self._driver = _Drv(w)
+
+    class _Shim(rt.AgentTerminal):
+        app = property(lambda self: self._app)
+        content_region = property(lambda self: _Region())
+
+    old_win, old_anchor, old_offset = rt._IS_WIN, rt._IME_ANCHOR, rt.Offset
+    rt._IS_WIN = True
+    rt._IME_ANCHOR = True
+    if rt.Offset is None:
+        rt.Offset = lambda x, y: (x, y)
+    try:
+        writes = []
+        t = _Shim.__new__(_Shim)
+        t.sid = "x"
+        t._app = _App(writes)
+        t._lock = _th.Lock()
+        t._screen = _Screen()
+        t._alt = _Alt()
+        t._scroll = 0
+        t.is_dead = False
+        t._status = "idle"
+        t._hw_cursor_visible = None
+        t._anchored_xy = None
+        t._frozen = False
+        t._is_focused_pane = lambda: True
+        t.refresh = lambda *a, **k: None
+
+        t._sync_terminal_cursor(reason="repaint")      # first show
+        assert writes == ["\x1b[?25h"], writes
+
+        # Repeated polls with nothing changed must write NOTHING (this is the blink).
+        for _ in range(5):
+            t._sync_terminal_cursor(reason="poll")
+        assert writes == ["\x1b[?25h"], f"poll must not re-assert ?25h: {writes}"
+
+        # A settle sync is likewise suppressed when visibility already matches.
+        t._sync_terminal_cursor(reason="settle")
+        assert writes == ["\x1b[?25h"], f"settle must not re-assert ?25h: {writes}"
+
+        # A focus sync DOES force one re-assertion (WT may have dropped it).
+        t._sync_terminal_cursor(reason="focus")
+        assert writes == ["\x1b[?25h", "\x1b[?25h"], f"focus must force: {writes}"
+    finally:
+        rt._IS_WIN, rt._IME_ANCHOR, rt.Offset = old_win, old_anchor, old_offset
+
+
 def test_ime_anchor_default_on_keeps_windows_caret_render_guard():
     """The IME anchor is default ON (opt-OUT) so CJK composition lands at the pane
     prompt, and the render guard must stay the general form that survives BOTH states.
@@ -3308,5 +3385,7 @@ if __name__ == "__main__":
     print("PASS test_cursor_anchor_settles_hidden_and_tracks_atomic_frames")
     test_cursor_anchor_freezes_on_busy_or_hidden_follows_visible()
     print("PASS test_cursor_anchor_freezes_on_busy_or_hidden_follows_visible")
+    test_only_a_focus_sync_forces_the_cursor_visibility_write()
+    print("PASS test_only_a_focus_sync_forces_the_cursor_visibility_write")
     test_ime_anchor_default_on_keeps_windows_caret_render_guard()
     print("PASS test_ime_anchor_default_on_keeps_windows_caret_render_guard")

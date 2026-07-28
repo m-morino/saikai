@@ -3319,9 +3319,17 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # Keep the native cursor SHOWN whenever the child shows its own — even if
             # geometry isn't settled yet (xy is None on an early focus event). Gating
             # the show behind a successful anchor left the IME disabled (×) on focus
-            # into a scrolled/unsettled pane. force= on the non-repaint syncs so a
-            # blur→refocus re-asserts ?25h even if visibility looked unchanged.
-            self._show_hw_cursor(True, force=(reason != "repaint"))
+            # into a scrolled/unsettled pane.
+            #
+            # force ONLY on a focus sync: that is the one case where WT/Textual may have
+            # dropped our visibility while we still believe it is set, so the ?25h has to
+            # be re-asserted unconditionally. The periodic host poll must NOT force — it
+            # runs every tick forever, so forcing there re-wrote ?25h on every poll even
+            # with nothing changed. While the mouse hovered the session list (focus on the
+            # list -> we hide) that fought the hide, and the native cursor visibly blinked
+            # between the list and the pane. Unforced, the write is suppressed whenever
+            # visibility is already what we want. (#native-cursor #wt-hover)
+            self._show_hw_cursor(True, force=(reason == "focus"))
             if xy is None:
                 return
             if not move_anchor:
