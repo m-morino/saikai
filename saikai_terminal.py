@@ -1810,6 +1810,19 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             pass
         event.stop()   # don't leak the key to the host app's bindings
 
+    def _pty_capture_path(self) -> str:
+        """One capture file PER PANE. Every pane's reader used to append to the one
+        path SAIKAI_PTY_CAPTURE names, so with several live panes the file was an
+        interleaving of N children with nothing to tell them apart — replaying it
+        reconstructed a screen no pane ever had, and it silently mixed transcripts.
+        Tag the path with the sid so a capture is replayable. (#pty-capture-per-pane)"""
+        path = getattr(self, "_pty_capture_file", None)
+        if path is None:
+            sid = (getattr(self, "sid", None) or "nosid")[:8]
+            root, ext = os.path.splitext(_PTY_CAPTURE)
+            path = self._pty_capture_file = "%s.%s%s" % (root, sid, ext or ".txt")
+        return path
+
     def _refresh_dirty_rows(self) -> None:
         """Repaint the rows that CHANGED, not the whole pane. UI thread.
 
@@ -2818,7 +2831,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         """Stage decoded output and feed only complete units to pyte."""
         if _PTY_CAPTURE:
             try:
-                with open(_PTY_CAPTURE, "a", encoding="utf-8") as _cf:
+                with open(self._pty_capture_path(), "a", encoding="utf-8") as _cf:
                     _cf.write(repr(chunk) + "\n")   # raw chunk, escape seqs visible
             except Exception:
                 pass

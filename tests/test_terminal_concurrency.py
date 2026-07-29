@@ -3450,6 +3450,31 @@ def test_rows_survive_a_refresh_that_raises():
     # row 5 was carried over; row 0 is the always-repainted cursor row
     assert ct._refreshes == [(0, 5)], ct._refreshes
 
+def test_pty_capture_is_one_file_per_pane():
+    """Every pane's reader appended to the ONE path SAIKAI_PTY_CAPTURE names, so
+    with several live panes the capture was an interleaving of N children with
+    nothing to tell them apart — replaying it rebuilt a screen no pane ever had.
+    Any diagnosis drawn from a multi-pane capture was unsound, so tag by sid."""
+    a = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    b = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    a.sid = "58e5abb5-85cd-492a"
+    b.sid = "b43e8db8-0f51-480f"
+    saved = rt._PTY_CAPTURE
+    try:
+        rt._PTY_CAPTURE = os.path.join("C:\\tmp", "child.txt")
+        pa, pb = a._pty_capture_path(), b._pty_capture_path()
+        assert pa != pb, (pa, pb)
+        assert pa.endswith("child.58e5abb5.txt"), pa
+        assert pb.endswith("child.b43e8db8.txt"), pb
+        assert a._pty_capture_path() is pa, "path must be computed once per pane"
+
+        # A pane with no sid yet still gets its own name rather than colliding.
+        c = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+        c.sid = None
+        assert c._pty_capture_path().endswith("child.nosid.txt")
+    finally:
+        rt._PTY_CAPTURE = saved
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -3660,3 +3685,5 @@ if __name__ == "__main__":
     print("PASS test_scrollback_and_freeze_fall_back_to_a_full_repaint")
     test_rows_survive_a_refresh_that_raises()
     print("PASS test_rows_survive_a_refresh_that_raises")
+    test_pty_capture_is_one_file_per_pane()
+    print("PASS test_pty_capture_is_one_file_per_pane")
