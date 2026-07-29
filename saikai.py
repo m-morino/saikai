@@ -6476,6 +6476,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             saved_cursor = table.cursor_row
             saved_sid = self._cursor_sid()   # restore by SESSION, not row index (headers/grouping shift it)
             saved_scroll_y = table.scroll_offset.y   # preserve the user's scroll across the rebuild
+            # clear() resets cursor_coordinate to (0,0), and that fires
+            # watch_cursor_coordinate WITHOUT going through move_cursor — so with the
+            # table's dimensions pending it queues call_after_refresh(
+            # _scroll_cursor_into_view), which lands AFTER our scroll restore and
+            # snapped the viewport to the top. TRACED during a wheel scroll: 28 -> 1.
+            # Suppress cursor-driven scrolling for the whole rebuild; re-enabled on a
+            # queued callback below, which FIFO puts behind the watcher's. The FIRST
+            # paint is exempt so the one-shot attention-home jump can still scroll.
+            _suppress_scroll = bool(getattr(self, "_did_attention_home", False))
+            if _suppress_scroll:
+                try:
+                    table._suppress_cursor_scroll = True
+                except Exception:
+                    _suppress_scroll = False
             table.clear(columns=True)
 
             # Read state first; layout mode decides whether the Topic column
@@ -6873,6 +6887,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.call_after_refresh(_reapply)
             except Exception:
                 pass
+            # Re-enable cursor-driven scrolling behind the watcher's queued call and
+            # behind our own re-apply, so the next real navigation scrolls normally.
+            if _suppress_scroll:
+                try:
+                    table.call_after_refresh(table._end_cursor_scroll_suppression)
+                except Exception:
+                    try:
+                        table._suppress_cursor_scroll = False
+                    except Exception:
+                        pass
             self._update_subtitle()
 
         def _update_subtitle(self) -> None:

@@ -1513,6 +1513,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # The pinned grid for the frame currently being rendered (see
         # render_lines): non-None ONLY between the start and end of one frame.
         self._frame: Optional[dict] = None
+        # The (rows, cols) last applied to pyte + the pty, so a Resize that didn't
+        # change anything can be ignored. (#resize-noop)
+        self._last_winsize: Optional[tuple] = None
         # Rows owed a repaint (see _refresh_dirty_rows) and the cursor row that
         # was last asked for, so a cursor MOVE — which dirties nothing in pyte —
         # still clears the cell it left behind.
@@ -2596,6 +2599,15 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if self._screen is None:
             return
         rows, cols = self._dims()
+        # Textual re-posts Resize on any relayout, so this fires with UNCHANGED
+        # geometry — measured on a real session: seven "rows=36 cols=97" resizes in
+        # eight seconds. Each one dropped the user's scrollback offset, called
+        # pyte.resize() (which dirties EVERY line, forcing a full repaint) and
+        # setwinsize() on the pty, which sends the child SIGWINCH and makes it redraw
+        # its whole screen. None of that is wanted when nothing moved. (#resize-noop)
+        if (rows, cols) == getattr(self, "_last_winsize", None):
+            return
+        self._last_winsize = (rows, cols)
         with self._lock:
             left_scrollback = self._scroll != 0
             self._scroll = 0     # geometry changed; drop any scrollback offset

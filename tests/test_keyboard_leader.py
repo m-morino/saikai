@@ -3085,6 +3085,64 @@ def test_pilot_rebuild_is_deferred_while_the_list_is_scrolling():
         ("a rebuild ran mid-scroll and moved the viewport "
          f"(before={facts['before']} during={facts['during']})")
 
+def test_pilot_wheel_scroll_is_monotonic_under_constant_rebuilds():
+    """The whole scroll-fight, measured end to end on the real app: turn the wheel
+    while the list rebuilds on a timer (what the live-status poll does during a storm)
+    and the viewport must only ever move DOWN.
+
+    Before the fixes this measured 1-3 backwards jumps per run with most of the travel
+    lost; the backwards jump that survived the first three fixes came from clear()
+    resetting cursor_coordinate, which fires watch_cursor_coordinate outside
+    move_cursor and queues a deferred _scroll_cursor_into_view (traced: 28 -> 1).
+    (#scroll-fight)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_wheel_scroll_is_monotonic_under_constant_rebuilds")
+        return
+    import asyncio
+    from textual.app import App
+    from textual import events as _ev
+    for _ in range(60):
+        _write_demo_session()
+    facts: dict = {}
+    NOTCHES = 16
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(120, 18)) as pilot:
+                await pilot.pause(0.5)
+                table = self.query_one("#table")
+                timer = self.set_interval(0.05, self._refresh_table)
+                offs = [table.scroll_offset.y]
+                try:
+                    for _ in range(NOTCHES):
+                        await pilot.hover("#table")
+                        table.post_message(_ev.MouseScrollDown(
+                            table, 5, 5, 0, 1, 0, False, False, False))
+                        await pilot.pause(0.08)
+                        offs.append(table.scroll_offset.y)
+                finally:
+                    timer.stop()
+                facts["offsets"] = offs
+                facts["max"] = table.max_scroll_y
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+    offs = facts.get("offsets") or []
+    assert len(offs) > NOTCHES, f"test setup: no samples: {facts}"
+    assert facts.get("max", 0) > 0, f"test setup: table cannot scroll: {facts}"
+    back = [(a, b) for a, b in zip(offs, offs[1:]) if b < a]
+    assert not back, f"wheel scroll went backwards {back} — offsets={offs}"
+    assert offs[-1] > offs[0], f"wheel scroll made no progress: {offs}"
+
 
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
@@ -3187,3 +3245,5 @@ if __name__ == "__main__":
     print("PASS test_pilot_cursor_restore_with_scroll_false_does_not_scroll")
     test_pilot_rebuild_is_deferred_while_the_list_is_scrolling()
     print("PASS test_pilot_rebuild_is_deferred_while_the_list_is_scrolling")
+    test_pilot_wheel_scroll_is_monotonic_under_constant_rebuilds()
+    print("PASS test_pilot_wheel_scroll_is_monotonic_under_constant_rebuilds")
