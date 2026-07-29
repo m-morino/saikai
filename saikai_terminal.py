@@ -115,6 +115,12 @@ if _IME_DEBUG == "1":
     _IME_DEBUG = os.path.join(
         os.environ.get("TEMP") or os.environ.get("TMP") or ".", "saikai_ime_debug.txt")
 
+# Opt-in render accounting: SAIKAI_FRAME_LOG=1 makes each pane log, once a second,
+# how many frames and get_style_at probes it served, how many rows it snapshotted,
+# and how many ms of the UI thread that took — so "the UI feels heavy" can be read
+# as numbers instead of adjectives. Cheap (a few counters) but off by default.
+_FRAME_LOG = str(os.environ.get("SAIKAI_FRAME_LOG", "")).strip() not in ("", "0")
+
 
 def _ime_dbg(line: str) -> None:
     """Append one IME-anchor trace line (no-op unless SAIKAI_IME_DEBUG is set)."""
@@ -1545,13 +1551,49 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         ``render_line`` outside a frame still takes the locked fallback rather
         than a stale grid. (#frame-snapshot)
         """
-        self._build_frame()
+        # A ONE-ROW crop cannot tear — and Textual issues one per MOUSE MOVE:
+        # Compositor.get_style_at(x, y) calls render_lines(Region(0, y, w, 1)) to
+        # find the style under the pointer. Snapshotting the grid there made a drag
+        # (i.e. copying with the mouse) cost a full grid copy + a lock acquisition
+        # per mouse event, on top of the storm — measurably worse than before.
+        # Snapshot only when a frame can actually splice rows. (#frame-snapshot)
+        t0 = time.monotonic() if _FRAME_LOG else 0.0
+        if crop.height > 1:
+            self._build_frame(crop)
+        t1 = time.monotonic() if _FRAME_LOG else 0.0
         try:
             return super().render_lines(crop)
         finally:
             self._frame = None
+            if _FRAME_LOG:
+                self._frame_log_tick(crop, t1 - t0, time.monotonic() - t1)
 
-    def _build_frame(self) -> None:
+    def _frame_log_tick(self, crop, build_s: float, render_s: float) -> None:
+        """SAIKAI_FRAME_LOG=1: per-second aggregate of what the render path costs,
+        so a 'the UI is heavy' report can be read as numbers (calls, rows, ms on
+        the UI thread) instead of adjectives. Off by default."""
+        st = getattr(self, "_frame_stats", None)
+        if st is None:
+            st = self._frame_stats = {"t": time.monotonic(), "frames": 0,
+                                      "style": 0, "rows": 0, "build": 0.0,
+                                      "render": 0.0}
+        if crop.height > 1:
+            st["frames"] += 1
+            st["rows"] += crop.height
+        else:
+            st["style"] += 1          # a get_style_at probe (mouse move)
+        st["build"] += build_s
+        st["render"] += render_s
+        now = time.monotonic()
+        if now - st["t"] >= 1.0:
+            _log("[frame] sid=%s frames/s=%d style_probes/s=%d rows/s=%d "
+                 "build=%.1fms render=%.1fms (of %.0fms wall)"
+                 % ((getattr(self, "sid", None) or "?")[:8], st["frames"],
+                    st["style"], st["rows"], st["build"] * 1000,
+                    st["render"] * 1000, (now - st["t"]) * 1000))
+            st.update(t=now, frames=0, style=0, rows=0, build=0.0, render=0.0)
+
+    def _build_frame(self, crop=None) -> None:
         """Pin the visible rows + cursor state as of ONE pyte generation.
 
         Copies cell REFERENCES (pyte Chars are immutable), so this is ~lines ×
@@ -1571,8 +1613,24 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 cols = scr.columns
                 lines = scr.lines
                 s = self._scroll
+                # Only the rows this frame will ask for. render_line receives a
+                # CONTENT-relative y (_styles_cache calls it as
+                # render_content_line(y - gutter.top)) while the crop is
+                # widget-relative, so shift by the gutter; a row that still misses
+                # falls back to the locked read in render_line.
+                if crop is None:
+                    ys = range(lines)
+                else:
+                    top = 0
+                    try:
+                        top = int(getattr(self.gutter, "top", 0) or 0)
+                    except Exception:
+                        top = 0
+                    y0 = max(0, crop.y - top)
+                    y1 = min(lines, crop.y + crop.height - top)
+                    ys = range(y0, max(y0, y1))
                 rows = {}
-                for y in range(lines):
+                for y in ys:
                     buf = self._buf_for_row(scr, s, y)
                     rows[y] = ([buf[x] for x in range(cols)]
                                if buf is not None else None)

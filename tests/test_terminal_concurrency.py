@@ -3318,6 +3318,36 @@ def test_render_takes_the_pane_lock_once_per_frame():
         ct.render_line(y)
     assert acquires == [1], f"expected 1 acquisition per frame, got {len(acquires)}"
 
+def test_single_row_render_skips_the_snapshot_and_crops_scope_it():
+    """Textual asks for ONE row per MOUSE MOVE — Compositor.get_style_at calls
+    render_lines(Region(0, y, w, 1)) to find the style under the pointer. A one-row
+    frame cannot splice rows, so snapshotting there is pure cost, and it made
+    dragging (copying with the mouse) far more expensive than the storm itself.
+    And when a frame IS snapshotted, it must cost only the rows it asked for."""
+    class _Crop:
+        def __init__(self, y, height):
+            self.y = y
+            self.height = height
+
+    ct = _grid_pane(rows=8, cols=3)
+    built = []
+    ct._build_frame = lambda crop=None: built.append(crop)
+    for crop, expect in ((_Crop(0, 1), 0), (_Crop(0, 8), 1)):
+        try:
+            ct.render_lines(crop)       # super() needs a live app; the count is
+        except Exception:               # decided before it runs either way
+            pass
+        assert len(built) == expect, (crop.height, len(built))
+
+    # A crop scopes the snapshot: 2 rows asked for, 2 rows copied — not the grid.
+    ct = _grid_pane(rows=8, cols=3)
+    ct._build_frame(_Crop(3, 2))
+    assert sorted(ct._frame["rows"]) == [3, 4], sorted(ct._frame["rows"])
+
+    # No crop (a direct call) still covers the whole visible grid.
+    ct._build_frame()
+    assert sorted(ct._frame["rows"]) == list(range(8))
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -3514,3 +3544,5 @@ if __name__ == "__main__":
     print("PASS test_render_frame_pins_one_pyte_generation")
     test_render_takes_the_pane_lock_once_per_frame()
     print("PASS test_render_takes_the_pane_lock_once_per_frame")
+    test_single_row_render_skips_the_snapshot_and_crops_scope_it()
+    print("PASS test_single_row_render_skips_the_snapshot_and_crops_scope_it")
