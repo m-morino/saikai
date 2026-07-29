@@ -658,6 +658,34 @@ def test_child_pty_env_presents_one_windows_terminal_identity_per_platform():
     }, is_win=False)
     assert [k for k in wez if k.startswith("WEZTERM")] == [], wez
 
+    # …and so does every other terminal that ships a control channel in the env. The
+    # hole was listing kitty and alacritty by their HARMLESS identity variables
+    # (KITTY_WINDOW_ID, ALACRITTY_LOG) while KITTY_LISTEN_ON and ALACRITTY_SOCKET went
+    # straight through: with either one a pane child runs `kitten @ close-window` or
+    # `alacritty msg create-window` against the REAL terminal, and KONSOLE_DBUS_* is
+    # the same over D-Bus. (#host-control-env)
+    hosts = rt._child_pty_env({
+        "PATH": "/bin",
+        "KITTY_WINDOW_ID": "1",
+        "KITTY_LISTEN_ON": "unix:/tmp/kitty-1",
+        "KITTY_PID": "42",
+        "KITTY_PUBLIC_KEY": "1:abc",
+        "ALACRITTY_LOG": "/tmp/a.log",
+        "ALACRITTY_SOCKET": "/tmp/alacritty-1.sock",
+        "ALACRITTY_WINDOW_ID": "7",
+        "KONSOLE_VERSION": "220400",
+        "KONSOLE_DBUS_SESSION": "/Sessions/1",
+        "KONSOLE_DBUS_SERVICE": ":1.42",
+        "GNOME_TERMINAL_SERVICE": ":1.99",
+        "GNOME_TERMINAL_SCREEN": "/org/gnome/Terminal/screen/abc",
+        "ITERM_SESSION_ID": "w0t0p0",
+        "GHOSTTY_RESOURCES_DIR": "/usr/share/ghostty",
+        "TERMINATOR_UUID": "urn:uuid:abc",
+        "TILIX_ID": "abc",
+        "VTE_VERSION": "7600",
+    }, is_win=False)
+    assert list(hosts) == ["PATH", "TERM", "COLORTERM"], hosts
+
 
 def test_cursor_sync_freezes_while_busy_and_settles_on_transition():
     """Anti-fly WITHOUT a timer: a per-repaint sync FREEZES the anchor while the pane
@@ -2228,6 +2256,24 @@ def test_decrqm_reports_the_modes_saikai_actually_implements():
     t._consume("\x1b[?2026hframe-body\x1b[?2026$p")
     assert sent == ["\x1b[?2026;1$y"], sent   # a child verifying its own BSU took effect
 
+    # An UNIMPLEMENTED mode must answer "0 = not recognised" wherever the query falls.
+    # The in-chunk overlay records every private param the write carried, so a
+    # set-then-verify in ONE write was told "1 = set" for a mode nothing here honours,
+    # while the same query one read later got 0 — two answers to one question, and a
+    # child that believed the first went on to send output the pane cannot render
+    # faithfully. (#decrqm-unrecognised)
+    sent.clear()
+    t._consume("\x1b[?2027h\x1b[?2027$p")      # grapheme clustering: not implemented
+    assert sent == ["\x1b[?2027;0$y"], sent
+    assert _reply("\x1b[?2027$p") == "\x1b[?2027;0$y"   # same answer one read later
+    sent.clear()
+    t._consume("\x1b[?1005;9h\x1b[?1005$p\x1b[?9$p")   # combined, neither implemented
+    assert "".join(sent) == "\x1b[?1005;0$y\x1b[?9;0$y", sent   # one batched write
+    # An IMPLEMENTED mode still reports position-accurately from the same overlay.
+    sent.clear()
+    t._consume("\x1b[?2004l\x1b[?2004$p\x1b[?2004h\x1b[?2004$p")
+    assert "".join(sent) == "\x1b[?2004;2$y\x1b[?2004;1$y", sent
+
 
 def test_cursor_report_clamps_pending_wrap_and_honours_origin_mode():
     """Two CPR coordinate bugs a child can act on.
@@ -3767,6 +3813,112 @@ def test_alt_screen_boundary_is_seen_in_a_combined_decset():
     # The tracker and the feed path share ONE pattern, so they agree byte for byte.
     assert rt.AltScreenTracker().transitions("\x1b[?1049;1002h") == 1
 
+def test_arrow_keys_follow_the_child_s_decckm_state():
+    """DECCKM (?1h) switches the CURSOR keys from CSI to SS3, and the pane must
+    follow the child that asked for it.
+
+    The pane sent CSI unconditionally while the mirror's seed REPLAYS ?1h into
+    xterm.js — so pressing the same arrow in the browser sent \\x1bOA and in the pane
+    \\x1b[A. A child in application-cursor mode that parses only the form it asked for
+    got its arrows from one surface and not the other, and the two surfaces are
+    supposed to be the same terminal. Modified arrows stay CSI: xterm keeps the
+    modifier form regardless of DECCKM. (#decckm-arrows)"""
+    assert rt.encode_key("up", None) == "\x1b[A"                      # default: CSI
+    assert rt.encode_key("end", None) == "\x1b[F"
+    for key, ss3 in (("up", "\x1bOA"), ("down", "\x1bOB"), ("right", "\x1bOC"),
+                     ("left", "\x1bOD"), ("home", "\x1bOH"), ("end", "\x1bOF")):
+        assert rt.encode_key(key, None, app_cursor=True) == ss3, key
+    # Modified arrows and everything else are unaffected by DECCKM.
+    assert rt.encode_key("ctrl+right", None, app_cursor=True) == "\x1b[1;5C"
+    assert rt.encode_key("shift+up", None, app_cursor=True) == "\x1b[1;2A"
+    assert rt.encode_key("pageup", None, app_cursor=True) == "\x1b[5~"
+    assert rt.encode_key("enter", None, app_cursor=True) == "\r"
+
+    # And the WIRING: the pane must pass its live DECCKM state, tracked from the
+    # child's own ?1h/?1l, not a default.
+    import pyte
+
+    class _Ev:
+        def __init__(self, key):
+            self.key, self.character = key, None
+        def stop(self):
+            pass
+
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t._lock = threading.Lock()
+    t._screen = pyte.HistoryScreen(20, 4, history=20)
+    t._stream = pyte.Stream(t._screen)
+    t._alt = rt.AltScreenTracker()
+    t._scroll = t._scr_ver = 0
+    t._esc_carry = ""
+    t._dcs_inside = False
+    t._dcs_dropped = 0
+    for attr in ("_mouse_click", "_mouse_btn_motion", "_mouse_any_motion",
+                 "_app_cursor", "_focus_reporting", "_bracketed_paste",
+                 "_mouse_sgr", "_mouse_reporting", "_frozen", "is_dead"):
+        setattr(t, attr, False)
+    t._sync_output = rt._SynchronizedOutputStager()
+    t._marshal = lambda fn: fn()
+    t._send_to_child = lambda data: None
+    t._current_screen = lambda: ("", "")
+    t._update_status = lambda s: None
+    t._status_classifier = lambda txt, title: "idle"
+    t._pty = object()
+    t._snap_to_live = lambda: None
+    written = []
+    t._write_child = written.append
+
+    t.on_key(_Ev("up"))
+    assert written == ["\x1b[A"], written            # child has not asked for SS3
+    t._consume("\x1b[?1h")                          # DECCKM set
+    assert t._app_cursor is True
+    written.clear()
+    t.on_key(_Ev("up"))
+    assert written == ["\x1bOA"], written
+    t._consume("\x1b[?1l")                          # …and back
+    written.clear()
+    t.on_key(_Ev("up"))
+    assert written == ["\x1b[A"], written
+
+def test_a_dropped_sixel_image_is_reported_once():
+    """The pane advertises sixel in DA1 and renders none of it, so say so.
+
+    DA1 is answered byte-identically to Windows Terminal because that is what makes
+    claude pick the renderer that tracks the input caret, and WT's reply includes
+    4 = sixel. Every DCS is then dropped (pyte would draw the payload into the grid),
+    so an image a child sent on that promise vanished with NOTHING said — a gap where
+    the picture should be and no reason for it. One notice per pane, and only for a
+    payload that was meant to be a picture: DECRQSS and XTGETTCAP are DCS too and
+    must stay silent. (#sixel-advertised)"""
+    t = _mk_alt_consumer()
+    notes = []
+    t._safe_notify = notes.append
+
+    t._consume("before\x1bPq#0;2;0;0;0#0~~@@vv@@~~$-#1~~@@\x1b\\after")
+    line0 = "".join(t._screen.buffer[0][x].data for x in range(20)).rstrip()
+    assert line0 == "beforeafter", repr(line0)      # payload never reached the grid
+    assert len(notes) == 1 and "sixel" in notes[0].lower(), notes
+    t._consume("\x1bP0;0;0q#0~~\x1b\\")             # a second image
+    assert len(notes) == 1, "notified again for the same pane: %r" % (notes,)
+
+    # DECRQSS / XTGETTCAP are DCS strings too, and are NOT pictures.
+    t2 = _mk_alt_consumer()
+    notes2 = []
+    t2._safe_notify = notes2.append
+    t2._consume('x\x1bP$q"p\x1b\\y\x1bP+q544e\x1b\\z')
+    line0b = "".join(t2._screen.buffer[0][x].data for x in range(20)).rstrip()
+    assert line0b == "xyz", repr(line0b)
+    assert notes2 == [], notes2
+
+    # An intro split across reads misses the regex, so kilobytes of dropped DCS is
+    # taken as a picture too — that is the case the size fallback exists for.
+    t3 = _mk_alt_consumer()
+    notes3 = []
+    t3._safe_notify = notes3.append
+    t3._consume("\x1bP0;0;")                        # intro split here
+    t3._consume("0q" + "~" * 5000)
+    assert len(notes3) == 1 and "sixel" in notes3[0].lower(), notes3
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -3995,3 +4147,7 @@ if __name__ == "__main__":
     print("PASS test_a_query_split_at_a_csi_intermediate_is_held")
     test_alt_screen_boundary_is_seen_in_a_combined_decset()
     print("PASS test_alt_screen_boundary_is_seen_in_a_combined_decset")
+    test_arrow_keys_follow_the_child_s_decckm_state()
+    print("PASS test_arrow_keys_follow_the_child_s_decckm_state")
+    test_a_dropped_sixel_image_is_reported_once()
+    print("PASS test_a_dropped_sixel_image_is_reported_once")

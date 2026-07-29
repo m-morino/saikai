@@ -256,21 +256,35 @@ _HOST_TERMINAL_ENV_STRIP = {
     "TERM_PROGRAM_VERSION",
     "LC_TERMINAL",
     "LC_TERMINAL_VERSION",
-    "KITTY_WINDOW_ID",
-    "ALACRITTY_LOG",
-    "KONSOLE_VERSION",
     "VTE_VERSION",
     "ZED_TERM",
+    "TERMINATOR_UUID",
+    "TILIX_ID",
     # Claude sets this for Windows/WT fleet views; saikai's pane is neither.
     # NOTE: CLAUDE_CODE_FORCE_SYNC_OUTPUT is deliberately NOT stripped — an
     # explicit user override stays explicit, and saikai now presents ?2026 frames
     # atomically instead of needing the child to avoid them.
     "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT",
 }
-# The whole WEZTERM_* family, not a hand-listed pair: WEZTERM_UNIX_SOCKET is a live
-# mux socket, so leaking it lets a pane child drive the REAL outer window through
-# `wezterm cli`, and WEZTERM_CONFIG_* re-identifies the host we just masked.
-_HOST_TERMINAL_ENV_STRIP_PREFIXES = ("WEZTERM_",)
+# WHOLE FAMILIES, not hand-listed members — each of these carries at least one
+# variable that is a live control channel to the OUTER window, and a hand-listed pair
+# is how the hole appeared: WEZTERM_ was stripped by prefix, but kitty and alacritty
+# were listed by their harmless identity variables (KITTY_WINDOW_ID, ALACRITTY_LOG)
+# while KITTY_LISTEN_ON and ALACRITTY_SOCKET went straight through. With those a pane
+# child runs `kitten @ …` / `alacritty msg …` against the real terminal — closing
+# windows, spawning tabs, writing text into another pane — and KONSOLE_DBUS_* is the
+# same story over D-Bus. The rest of each family re-identifies the host saikai just
+# masked. Members are covered by their prefix, so the set above lists only the
+# variables that have no family. (#host-control-env)
+_HOST_TERMINAL_ENV_STRIP_PREFIXES = (
+    "WEZTERM_",         # WEZTERM_UNIX_SOCKET: `wezterm cli` drives the real window
+    "KITTY_",           # KITTY_LISTEN_ON: `kitten @` remote control
+    "ALACRITTY_",       # ALACRITTY_SOCKET: `alacritty msg` IPC
+    "KONSOLE_",         # KONSOLE_DBUS_SESSION/WINDOW/SERVICE: D-Bus control
+    "GNOME_TERMINAL_",  # GNOME_TERMINAL_SERVICE/SCREEN: D-Bus object paths
+    "ITERM_",           # ITERM_SESSION_ID / ITERM_PROFILE: host identity
+    "GHOSTTY_",         # GHOSTTY_RESOURCES_DIR / BIN_DIR: host identity
+)
 
 # Opt out of presenting the pane as Windows Terminal (env side): SAIKAI_WT_IDENTITY=0
 # leaves WT_SESSION exactly as the host set it. (#wt-session-optout)
@@ -841,6 +855,16 @@ _KEYMAP.update({
     "ctrl+circumflex_accent": "\x1e", "ctrl+underscore": "\x1f",
 })
 _BASE_KEYMAP = dict(_KEYMAP)
+# DECCKM (?1h): while the child has APPLICATION cursor keys set, a terminal sends the
+# cursor keys as SS3 (\x1bOA) instead of CSI (\x1b[A). The pane sent CSI always, while
+# the mirror REPLAYS ?1h into xterm.js — so the browser sent SS3 and the pane sent CSI
+# for the same arrow key, and a child that switched on DECCKM and parses only the form
+# it asked for got its arrows from one surface and not the other. Modified arrows stay
+# CSI (\x1b[1;5A): xterm keeps the modifier form regardless of DECCKM. (#decckm-arrows)
+_APP_CURSOR_KEYMAP = {
+    "up": "\x1bOA", "down": "\x1bOB", "right": "\x1bOC", "left": "\x1bOD",
+    "home": "\x1bOH", "end": "\x1bOF",
+}
 _MODIFIED_CSI_FINALS = {
     "up": "A", "down": "B", "right": "C", "left": "D",
     "home": "H", "end": "F",
@@ -891,12 +915,21 @@ for _rk in ("f2", "f3", "f4"):
     _KEYMAP.pop(_rk, None)
 
 
-def encode_key(key: str, character: Optional[str]) -> Optional[str]:
+def encode_key(key: str, character: Optional[str],
+               app_cursor: bool = False) -> Optional[str]:
     """Translate a Textual key event into the byte string to write to the PTY,
     or None if the key carries nothing the child should receive.
 
+    *app_cursor* is the child's DECCKM state (?1h): with it set the cursor keys go
+    out as SS3, which is what the mirror's xterm.js already sends after the seed
+    replays ?1h. (#decckm-arrows)
+
     Pure + table-driven so it is unit-testable without a TTY.
     """
+    if app_cursor:
+        ss3 = _APP_CURSOR_KEYMAP.get(key)
+        if ss3 is not None:
+            return ss3
     mapped = _KEYMAP.get(key)
     if mapped is not None:
         return mapped
@@ -1088,6 +1121,10 @@ _DECRQM_ALT_SCREEN = ("47", "1047", "1049")
 # sixel in its Windows-Terminal DA reply, so an auto-detecting image tool would
 # fill the pane with garbage. Strip them before pyte and the mirror. (#dcs-scrub)
 _DCS_END_RE = re.compile(r"\x07|\x1b\\")
+# A sixel image's introducer: ESC P, numeric params, final 'q' (\x1bPq, \x1bP7;1;75q).
+# DECRQSS (\x1bP$q…) and XTGETTCAP (\x1bP+q…) carry a non-digit intermediate, so they
+# do not match — only a payload that was meant to be a PICTURE does. (#sixel-advertised)
+_SIXEL_INTRO_RE = re.compile(r"\x1bP[0-9;]*q")
 _DCS_MAX_DROP = 4 * 1024 * 1024
 
 
@@ -2111,7 +2148,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         if self._frozen:
             self.toggle_freeze()   # any key = done selecting → resume live updates
-        data = encode_key(event.key, getattr(event, "character", None))
+        data = encode_key(event.key, getattr(event, "character", None),
+                          app_cursor=bool(getattr(self, "_app_cursor", False)))
         if data is None:
             return
         self.last_input_ts = time.monotonic()   # (#linux-state-regroup)
@@ -3071,7 +3109,18 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
 
         `so_far` is the set of modes the chunk being scanned has already changed
         BEFORE this query. It wins over the live state, which for a mode the same
-        chunk sets later would answer with the child's future. (#term-queries)"""
+        chunk sets later would answer with the child's future. (#term-queries)
+
+        The overlay applies only to modes saikai actually reports, because `so_far`
+        records EVERY private param the chunk carried — including ones nothing here
+        implements. A child that wrote `\\x1b[?2027h` and queried `\\x1b[?2027$p` in
+        the SAME read was told "1 = set" (saikai does not implement 2027), while the
+        same query one read later correctly got "0 = not recognised": two answers to
+        one question, and a child that believed the first went on to send output
+        saikai's pyte does not honour. Deciding recognition FIRST makes the answer
+        independent of where the query fell. (#decrqm-unrecognised)"""
+        if not self._decrqm_recognised(mode):
+            return 0
         if so_far and mode in so_far:
             return 1 if so_far[mode] else 2
         if mode == "2026":
@@ -3091,6 +3140,16 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if attr is None:
             return 0
         return 1 if getattr(self, attr, False) else 2
+
+    @staticmethod
+    def _decrqm_recognised(mode: str) -> bool:
+        """True if saikai can report this private mode's state at all.
+
+        The single list the report and the in-chunk overlay both consult, so an
+        unimplemented mode cannot be answered one way mid-chunk and another way
+        later. (#decrqm-unrecognised)"""
+        return (mode in ("2026", "25") or mode in _DECRQM_ALT_SCREEN
+                or mode in _DECRQM_TRACKED)
 
     def _static_query_replies(self, chunk: str) -> list:
         """(position, reply) for every query whose answer needs no live state.
@@ -3199,8 +3258,23 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # be able to spoof an OSC 52 clipboard write or a notification either. The
         # 'inside' state carries across reads. (#dcs-scrub)
         if "\x1bP" in chunk or self._dcs_inside:
+            _graphics = _SIXEL_INTRO_RE.search(chunk) is not None
             chunk, self._dcs_inside, self._dcs_dropped = _strip_dcs(
                 chunk, self._dcs_inside, self._dcs_dropped)
+            # The pane answers DA1 byte-identically to Windows Terminal, and that
+            # reply includes 4 = sixel — it has to, because looking exactly like WT
+            # is what makes claude pick the renderer that tracks the input caret
+            # (#agents-cursor #wt-da). But every DCS is dropped, so an image a child
+            # sent on that promise VANISHED with nothing said: the user saw a gap
+            # where the picture should be and no reason for it. Say it once per pane.
+            # A payload whose intro is split across reads misses the regex, hence the
+            # size fallback: DECRQSS/XTGETTCAP replies are tiny, so kilobytes of
+            # dropped DCS is a picture. (#sixel-advertised)
+            if (_graphics or self._dcs_dropped > 4096) and \
+                    not getattr(self, "_sixel_notified", False):
+                self._sixel_notified = True
+                self._notify_host("This pane dropped a graphics (sixel) image — "
+                                  "saikai renders text only")
             # Removing a string can leave an ESC trailing that was interior
             # before, so re-hold: otherwise it joins the next read's first byte
             # into an introducer downstream of every scrub. (#dcs-scrub)

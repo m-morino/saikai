@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+A cross-terminal audit of the pane's own contract: what it tells a child it is, and
+what it actually does. Every item is a place the two disagreed, so the symptom only
+appeared on some hosts or under some children.
+
+### Fixed
+- **A multi-line paste could be submitted line by line.** A PTY read that ended on a
+  CSI *intermediate* byte (the `$` of `\x1b[?2004$p`) was released instead of held, so
+  saikai's DECRQM scanners matched neither half and the query went unanswered — a child
+  that sets bracketed paste and then verifies it concluded the mode was unsupported.
+  pyte's own parser spans the split, which is why nothing looked broken.
+- **DECRQM no longer claims modes saikai does not implement.** The position-accurate
+  overlay recorded *every* private mode a chunk carried, so a set-then-verify in one
+  write was told "1 = set" for a mode nothing here honours, while the same query one
+  read later correctly got "0 = not recognised".
+- **The alt screen is detected in a combined DECSET.** A child that writes its whole
+  entry at once (`\x1b[?1049;1002;1006h`) produced no boundary, so pyte's single buffer
+  kept the pre-alt frame under the child's new UI. `AltScreenTracker` had a second copy
+  of the same pattern; it now shares one.
+- **Arrow keys follow the child's DECCKM state.** The pane always sent CSI while the
+  mirror replays `?1h` into xterm.js, so the same arrow reached the child as `\x1bOA`
+  from a browser and `\x1b[A` from the pane.
+- **A dropped image is reported.** The pane answers DA1 byte-identically to Windows
+  Terminal — which advertises sixel — and then drops every DCS, so a graphics payload
+  vanished silently. It now says so once per pane.
+- **Terminal remote-control sockets no longer reach a pane child.** kitty and alacritty
+  were scrubbed by their identity variables while `KITTY_LISTEN_ON` and
+  `ALACRITTY_SOCKET` went through, which let a child drive the real outer window
+  (`kitten @`, `alacritty msg`); `KONSOLE_DBUS_*` was the same over D-Bus. Whole
+  families are stripped now, as WezTerm's already was.
+- **The list's viewport no longer flicks to the cursor row under load.** The
+  cursor-scroll suppression closes on a queued callback, so a rebuild that starts
+  before the previous one's callbacks drain opens a second window — and a boolean let
+  the first window's end re-arm the second's pending scroll. It counts now.
+
 ## [0.6.0] — 2026-07-29
 
 Live panes render a real terminal, and this release is mostly about making that
