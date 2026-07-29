@@ -71,6 +71,43 @@ Violating these rules can hard-freeze the UI or orphan agent worker processes:
 Do not add locking to fix a cosmetic race unless the lock ordering has been
 proved and covered by a regression test.
 
+## Rendering invariants
+
+A pane is a terminal emulator inside a TUI framework, which means three width and
+state models have to agree: pyte's (the model), Rich/Textual's (the layout), and the
+host terminal's. Every rendering defect found so far was one of these five invariants
+breaking, and each broke silently — the symptom appeared somewhere else.
+
+1. **A cell renders in exactly the columns it owns.** pyte pairs a double-width glyph
+   with an empty stub; a cell that renders 2 columns while owning 1 pushes the rest of
+   the row right and spills its tail past the pane. *Symptom: a row looks shifted, and
+   heals when the child redraws it without the wide glyph.* The zero-width merge has to
+   claim the second column, and a 2-column cell consumes its neighbour at render time.
+2. **The model never holds a state a terminal cannot display.** A real terminal that
+   overwrites half a double-width glyph erases the whole glyph; pyte erases per cell and
+   leaves the other half, so the buffer can hold `[2-column glyph][real character]`.
+   Rendering that forces a choice between eating the character and shifting the row, and
+   a redrawing child alternates between the two. *Symptom: the pane oscillates.* Repair
+   it where the write happens, not when reading.
+3. **One painted frame shows one pyte generation.** `render_line` is called per row with
+   the lock released between rows, while the reader installs whole child frames
+   atomically — so a frame can splice generations. *Symptom: rows out of place, healed by
+   the next repaint, with nothing in the byte stream that could have moved them.* Pin the
+   grid once at the frame boundary (`render_lines`) and read it lock-free.
+4. **Every render input that changes a row dirties that row.** Only pyte's `dirty` rows
+   are repainted, and Textual serves the rest from its per-line strip cache, so an input
+   pyte does not track leaves a *permanently* stale row. Cursor moves, DECTCEM, focus,
+   and an overlay on top of the pane are all such inputs. *Symptom: a stale row or a
+   ghost cursor that only clears when something else happens to touch that row.*
+5. **The user's viewport intent outlives any rebuild.** `DataTable.clear()` zeroes
+   `scroll_y`, so a rebuild must restore it — from the position the user owns, not a
+   snapshot taken when the rebuild started, and never from a callback that runs a frame
+   later. Guarding this with a timer (`is_scrolling`) only holds while frames are fast.
+   *Symptom: the list jumps back a row or two while scrolling, worse under load.*
+
+Diagnostics for all five, and how to attribute a defect to saikai or to the child, are
+in [DEBUGGING.md](DEBUGGING.md).
+
 ## UI contracts
 
 - Session and pane actions use function keys. Ordinary bare `Ctrl+letter`

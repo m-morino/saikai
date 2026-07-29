@@ -6,7 +6,10 @@ Before changing code, read:
 
 - [CONTRIBUTING.md](CONTRIBUTING.md) for the development loop.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for module boundaries, history
-  semantics, split-live lifecycle, and concurrency invariants.
+  semantics, split-live lifecycle, and the concurrency and rendering invariants.
+- [docs/DEBUGGING.md](docs/DEBUGGING.md) before investigating anything visual —
+  `SAIKAI_DIAG=1` captures the whole display picture in one run, and that page
+  lists what each instrument cannot distinguish.
 
 Non-negotiable split-live rules:
 

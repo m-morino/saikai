@@ -71,6 +71,23 @@ If you change threading, lock, or async behavior, **verify it yourself**
 headlessly (see `tests/test_terminal_concurrency.py`) — don't ship an untested
 batch, and don't "fix" a cosmetic race with a lock that can deadlock.
 
+## The rendering invariants
+
+A pane is a terminal emulator inside a TUI framework, so pyte's width and state
+model, Rich/Textual's layout, and the host terminal all have to agree. Read the
+[rendering invariants](docs/ARCHITECTURE.md#rendering-invariants) before touching
+`render_line`, the pyte `draw` override, pane repaint scheduling, or the session
+list's viewport. Every one of them broke silently at least once, and the symptom
+always surfaced somewhere other than the cause — a shifted row, a pane that
+oscillates, a stale row, a list that jumps back while scrolling.
+
+For anything visual, start from [DEBUGGING.md](docs/DEBUGGING.md): `SAIKAI_DIAG=1`
+captures the whole picture in one run, replaying a capture gives a repro that needs
+nobody at a keyboard, and the same detector run on both the child's bytes and our
+output is what tells a defect of ours apart from the child's own rendering. That page
+also records what each instrument *cannot* distinguish — three diagnostics here were
+wrong in exactly that way, and each cost a round of blind patching.
+
 ## Style
 
 - Match the surrounding code: comment density, naming, idiom.
