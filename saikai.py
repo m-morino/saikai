@@ -6070,6 +6070,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # No saikai toast uses intentional markup — turn it off wholesale.
             # (#audit-toast-markup)
             kwargs.setdefault("markup", False)
+            # Set here as well as in _heal_toasts, so the very FIRST frame after a
+            # toast appears already has the panes on a whole-widget refresh instead of
+            # waiting up to 0.4s for the heal tick to notice. (#toast-heal)
+            self._toast_active = True
             buf = getattr(self, "_notif_log", None)
             if buf is None:
                 from collections import deque
@@ -6099,7 +6103,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             and the tick is a cheap no-op when no toast is up. (#toast-heal)"""
             try:
                 from textual.widgets._toast import Toast
-                for t in self.screen.query(Toast):
+                toasts = list(self.screen.query(Toast))
+                # Panes repaint only the pyte rows that CHANGED now, so a pane no
+                # longer redraws under a toast that overlaps it — and a toast is an
+                # overlay the compositor has to re-place over whatever repainted
+                # beneath it. Tell the panes to fall back to a whole-widget refresh
+                # while any toast is up: they are transient and rare, so the cost is
+                # nothing, and it removes a whole interaction to reason about.
+                # (#toast-heal #scroll-fight)
+                self._toast_active = bool(toasts)
+                for t in toasts:
                     t.refresh()
             except Exception:
                 pass

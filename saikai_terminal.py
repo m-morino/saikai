@@ -147,7 +147,12 @@ _DIAG_DIR = ""
 if _DIAG and _DIAG != "0":
     _DIAG_DIR = _DIAG if os.path.sep in _DIAG or (os.path.altsep or "") in _DIAG else \
         os.path.join(os.path.expanduser("~"), ".cache", "saikai", "diag")
+    # One directory PER RUN. Every capture here is opened in append mode, so a shared
+    # directory concatenates runs into one file and replaying it reconstructs a screen
+    # no run ever had — the same mistake the per-pane split fixed in the other
+    # dimension. Stamp the launch. (#diag-per-run)
     try:
+        _DIAG_DIR = os.path.join(_DIAG_DIR, time.strftime("%Y%m%d-%H%M%S"))
         os.makedirs(_DIAG_DIR, exist_ok=True)
     except Exception:
         _DIAG_DIR = ""
@@ -2051,6 +2056,14 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # Scrolled back or frozen: visible rows come from history / a pinned
         # snapshot and no longer correspond to live pyte rows. Correctness first.
         if self._scroll != 0 or getattr(self, "_frozen", False):
+            self.refresh()
+            return
+        # A toast is an overlay the compositor re-places over whatever repainted
+        # beneath it. Repainting only the rows pyte changed leaves the pane's other
+        # rows to the strip cache, which is one interaction too many while an overlay
+        # is on screen — and a toast is transient, so a whole-widget refresh costs
+        # nothing here. (#toast-heal)
+        if getattr(getattr(self, "app", None), "_toast_active", False):
             self.refresh()
             return
         try:
