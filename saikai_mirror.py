@@ -302,7 +302,21 @@ class MirrorHub:
         self._rows = rows
         self._ingest: queue.Queue[str] = queue.Queue(ingest_cap)
         self._mirror_lock = threading.Lock()
-        self._screen = pyte.Screen(cols, rows)
+        # saikai's screen, not a stock pyte one: pyte's draw BREAKS on the first
+        # width-0 character (a VS16 emoji, a ZWJ sequence, a combining mark) and
+        # silently drops the rest of the run, which is why the pane has a corrected
+        # draw. The hub models the same output, so it needs the same correction — a
+        # live SSE client sees raw bytes and looks right, but every re-seed (a phone
+        # connecting, a reconnect after a blip, a client falling behind) is built from
+        # THIS screen and would arrive with rows truncated at the emoji.
+        # (#saikai-screen-shared)
+        _scr_cls = pyte.Screen
+        try:
+            import saikai_terminal as _rt
+            _scr_cls = getattr(_rt, "_ScreenBase", None) or pyte.Screen
+        except Exception:
+            pass
+        self._screen = _scr_cls(cols, rows)
         self._stream = pyte.Stream(self._screen)
         self._clients: "set[queue.Queue]" = set()
         self._clients_lock = threading.Lock()

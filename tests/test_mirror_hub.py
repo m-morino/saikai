@@ -826,6 +826,43 @@ def test_overflow_repaint_is_gated_on_a_viewer_and_rate_limited():
     with hub._clients_lock:
         hub._clients.discard(cq)
 
+def test_hub_screen_keeps_text_after_a_width_zero_character():
+    """The hub models the app's output, so it needs the same corrected `draw` the pane
+    has. It used to build a stock `pyte.Screen`, whose draw BREAKS on the first width-0
+    character and drops the rest of the run — so a live SSE client (raw bytes) looked
+    right while every re-seed built from this screen (a phone connecting, a reconnect
+    after a blip, a client falling behind) arrived with rows truncated at the emoji.
+    (#saikai-screen-shared)"""
+    import pyte
+
+    hub = m.MirrorHub(token="t", cols=20, rows=2)
+
+    # The class is shared with the pane, not re-implemented.
+    try:
+        import saikai_terminal as rt
+        assert type(hub._screen) is rt._ScreenBase, type(hub._screen).__name__
+        assert rt._ScreenBase.__mro__[1] is rt._HistoryScreenBase.__mro__[1], \
+            "pane and hub screens must share ONE draw implementation"
+    except ImportError:
+        print("SKIP shared-class assertion (saikai_terminal unavailable)")
+
+    def row0(scr, n=12):
+        return "".join(scr.buffer[0][x].data for x in range(n))
+
+    # Stock pyte is the baseline this test exists to beat.
+    stock = pyte.Screen(20, 2)
+    pyte.Stream(stock).feed("AB⚠️CDEF")
+    assert "CDEF" not in row0(stock), \
+        "precondition: stock pyte is expected to drop the run (got %r)" % row0(stock)
+
+    for text, keep in (("AB⚠️CDEF", "CDEF"),
+                       ("AB\U0001F469‍\U0001F4BBCDEF", "CDEF"),
+                       ("ABéCDEF", "CDEF")):
+        h = m.MirrorHub(token="t", cols=20, rows=2)
+        pyte.Stream(h._screen).feed(text)
+        got = row0(h._screen)
+        assert keep in got, "hub screen dropped the run after a width-0 char: %r" % got
+
 
 if __name__ == "__main__":
     test_set_size_broadcasts_and_dedups()
@@ -868,3 +905,5 @@ if __name__ == "__main__":
     print("OK test_mirror_hub")
     test_overflow_repaint_is_gated_on_a_viewer_and_rate_limited()
     print("PASS test_overflow_repaint_is_gated_on_a_viewer_and_rate_limited")
+    test_hub_screen_keeps_text_after_a_width_zero_character()
+    print("PASS test_hub_screen_keeps_text_after_a_width_zero_character")

@@ -417,11 +417,19 @@ try:
     # to SKIP (not break on) width<0 chars. Faithful copy of pyte's draw otherwise;
     # guarded so a pyte-internal change just falls back to the stock screen. (#audit-zwj)
     _HistoryScreenBase = pyte.HistoryScreen
+    _ScreenBase = pyte.Screen
     try:
         import unicodedata as _ud
         from pyte import modes as _mo
 
-        class _SaikaiHistoryScreen(pyte.HistoryScreen):  # type: ignore[misc]
+        class _SaikaiDraw:                              # type: ignore[misc]
+            """The corrected `draw`, as a mixin so every pyte screen saikai builds
+            gets it. It used to live on the pane's HistoryScreen subclass alone, and
+            the web mirror consequently fed app frames to a stock ``pyte.Screen`` —
+            which still breaks on the first width-0 character, dropping the whole rest
+            of the run. An invariant implemented in one place and needed in two will
+            always be missing from one of them. (#saikai-screen-shared)"""
+
             def draw(self, data: str) -> None:
                 data = data.translate(
                     self.g1_charset if self.charset else self.g0_charset)
@@ -559,12 +567,21 @@ try:
                 # saikai isn't a recognised rich-notification terminal. (#bell)
                 self._bell_rang = True
 
+        class _SaikaiHistoryScreen(_SaikaiDraw, pyte.HistoryScreen):  # type: ignore[misc]
+            """The pane's screen: corrected draw + pyte's scrollback."""
+
+        class _SaikaiScreen(_SaikaiDraw, pyte.Screen):  # type: ignore[misc]
+            """A plain screen with the corrected draw, for anything that models the
+            APP's output rather than a pane's (the web mirror)."""
+
         _HistoryScreenBase = _SaikaiHistoryScreen
+        _ScreenBase = _SaikaiScreen
     except Exception:
         pass
 except Exception:  # pragma: no cover - exercised only when dep absent
     pyte = None  # type: ignore
     _HistoryScreenBase = None  # type: ignore
+    _ScreenBase = None  # type: ignore
 
 # Origin mode (DECOM) marker as pyte stores it in Screen.mode — a cursor report is
 # margin-relative while it is set. None when pyte is absent. (#term-queries)
