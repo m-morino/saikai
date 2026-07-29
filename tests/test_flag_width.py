@@ -141,6 +141,48 @@ def test_a_cell_never_renders_wider_than_the_columns_it_owns():
     # alternated between shifted and unshifted (the scroll oscillation).
     assert text.startswith("A⚠️B"), repr(text[:6])
 
+def test_overwriting_half_a_wide_glyph_erases_the_whole_glyph():
+    """A real terminal that overwrites HALF of a double-width glyph erases the WHOLE
+    glyph. pyte leaves the other half behind, so the model could hold
+    [2-column glyph][real character] — a state no terminal can display. Rendering it
+    forces a choice between eating that character and shifting the rest of the row, and
+    the child redrawing the row flips between the two: TRACED on a real session as the
+    pane alternating between "⚠ 注記" and "⚠注記" while scrolling. (#wide-glyph-halves)"""
+    import pyte
+    from rich.cells import cell_len
+
+    COLS, ROWS = 12, 2
+
+    def cells(scr, y=0):
+        return [scr.buffer[y][x].data for x in range(COLS)]
+
+    # Overwriting the STUB must blank the glyph that owned it.
+    scr = saikai_terminal._HistoryScreenBase(COLS, ROWS, history=5, ratio=0.5)
+    st = pyte.Stream(scr, strict=False)
+    st.feed("A⚠️B")                      # A, cluster(2 cols), B
+    assert cells(scr)[1] == "⚠️" and cells(scr)[2] == "", cells(scr)
+    st.feed("\x1b[1;3Hx")                # write over the stub at column 3 (index 2)
+    got = cells(scr)
+    assert got[1] == " ", "the glyph losing its second column must be blanked: %s" % got
+    assert got[2] == "x", got
+
+    # Overwriting the FIRST column must blank the orphaned stub.
+    scr2 = saikai_terminal._HistoryScreenBase(COLS, ROWS, history=5, ratio=0.5)
+    st2 = pyte.Stream(scr2, strict=False)
+    st2.feed("A⚠️B")
+    st2.feed("\x1b[1;2Hy")               # write over the cluster itself (index 1)
+    got2 = cells(scr2)
+    assert got2[1] == "y", got2
+    assert got2[2] == " ", "the orphaned stub must be blanked: %s" % got2
+
+    # The invariant that follows: no cell renders 2 columns with a real neighbour.
+    for scr_ in (scr, scr2):
+        for y in range(scr_.lines):
+            for x in range(scr_.columns - 1):
+                d = scr_.buffer[y][x].data
+                if d and cell_len(d) == 2:
+                    assert scr_.buffer[y][x + 1].data == "", (y, x, d)
+
 
 if __name__ == "__main__":
     test_regional_indicator_is_width_1()
@@ -151,3 +193,5 @@ if __name__ == "__main__":
     print("PASS test_emoji_presentation_cluster_occupies_the_columns_it_renders")
     test_a_cell_never_renders_wider_than_the_columns_it_owns()
     print("PASS test_a_cell_never_renders_wider_than_the_columns_it_owns")
+    test_overwriting_half_a_wide_glyph_erases_the_whole_glyph()
+    print("PASS test_overwriting_half_a_wide_glyph_erases_the_whole_glyph")

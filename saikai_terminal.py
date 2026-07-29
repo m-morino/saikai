@@ -433,6 +433,33 @@ try:
                     if _mo.IRM in self.mode and char_width > 0:
                         self.insert_characters(char_width)
                     line = self.buffer[self.cursor.y]
+                    if char_width > 0 and _cell_len is not None:
+                        # A real terminal that overwrites HALF of a double-width glyph
+                        # erases the WHOLE glyph; pyte leaves the other half behind, so
+                        # the model can hold [2-column glyph][real character] — a state
+                        # no terminal can display. Rendering it forces a choice between
+                        # eating that character and shifting the rest of the row, and
+                        # the child redrawing the row flips between the two: TRACED on
+                        # a real session as the pane alternating between "⚠ 注記" and
+                        # "⚠注記". Repair it here, where the write happens, so the
+                        # invariant [wide][stub] | [narrow][narrow] always holds.
+                        # (#wide-glyph-halves)
+                        x = self.cursor.x
+                        try:
+                            if x and line[x].data == "" and _cell_len(line[x - 1].data) == 2:
+                                # We are overwriting the stub: its glyph loses its
+                                # second column.
+                                line[x - 1] = line[x - 1]._replace(data=" ")
+                                self.dirty.add(self.cursor.y)
+                            nxt = x + char_width
+                            if nxt < self.columns and line[nxt].data == "" and \
+                                    _cell_len(line[nxt - 1].data) == 2:
+                                # We are overwriting a wide glyph's FIRST column: the
+                                # stub after it would be orphaned.
+                                line[nxt] = line[nxt]._replace(data=" ")
+                                self.dirty.add(self.cursor.y)
+                        except Exception:
+                            pass
                     if char_width == 1:
                         line[self.cursor.x] = self.cursor.attrs._replace(data=char)
                     elif char_width == 2:
