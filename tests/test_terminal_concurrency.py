@@ -1083,12 +1083,27 @@ def test_toggle_freeze_flips_and_resumes():
 def test_bracketed_paste_mode_tracking():
     """saikai re-wraps pastes in \\x1b[200~ … \\x1b[201~ only when claude has
     enabled bracketed-paste mode; the mode is tracked from CSI ?2004 h/l in the
-    output stream (pyte doesn't expose it). Last h/l in a chunk wins."""
-    fa = rt._BRACKETED_RE.findall
-    assert fa("\x1b[?2004h") == ["h"]
-    assert fa("\x1b[?2004l") == ["l"]
-    assert fa("x\x1b[?2004h y \x1b[?2004l") == ["h", "l"]
-    assert fa("no paste mode here") == []
+    output stream (pyte doesn't expose it). Last h/l in a chunk wins.
+
+    Asserted on the LIVE path (the param-list scanner in
+    _apply_modes_in_stream_order), so the COMBINED form \\x1b[?2004;1004h arms it
+    too. This used to assert on a ?2004-only regex that NOTHING in the code read,
+    which is why it could not have caught the combined form going unseen — the
+    same defect the alt-screen pattern had. (#alt-combined-params)"""
+    def mode(chunk):
+        t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+        for attr in ("_mouse_click", "_mouse_btn_motion", "_mouse_any_motion",
+                     "_app_cursor", "_focus_reporting", "_bracketed_paste",
+                     "_mouse_sgr", "_mouse_reporting"):
+            setattr(t, attr, False)
+        t._apply_modes_in_stream_order(chunk)
+        return t._bracketed_paste
+    assert mode("\x1b[?2004h") is True
+    assert mode("\x1b[?2004l") is False
+    assert mode("x\x1b[?2004h y \x1b[?2004l") is False   # last h/l in a chunk wins
+    assert mode("\x1b[?2004;1004h") is True               # combined entry
+    assert mode("\x1b[?12004h") is False                  # merely CONTAINS 2004
+    assert mode("no paste mode here") is False
 
 
 def test_ime_anchor_xy_maps_cursor_into_region():
@@ -3670,6 +3685,88 @@ def test_pane_copy_tries_native_linux_tools_before_osc52():
     finally:
         rt.set_clipboard_linux = saved
 
+def test_a_query_split_at_a_csi_intermediate_is_held():
+    """_hold_partial_escape must cover the CSI INTERMEDIATE bytes (0x20-0x2F), not just
+    parameters. A read ending after the '$' of \\x1b[?2004$p was released: pyte's FSM
+    spans the split so nothing looked broken, but saikai's DECRQM scanners matched
+    neither half, so the query went UNANSWERED — a set-then-verify child then concluded
+    bracketed paste was unsupported and its next multi-line paste submitted line by
+    line. (#csi-intermediate)"""
+    ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    for query in ("\x1b[?2004$p", "\x1b[?1006$p", "\x1b[5 q", '\x1b[?1;2"p'):
+        for cut in range(1, len(query)):        # every split before the final byte
+            ct._esc_carry = ""
+            released = ct._hold_partial_escape("out" + query[:cut])
+            held = ct._esc_carry
+            assert released == "out", (query, cut, released)
+            assert held + query[cut:] == query, \
+                "split at %r lost bytes: held=%r" % (query[:cut][-2:], held)
+    # A COMPLETE sequence is not held — it must reach the scanners in this read.
+    ct._esc_carry = ""
+    assert ct._hold_partial_escape("out\x1b[?2004$p") == "out\x1b[?2004$p"
+    assert ct._esc_carry == ""
+
+def _mk_alt_consumer():
+    """A bare AgentTerminal wired for _consume() — same fields as the
+    alt-screen amplification test above."""
+    import pyte
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t._lock = threading.Lock()
+    t._screen = pyte.HistoryScreen(20, 4, history=50)
+    t._stream = pyte.Stream(t._screen)
+    t._alt = rt.AltScreenTracker()
+    t._scroll = 0
+    t._scr_ver = 0
+    t._esc_carry = ""
+    t._dcs_inside = False
+    t._dcs_dropped = 0
+    t._mouse_click = False
+    t._mouse_btn_motion = False
+    t._mouse_any_motion = False
+    t._app_cursor = False
+    t._focus_reporting = False
+    t._bracketed_paste = False
+    t._sync_output = rt._SynchronizedOutputStager()
+    t._marshal = lambda fn: fn()
+    t._send_to_child = lambda data: None
+    t._mouse_reporting = False
+    t._mouse_sgr = False
+    t._current_screen = lambda: ("", "")
+    t._update_status = lambda s: None
+    t._status_classifier = lambda txt, title: "idle"
+    return t
+
+
+def test_alt_screen_boundary_is_seen_in_a_combined_decset():
+    """The alt mode may sit ANYWHERE in a DECSET's parameter list.
+
+    A child that opens its whole entry in one write (\\x1b[?1049;1002;1006h — the
+    form crossterm/termwiz-style setup code emits) hit a pattern that required the
+    alt mode to BE the list, so no boundary was seen: pyte's single buffer kept the
+    pre-alt frame and it stayed under the child's new UI until something else forced
+    a full repaint. The mouse params in the SAME write were already handled by the
+    param-list-aware scanner — the two disagreed about the same bytes.
+    (#alt-combined-params)"""
+    def line0(t):
+        return "".join(t._screen.buffer[0][x].data for x in range(20)).rstrip()
+
+    t = _mk_alt_consumer()
+    t._consume("PRE\x1b[?1049;1002;1006hPOST")
+    assert t._alt.in_alt is True, "combined DECSET was not seen as a boundary"
+    assert line0(t) == "POST", repr(line0(t))          # pre-alt frame was cleared
+    assert t._mouse_reporting is True and t._mouse_sgr is True   # same write, both applied
+    t._consume("\x1b[?1002;1006;1049lBACK")            # alt LAST in the list
+    assert t._alt.in_alt is False, "combined DECRST was not seen as a boundary"
+    assert line0(t) == "BACK", repr(line0(t))
+    assert t._mouse_reporting is False and t._mouse_sgr is False
+    # A mode that merely CONTAINS the digits is not the alt screen.
+    t2 = _mk_alt_consumer()
+    t2._consume("\x1b[?2047h\x1b[?147h\x1b[?490hX")
+    assert t2._alt.in_alt is False, "matched a mode that only contains 47/1049"
+    assert line0(t2) == "X", repr(line0(t2))
+    # The tracker and the feed path share ONE pattern, so they agree byte for byte.
+    assert rt.AltScreenTracker().transitions("\x1b[?1049;1002h") == 1
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -3894,3 +3991,7 @@ if __name__ == "__main__":
     print("PASS test_clipboard_declines_over_ssh_so_osc52_reaches_the_client")
     test_pane_copy_tries_native_linux_tools_before_osc52()
     print("PASS test_pane_copy_tries_native_linux_tools_before_osc52")
+    test_a_query_split_at_a_csi_intermediate_is_held()
+    print("PASS test_a_query_split_at_a_csi_intermediate_is_held")
+    test_alt_screen_boundary_is_seen_in_a_combined_decset()
+    print("PASS test_alt_screen_boundary_is_seen_in_a_combined_decset")

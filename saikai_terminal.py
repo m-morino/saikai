@@ -936,15 +936,22 @@ def encode_key(key: str, character: Optional[str]) -> Optional[str]:
 
 # ── alt-screen tracking (pyte gap, see pyte spike) ────────────────────────────
 # pyte records the ?1049h/?1049l mode bit but has only ONE buffer: it does NOT
-# swap/save/restore, and ignores ?47/?1047 entirely. NOTE: current claude
-# renders to the NORMAL buffer (probe 2026-06: no ?1049h alt-screen, no mouse
-# reporting) — which is why the HistoryScreen scrollback above works. The
-# alt-reset below is now a dormant SAFETY NET: if some tool DOES swap buffers,
-# resetting pyte's single buffer at the boundary keeps a pre-alt prompt from
-# bleeding under its UI and stops the last frame lingering after it exits.
-_ALT_ENTER_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)h")
-_ALT_LEAVE_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)l")
-_ALT_ANY_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)[hl]")
+# swap/save/restore, and ignores ?47/?1047 entirely. This is a LIVE path, not the
+# dormant net the 2026-06 probe suggested: a capture census (2026-07-29 diag run,
+# every pane) shows claude's fullscreen renderer opening with ?1049h and ?1004h /
+# ?1000h / ?1002h / ?1003h / ?1006h. Resetting pyte's single buffer at the
+# boundary keeps a pre-alt prompt from bleeding under the child's UI and stops the
+# last frame lingering after it exits.
+#
+# The mode may sit ANYWHERE in the parameter list: a child that writes the whole
+# entry in one DECSET (\x1b[?1049;1002;1006h — the form crossterm/termwiz-style
+# setup code emits) matched nothing when the pattern required the alt mode to BE
+# the list, so the boundary went unseen and the pre-alt frame stayed under the new
+# UI until something forced a full repaint. (#alt-combined-params)
+_ALT_IN_LIST = r"(?:\d+;)*(?:1049|1047|47)(?:;\d+)*"
+_ALT_ENTER_RE = re.compile(r"\x1b\[\?" + _ALT_IN_LIST + "h")
+_ALT_LEAVE_RE = re.compile(r"\x1b\[\?" + _ALT_IN_LIST + "l")
+_ALT_ANY_RE = re.compile(r"\x1b\[\?" + _ALT_IN_LIST + "[hl]")
 # Private-intro CSI sequences that END in 'm' but are NOT SGR: XTMODKEYS
 # (\x1b[>4;2m = modifyOtherKeys) and friends. pyte ignores the >/</= private
 # marker and misapplies the params as SGR — '>4;2m' becomes underline(4)+faint(2),
@@ -962,8 +969,11 @@ _KITTY_KBD_RE = re.compile(r"\x1b\[[<>=?][0-9;:]*u")
 # Bracketed-paste mode (CSI ?2004 h/l): claude enables it so it can distinguish a
 # PASTE from typed input. pyte doesn't expose the mode, so we track it from the
 # output stream and re-wrap pastes (\x1b[200~ … \x1b[201~) in on_paste — otherwise
-# claude treats a multi-line paste as typed lines and submits on each newline.
-_BRACKETED_RE = re.compile(r"\x1b\[\?2004([hl])")
+# claude treats a multi-line paste as typed lines and submits on each newline. The
+# tracking lives in _apply_modes_in_stream_order, via the param-list-aware
+# _DEC_PRIVATE_RE below; there is deliberately NO ?2004-only pattern here, because
+# one would miss the combined form (\x1b[?2004;1004h) the same way the alt-screen
+# pattern did — and an unseen ?2004h means the paste is never wrapped.
 # Mouse reporting (?1000 click / ?1002 button-drag / ?1003 any-motion) + the SGR
 # extended-coordinate encoding (?1006). A full-screen child TUI (e.g. an agent
 # picker) enables these to receive mouse events ITSELF — including the WHEEL, which
@@ -1485,7 +1495,10 @@ class AltScreenTracker:
         """Feed a chunk; return how many enter/leave boundaries it contained
         (so the caller resets pyte once per boundary). Updates ``in_alt``."""
         count = 0
-        for m in re.finditer(r"\x1b\[\?(?:1049|1047|47)[hl]", text):
+        # _ALT_ANY_RE, not a second copy of it: the copy that used to live here
+        # stayed narrow when that one learned combined params, so the tracker and
+        # the feed path disagreed about what a boundary was. (#alt-combined-params)
+        for m in _ALT_ANY_RE.finditer(text):
             entering = m.group().endswith("h")
             if entering != self.in_alt:
                 self.in_alt = entering
@@ -3307,8 +3320,17 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         The whole trailing ESC RUN is held, not just the last one: a chunk ending
         "\\x1b\\x1b" would otherwise feed a bare ESC that joins the next read's
         first byte into an introducer nothing downstream rescans. Anything already
-        held is stream-ordered AFTER what is held now. (#dcs-scrub)"""
-        match = re.search(r"\x1b+(?:[\[\]][0-9;:<>=?]*)?$", chunk)
+        held is stream-ordered AFTER what is held now. (#dcs-scrub)
+
+        The held prefix covers the CSI INTERMEDIATE bytes (0x20-0x2F, e.g. the "$"
+        of a DECRQM query or the space of a cursor-shape write) as well as the
+        parameters. A read ending right after that byte used to be released: pyte's
+        own FSM spans the split so nothing looked broken, but saikai's DECRQM
+        scanners matched neither half and the query went UNANSWERED — a child using
+        set-then-verify then concluded bracketed paste (or SGR mouse) was
+        unsupported, and its next multi-line paste submitted line by line, firing
+        half-written messages at the agent. (#csi-intermediate)"""
+        match = re.search(r"\x1b+(?:[\[\]][0-9;:<>=?]*[ -/]*)?$", chunk)
         if match is None or (len(chunk) - match.start()) >= 32:
             return chunk
         self._esc_carry = chunk[match.start():] + self._esc_carry
