@@ -3348,6 +3348,108 @@ def test_single_row_render_skips_the_snapshot_and_crops_scope_it():
     ct._build_frame()
     assert sorted(ct._frame["rows"]) == list(range(8))
 
+def _dirty_pane(rows=10, cols=4, height=None):
+    """_grid_pane, plus the pieces _refresh_dirty_rows needs: a pyte-ish dirty set
+    and a recorder for what got refreshed."""
+    ct = _grid_pane(rows=rows, cols=cols)
+    ct._screen.dirty = set()
+    ct._pending_rows = set()
+    ct._cursor_row_drawn = None
+    ct._refreshes = []
+    ct.refresh = lambda *regions, **kw: ct._refreshes.append(
+        tuple(sorted(r.y for r in regions)) if regions else "FULL")
+    return ct
+
+
+def test_dirty_row_repaint_only_touches_rows_that_changed():
+    """A bare refresh() marks every row dirty, so Textual re-rendered the whole
+    pane per frame — MEASURED as 115-670 ms of UI thread per second for one pane,
+    with rows/s always frames/s x the pane height. A spinner frame touches one or
+    two rows, so repaint those."""
+    ct = _dirty_pane(rows=10)
+    ct._screen.dirty.update({3, 4})
+    ct._screen.cursor.y = 4
+    ct._refresh_dirty_rows()
+    assert ct._refreshes == [(3, 4)], ct._refreshes
+    assert ct._screen.dirty == set(), "dirty must be drained"
+
+    # Nothing changed and the cursor stayed put: the cursor row is STILL repainted,
+    # deliberately. DECTCEM (?25l / ?25h) flips cursor.hidden with no dirty at all,
+    # and render_line draws saikai's cursor cell from it — so the cursor row is the
+    # one row we cannot skip. That is 1 row a frame instead of the pane's 36.
+    ct._refreshes.clear()
+    ct._refresh_dirty_rows()
+    assert ct._refreshes == [(4,)], ct._refreshes
+
+
+def test_cursor_move_repaints_the_row_it_left():
+    """pyte dirties a row in draw() but NOT on a cursor move, and render_line
+    paints saikai's own cursor cell — so a move must repaint the old row too or it
+    keeps a ghost cursor."""
+    ct = _dirty_pane(rows=10)
+    ct._screen.cursor.y = 2
+    ct._refresh_dirty_rows()                 # establishes row 2 as drawn
+    ct._refreshes.clear()
+    ct._screen.cursor.y = 7                  # pure move: dirty stays empty
+    ct._refresh_dirty_rows()
+    assert ct._refreshes == [(2, 7)], ct._refreshes
+
+
+def test_cursor_row_is_clamped_like_render_line_after_a_shrink():
+    """pyte does not clamp the cursor on shrink (resize never touches cursor.y), and
+    render_line paints at min(cursor.y, lines - 1). Recording the RAW cursor.y would
+    refresh a row that no longer exists while the cursor is drawn on the last row —
+    a ghost that never clears. The three tests above all pass with this bug."""
+    ct = _dirty_pane(rows=4)
+    ct._screen.cursor.y = 9                  # stale: beyond the shrunken grid
+    ct._refresh_dirty_rows()
+    assert ct._refreshes == [(3,)], ct._refreshes   # clamped to lines - 1
+
+
+def test_a_child_scroll_takes_one_full_repaint():
+    """pyte's index() dirties every line when the child scrolls, and a region per
+    row costs more than one full repaint."""
+    ct = _dirty_pane(rows=10)
+    ct._screen.dirty.update(range(10))
+    ct._refresh_dirty_rows()
+    assert ct._refreshes == ["FULL"], ct._refreshes
+
+
+def test_scrollback_and_freeze_fall_back_to_a_full_repaint():
+    """Scrolled back, visible rows come from history; frozen, from a pinned
+    snapshot. Neither maps to live pyte rows, so don't try to be clever."""
+    ct = _dirty_pane(rows=10)
+    ct._scroll = 3
+    ct._screen.dirty.add(1)
+    ct._refresh_dirty_rows()
+    assert ct._refreshes == ["FULL"], ct._refreshes
+
+    ct = _dirty_pane(rows=10)
+    ct._frozen = True
+    ct._screen.dirty.add(1)
+    ct._refresh_dirty_rows()
+    assert ct._refreshes == ["FULL"], ct._refreshes
+
+
+def test_rows_survive_a_refresh_that_raises():
+    """Every other refresh() in this file is wrapped in try/except; a swallowed
+    exception must not swallow the rows owed a repaint."""
+    ct = _dirty_pane(rows=10)
+    ct._screen.dirty.add(5)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("compositor busy")
+
+    ct.refresh = _boom
+    ct._refresh_dirty_rows()                 # the except: falls back to refresh()
+    assert 5 in ct._pending_rows, ct._pending_rows
+
+    ct.refresh = lambda *regions, **kw: ct._refreshes.append(
+        tuple(sorted(r.y for r in regions)) if regions else "FULL")
+    ct._refresh_dirty_rows()
+    # row 5 was carried over; row 0 is the always-repainted cursor row
+    assert ct._refreshes == [(0, 5)], ct._refreshes
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -3546,3 +3648,15 @@ if __name__ == "__main__":
     print("PASS test_render_takes_the_pane_lock_once_per_frame")
     test_single_row_render_skips_the_snapshot_and_crops_scope_it()
     print("PASS test_single_row_render_skips_the_snapshot_and_crops_scope_it")
+    test_dirty_row_repaint_only_touches_rows_that_changed()
+    print("PASS test_dirty_row_repaint_only_touches_rows_that_changed")
+    test_cursor_move_repaints_the_row_it_left()
+    print("PASS test_cursor_move_repaints_the_row_it_left")
+    test_cursor_row_is_clamped_like_render_line_after_a_shrink()
+    print("PASS test_cursor_row_is_clamped_like_render_line_after_a_shrink")
+    test_a_child_scroll_takes_one_full_repaint()
+    print("PASS test_a_child_scroll_takes_one_full_repaint")
+    test_scrollback_and_freeze_fall_back_to_a_full_repaint()
+    print("PASS test_scrollback_and_freeze_fall_back_to_a_full_repaint")
+    test_rows_survive_a_refresh_that_raises()
+    print("PASS test_rows_survive_a_refresh_that_raises")

@@ -395,6 +395,10 @@ try:
                                 merged = _ud.normalize("NFC", merged)
                             self.buffer[self.cursor.y - 1][self.columns - 1] = \
                                 prev._replace(data=merged)
+                            # This branch is the one buffer write that lands on a
+                            # row the trailing dirty.add(cursor.y) does not cover —
+                            # a dirty-line repaint would leave it stale.
+                            self.dirty.add(self.cursor.y - 1)
                         # else: leading zero-width char, nothing on-screen to attach to.
                     else:
                         continue   # width < 0: unprintable; skip it, DON'T abort the chunk
@@ -445,13 +449,13 @@ try:
     from textual import events
     from textual.strip import Strip
     from textual.widget import Widget
-    from textual.geometry import Offset
+    from textual.geometry import Offset, Region
 except Exception as _te:  # pragma: no cover - textual is a hard dep of saikai
     _TEXTUAL_IMPORT_ERROR = repr(_te)
     # Stand-ins so the module still imports for py_compile / pure-function tests
     # on a box without textual.
     Widget = object  # type: ignore
-    Segment = Style = Strip = events = Offset = None  # type: ignore
+    Segment = Style = Strip = events = Offset = Region = None  # type: ignore
 
 #: True when every dependency needed for a live pane is importable.
 TERMINAL_AVAILABLE = (
@@ -1427,6 +1431,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # The pinned grid for the frame currently being rendered (see
         # render_lines): non-None ONLY between the start and end of one frame.
         self._frame: Optional[dict] = None
+        # Rows owed a repaint (see _refresh_dirty_rows) and the cursor row that
+        # was last asked for, so a cursor MOVE — which dirties nothing in pyte —
+        # still clears the cell it left behind.
+        self._pending_rows: set = set()
+        self._cursor_row_drawn: Optional[int] = None
 
         # status detection
         self._tail = ""                  # rolling decoded tail for classify
@@ -1793,6 +1802,74 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # reader's EOF path finalize.
             pass
         event.stop()   # don't leak the key to the host app's bindings
+
+    def _refresh_dirty_rows(self) -> None:
+        """Repaint the rows that CHANGED, not the whole pane. UI thread.
+
+        A bare ``refresh()`` marks every row dirty, so Textual re-rendered all of
+        them per frame. MEASURED with SAIKAI_FRAME_LOG during a storm: rows/s was
+        always frames/s x the pane height, and the render cost tracked it — 115 to
+        670 ms of UI thread per second for ONE pane, which is the heaviness. A
+        spinner frame usually touches one or two rows, so this is where the work is.
+
+        pyte already records per-line damage in ``screen.dirty`` and saikai is its
+        only consumer (nothing else reads it; ``_pyte_grid_lines``, the mirror and
+        ``snapshot_text`` all read the buffer directly), so drain it here."""
+        scr = getattr(self, "_screen", None)
+        if scr is None or Region is None:
+            self.refresh()
+            return
+        # Scrolled back or frozen: visible rows come from history / a pinned
+        # snapshot and no longer correspond to live pyte rows. Correctness first.
+        if self._scroll != 0 or getattr(self, "_frozen", False):
+            self.refresh()
+            return
+        try:
+            with self._lock:
+                dirty = set(scr.dirty)
+                scr.dirty.clear()          # we are the only consumer
+                lines = scr.lines
+                # Same clamp render_line paints with: pyte does NOT clamp the
+                # cursor on shrink, so the raw cursor.y can name a row that no
+                # longer exists while the cursor is drawn on lines - 1.
+                cur_y = max(0, min(scr.cursor.y, lines - 1))
+            rows = self._pending_rows
+            rows |= dirty
+            # A cursor MOVE dirties nothing in pyte (only draw does), and
+            # render_line paints saikai's own cursor cell — so without the old row
+            # a move leaves a ghost cursor behind. Hiding/showing the cursor
+            # (DECTCEM) likewise never dirties, which the unconditional add covers.
+            rows.add(cur_y)
+            prev = self._cursor_row_drawn
+            if prev is not None:
+                rows.add(prev)
+            # resize leaves out-of-range indices in dirty (its shrink path ranges
+            # over the OLD line count and nothing prunes the set), so clamp.
+            height = self.size.height or lines
+            limit = min(lines, height)
+            rows = {y for y in rows if 0 <= y < limit}
+            if not rows:
+                self._pending_rows = set()
+                self._cursor_row_drawn = cur_y
+                return                     # nothing changed: nothing to repaint
+            if len(rows) * 5 >= limit * 3:  # >= 60% dirty (a child scroll dirties
+                self.refresh()             # every line) — one full repaint is
+            else:                          # cheaper than a region per row
+                width = self.size.width
+                self.refresh(*[Region(0, y, width, 1) for y in sorted(rows)])
+            # Cleared only once the refresh actually went through: every other
+            # refresh() in this file is wrapped in try/except, and a swallowed
+            # exception must not swallow the rows with it.
+            self._pending_rows = set()
+            self._cursor_row_drawn = cur_y
+        except Exception:
+            # Keep the rows owed (see above) and try the blunt path — but never let
+            # THAT raise either: the caller still has to sync the IME anchor, and an
+            # exception here would surface inside Textual's message loop.
+            try:
+                self.refresh()
+            except Exception:
+                pass
 
     def _snapshot_frozen(self) -> None:
         """Pin the currently-DISPLAYED live rows (scroll==0) as fixed lists of
@@ -3212,7 +3289,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
 
     def _do_pane_refresh(self) -> None:   # runs on the UI thread
         self._refresh_pending = False
-        self.refresh()
+        self._refresh_dirty_rows()
         # Sync the IME anchor INLINE on the repaint: it rides this CompositorUpdate
         # (so app.cursor_position actually reaches WT — no separate flush needed),
         # updates cross-platform, and can't be starved by a timer. The anti-fly is a
