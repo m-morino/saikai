@@ -1418,6 +1418,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         self._cached_ver = -1
         self._cached_screen: tuple = ("", "")
         self._last_poll_ver = -1
+        # The pinned grid for the frame currently being rendered (see
+        # render_lines): non-None ONLY between the start and end of one frame.
+        self._frame: Optional[dict] = None
 
         # status detection
         self._tail = ""                  # rolling decoded tail for classify
@@ -1523,6 +1526,75 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 pass
 
     # ── (1) render a grid of styled cells, one Strip per row ───────────────────
+    def render_lines(self, crop):   # -> list[Strip]
+        """Frame boundary: pin ONE pyte generation for the whole frame.
+
+        Textual renders a widget row by row (``_styles_cache.render_widget``
+        loops ``for y in crop.line_range`` and calls ``render_line`` per row),
+        and ``render_line`` used to take ``self._lock`` PER ROW. The reader
+        installs a whole child frame atomically under that same lock, so it
+        could land between two rows and the composited image then carried rows
+        from two pyte generations — positions right, contents stale, i.e. rows
+        visibly out of place until the next repaint healed them (MEASURED
+        2026-07-29: 40/40 render passes torn). The same per-row read also let
+        ``_scroll`` / ``_frozen`` flip mid-frame, so a drag-select could mix
+        pinned and live rows.
+
+        So snapshot the visible grid ONCE here, under a single lock hold, and
+        let ``render_line`` read it lock-free. Cleared on the way out, so a
+        ``render_line`` outside a frame still takes the locked fallback rather
+        than a stale grid. (#frame-snapshot)
+        """
+        self._build_frame()
+        try:
+            return super().render_lines(crop)
+        finally:
+            self._frame = None
+
+    def _build_frame(self) -> None:
+        """Pin the visible rows + cursor state as of ONE pyte generation.
+
+        Copies cell REFERENCES (pyte Chars are immutable), so this is ~lines ×
+        columns pointer copies — negligible next to building Segments, and it is
+        the only lock acquisition the frame needs. Snapshots every visible row
+        rather than just the crop, because the widget's ``render_line`` receives
+        a CONTENT-relative y (``_styles_cache`` calls it as
+        ``render_content_line(y - gutter.top)``) while the loop iterates
+        widget-relative rows; covering the whole grid sidesteps that mapping.
+        Mirrors _snapshot_frozen, which already does this for the frozen path."""
+        scr = getattr(self, "_screen", None)   # getattr: __new__-built test instances
+        if scr is None:
+            self._frame = None
+            return
+        try:
+            with self._lock:
+                cols = scr.columns
+                lines = scr.lines
+                s = self._scroll
+                rows = {}
+                for y in range(lines):
+                    buf = self._buf_for_row(scr, s, y)
+                    rows[y] = ([buf[x] for x in range(cols)]
+                               if buf is not None else None)
+                self._frame = {
+                    "s": s,
+                    "cols": cols,
+                    # Pinned too, because the banner rows in render_line branch on
+                    # them per row (a mid-frame flip would banner one row of a
+                    # frame built from the other state).
+                    "frozen": bool(getattr(self, "_frozen", False)),
+                    "dead": bool(getattr(self, "is_dead", False)),
+                    # Clamp exactly as render_line did: pyte does NOT clamp the
+                    # cursor on shrink, so a stale cursor_y >= lines would put the
+                    # cursor on no row at all for a frame.
+                    "cursor_x": max(0, min(scr.cursor.x, cols - 1)),
+                    "cursor_y": max(0, min(scr.cursor.y, lines - 1)),
+                    "cursor_hidden": bool(getattr(scr.cursor, "hidden", False)),
+                    "rows": rows,
+                }
+        except Exception:
+            self._frame = None
+
     def render_line(self, y: int):  # -> Strip
         width = self.size.width
         screen = self._screen
@@ -1534,14 +1606,21 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return Strip.blank(width)
         if screen is None or y >= screen.lines:
             return Strip.blank(width)
-        if self.is_dead and self._scroll == 0 and y == screen.lines - 1:
+        # The banner rows below decide per row, so read their inputs from the
+        # pinned frame too — otherwise a mid-frame freeze/exit flip puts a banner
+        # on one row of a frame whose other rows came from the other state.
+        frame = getattr(self, "_frame", None)
+        _dead = frame["dead"] if frame is not None else self.is_dead
+        _froz = frame["frozen"] if frame is not None else self._frozen
+        _s = frame["s"] if frame is not None else self._scroll
+        if _dead and _s == 0 and y == screen.lines - 1:
             # claude exited: overlay a one-line hint on the bottom row so a dead
-            # pane isn't just a frozen frame with no cue on how to act. Reads only
-            # atomic int/bool (no lock); live view only (s==0) so scrolled-back
-            # history stays clean for copy/read. _finalize already repaints once.
+            # pane isn't just a frozen frame with no cue on how to act. Live view
+            # only (s==0) so scrolled-back history stays clean for copy/read.
+            # _finalize already repaints once.
             msg = " ⏎ agent exited — Enter relaunches · F10 closes this tab "
             return Strip([Segment(msg[:width] if width else msg, Style(reverse=True))])
-        if self._frozen and not self.is_dead and self._scroll == 0 and y == 0:
+        if _froz and not _dead and _s == 0 and y == 0:
             # Frozen for copy/select: the view holds still while claude streams in
             # the background, so a WezTerm Shift+drag selection survives. One-row
             # hint at the TOP (recent output is at the bottom, where you select);
@@ -1549,22 +1628,34 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             msg = " ❄ frozen — Shift+drag to copy · Shift+F9 / type to resume "
             return Strip([Segment(msg[:width] if width else msg, Style(reverse=True))])
 
-        with self._lock:
-            cols = screen.columns
-            # Clamp into the (possibly just-resized) grid — pyte does NOT clamp the
-            # cursor on shrink, so a stale cursor_y >= lines would make the cursor
-            # vanish for a frame (no display row matches y == cursor_y).
-            cursor_x = max(0, min(screen.cursor.x, cols - 1))
-            cursor_y = max(0, min(screen.cursor.y, screen.lines - 1))
-            # Honour DECTCEM (?25l/?25h): a full-screen TUI (e.g. an agent picker)
-            # HIDES the cursor while it repaints, then shows it. pyte tracks this as
-            # cursor.hidden; without checking it we drew saikai's reversed cursor cell
-            # throughout the repaint — a stray cursor flickering over the half-drawn
-            # layout ("the screen-update cursor is visible / layout looks broken").
-            cursor_hidden = bool(getattr(screen.cursor, "hidden", False))
-            s = self._scroll
-            buf = self._buf_for_row(screen, s, y)
-            cells = [buf[x] for x in range(cols)] if buf is not None else None
+        # Read the frame pinned by render_lines — one generation for every row of
+        # this frame, no lock. Only when there is no frame (a render_line outside
+        # a frame: direct calls, tests) fall back to the locked per-row read.
+        if frame is not None and y in frame["rows"]:
+            cols = frame["cols"]
+            cursor_x = frame["cursor_x"]
+            cursor_y = frame["cursor_y"]
+            cursor_hidden = frame["cursor_hidden"]
+            s = frame["s"]
+            cells = frame["rows"][y]
+        else:
+            with self._lock:
+                cols = screen.columns
+                # Clamp into the (possibly just-resized) grid — pyte does NOT clamp
+                # the cursor on shrink, so a stale cursor_y >= lines would make the
+                # cursor vanish for a frame (no display row matches y == cursor_y).
+                cursor_x = max(0, min(screen.cursor.x, cols - 1))
+                cursor_y = max(0, min(screen.cursor.y, screen.lines - 1))
+                # Honour DECTCEM (?25l/?25h): a full-screen TUI (e.g. an agent
+                # picker) HIDES the cursor while it repaints, then shows it. pyte
+                # tracks this as cursor.hidden; without checking it we drew saikai's
+                # reversed cursor cell throughout the repaint — a stray cursor
+                # flickering over the half-drawn layout ("the screen-update cursor
+                # is visible / layout looks broken").
+                cursor_hidden = bool(getattr(screen.cursor, "hidden", False))
+                s = self._scroll
+                buf = self._buf_for_row(screen, s, y)
+                cells = [buf[x] for x in range(cols)] if buf is not None else None
 
         if cells is None:
             return Strip.blank(width)

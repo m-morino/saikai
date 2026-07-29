@@ -3201,6 +3201,123 @@ def test_ime_anchor_default_on_keeps_windows_caret_render_guard():
         "the anchor env parse must be opt-OUT (default ON)"
     assert '"0", "false", "no", "off"' in src, "opt-out tokens missing"
 
+def _fake_char(d):
+    """Minimal stand-in for a pyte Char: _cell_style reads every other attribute
+    with a defaulted getattr, so .data is all render_line actually needs."""
+    class _C:
+        __slots__ = ("data",)
+    c = _C()
+    c.data = d
+    return c
+
+
+def _grid_pane(rows=4, cols=3, fill="a"):
+    """A ClaudeTerminal wired with just what render_line / _build_frame touch.
+
+    size / has_focus are read-only properties on Textual's Widget, so shadow them
+    on a throwaway subclass rather than assigning to the instance."""
+    class _Size:
+        width = cols
+        height = rows
+
+    class _Pane(rt.ClaudeTerminal):
+        size = _Size()
+        has_focus = False
+
+    ct = _Pane.__new__(_Pane)
+    ct._lock = threading.Lock()
+    ct._scroll = 0
+    ct._frozen = False
+    ct._frozen_buf = None
+    ct._sel_anchor = None
+    ct._sel_head = None
+    ct.is_dead = False
+    ct._spawn_error = None
+    ct._frame = None
+
+    class _Cursor:
+        x = 0
+        y = 0
+        hidden = True      # keep saikai's own cursor cell out of the comparison
+
+    class _Screen:
+        columns = cols
+        lines = rows
+        cursor = _Cursor()
+
+        def __init__(self):
+            self.buffer = {y: [_fake_char(fill) for _ in range(cols)]
+                           for y in range(rows)}
+
+    ct._screen = _Screen()
+    return ct
+
+
+def _row_text(ct, y):
+    return "".join(seg.text for seg in ct.render_line(y))
+
+
+def test_render_frame_pins_one_pyte_generation():
+    """A frame must show ONE pyte generation. Textual renders row by row
+    (_styles_cache loops render_line per y) and render_line used to take
+    self._lock PER ROW, while the reader installs a whole child frame atomically
+    under that same lock — so a frame could splice rows from two generations:
+    positions right, contents stale, rows visibly out of place until the next
+    repaint healed them. render_lines pins the grid once instead."""
+    ct = _grid_pane(rows=4, cols=3, fill="a")
+    ct._build_frame()                      # frame boundary: generation "a" pinned
+
+    # The reader lands mid-frame and replaces the whole screen with generation
+    # "b", holding the lock for the whole feed exactly as _consume does.
+    with ct._lock:
+        for y in range(4):
+            ct._screen.buffer[y] = [_fake_char("b") for _ in range(3)]
+
+    rows = [_row_text(ct, y) for y in range(4)]
+    assert rows == ["aaa"] * 4, f"torn frame: {rows}"
+
+    # A _frozen flip mid-frame must not mix pinned and live rows either (this is
+    # the drag-select-breaks-the-display case).
+    ct._frozen = True
+    ct._frozen_buf = {y: [_fake_char("c") for _ in range(3)] for y in range(4)}
+    assert [_row_text(ct, y) for y in range(4)] == ["aaa"] * 4
+
+    # The next frame boundary picks up the new state (here: the freeze snapshot).
+    # Row 0 is the frozen banner by design — and it is pinned WITH the grid, so a
+    # frame can't show the banner over rows built from the un-frozen state.
+    ct._build_frame()
+    rows = [_row_text(ct, y) for y in range(4)]
+    assert "❄" in rows[0], rows[0]      # banner, truncated to the pane's width
+    assert rows[1:] == ["ccc"] * 3, rows
+
+    # No frame pinned (a render_line outside a frame) → locked live fallback.
+    ct._frame = None
+    ct._frozen = False
+    ct._frozen_buf = None
+    assert [_row_text(ct, y) for y in range(4)] == ["bbb"] * 4
+
+
+def test_render_takes_the_pane_lock_once_per_frame():
+    """The per-row lock was also the cost: N rows meant N acquisitions, each one a
+    chance for the reader to slip in. One acquisition per frame, not per row."""
+    ct = _grid_pane(rows=10, cols=3)
+    real = ct._lock
+    acquires = []
+
+    class _CountingLock:
+        def __enter__(self):
+            acquires.append(1)
+            return real.__enter__()
+
+        def __exit__(self, *a):
+            return real.__exit__(*a)
+
+    ct._lock = _CountingLock()
+    ct._build_frame()
+    for y in range(10):
+        ct.render_line(y)
+    assert acquires == [1], f"expected 1 acquisition per frame, got {len(acquires)}"
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -3393,3 +3510,7 @@ if __name__ == "__main__":
     print("PASS test_only_a_focus_sync_forces_the_cursor_visibility_write")
     test_ime_anchor_default_on_keeps_windows_caret_render_guard()
     print("PASS test_ime_anchor_default_on_keeps_windows_caret_render_guard")
+    test_render_frame_pins_one_pyte_generation()
+    print("PASS test_render_frame_pins_one_pyte_generation")
+    test_render_takes_the_pane_lock_once_per_frame()
+    print("PASS test_render_takes_the_pane_lock_once_per_frame")
