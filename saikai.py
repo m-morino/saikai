@@ -4490,14 +4490,27 @@ def _copy_to_host_clipboard(text: str) -> bool:
     (F12 / startup), and `xclip` can otherwise daemonize and block the event loop
     holding the X selection — a timeout caps the worst case and reports False."""
     import subprocess as _sp
+    # Over SSH the host clipboard is the SERVER's, which the user cannot paste from —
+    # and succeeding here skips the OSC-52 fallback that would have reached their own
+    # terminal, so the copy silently went nowhere while the UI said "copied". Decline
+    # and let _copy_host_or_osc52 emit OSC 52, exactly as set_clipboard_macos
+    # (saikai_terminal.py) already does for the same reason. (#ssh-clipboard)
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
+        return False
     if sys.platform == "win32":
         cmds = [["clip"]]
     elif sys.platform == "darwin":
         cmds = [["pbcopy"]]
     else:
-        # Linux/BSD: try Wayland's wl-copy, then X11 xclip, then xsel — the first
-        # tool actually installed wins (a missing one raises FileNotFoundError, so
-        # fall through). Avoids assuming xclip on a Wayland-only or minimal box.
+        # Linux/BSD: delegate to the shared helper so the tool chain (wl-copy → xclip →
+        # xsel) and its timeout live in ONE place — this used to be a second copy of
+        # that logic, and the pane's own copy path had no chain at all.
+        # (#linux-clipboard)
+        try:
+            import saikai_terminal as _rt
+            return _rt.set_clipboard_linux(text)
+        except Exception:
+            pass          # sibling or its deps absent — fall back to the chain below
         cmds = ([["wl-copy"]] if os.environ.get("WAYLAND_DISPLAY") else []) + \
                [["xclip", "-selection", "clipboard"], ["xsel", "-b", "-i"]]
     for clip in cmds:

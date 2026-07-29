@@ -1431,6 +1431,32 @@ def set_clipboard_windows(text: str) -> bool:
         u32.CloseClipboard()
 
 
+def set_clipboard_linux(text: str) -> bool:
+    """Local Linux/BSD clipboard: Wayland's wl-copy, then X11 xclip, then xsel — the
+    first tool actually installed wins. Remote sessions decline so OSC-52 can target
+    the client, like set_clipboard_macos.
+
+    The pane's own copy had no native chain at all and relied solely on Textual's
+    OSC-52 write, which gnome-terminal/VTE, a default xterm (allowWindowOps off) and
+    tmux without `set-clipboard on` all discard — so a drag-select copy landed nowhere
+    and said nothing. Bounded by a timeout: this runs on the UI thread, and xclip can
+    daemonize holding the X selection. (#linux-clipboard)"""
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
+        return False
+    cmds = ([["wl-copy"]] if os.environ.get("WAYLAND_DISPLAY") else []) + \
+           [["xclip", "-selection", "clipboard"], ["xsel", "-b", "-i"]]
+    for clip in cmds:
+        try:
+            return subprocess.run(clip, input=text.encode("utf-8"), timeout=2.0,
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL).returncode == 0
+        except FileNotFoundError:
+            continue              # not installed -> try the next
+        except Exception:
+            return False          # ran but errored/timed out -> honest "not copied"
+    return False
+
+
 def set_clipboard_macos(text: str) -> bool:
     """Use the local macOS clipboard, but leave remote sessions to OSC-52."""
     if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
@@ -2475,6 +2501,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # Textual's OSC-52 path does not work in Terminal.app. Over SSH the
             # helper deliberately declines so OSC-52 can target the client.
             if set_clipboard_macos(text):
+                return
+        else:
+            # Linux/BSD: try the native tools before OSC-52. gnome-terminal/VTE, a
+            # default xterm and tmux without set-clipboard all discard the escape, and
+            # nothing here surfaced the failure — the selection was gone and the
+            # clipboard still held whatever it had. (#linux-clipboard)
+            if set_clipboard_linux(text):
                 return
         try:
             self.app.copy_to_clipboard(text)

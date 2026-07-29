@@ -3577,6 +3577,99 @@ def test_focus_change_repaints_the_cursor_row():
             pass
         assert ct._refreshes == [(3,)], (handler, ct._refreshes)
 
+def test_clipboard_declines_over_ssh_so_osc52_reaches_the_client():
+    """Over SSH the host clipboard is the SERVER's, which the user cannot paste from —
+    and succeeding there skips the OSC-52 fallback that would have reached their own
+    terminal, so the copy went nowhere while the UI said "copied". set_clipboard_macos
+    already declined for exactly this reason; the Linux chain and saikai.py's helper did
+    not. (#ssh-clipboard)"""
+    import saikai
+    saved = {k: os.environ.get(k) for k in ("SSH_CONNECTION", "SSH_TTY",
+                                            "WAYLAND_DISPLAY")}
+    real = rt.subprocess.run
+    real_saikai_sp = None
+    calls = []
+
+    class _R:
+        returncode = 0
+
+    def _fake(cmd, **kw):
+        calls.append(cmd[0])
+        return _R()
+
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+        rt.subprocess.run = _fake
+
+        # Local: the native tool is used.
+        calls.clear()
+        assert rt.set_clipboard_linux("x") is True
+        assert calls and calls[0] in ("xclip", "wl-copy"), calls
+
+        # Wayland is preferred when its display is present.
+        calls.clear()
+        os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+        assert rt.set_clipboard_linux("x") is True
+        assert calls[0] == "wl-copy", calls
+        os.environ.pop("WAYLAND_DISPLAY")
+
+        # Over SSH: decline WITHOUT running anything, so OSC-52 gets its turn.
+        for var in ("SSH_CONNECTION", "SSH_TTY"):
+            calls.clear()
+            os.environ[var] = "10.0.0.1 22 10.0.0.2 22"
+            assert rt.set_clipboard_linux("x") is False, var
+            assert rt.set_clipboard_macos("x") is False, var
+            assert calls == [], "nothing may run on the server: %s" % calls
+            # saikai.py's helper obeys the same rule on every platform.
+            import subprocess as _sp
+            real_saikai_sp = _sp.run
+            _sp.run = _fake
+            try:
+                assert saikai._copy_to_host_clipboard("x") is False, var
+                assert calls == [], calls
+            finally:
+                _sp.run = real_saikai_sp
+            os.environ.pop(var)
+    finally:
+        rt.subprocess.run = real
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_pane_copy_tries_native_linux_tools_before_osc52():
+    """The pane's own copy fell straight through to Textual's OSC-52 write for
+    everything but Windows/macOS, and gnome-terminal/VTE, a default xterm and tmux
+    without set-clipboard all discard it — the selection was gone and the clipboard
+    still held whatever it had, with no toast. (#linux-clipboard)"""
+    if sys.platform in ("win32", "darwin"):
+        print("SKIP test_pane_copy_tries_native_linux_tools_before_osc52 (needs the "
+              "non-win32/darwin branch; the chain itself is covered above)")
+        return
+    ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
+    used = []
+
+    class _App:
+        def copy_to_clipboard(self, text):
+            used.append("osc52")
+
+    ct.app = _App()
+    saved = rt.set_clipboard_linux
+    try:
+        rt.set_clipboard_linux = lambda t: (used.append("native"), True)[1]
+        ct._copy_text("hello")
+        assert used == ["native"], used
+
+        used.clear()
+        rt.set_clipboard_linux = lambda t: (used.append("native"), False)[1]
+        ct._copy_text("hello")
+        assert used == ["native", "osc52"], "must fall back to OSC-52: %s" % used
+    finally:
+        rt.set_clipboard_linux = saved
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -3797,3 +3890,7 @@ if __name__ == "__main__":
     print("PASS test_a_frame_pins_every_visible_row_not_just_the_crop")
     test_focus_change_repaints_the_cursor_row()
     print("PASS test_focus_change_repaints_the_cursor_row")
+    test_clipboard_declines_over_ssh_so_osc52_reaches_the_client()
+    print("PASS test_clipboard_declines_over_ssh_so_osc52_reaches_the_client")
+    test_pane_copy_tries_native_linux_tools_before_osc52()
+    print("PASS test_pane_copy_tries_native_linux_tools_before_osc52")
