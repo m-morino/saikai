@@ -183,6 +183,80 @@ def test_overwriting_half_a_wide_glyph_erases_the_whole_glyph():
                 if d and cell_len(d) == 2:
                     assert scr_.buffer[y][x + 1].data == "", (y, x, d)
 
+def _pane_for(scr, cols, rows):
+    import threading
+
+    class _Size:
+        width = cols
+        height = rows
+
+    class _Pane(saikai_terminal.ClaudeTerminal):
+        size = _Size()
+        has_focus = False
+
+    ct = _Pane.__new__(_Pane)
+    ct._lock = threading.Lock()
+    ct._screen = scr
+    ct._scroll = 0
+    ct._frozen = False
+    ct._frozen_buf = None
+    ct._sel_anchor = None
+    ct._sel_head = None
+    ct.is_dead = False
+    ct._spawn_error = None
+    ct._frame = None
+    return ct
+
+
+def test_zwj_cluster_occupies_two_columns_like_the_renderer():
+    """A ZWJ sequence is ONE grapheme cluster and Rich — so Textual, so the terminal —
+    draws it in two columns. The width-0 merge used to fold the ZWJ into the wide
+    glyph's empty STUB cell and then write the next emoji as a fresh glyph, so the
+    cluster occupied two columns PER COMPONENT: the model ran ahead of the child for the
+    rest of the row and the cluster rendered as separate emoji. The VS16 fix did not
+    cover it because the merge target was the stub, making `merged` a lone width-0 ZWJ.
+    (#emoji-presentation-width)"""
+    import pyte
+    from rich.cells import cell_len
+
+    COLS, ROWS = 20, 2
+    for text, cluster in (("A\U0001F469‍\U0001F4BBB", "\U0001F469‍\U0001F4BB"),
+                          ("A\U0001F3F3️‍\U0001F308B",
+                           "\U0001F3F3️‍\U0001F308")):
+        scr = saikai_terminal._HistoryScreenBase(COLS, ROWS, history=5, ratio=0.5)
+        pyte.Stream(scr, strict=False).feed(text)
+        cells = [scr.buffer[0][x].data for x in range(4)]
+        assert cell_len(cluster) == 2, cluster
+        assert cells[1] == cluster, cells
+        assert cells[2] == "", "the cluster must own its second column: %s" % (cells,)
+        assert cells[3] == "B", "the next glyph goes where the child put it: %s" % (cells,)
+        assert _pane_for(scr, COLS, ROWS).render_line(0).cell_length == COLS
+
+    # Regressions the same code path must not cause:
+    for text, at, want in (("A⚠️B", 1, "⚠️"),      # VS16
+                           ("AéB", 1, "é"),                   # combining
+                           ("AあB", 1, "あ")):                  # plain CJK
+        scr = saikai_terminal._HistoryScreenBase(COLS, ROWS, history=5, ratio=0.5)
+        pyte.Stream(scr, strict=False).feed(text)
+        assert scr.buffer[0][at].data == want, scr.buffer[0][at].data
+        assert _pane_for(scr, COLS, ROWS).render_line(0).cell_length == COLS
+
+
+def test_a_wide_glyph_in_the_last_column_still_renders_one_column():
+    """pyte's width-2 branch skips the stub when cursor.x + 1 == columns, so a wide
+    glyph written into the LAST column owns one column and renders two. MEASURED on a
+    real capture: five rows of 98 cells in a 97-column pane, each ending in a CJK
+    character. Trimming to data[:1] does not help — for a single wide codepoint that IS
+    the glyph. (#last-column-wide)"""
+    import pyte
+
+    COLS, ROWS = 6, 2
+    scr = saikai_terminal._HistoryScreenBase(COLS, ROWS, history=5, ratio=0.5)
+    pyte.Stream(scr, strict=False).feed("\x1b[1;6Hあ")   # CJK at the last column
+    assert scr.buffer[0][COLS - 1].data == "あ", "precondition: pyte wrote it anyway"
+    strip = _pane_for(scr, COLS, ROWS).render_line(0)
+    assert strip.cell_length == COLS, strip.cell_length
+
 
 if __name__ == "__main__":
     test_regional_indicator_is_width_1()
@@ -195,3 +269,7 @@ if __name__ == "__main__":
     print("PASS test_a_cell_never_renders_wider_than_the_columns_it_owns")
     test_overwriting_half_a_wide_glyph_erases_the_whole_glyph()
     print("PASS test_overwriting_half_a_wide_glyph_erases_the_whole_glyph")
+    test_zwj_cluster_occupies_two_columns_like_the_renderer()
+    print("PASS test_zwj_cluster_occupies_two_columns_like_the_renderer")
+    test_a_wide_glyph_in_the_last_column_still_renders_one_column()
+    print("PASS test_a_wide_glyph_in_the_last_column_still_renders_one_column")

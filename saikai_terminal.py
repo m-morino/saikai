@@ -465,6 +465,23 @@ try:
                                 self.dirty.add(self.cursor.y)
                         except Exception:
                             pass
+                    if char_width > 0 and _cell_len is not None and self.cursor.x:
+                        # ZWJ CONTINUATION. A character following U+200D continues the
+                        # SAME grapheme cluster ("👩" ZWJ "💻" is one glyph), and Rich —
+                        # so Textual, so the terminal — draws the whole cluster in 2
+                        # columns. Written as a fresh glyph it would take 2 more,
+                        # putting the model 2 columns ahead of the child for the rest of
+                        # the row and drawing the cluster as separate emoji. Append it
+                        # to the cluster cell and consume no column. Same class as the
+                        # VS16 case below. (#emoji-presentation-width)
+                        _ci = self.cursor.x - 1
+                        if line[_ci].data == "" and _ci:
+                            _ci -= 1                    # step over a wide glyph's stub
+                        if line[_ci].data.endswith("‍"):
+                            line[_ci] = line[_ci]._replace(
+                                data=line[_ci].data + char)
+                            self.dirty.add(self.cursor.y)
+                            continue
                     if char_width == 1:
                         line[self.cursor.x] = self.cursor.attrs._replace(data=char)
                     elif char_width == 2:
@@ -476,11 +493,19 @@ try:
                         # Cf) into the preceding cell instead of pyte's break. NFC-fold
                         # only real combining marks, to match pyte's prior behaviour.
                         if self.cursor.x:
-                            last = line[self.cursor.x - 1]
+                            # Merge into the cell that OWNS the preceding column, not
+                            # into a wide glyph's empty stub: a ZWJ landing in the stub
+                            # left the cluster split across cells, so it occupied two
+                            # columns per component while the terminal drew it in two
+                            # total. (#emoji-presentation-width)
+                            _mi = self.cursor.x - 1
+                            if line[_mi].data == "" and _mi:
+                                _mi -= 1
+                            last = line[_mi]
                             merged = last.data + char
                             if _ud.combining(char):
                                 merged = _ud.normalize("NFC", merged)
-                            line[self.cursor.x - 1] = last._replace(data=merged)
+                            line[_mi] = last._replace(data=merged)
                             # A merge can make the cell WIDER than the column it
                             # occupies: "⚠" is 1 column, but "⚠"+VS16 is an emoji
                             # presentation sequence that Rich (so Textual, so the
@@ -492,12 +517,20 @@ try:
                             # without the emoji. Claim the second column with pyte's
                             # own wide-char stub so cells and columns agree.
                             # (#emoji-presentation-width)
-                            if (_cell_len is not None and self.cursor.x < self.columns
-                                    and line[self.cursor.x].data != ""
+                            # Claim the column next to the CLUSTER, not next to the
+                            # cursor: with a wide base the cursor is already past the
+                            # glyph's stub, and stubbing there stole a column from the
+                            # next glyph and put the cursor one further ahead — which is
+                            # how a ZWJ sequence ended up as two separate emoji.
+                            _owned = 2 if (_mi + 1 < self.columns
+                                           and line[_mi + 1].data == "") else 1
+                            if (_cell_len is not None and _owned == 1
+                                    and _mi + 1 < self.columns
                                     and _cell_len(merged) == 2):
-                                line[self.cursor.x] = last._replace(data="")
+                                line[_mi + 1] = last._replace(data="")
                                 self.dirty.add(self.cursor.y)
-                                self.cursor.x += 1
+                                if self.cursor.x == _mi + 1:
+                                    self.cursor.x += 1
                         elif self.cursor.y:
                             prev = self.buffer[self.cursor.y - 1][self.columns - 1]
                             merged = prev.data + char
@@ -1966,7 +1999,18 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 if x + 1 < len(cells):
                     skip_next = True
                 else:
-                    data = data[:1]      # last column: no second column to consume
+                    # LAST column: there is no second column to consume, and no
+                    # terminal can show a 2-column glyph in one cell. pyte writes the
+                    # glyph anyway (its width-2 branch skips the stub when
+                    # cursor.x + 1 == columns), so without this the row hands Textual
+                    # one cell too many — measured on a real capture as five rows of 98
+                    # in a 97-column pane, each ending in a CJK character. Trimming to
+                    # data[:1] is not enough: for a single wide codepoint that IS the
+                    # glyph. Emit a space, which is what the child's own next repaint
+                    # of that column will replace. (#last-column-wide)
+                    data = data[:1]
+                    if _cell_len(data) != 1:
+                        data = " "
             if show_cursor and x == cursor_x and not (_IS_WIN and _IME_ANCHOR):
                 # Draw saikai's own cursor (cell reversed, keeping the cell's real
                 # fg/bg/bold so a themed prompt isn't flattened). SKIP only on Windows
