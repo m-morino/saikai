@@ -6,12 +6,107 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-07-29
+
+Live panes render a real terminal, and this release is mostly about making that
+faithful and cheap on Windows Terminal: a pane no longer redraws itself wholesale on
+every chunk, a frame can no longer mix two states of the child's screen, and the
+widths in the model now match the widths on screen.
+
 ### Fixed
-- **Quitting now takes a deliberate double press.** A single `Esc` (or `Ctrl+C`)
-  on the list quit saikai outright — too easy to fire by reflex (`Esc` interrupts
-  claude in a pane; Claude Code itself exits only on a *second* `Ctrl+C`). The
-  first press arms and shows a hint; a second within ~2.5s quits, and any other
-  key disarms. `Esc` still leaves search / dropdown / pane → list as before.
+- **Rows in a pane no longer land out of place.** `render_line` took the pane lock
+  once *per row* while Textual calls it in a per-row loop, and the reader installs a
+  whole child frame atomically under that same lock — so one composited image could
+  carry rows from two pyte generations (measured: 40 of 40 render passes torn). The
+  positions were always right and the *contents* were stale, which is why nothing in
+  the output stream explained it. The visible grid is now pinned once at the frame
+  boundary and read lock-free.
+- **Emoji no longer shift the rest of their row.** `⚠` is one column but `⚠`+VS16 is
+  an emoji-presentation sequence that Rich — so Textual, so the terminal — draws in
+  two, and the zero-width merge left the cluster owning one. Every glyph after it sat
+  a column right and the row's tail spilled past the pane. Measured on a captured
+  session: the rows carrying `⚠️` handed Textual a 98-cell row for a 97-cell pane.
+- **The pane no longer oscillates while scrolling.** pyte erases per cell, so
+  overwriting half a double-width glyph left the other half behind — a state no
+  terminal can display. Rendering it forced a choice between eating a character and
+  shifting the row, and a redrawing child alternated between the two. saikai now
+  erases the whole glyph when either half is overwritten, as a real terminal does.
+- **Copying with the mouse no longer corrupts the pane.** The same per-row read let
+  `_scroll` and the freeze snapshot flip mid-frame, mixing pinned and live rows.
+- **The session list no longer jumps back while you scroll it.** Three separate places
+  moved the viewport during a rebuild: the rebuild itself (`clear()` zeroes `scroll_y`),
+  a deferred restore that re-applied a pre-wheel position a frame later, and
+  `move_cursor(scroll=False)`, which did not actually prevent scrolling. The user's
+  scroll position is now owned state rather than a snapshot guarded by a timer —
+  measured on the real app under constant rebuilds: 0 backwards jumps and full travel,
+  where before most of the travel was lost.
+- **A resize that changes nothing is ignored.** Textual re-posts `Resize` on any
+  relayout, and each one dropped the pane's scrollback offset, dirtied every pyte line
+  and sent the child `SIGWINCH`. A real session logged seven identical `36x97` resizes
+  in eight seconds.
+- **The native cursor no longer flickers over the list.** Frames are bracketed in DEC
+  2026 synchronized output on Windows (Textual's Windows driver never probes for it),
+  the list's mouse-hover repaint is gone, and the periodic anchor no longer re-asserts
+  `?25h` on every tick.
+- **IME anchoring follows the caret.** The anchor rides the repaint, freezes while the
+  child is mid-frame, settles on the busy→idle transition, re-anchors when leaving
+  scrollback and after a resize, and heals a drifted cursor-visibility state. The pane
+  presents itself as Windows Terminal, keeping `WT_SESSION` so claude tracks the caret.
+- **Terminal queries are answered like a terminal.** Primary and secondary DA, DECRQM
+  with real mode state, DSR at the position the child asked from, in the order asked,
+  once per split unit; DCS is scrubbed before pyte without leaking payloads or opening
+  a deletion seam.
+- **The PTY write path never blocks the UI thread.** Oversized writes go to the pane's
+  writer thread, the input queue is bounded, a refused write is logged instead of
+  vanishing, and a writer that fails to start no longer swallows the data it was given.
+- **Panes flagged "needs input" again** for claude's resume and permission gates on the
+  alt screen.
+- **Quitting takes a deliberate double press.** A single `Esc` (or `Ctrl+C`) on the
+  list quit saikai outright — too easy to fire by reflex (`Esc` interrupts claude in a
+  pane; Claude Code itself exits only on a *second* `Ctrl+C`). The first press arms and
+  shows a hint; a second within ~2.5s quits, and any other key disarms. `Esc` still
+  leaves search / dropdown / pane → list as before.
+
+### Changed
+- **A pane repaints the rows that changed, not all of them.** pyte tracks per-line
+  damage and saikai never read it; a spinner frame touches one or two rows out of
+  thirty-six. Measured per pane during an agent-mode storm: 115–670 ms of UI thread per
+  second before, 8–33 ms after. The traps this has to survive are listed in the
+  rendering invariants — a cursor move dirties nothing, `resize` leaves out-of-range
+  indices, a child scroll dirties everything.
+- **The web mirror no longer forces a full-screen relayout per frame.** Its
+  overflow-recovery repaint was the only `refresh(layout=True)` in the repository and
+  fired on essentially every drain during a storm; it is now rate-limited, gated on a
+  connected viewer, and asks for a repaint rather than a relayout. The statusbar also
+  stopped requesting a layout pass on every update.
+
+### Added
+- **`SAIKAI_DIAG=1` captures the whole display picture in one run** — per-pane child
+  bytes, what saikai wrote to the terminal, per-second render accounting, a scroll /
+  focus / resize trail, rows whose rendered width disagrees with the pane (with the
+  row's text), and an automatic model dump at the first such row. One directory per
+  launch. `SAIKAI_FULL_REPAINT=1` and `SAIKAI_NO_SYNC=1` isolate the two riskiest
+  behaviours in a single variable.
+- **Documented rendering invariants and a debugging guide.**
+  [ARCHITECTURE.md](docs/ARCHITECTURE.md#rendering-invariants) lists the five
+  invariants with the symptom each produces when it breaks;
+  [DEBUGGING.md](docs/DEBUGGING.md) covers reading the diagnostics, replaying a capture
+  offline, attributing a defect to saikai or to the child, and what each instrument
+  cannot distinguish.
+
+### Known limitations
+- **East Asian Ambiguous characters (`①`, and others) can overhang their cell.** Their
+  width is not defined by the standard: the terminal advances one column while a CJK
+  fallback font may draw two. This reproduces with claude in Windows Terminal *without*
+  saikai, and inside saikai the model and the renderer agree on every one of the 639
+  distinct non-ASCII characters in a captured session — so there is nothing for saikai
+  to fix here.
+- **claude's own transient renders show through.** Its spinner cycles, and its
+  transcript briefly re-renders at a shifted offset; saikai reproduces the child's
+  screen faithfully, including those.
+
+> Releases 0.4.0 – 0.5.2 were tagged without CHANGELOG entries. This entry covers the
+> work since 0.5.2 only; `git log v0.3.0..v0.5.2` is the record for that gap.
 
 ## [0.3.0] — 2026-06-15
 
