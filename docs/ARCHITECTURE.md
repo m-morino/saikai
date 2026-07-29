@@ -75,7 +75,7 @@ proved and covered by a regression test.
 
 A pane is a terminal emulator inside a TUI framework, which means three width and
 state models have to agree: pyte's (the model), Rich/Textual's (the layout), and the
-host terminal's. Every rendering defect found so far was one of these five invariants
+host terminal's. Every rendering defect found so far was one of these six invariants
 breaking, and each broke silently — the symptom appeared somewhere else.
 
 1. **A cell renders in exactly the columns it owns.** pyte pairs a double-width glyph
@@ -104,9 +104,19 @@ breaking, and each broke silently — the symptom appeared somewhere else.
    snapshot taken when the rebuild started, and never from a callback that runs a frame
    later. Guarding this with a timer (`is_scrolling`) only holds while frames are fast.
    *Symptom: the list jumps back a row or two while scrolling, worse under load.*
+6. **A suppression that ends on a queued callback must COUNT, not flag.** Anything the
+   framework defers (`DataTable`'s cursor watcher queues its scroll, so our re-enable
+   has to be queued behind it) makes the suppression window outlive the code that
+   opened it. Two rebuilds then overlap, and a boolean lets the FIRST window's end
+   re-arm the SECOND window's pending work. *Symptom: one frame at the wrong position
+   under load, correct again on the next sample — and it does not reproduce on an idle
+   machine.* Count the windows and clamp the end at zero.
 
-Diagnostics for all five, and how to attribute a defect to saikai or to the child, are
-in [DEBUGGING.md](DEBUGGING.md).
+Diagnostics for all six, and how to attribute a defect to saikai or to the child, are
+in [DEBUGGING.md](DEBUGGING.md). For a defect that only shows under load, record every
+call that could have caused it WITH its caller and run until it happens: the sixth
+invariant was found that way after reasoning about the queue order twice and getting it
+wrong both times.
 
 ## UI contracts
 
