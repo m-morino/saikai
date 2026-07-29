@@ -4870,15 +4870,76 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         # our own clamped set. (#scroll-fight)
         _user_scroll_seq = 0
 
+        # Where the USER last scrolled to. None means nobody but us has moved the
+        # viewport, so a rebuild may restore whatever it saved. Once set, this — not a
+        # snapshot taken when the rebuild STARTED — is the position a rebuild must
+        # land on. A snapshot goes stale the moment the wheel turns, and gating the
+        # rebuild on Textual's is_scrolling only helps while frames are fast enough
+        # for its 0.1 s grace to still cover the gap between notches: MEASURED, the
+        # same harness scored 0 backwards jumps when frames were cheap and 4 (with 32%
+        # of the travel surviving) once tracing made them slower. A loaded session is
+        # the slow case, which is why this kept reproducing there. (#scroll-fight)
+        _user_scroll_y = None
+
         def _on_mouse_scroll_down(self, event) -> None:
             type(self)._user_scroll_seq += 1
             self._user_scroll_seq = type(self)._user_scroll_seq
-            return super()._on_mouse_scroll_down(event)
+            r = super()._on_mouse_scroll_down(event)
+            self._user_scroll_y = self.scroll_offset.y
+            self._diag_scroll("wheel-down", "own=%s" % self._user_scroll_y)
+            return r
 
         def _on_mouse_scroll_up(self, event) -> None:
             type(self)._user_scroll_seq += 1
             self._user_scroll_seq = type(self)._user_scroll_seq
-            return super()._on_mouse_scroll_up(event)
+            r = super()._on_mouse_scroll_up(event)
+            self._user_scroll_y = self.scroll_offset.y
+            self._diag_scroll("wheel-up", "own=%s" % self._user_scroll_y)
+            return r
+
+        # ── SAIKAI_DIAG: who moves the list's viewport, in the REAL app ──────────
+        # A harness with no live panes and no mirror measures this clean, so the only
+        # way to settle a scroll complaint on a loaded session is to record every
+        # viewport move where it happens, with the caller. Off unless SAIKAI_DIAG.
+        # (#scroll-fight #diag-one-run)
+        def _diag_scroll(self, what: str, extra) -> None:
+            if _LIVE_TERM is None or not getattr(_LIVE_TERM, "_DIAG_DIR", ""):
+                return
+            try:
+                import traceback
+                where = ""
+                for fr in reversed(traceback.extract_stack()[:-2]):
+                    if "saikai.py" in (fr.filename or "") or \
+                            "saikai_terminal.py" in (fr.filename or ""):
+                        where = "%s:%d %s" % (os.path.basename(fr.filename),
+                                              fr.lineno, fr.name)
+                        break
+                _LIVE_TERM._diag("list", "%-14s y=%s%s  <- %s"
+                                 % (what, self.scroll_offset.y,
+                                    "" if extra is None else (" " + str(extra)),
+                                    where or "?"))
+            except Exception:
+                pass
+
+        def scroll_to(self, x=None, y=None, **kw):
+            if _LIVE_TERM is not None and getattr(_LIVE_TERM, "_DIAG_DIR", ""):
+                before = self.scroll_offset.y
+                r = super().scroll_to(x=x, y=y, **kw)
+                if self.scroll_offset.y != before:
+                    self._diag_scroll("scroll_to", "req=%s %s->%s"
+                                      % (y, before, self.scroll_offset.y))
+                return r
+            return super().scroll_to(x=x, y=y, **kw)
+
+        def scroll_to_region(self, region, *a, **kw):
+            if _LIVE_TERM is not None and getattr(_LIVE_TERM, "_DIAG_DIR", ""):
+                before = self.scroll_offset.y
+                r = super().scroll_to_region(region, *a, **kw)
+                if self.scroll_offset.y != before:
+                    self._diag_scroll("scroll_to_region", "%s->%s"
+                                      % (before, self.scroll_offset.y))
+                return r
+            return super().scroll_to_region(region, *a, **kw)
 
         def move_cursor(self, *, row=None, column=None, animate=False, scroll=True):
             # Remember the caller's intent: the RowHighlighted handler skips the
@@ -4889,6 +4950,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # (#scroll-fight)
             self._last_move_scrolled = bool(scroll)
             if scroll:
+                # An intentional navigation supersedes the user's wheel position: the
+                # viewport is meant to follow the cursor from here on.
+                self._user_scroll_y = None
                 return super().move_cursor(row=row, column=column,
                                            animate=animate, scroll=scroll)
             self._suppress_cursor_scroll = True
@@ -6864,6 +6928,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Set synchronously to avoid a flicker, then again after layout in case
             # the new rows' virtual size wasn't known yet (the sync set would clamp).
             try:
+                # Prefer the position the USER owns over the snapshot this rebuild
+                # started with: the snapshot is stale as soon as the wheel turns, and a
+                # rebuild that began before a notch would otherwise restore the
+                # pre-notch position. (#scroll-fight)
+                _own = getattr(table, "_user_scroll_y", None)
+                if _own is not None:
+                    saved_scroll_y = _own
                 table.scroll_to(y=saved_scroll_y, animate=False)
                 _sy = saved_scroll_y
                 # The deferred re-apply exists for the case where the sync set was
@@ -6875,12 +6946,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # while the position we saved is still the user's: ListTable counts
                 # wheel notches, which tells the user's scroll apart from our own
                 # clamped set (an offset or target comparison cannot). (#scroll-fight)
-                _seq = getattr(table, "_user_scroll_seq", 0)
-
-                def _reapply(_t=table, _y=_sy, _s=_seq):
+                def _reapply(_t=table, _y=_sy):
+                    # Read the user's position WHEN THIS RUNS, not when it was queued:
+                    # a frame is long enough for the wheel to turn, and re-applying the
+                    # queued value is what yanked the viewport back.
                     try:
-                        if getattr(_t, "_user_scroll_seq", 0) == _s:
-                            _t.scroll_to(y=_y, animate=False)
+                        _cur = getattr(_t, "_user_scroll_y", None)
+                        _t.scroll_to(y=_y if _cur is None else _cur, animate=False)
                     except Exception:
                         pass
 
