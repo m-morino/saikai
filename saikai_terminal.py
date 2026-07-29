@@ -395,6 +395,23 @@ try:
                             if _ud.combining(char):
                                 merged = _ud.normalize("NFC", merged)
                             line[self.cursor.x - 1] = last._replace(data=merged)
+                            # A merge can make the cell WIDER than the column it
+                            # occupies: "⚠" is 1 column, but "⚠"+VS16 is an emoji
+                            # presentation sequence that Rich (so Textual, so the
+                            # terminal) draws in 2. The model advanced one column and
+                            # the render takes two, so every glyph after it on that
+                            # row landed one column right of where the child put it,
+                            # and the row's tail spilled past the pane — rows visibly
+                            # out of place, healing whenever the child redrew them
+                            # without the emoji. Claim the second column with pyte's
+                            # own wide-char stub so cells and columns agree.
+                            # (#emoji-presentation-width)
+                            if (_cell_len is not None and self.cursor.x < self.columns
+                                    and line[self.cursor.x].data != ""
+                                    and _cell_len(merged) == 2):
+                                line[self.cursor.x] = last._replace(data="")
+                                self.dirty.add(self.cursor.y)
+                                self.cursor.x += 1
                         elif self.cursor.y:
                             prev = self.buffer[self.cursor.y - 1][self.columns - 1]
                             merged = prev.data + char
@@ -453,6 +470,9 @@ _TEXTUAL_IMPORT_ERROR: Optional[str] = None
 try:
     from rich.segment import Segment
     from rich.style import Style
+    # The renderer's own width table: the pyte model has to advance as many columns
+    # as this will draw, or a row's glyphs land off by one. (#emoji-presentation-width)
+    from rich.cells import cell_len as _cell_len
     from textual import events
     from textual.strip import Strip
     from textual.widget import Widget
@@ -463,6 +483,7 @@ except Exception as _te:  # pragma: no cover - textual is a hard dep of saikai
     # on a box without textual.
     Widget = object  # type: ignore
     Segment = Style = Strip = events = Offset = Region = None  # type: ignore
+    _cell_len = None  # type: ignore
 
 #: True when every dependency needed for a live pane is importable.
 TERMINAL_AVAILABLE = (

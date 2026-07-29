@@ -39,9 +39,63 @@ def test_matches_rich_cell_width():
     pyte_cells = pyte.screens.wcwidth("\U0001F1EF") + pyte.screens.wcwidth("\U0001F1F5")
     assert pyte_cells == cell_len(_JP_FLAG) == 2
 
+def test_emoji_presentation_cluster_occupies_the_columns_it_renders():
+    """A cell must never render wider than the columns it occupies.
+
+    "⚠" is one column, but "⚠"+VS16 is an emoji-presentation sequence that Rich —
+    so Textual, so the terminal — draws in two. The zero-width merge used to leave
+    that cluster in ONE cell, so the model advanced one column while the render took
+    two: every glyph after it on the row landed a column right of where the child put
+    it and the row's tail spilled past the pane. MEASURED on a real capture: the two
+    rows containing ⚠️ handed Textual a 98-cell Strip for a 97-cell pane, and rows
+    looked shifted until the child redrew them without the emoji."""
+    import threading
+    import pyte
+    from rich.cells import cell_len
+
+    COLS, ROWS = 20, 3
+    scr = saikai_terminal._HistoryScreenBase(COLS, ROWS, history=10, ratio=0.5)
+    pyte.Stream(scr, strict=False).feed("A⚠️B")
+
+    assert scr.buffer[0][0].data == "A"
+    assert scr.buffer[0][1].data == "⚠️", scr.buffer[0][1].data
+    assert scr.buffer[0][2].data == "", "the cluster must claim its second column"
+    assert scr.buffer[0][3].data == "B", "the next glyph goes where the child put it"
+    assert cell_len(scr.buffer[0][1].data) == 2
+
+    # And the row the renderer hands Textual is exactly the pane's width.
+    class _Size:
+        width = COLS
+        height = ROWS
+
+    class _Pane(saikai_terminal.ClaudeTerminal):
+        size = _Size()
+        has_focus = False
+
+    ct = _Pane.__new__(_Pane)
+    ct._lock = threading.Lock()
+    ct._screen = scr
+    ct._scroll = 0
+    ct._frozen = False
+    ct._frozen_buf = None
+    ct._sel_anchor = None
+    ct._sel_head = None
+    ct.is_dead = False
+    ct._spawn_error = None
+    ct._frame = None
+    assert ct.render_line(0).cell_length == COLS, ct.render_line(0).cell_length
+
+    # A combining mark still merges WITHOUT claiming a column (it renders as one).
+    scr2 = saikai_terminal._HistoryScreenBase(COLS, ROWS, history=10, ratio=0.5)
+    pyte.Stream(scr2, strict=False).feed("éX")      # e + COMBINING ACUTE
+    assert cell_len(scr2.buffer[0][0].data) == 1, scr2.buffer[0][0].data
+    assert scr2.buffer[0][1].data == "X", scr2.buffer[0][1].data
+
 
 if __name__ == "__main__":
     test_regional_indicator_is_width_1()
     test_flag_occupies_two_cells_in_pyte_grid()
     test_matches_rich_cell_width()
     print("OK test_flag_width")
+    test_emoji_presentation_cluster_occupies_the_columns_it_renders()
+    print("PASS test_emoji_presentation_cluster_occupies_the_columns_it_renders")
