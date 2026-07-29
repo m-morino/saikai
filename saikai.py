@@ -5182,7 +5182,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 hint = (f"{len(self._opts)} match{'' if len(self._opts) == 1 else 'es'}"
                         if self._opts else "no matching folder")
             try:
-                self.query_one("#new-hint", Static).update(f"[dim]{hint}[/dim]")
+                # layout=False — #new-hint is height: 1 (see #statusbar-reflow).
+                self.query_one("#new-hint", Static).update(f"[dim]{hint}[/dim]",
+                                                           layout=False)
                 ol = self.query_one("#new-dirs", OptionList)
                 ol.clear_options()
                 if self._opts:
@@ -5995,7 +5997,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # descendant, so a non-WT emulator spawned under a WT shell would wrongly
             # qualify and get literal ?2026 escapes). (#wt-sync #wt-hover)
             try:
-                if sys.platform == "win32":
+                if sys.platform == "win32" and not os.environ.get("SAIKAI_NO_SYNC"):
                     drv = getattr(self, "_driver", None)
                     if drv is not None:
                         drv.write("\x1b[?2026$p")
@@ -6163,8 +6165,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             _hub = getattr(self, "_mirror_hub", None)
             if _hub is not None:
                 _hub.set_size(self.size.width, self.size.height)
+                # Repaint, NOT relayout: the hub asks for this to reseed its server
+                # pyte after an ingest overflow, which needs every cell re-emitted —
+                # nothing moved, so a layout pass is pure cost (a screen-wide
+                # Compositor.reflow per request). The hub rate-limits and gates these
+                # on an attached viewer; see _drain_overflow_recovery.
                 _hub.set_repaint_request(
-                    lambda: self.call_from_thread(self.refresh, layout=True))
+                    lambda: self.call_from_thread(self.refresh))
                 # Phase B: deliver browser input to the focused pane. The handler
                 # is _marshal-shaped — capture the app, bail if it's gone, marshal
                 # onto the UI thread, and swallow shutdown errors. NEVER a bare
@@ -6916,7 +6923,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             text = (f"  {n} sessions{search_str}{sort_str}"
                     f"{scope_str}{group_str}{filt_str}{tree_str}"
                     f"{live_str}{ctx_str}{sep}{_kb}")
-            self.query_one("#statusbar", Static).update(text)
+            # layout=False: Static.update() defaults to layout=True, which runs a
+            # screen-wide Compositor.reflow — and #statusbar is height: 1, so its
+            # size cannot change. This runs on every list rebuild, i.e. constantly
+            # during a storm. (#statusbar-reflow)
+            self.query_one("#statusbar", Static).update(text, layout=False)
 
         def _cursor_sid(self) -> str | None:
             table = self.query_one("#table", DataTable)

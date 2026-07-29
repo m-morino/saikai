@@ -83,6 +83,7 @@ _PROVEN_TTL_SECS = 3600.0
 # that would otherwise park a blocked thread per socket and freeze the host's own
 # UI thread; the client cap bounds a token-holder opening many SSE streams. Sized
 # for a single user (a browser opens ~6 parallel + one SSE), not a server. (#audit-mirror-dos)
+_REPAINT_REQ_MIN_GAP = 0.5  # seconds between resync full-repaint requests to the app
 _MAX_SSE_CLIENTS = 8        # concurrent /stream viewers
 _MAX_CONNECTIONS = 48       # concurrent accepted sockets, all sources
 _MAX_CONN_PER_IP = 12       # concurrent accepted sockets from one source IP
@@ -350,6 +351,7 @@ class MirrorHub:
         except (TypeError, ValueError):
             self._min_accept_gap = 0.0
         self._ingest_overflow = False  # set by broadcast() on overflow → drain requests a resync
+        self._repaint_req_after = 0.0  # monotonic; rate-limits the resync repaint
         self.allow_lan_input = False  # set True only via the launch opt-in
         # ── Pane direct view (#pane-direct) ───────────────────────────────────
         # Pane-view SSE clients get the child's raw byte stream, not app frames.
@@ -736,12 +738,26 @@ class MirrorHub:
         _repaint_request, which marshals via call_from_thread). (#audit-mirror-broadcast-splice)"""
         if self._ingest_overflow:
             self._ingest_overflow = False
-            fn = self._repaint_request
-            if fn is not None:
-                try:
-                    fn()
-                except Exception:
-                    pass
+            # GATE + DEDUPE. A full repaint is the app's most expensive frame, and
+            # during a pane storm the ingest queue overflows on essentially every
+            # drain, so an ungated request here latched saikai into one full-screen
+            # repaint per drain cycle — the local UI went heavy in lockstep with a
+            # mirror nobody had to be watching. Ask at most once per window, and
+            # only when a browser is actually attached (with no viewer there is no
+            # server-pyte state worth resyncing; the next attach requests its own
+            # repaint in add_client()). (#mirror-repaint-storm)
+            import time as _t
+            now = _t.monotonic()
+            with self._clients_lock:
+                watched = bool(self._clients or self._pane_clients)
+            if watched and now >= self._repaint_req_after:
+                self._repaint_req_after = now + _REPAINT_REQ_MIN_GAP
+                fn = self._repaint_request
+                if fn is not None:
+                    try:
+                        fn()
+                    except Exception:
+                        pass
         if self._pane_lost:
             self._pane_lost = False
             # the flush discarded queued pane data mid-stream — a half-carried

@@ -790,6 +790,43 @@ def test_offer_sentinel_reaches_full_queue():
     assert None in drained, f"sentinel must be delivered: {drained}"
     print("PASS test_offer_sentinel_reaches_full_queue")
 
+def test_overflow_repaint_is_gated_on_a_viewer_and_rate_limited():
+    """The resync repaint is the app's most expensive frame (every cell re-emitted),
+    and during a pane storm the ingest queue overflows on essentially every drain —
+    so an ungated request latched saikai into one full repaint per drain cycle and
+    the LOCAL ui went heavy in lockstep with a mirror nobody had to be watching.
+    Ask at most once per window, and only with a browser attached."""
+    import queue as _q
+    hub = m.MirrorHub(token="t", cols=20, rows=5)
+    calls = []
+    hub.set_repaint_request(lambda: calls.append(1))
+
+    # No viewer: overflow after overflow must not touch the app at all.
+    for _ in range(5):
+        hub._ingest_overflow = True
+        hub._drain_overflow_recovery()
+    assert calls == [], f"repaint requested with no viewer: {calls}"
+
+    # With a viewer: the first overflow asks, the immediate ones behind it don't.
+    cq = _q.Queue()
+    with hub._clients_lock:
+        hub._clients.add(cq)
+    for _ in range(5):
+        hub._ingest_overflow = True
+        hub._drain_overflow_recovery()
+    assert calls == [1], f"expected one request per window, got {len(calls)}"
+
+    # Once the window passes, a fresh overflow asks again (a resync still has to
+    # be possible — this is a rate limit, not a one-shot).
+    hub._repaint_req_after = 0.0
+    hub._ingest_overflow = True
+    hub._drain_overflow_recovery()
+    assert calls == [1, 1], calls
+
+    with hub._clients_lock:
+        hub._clients.discard(cq)
+
+
 if __name__ == "__main__":
     test_set_size_broadcasts_and_dedups()
     test_set_regions_dedups_and_reaches_clients()
@@ -829,3 +866,5 @@ if __name__ == "__main__":
     test_offer_sentinel_reaches_full_queue()
     test_pane_strip_carry_cleared_at_stream_boundary()
     print("OK test_mirror_hub")
+    test_overflow_repaint_is_gated_on_a_viewer_and_rate_limited()
+    print("PASS test_overflow_repaint_is_gated_on_a_viewer_and_rate_limited")
