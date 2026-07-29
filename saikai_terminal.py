@@ -121,6 +121,13 @@ if _IME_DEBUG == "1":
 # as numbers instead of adjectives. Cheap (a few counters) but off by default.
 _FRAME_LOG = str(os.environ.get("SAIKAI_FRAME_LOG", "")).strip() not in ("", "0")
 
+# Escape hatch / A-B lever: SAIKAI_FULL_REPAINT=1 makes every pane repaint go back
+# to a whole-widget refresh, i.e. the behaviour before dirty-line repainting. Textual
+# serves rows we don't refresh from its per-line strip cache, so ANY visible input
+# that pyte fails to mark dirty shows up as a stale row — this isolates that class of
+# bug in one variable instead of by inspection. Off by default.
+_FULL_REPAINT = str(os.environ.get("SAIKAI_FULL_REPAINT", "")).strip() not in ("", "0")
+
 
 def _ime_dbg(line: str) -> None:
     """Append one IME-anchor trace line (no-op unless SAIKAI_IME_DEBUG is set)."""
@@ -1816,7 +1823,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         only consumer (nothing else reads it; ``_pyte_grid_lines``, the mirror and
         ``snapshot_text`` all read the buffer directly), so drain it here."""
         scr = getattr(self, "_screen", None)
-        if scr is None or Region is None:
+        if scr is None or Region is None or _FULL_REPAINT:
             self.refresh()
             return
         # Scrolled back or frozen: visible rows come from history / a pinned
