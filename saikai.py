@@ -6015,7 +6015,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # terminal to a file, so the cursor/IME escape stream around focus can
             # be inspected byte-for-byte (does our ?25h survive, or does a later
             # write re-hide it?). Off unless SAIKAI_OUT_CAPTURE=<path>. (#wt-ime)
+            # SAIKAI_DIAG collects the whole display picture in one run, so it turns
+            # this on too rather than making someone reproduce a glitch again with a
+            # different variable. (#diag-one-run)
             _ocap = os.environ.get("SAIKAI_OUT_CAPTURE")
+            if not _ocap and getattr(_LIVE_TERM, "_DIAG_DIR", ""):
+                _ocap = os.path.join(_LIVE_TERM._DIAG_DIR, "out.txt")
             if _ocap:
                 try:
                     _drv = getattr(self, "_driver", None)

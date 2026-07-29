@@ -128,6 +128,60 @@ _FRAME_LOG = str(os.environ.get("SAIKAI_FRAME_LOG", "")).strip() not in ("", "0"
 # bug in one variable instead of by inspection. Off by default.
 _FULL_REPAINT = str(os.environ.get("SAIKAI_FULL_REPAINT", "")).strip() not in ("", "0")
 
+# ── One-shot display diagnostics ──────────────────────────────────────────────
+# SAIKAI_DIAG=1 (or =<dir>) turns on EVERYTHING needed to diagnose a rendering
+# complaint in a SINGLE run, so nobody has to reproduce a glitch three times with a
+# different variable each time:
+#   child.<sid>.txt  raw per-pane PTY bytes — replay a pane's screen offline
+#   out.txt          what saikai wrote to the real terminal
+#   frames.log       per-second render accounting (frames/probes/rows/drawn/ms)
+#   events.log       every scroll / focus / freeze / resize, with who moved it
+#   violations.log   rows whose render width != the pane width, WITH the row's text
+#   dump-<sid>-<n>.txt  the pane's full pyte model, written automatically at the
+#                       first violation (no need to hit the dump key in time)
+# The invariant check is the point: a row that renders wider than the pane is the
+# defect class behind every "rows look shifted" report so far, and this catches it
+# the moment it happens instead of inferring it from a description afterwards.
+_DIAG = str(os.environ.get("SAIKAI_DIAG", "")).strip()
+_DIAG_DIR = ""
+if _DIAG and _DIAG != "0":
+    _DIAG_DIR = _DIAG if os.path.sep in _DIAG or (os.path.altsep or "") in _DIAG else \
+        os.path.join(os.path.expanduser("~"), ".cache", "saikai", "diag")
+    try:
+        os.makedirs(_DIAG_DIR, exist_ok=True)
+    except Exception:
+        _DIAG_DIR = ""
+if _DIAG_DIR:
+    _FRAME_LOG = True
+    if not _PTY_CAPTURE:
+        _PTY_CAPTURE = os.path.join(_DIAG_DIR, "child.txt")
+
+
+def _diag(kind: str, msg: str) -> None:
+    """Append one timestamped diagnostic line. No-op unless SAIKAI_DIAG is set."""
+    if not _DIAG_DIR:
+        return
+    try:
+        with open(os.path.join(_DIAG_DIR, "events.log"), "a",
+                  encoding="utf-8") as f:
+            f.write("%.3f %-10s %s\n" % (time.monotonic(), kind, msg))
+    except Exception:
+        pass
+
+def _frame_write(fmt: str, *args) -> None:
+    """Per-second render accounting. Goes to <diag>/frames.log when SAIKAI_DIAG is
+    on (so the render trace stays readable), otherwise to the normal app log."""
+    line = fmt % args if args else fmt
+    if _DIAG_DIR:
+        try:
+            with open(os.path.join(_DIAG_DIR, "frames.log"), "a",
+                      encoding="utf-8") as f:
+                f.write("%.3f %s\n" % (time.monotonic(), line))
+            return
+        except Exception:
+            pass
+    _log(line)
+
 
 def _ime_dbg(line: str) -> None:
     """Append one IME-anchor trace line (no-op unless SAIKAI_IME_DEBUG is set)."""
@@ -1605,7 +1659,10 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._build_frame()
         t1 = time.monotonic() if _FRAME_LOG else 0.0
         try:
-            return super().render_lines(crop)
+            strips = super().render_lines(crop)
+            if _DIAG_DIR:
+                self._diag_check_strips(crop, strips)
+            return strips
         finally:
             # RESTORE rather than clear: get_style_at renders a single row, and
             # App._update_mouse_over reaches it from inside the paint cycle
@@ -1627,6 +1684,44 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                     pass
             if _FRAME_LOG:
                 self._frame_log_tick(crop, t1 - t0, time.monotonic() - t1)
+
+    def _diag_check_strips(self, crop, strips) -> None:
+        """SAIKAI_DIAG: verify every rendered row is exactly as wide as the crop.
+
+        A row that renders wider than the pane pushes its own glyphs right and spills
+        its tail past the edge — the "rows look shifted" defect, whatever produced it
+        (a cluster that outgrew its columns, a wide pair an erase split, a future
+        width-table drift). Catch it the moment it renders, record the row's text, and
+        dump the pane's model on the FIRST violation so the offline replay has
+        something to reproduce. Never raises, never runs unless SAIKAI_DIAG is set."""
+        try:
+            want = int(getattr(crop, "width", 0) or 0)
+            if want <= 0:
+                return
+            bad = [(i, s) for i, s in enumerate(strips)
+                   if s is not None and s.cell_length != want]
+            if not bad:
+                return
+            sid = (getattr(self, "sid", None) or "?")[:8]
+            y0 = int(getattr(crop, "y", 0) or 0)
+            with open(os.path.join(_DIAG_DIR, "violations.log"), "a",
+                      encoding="utf-8") as f:
+                for i, s in bad:
+                    f.write("%.3f sid=%s row=%d width=%d want=%d %r\n"
+                            % (time.monotonic(), sid, y0 + i, s.cell_length, want,
+                               "".join(seg.text for seg in s)[:160]))
+            if not getattr(self, "_diag_dumped", False):
+                self._diag_dumped = True
+                try:
+                    with open(os.path.join(_DIAG_DIR, "dump-%s.txt" % sid), "w",
+                              encoding="utf-8") as f:
+                        f.write(self.snapshot_text())
+                except Exception:
+                    pass
+                _diag("violation", "sid=%s first row=%d width=%d want=%d (model dumped)"
+                      % (sid, y0 + bad[0][0], bad[0][1].cell_length, want))
+        except Exception:
+            pass
 
     def _frame_log_tick(self, crop, build_s: float, render_s: float) -> None:
         """SAIKAI_FRAME_LOG=1: per-second aggregate of what the render path costs,
@@ -1650,7 +1745,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # far below rows/s when dirty-line repainting is working); live/s = rows
             # served from the locked live read instead of the pinned frame, which
             # must stay at the probe count or a frame can still tear.
-            _log("[frame] sid=%s frames/s=%d style_probes/s=%d rows/s=%d drawn/s=%d "
+            _frame_write("[frame] sid=%s frames/s=%d style_probes/s=%d rows/s=%d drawn/s=%d "
                  "live/s=%d build=%.1fms render=%.1fms (of %.0fms wall)"
                  % ((getattr(self, "sid", None) or "?")[:8], st["frames"],
                     st["style"], st["rows"], getattr(self, "_frame_rl", 0),
@@ -1987,6 +2082,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         the background). Freeze PINS the displayed frame (snapshot) so render + copy
         stay consistent; resume drops it and repaints once to catch up. UI thread."""
         self._frozen = not self._frozen
+        _diag("freeze", "frozen=%s" % self._frozen)
         if self._frozen:
             self._snapshot_frozen()
         else:
@@ -2107,6 +2203,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return
         with self._lock:   # same lock the reader uses to bump _scroll in _consume
             self._scroll = min(self._scroll + 3, len(self._screen.history.top))
+        _diag("scroll", "wheel-up -> %d" % self._scroll)
         try:
             event.stop()
         except Exception:
@@ -2124,6 +2221,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             moved = self._scroll > 0
             if moved:
                 self._scroll = max(0, self._scroll - 3)
+                _diag("scroll", "wheel-down -> %d" % self._scroll)
             back_at_live = moved and self._scroll == 0
         if moved:
             self.refresh()
@@ -2501,6 +2599,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         with self._lock:
             left_scrollback = self._scroll != 0
             self._scroll = 0     # geometry changed; drop any scrollback offset
+            _diag("resize", "rows=%d cols=%d (scroll reset)" % (rows, cols))
             try:
                 self._screen.resize(rows, cols)     # pyte: (rows, cols)!
             except Exception:
@@ -3151,6 +3250,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             if self._scroll > 0:
                 added = len(self._screen.history.top) - top_before
                 if added > 0:
+                    _diag("scroll", "reader-bump +%d from %d"
+                          % (added, self._scroll))
                     self._scroll = min(self._scroll + added,
                                        len(self._screen.history.top))
             if not present:
@@ -3492,6 +3593,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # _sync_terminal_cursor decides whether the native cursor is actually
         # visible: alt-screen full-screen UIs keep it hidden.
         self._sync_terminal_cursor(reason="focus")
+        _diag("focus", "gained sid=%s" % ((getattr(self, "sid", None) or "?")[:8]))
         # render_line draws saikai's cursor cell only when has_focus, and focus
         # changes nothing in pyte — so with dirty-line repainting the row would keep
         # its cached, cursor-less strip until something else dirtied it. Repaint the
@@ -3718,6 +3820,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._show_hw_cursor(False)
         if getattr(self, "_focus_reporting", False):                # ?1004: tell the child it lost focus
             self._send_to_child("\x1b[O")
+        _diag("focus", "lost sid=%s" % ((getattr(self, "sid", None) or "?")[:8]))
         # Clear the cursor cell the focused pane was drawing — same reason as
         # on_focus: losing focus dirties nothing in pyte. (#focus-cursor-row)
         try:
