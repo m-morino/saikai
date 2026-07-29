@@ -1646,11 +1646,18 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         st["render"] += render_s
         now = time.monotonic()
         if now - st["t"] >= 1.0:
-            _log("[frame] sid=%s frames/s=%d style_probes/s=%d rows/s=%d "
-                 "build=%.1fms render=%.1fms (of %.0fms wall)"
+            # drawn/s = render_line calls Textual actually made (dirty rows only, so
+            # far below rows/s when dirty-line repainting is working); live/s = rows
+            # served from the locked live read instead of the pinned frame, which
+            # must stay at the probe count or a frame can still tear.
+            _log("[frame] sid=%s frames/s=%d style_probes/s=%d rows/s=%d drawn/s=%d "
+                 "live/s=%d build=%.1fms render=%.1fms (of %.0fms wall)"
                  % ((getattr(self, "sid", None) or "?")[:8], st["frames"],
-                    st["style"], st["rows"], st["build"] * 1000,
+                    st["style"], st["rows"], getattr(self, "_frame_rl", 0),
+                    getattr(self, "_frame_fb", 0), st["build"] * 1000,
                     st["render"] * 1000, (now - st["t"]) * 1000))
+            self._frame_rl = 0
+            self._frame_fb = 0
             st.update(t=now, frames=0, style=0, rows=0, build=0.0, render=0.0)
 
     def _build_frame(self, crop=None) -> None:
@@ -1749,6 +1756,10 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # Read the frame pinned by render_lines — one generation for every row of
         # this frame, no lock. Only when there is no frame (a render_line outside
         # a frame: direct calls, tests) fall back to the locked per-row read.
+        if _FRAME_LOG:
+            self._frame_rl = getattr(self, "_frame_rl", 0) + 1
+            if frame is None or y not in frame["rows"]:
+                self._frame_fb = getattr(self, "_frame_fb", 0) + 1
         if frame is not None and y in frame["rows"]:
             cols = frame["cols"]
             cursor_x = frame["cursor_x"]
