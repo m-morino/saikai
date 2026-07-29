@@ -1899,7 +1899,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             if run_chars:
                 segments.append(Segment("".join(run_chars), run_style))
 
+        skip_next = False
         for x, ch in enumerate(cells):
+            if skip_next:                 # consumed by the 2-column cluster before it
+                skip_next = False
+                continue
             # pyte stores a full-width glyph at x and an empty-string STUB at
             # x+1. Emitting anything for the stub injects an extra column and
             # shifts every line containing CJK / emoji / box-drawing. Skip it —
@@ -1915,14 +1919,22 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # not durable: an erase (the child sends thousands of ECH) can blank the
             # stub and leave the cluster behind. So enforce it here, where the
             # columns are known. Prefiltered on len > 1 to keep ASCII cells free.
-            if len(data) > 1 and _cell_len is not None:
-                owned = 2 if (x + 1 < len(cells) and cells[x + 1].data == "") else 1
-                if _cell_len(data) != owned:
-                    # Fall back to the base codepoint: alignment matters more than
-                    # the emoji presentation, and the model only owns one column.
-                    data = data[:1]
-                    if _cell_len(data) != owned:
-                        data = " " * owned
+            if _cell_len is not None and _cell_len(data) == 2:
+                # A 2-COLUMN CELL consumes the next one, whatever is in it — a CJK
+                # glyph as much as an emoji cluster. The
+                # stub pyte pairs it with can be wiped by an erase (the child sends
+                # thousands of ECH), and shrinking the cluster to its base codepoint
+                # instead — which is what this used to do — keeps the row's width but
+                # moves every later glyph one column left. The child then redraws the
+                # row with the stub back, so the pane ALTERNATED between shifted and
+                # unshifted: TRACED on a real session as a whole-screen A->B->A where
+                # every differing row was off by exactly one column and the prompt's
+                # ❯ vanished. Consuming the neighbour keeps both the width and every
+                # later column fixed. (#emoji-presentation-width)
+                if x + 1 < len(cells):
+                    skip_next = True
+                else:
+                    data = data[:1]      # last column: no second column to consume
             if show_cursor and x == cursor_x and not (_IS_WIN and _IME_ANCHOR):
                 # Draw saikai's own cursor (cell reversed, keeping the cell's real
                 # fg/bg/bold so a themed prompt isn't flattened). SKIP only on Windows

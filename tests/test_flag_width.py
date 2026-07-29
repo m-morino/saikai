@@ -134,7 +134,12 @@ def test_a_cell_never_renders_wider_than_the_columns_it_owns():
     strip = _pane(scr).render_line(0)
     assert strip.cell_length == COLS, strip.cell_length
     text = "".join(s.text for s in strip)
-    assert text.startswith("A⚠ "), repr(text[:6])   # base char, alignment kept
+    # The cluster keeps its TWO columns and consumes the cell the erase wrote over,
+    # so every later glyph stays in the column the child put it in. Shrinking the
+    # cluster to its base codepoint instead would keep the row's width but move "B"
+    # one column left — and since the child redraws with the stub back, the pane
+    # alternated between shifted and unshifted (the scroll oscillation).
+    assert text.startswith("A⚠️B"), repr(text[:6])
 
 
 if __name__ == "__main__":
