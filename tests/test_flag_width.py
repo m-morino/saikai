@@ -91,6 +91,51 @@ def test_emoji_presentation_cluster_occupies_the_columns_it_renders():
     assert cell_len(scr2.buffer[0][0].data) == 1, scr2.buffer[0][0].data
     assert scr2.buffer[0][1].data == "X", scr2.buffer[0][1].data
 
+def test_a_cell_never_renders_wider_than_the_columns_it_owns():
+    """Claiming the second column when the cluster is BUILT is not durable: the
+    child sends thousands of ECH/EL, and pyte erases per cell, so an erase can blank
+    the stub and leave the 2-column cluster behind. MEASURED on a real capture: a row
+    whose stub had been erased handed Textual a 98-cell Strip for a 97-cell pane.
+    render_line must enforce the invariant where the columns are known."""
+    import threading
+    import pyte
+
+    COLS, ROWS = 20, 3
+    scr = saikai_terminal._HistoryScreenBase(COLS, ROWS, history=10, ratio=0.5)
+    pyte.Stream(scr, strict=False).feed("A⚠️B")
+    assert scr.buffer[0][2].data == "", "precondition: the cluster claimed x=2"
+
+    class _Size:
+        width = COLS
+        height = ROWS
+
+    class _Pane(saikai_terminal.ClaudeTerminal):
+        size = _Size()
+        has_focus = False
+
+    def _pane(screen):
+        ct = _Pane.__new__(_Pane)
+        ct._lock = threading.Lock()
+        ct._screen = screen
+        ct._scroll = 0
+        ct._frozen = False
+        ct._frozen_buf = None
+        ct._sel_anchor = None
+        ct._sel_head = None
+        ct.is_dead = False
+        ct._spawn_error = None
+        ct._frame = None
+        return ct
+
+    assert _pane(scr).render_line(0).cell_length == COLS
+
+    # Now an erase blanks the stub but not the cluster (pyte erases per cell).
+    scr.buffer[0][2] = scr.buffer[0][2]._replace(data=" ")
+    strip = _pane(scr).render_line(0)
+    assert strip.cell_length == COLS, strip.cell_length
+    text = "".join(s.text for s in strip)
+    assert text.startswith("A⚠ "), repr(text[:6])   # base char, alignment kept
+
 
 if __name__ == "__main__":
     test_regional_indicator_is_width_1()
@@ -99,3 +144,5 @@ if __name__ == "__main__":
     print("OK test_flag_width")
     test_emoji_presentation_cluster_occupies_the_columns_it_renders()
     print("PASS test_emoji_presentation_cluster_occupies_the_columns_it_renders")
+    test_a_cell_never_renders_wider_than_the_columns_it_owns()
+    print("PASS test_a_cell_never_renders_wider_than_the_columns_it_owns")

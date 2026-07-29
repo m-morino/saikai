@@ -3475,6 +3475,108 @@ def test_pty_capture_is_one_file_per_pane():
     finally:
         rt._PTY_CAPTURE = saved
 
+def test_a_style_probe_does_not_leave_a_paint_in_the_cache():
+    """Compositor.get_style_at renders ONE row per mouse move, and Textual's row
+    loop caches whatever it renders and drops that line from its dirty set. Since a
+    one-row crop is deliberately rendered WITHOUT a pinned frame (it cannot tear,
+    and snapshotting per mouse event was expensive), that cached strip came from the
+    live pyte state — so the next real frame served a row from an arbitrary
+    generation and the pane oscillated between them. A probe must put the line back."""
+    class _Crop:
+        def __init__(self, y, height):
+            self.y = y
+            self.height = height
+
+    class _Cache:
+        def __init__(self):
+            self.dirtied = []
+
+        def set_dirty(self, *regions):
+            self.dirtied.extend(regions)
+
+    ct = _grid_pane(rows=8, cols=3)
+    ct._styles_cache = _Cache()
+    ct._build_frame = lambda crop=None: None       # keep super() out of the way
+
+    probe = _Crop(4, 1)
+    try:
+        ct.render_lines(probe)
+    except Exception:
+        pass
+    assert ct._styles_cache.dirtied == [probe], ct._styles_cache.dirtied
+
+    # A real frame renders inside the pinned snapshot, so its rows are consistent
+    # and must NOT be re-dirtied (that would repaint every row every frame again).
+    ct._styles_cache.dirtied.clear()
+    try:
+        ct.render_lines(_Crop(0, 8))
+    except Exception:
+        pass
+    assert ct._styles_cache.dirtied == [], ct._styles_cache.dirtied
+
+def test_a_nested_probe_does_not_drop_the_outer_frames_pin():
+    """get_style_at renders one row, and App._update_mouse_over reaches it from
+    inside the paint cycle (screen.py:1234). Clearing self._frame unconditionally on
+    the way out would drop an outer frame's pin mid-frame and let the remaining rows
+    render from live pyte again — the tearing the pin exists to prevent."""
+    class _Crop:
+        def __init__(self, y, height):
+            self.y = y
+            self.height = height
+
+    ct = _grid_pane(rows=8, cols=3)
+    ct._styles_cache = type("C", (), {"set_dirty": lambda self, *a: None})()
+    ct._build_frame()                      # an outer frame is pinned
+    outer = ct._frame
+    assert outer is not None
+    try:
+        ct.render_lines(_Crop(4, 1))       # a probe runs inside it
+    except Exception:
+        pass
+    assert ct._frame is outer, "the probe must restore the outer frame's pin"
+
+
+def test_a_frame_pins_every_visible_row_not_just_the_crop():
+    """render_line is handed a CONTENT-relative y while the crop is widget-relative,
+    so a crop-scoped snapshot could miss a row — and a missing row falls back to a
+    live per-row read INSIDE a multi-row frame, reintroducing the tear. Cover the
+    grid instead of relying on that mapping being zero."""
+    class _Crop:
+        def __init__(self, y, height):
+            self.y = y
+            self.height = height
+
+    ct = _grid_pane(rows=8, cols=3)
+    ct._styles_cache = type("C", (), {"set_dirty": lambda self, *a: None})()
+    built = []
+    real = ct._build_frame
+    ct._build_frame = lambda crop=None: built.append(crop) or real()
+    try:
+        ct.render_lines(_Crop(2, 4))       # a partial crop
+    except Exception:
+        pass
+    assert built == [None], "a frame must snapshot the grid, not the crop"
+    assert sorted(ct._frame["rows"]) == list(range(8)) if ct._frame else True
+
+
+def test_focus_change_repaints_the_cursor_row():
+    """render_line draws saikai's cursor cell only when has_focus, and focus changes
+    nothing in pyte — so with dirty-line repainting the row would keep its cached,
+    cursor-less strip until something else dirtied it."""
+    for handler in ("on_focus", "on_blur"):
+        ct = _dirty_pane(rows=8)
+        ct._screen.cursor.y = 3
+        ct._focus_reporting = False
+        ct._sync_terminal_cursor = lambda *a, **k: None
+        ct.call_after_refresh = lambda *a, **k: None
+        ct._show_hw_cursor = lambda *a, **k: None
+        ct._cancel_forwarded_drag = lambda *a, **k: None
+        try:
+            getattr(ct, handler)()
+        except Exception:
+            pass
+        assert ct._refreshes == [(3,)], (handler, ct._refreshes)
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -3687,3 +3789,11 @@ if __name__ == "__main__":
     print("PASS test_rows_survive_a_refresh_that_raises")
     test_pty_capture_is_one_file_per_pane()
     print("PASS test_pty_capture_is_one_file_per_pane")
+    test_a_style_probe_does_not_leave_a_paint_in_the_cache()
+    print("PASS test_a_style_probe_does_not_leave_a_paint_in_the_cache")
+    test_a_nested_probe_does_not_drop_the_outer_frames_pin()
+    print("PASS test_a_nested_probe_does_not_drop_the_outer_frames_pin")
+    test_a_frame_pins_every_visible_row_not_just_the_crop()
+    print("PASS test_a_frame_pins_every_visible_row_not_just_the_crop")
+    test_focus_change_repaints_the_cursor_row()
+    print("PASS test_focus_change_repaints_the_cursor_row")

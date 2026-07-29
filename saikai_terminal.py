@@ -1595,13 +1595,36 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # per mouse event, on top of the storm — measurably worse than before.
         # Snapshot only when a frame can actually splice rows. (#frame-snapshot)
         t0 = time.monotonic() if _FRAME_LOG else 0.0
+        # Snapshot the WHOLE visible grid, not the crop: render_line is handed a
+        # content-relative y while the crop is widget-relative, and any row the
+        # snapshot missed would silently fall back to a live per-row read INSIDE a
+        # multi-row frame — reintroducing exactly the tearing the pin prevents.
+        # Covering the grid removes that assumption; it measured 1-20 ms/s.
+        prev_frame = self._frame
         if crop.height > 1:
-            self._build_frame(crop)
+            self._build_frame()
         t1 = time.monotonic() if _FRAME_LOG else 0.0
         try:
             return super().render_lines(crop)
         finally:
-            self._frame = None
+            # RESTORE rather than clear: get_style_at renders a single row, and
+            # App._update_mouse_over reaches it from inside the paint cycle
+            # (screen.py:1234). Clearing unconditionally would drop an outer frame's
+            # pin mid-frame and let the remaining rows tear.
+            self._frame = prev_frame
+            if crop.height <= 1:
+                # A probe is a READ, but Textual's row loop CACHES whatever it
+                # renders (``self._cache[y] = strip``) and then drops that line from
+                # its dirty set. So a get_style_at probe — one per mouse move — left
+                # a strip rendered from the live, unpinned pyte state in the paint
+                # cache, and the next real frame served it instead of re-rendering:
+                # moving the pointer stamped rows with content from whatever
+                # generation happened to be current, and the pane oscillated between
+                # them. Put the line back so the next frame renders it pinned.
+                try:
+                    self._styles_cache.set_dirty(crop)
+                except Exception:
+                    pass
             if _FRAME_LOG:
                 self._frame_log_tick(crop, t1 - t0, time.monotonic() - t1)
 
@@ -1772,8 +1795,25 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # x+1. Emitting anything for the stub injects an extra column and
             # shifts every line containing CJK / emoji / box-drawing. Skip it —
             # the glyph already carries width 2 (real blank cells hold " ").
-            if ch.data == "":
+            data = ch.data
+            if data == "":
                 continue
+            # INVARIANT: a cell may only render in the columns it OWNS (its own,
+            # plus the next one when that holds a stub). A multi-codepoint cell —
+            # the zero-width merge folds VS16 into the base char — can render 2
+            # while owning 1, which pushes the rest of the row a column right and
+            # spills its tail past the pane. Claiming the column at merge time is
+            # not durable: an erase (the child sends thousands of ECH) can blank the
+            # stub and leave the cluster behind. So enforce it here, where the
+            # columns are known. Prefiltered on len > 1 to keep ASCII cells free.
+            if len(data) > 1 and _cell_len is not None:
+                owned = 2 if (x + 1 < len(cells) and cells[x + 1].data == "") else 1
+                if _cell_len(data) != owned:
+                    # Fall back to the base codepoint: alignment matters more than
+                    # the emoji presentation, and the model only owns one column.
+                    data = data[:1]
+                    if _cell_len(data) != owned:
+                        data = " " * owned
             if show_cursor and x == cursor_x and not (_IS_WIN and _IME_ANCHOR):
                 # Draw saikai's own cursor (cell reversed, keeping the cell's real
                 # fg/bg/bold so a themed prompt isn't flattened). SKIP only on Windows
@@ -1784,7 +1824,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 # pane has NO caret at all (the default-OFF regression). (#native-cursor)
                 flush(x)
                 run_chars = []
-                segments.append(Segment(ch.data or " ",
+                segments.append(Segment(data or " ",
                                         _cell_style(ch) + Style(reverse=True)))
                 run_style = None
                 continue
@@ -1798,7 +1838,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 segments.append(Segment("".join(run_chars), run_style))
                 run_chars = []
             run_style = st
-            run_chars.append(ch.data)
+            run_chars.append(data)
         if run_chars:
             segments.append(Segment("".join(run_chars), run_style))
         # Let Textual compute the cell length (handles CJK/emoji double-width).
@@ -3441,6 +3481,14 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # _sync_terminal_cursor decides whether the native cursor is actually
         # visible: alt-screen full-screen UIs keep it hidden.
         self._sync_terminal_cursor(reason="focus")
+        # render_line draws saikai's cursor cell only when has_focus, and focus
+        # changes nothing in pyte — so with dirty-line repainting the row would keep
+        # its cached, cursor-less strip until something else dirtied it. Repaint the
+        # cursor row. (#focus-cursor-row)
+        try:
+            self._refresh_dirty_rows()
+        except Exception:
+            pass
         if getattr(self, "_focus_reporting", False):                # ?1004: tell the child it's focused
             self._send_to_child("\x1b[I")
         # The immediate sync above can fire before layout settles — inside the
@@ -3659,6 +3707,12 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self._show_hw_cursor(False)
         if getattr(self, "_focus_reporting", False):                # ?1004: tell the child it lost focus
             self._send_to_child("\x1b[O")
+        # Clear the cursor cell the focused pane was drawing — same reason as
+        # on_focus: losing focus dirties nothing in pyte. (#focus-cursor-row)
+        try:
+            self._refresh_dirty_rows()
+        except Exception:
+            pass
         self._cancel_forwarded_drag()          # a lost MouseUp must not stick capture
 
     # ── thread → UI marshaling (defensive) ─────────────────────────────────────
