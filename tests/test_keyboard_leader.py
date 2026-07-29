@@ -2990,6 +2990,101 @@ def test_pilot_front_door_homes_on_needs_you():
     assert facts.get("cursor_sid") == sid_att, \
         f"cursor should home on the reply-due session, not the newest: {facts}"
 
+def test_pilot_cursor_restore_with_scroll_false_does_not_scroll():
+    """move_cursor(scroll=False) must actually not scroll. DataTable's own
+    watch_cursor_coordinate calls _scroll_cursor_into_view() on any coordinate
+    change, so the flag never reached the scroll: a background rebuild restoring the
+    cursor still yanked the viewport toward the cursor row, and mid-wheel that reads
+    as the list jumping back and forth. MEASURED in a Textual harness: this path
+    alone produced 3 A->B->A jumps during a scroll. (#scroll-fight)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_cursor_restore_with_scroll_false_does_not_scroll")
+        return
+    import asyncio
+    from textual.app import App
+    for _ in range(40):
+        _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(120, 18)) as pilot:
+                await pilot.pause(0.4)
+                table = self.query_one("#table")
+                table.scroll_to(y=12, animate=False)
+                await pilot.pause(0.2)
+                facts["before"] = table.scroll_offset.y
+                table.move_cursor(row=0, scroll=False)      # the rebuild's restore
+                await pilot.pause(0.2)
+                facts["after"] = table.scroll_offset.y
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+    assert facts.get("before", 0) > 0, f"test setup: table did not scroll: {facts}"
+    assert facts["after"] == facts["before"], \
+        ("move_cursor(scroll=False) scrolled anyway "
+         f"(before={facts['before']} after={facts['after']})")
+
+
+def test_pilot_rebuild_is_deferred_while_the_list_is_scrolling():
+    """A rebuild landing mid-scroll is the oscillation: clear() zeroes scroll_y, so
+    the rebuild restores a position captured before the user's notch. During a storm
+    the live poll rebuilds about once a frame, so nearly every notch hit one —
+    MEASURED: 14 jumps in a 1.6 s scroll and 31 of 32 notches of travel lost. Skip
+    the rebuild while the table is scrolling and pick it up after. (#scroll-fight)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_rebuild_is_deferred_while_the_list_is_scrolling")
+        return
+    import asyncio
+    from textual.app import App
+    for _ in range(40):
+        _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(120, 18)) as pilot:
+                await pilot.pause(0.4)
+                table = self.query_one("#table")
+                table.scroll_to(y=12, animate=False)
+                await pilot.pause(0.2)
+                facts["before"] = table.scroll_offset.y
+                # Pin is_scrolling True for the duration, as a real wheel does.
+                cls = type(table)
+                saved = cls.is_scrolling
+                cls.is_scrolling = property(lambda self: True)
+                try:
+                    self._refresh_table()
+                    await pilot.pause(0.2)
+                    facts["during"] = table.scroll_offset.y
+                finally:
+                    cls.is_scrolling = saved
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+    assert facts.get("before", 0) > 0, f"test setup: table did not scroll: {facts}"
+    assert facts["during"] == facts["before"], \
+        ("a rebuild ran mid-scroll and moved the viewport "
+         f"(before={facts['before']} during={facts['during']})")
+
 
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
@@ -3088,3 +3183,7 @@ if __name__ == "__main__":
     print("PASS test_pilot_toast_user_content_renders_verbatim")
     print("PASS test_pilot_cycle_tab_skips_dead_pane")
     print("ALL PASS")
+    test_pilot_cursor_restore_with_scroll_false_does_not_scroll()
+    print("PASS test_pilot_cursor_restore_with_scroll_false_does_not_scroll")
+    test_pilot_rebuild_is_deferred_while_the_list_is_scrolling()
+    print("PASS test_pilot_rebuild_is_deferred_while_the_list_is_scrolling")

@@ -4855,6 +4855,65 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def watch_hover_coordinate(self, old, value) -> None:
             return
 
+        # Make move_cursor(scroll=False) actually mean it. DataTable's own
+        # watch_cursor_coordinate calls _scroll_cursor_into_view() whenever the
+        # coordinate changes, so the flag never reached the scroll — a background
+        # rebuild restoring the cursor with scroll=False still yanked the viewport
+        # toward the cursor row, and mid-wheel that reads as the list jumping back.
+        # MEASURED in a Textual harness: this path alone produced 3 A->B->A jumps in a
+        # scroll even with the deferred restore removed. (#scroll-fight)
+        _suppress_cursor_scroll = False
+
+        # Bumped on every wheel notch, so a rebuild can tell "the scroll position I
+        # saved is still the user's" from "the user has moved since". Comparing
+        # scroll offsets or targets instead can't distinguish the user's wheel from
+        # our own clamped set. (#scroll-fight)
+        _user_scroll_seq = 0
+
+        def _on_mouse_scroll_down(self, event) -> None:
+            type(self)._user_scroll_seq += 1
+            self._user_scroll_seq = type(self)._user_scroll_seq
+            return super()._on_mouse_scroll_down(event)
+
+        def _on_mouse_scroll_up(self, event) -> None:
+            type(self)._user_scroll_seq += 1
+            self._user_scroll_seq = type(self)._user_scroll_seq
+            return super()._on_mouse_scroll_up(event)
+
+        def move_cursor(self, *, row=None, column=None, animate=False, scroll=True):
+            # Remember the caller's intent: the RowHighlighted handler skips the
+            # cursor past a category header by moving it AGAIN, and that second move
+            # must inherit whether scrolling was wanted. With the default (scroll=True)
+            # a background rebuild's scroll=False restore still yanked the viewport,
+            # because the restore landed on a header row and the skip scrolled.
+            # (#scroll-fight)
+            self._last_move_scrolled = bool(scroll)
+            if scroll:
+                return super().move_cursor(row=row, column=column,
+                                           animate=animate, scroll=scroll)
+            self._suppress_cursor_scroll = True
+            try:
+                return super().move_cursor(row=row, column=column,
+                                           animate=animate, scroll=scroll)
+            finally:
+                # The watcher does NOT scroll inline: with dimensions pending it does
+                # call_after_refresh(self._scroll_cursor_into_view) (_data_table.py:
+                # 1209-1212), so a flag cleared here would already be gone. It queues
+                # that during the coordinate assignment inside super(), and
+                # call_after_refresh is FIFO, so a clear queued now lands behind it.
+                try:
+                    self.call_after_refresh(self._end_cursor_scroll_suppression)
+                except Exception:
+                    self._suppress_cursor_scroll = False
+
+        def _end_cursor_scroll_suppression(self) -> None:
+            self._suppress_cursor_scroll = False
+
+        def _scroll_cursor_into_view(self, animate: bool = False) -> None:
+            if self._suppress_cursor_scroll:
+                return
+            return super()._scroll_cursor_into_view(animate=animate)
+
     class SplitGrip(Static):
         """A 1-column draggable divider between the session list and the right
         pane. Mouse-down captures the pointer; subsequent moves resize the list
@@ -6400,6 +6459,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def _do_refresh_table(self) -> None:
             table = self.query_one("#table", DataTable)
+            # NEVER rebuild while the user is scrolling. clear() zeroes scroll_y, so
+            # a rebuild has to restore it — and a rebuild landing mid-wheel restores a
+            # position from BEFORE the notch, so the viewport snaps back and forth.
+            # During a storm _on_live_status rebuilds about once a frame, so a wheel
+            # scroll fought a rebuild on nearly every notch: MEASURED in a Textual
+            # harness, 14 A->B->A jumps of +/-2 rows in a 1.6 s scroll and 31 of 32
+            # notches of travel lost. Textual's is_scrolling already carries a short
+            # post-scroll grace, so re-arm and pick the rebuild up after. (#scroll-fight)
+            try:
+                if getattr(table, "is_scrolling", False):
+                    self._request_refresh()
+                    return
+            except Exception:
+                pass
             saved_cursor = table.cursor_row
             saved_sid = self._cursor_sid()   # restore by SESSION, not row index (headers/grouping shift it)
             saved_scroll_y = table.scroll_offset.y   # preserve the user's scroll across the rebuild
@@ -6779,7 +6852,25 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             try:
                 table.scroll_to(y=saved_scroll_y, animate=False)
                 _sy = saved_scroll_y
-                self.call_after_refresh(lambda: table.scroll_to(y=_sy, animate=False))
+                # The deferred re-apply exists for the case where the sync set was
+                # clamped (the new rows' virtual size wasn't known yet). But it runs a
+                # frame later, so if the user turned the wheel in between it re-applied
+                # a PRE-WHEEL position and yanked the viewport back — measured as the
+                # single biggest source of the scroll oscillation (removing this line
+                # alone took a harness run from 14 oscillations to 0). Re-apply only
+                # while the position we saved is still the user's: ListTable counts
+                # wheel notches, which tells the user's scroll apart from our own
+                # clamped set (an offset or target comparison cannot). (#scroll-fight)
+                _seq = getattr(table, "_user_scroll_seq", 0)
+
+                def _reapply(_t=table, _y=_sy, _s=_seq):
+                    try:
+                        if getattr(_t, "_user_scroll_seq", 0) == _s:
+                            _t.scroll_to(y=_y, animate=False)
+                    except Exception:
+                        pass
+
+                self.call_after_refresh(_reapply)
             except Exception:
                 pass
             self._update_subtitle()
@@ -7395,7 +7486,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if tgt is None:                       # nothing that way → try back
                     tgt = _first_selectable_row(tbl, cur, -1 if down else 1)
                 if tgt is not None:
-                    tbl.move_cursor(row=tgt)          # re-fires highlight on a real row
+                    # Inherit the scroll intent of the move that landed here: an arrow
+                    # key wants the cursor scrolled into view, a background rebuild's
+                    # scroll=False restore must not move the viewport. (#scroll-fight)
+                    tbl.move_cursor(row=tgt,          # re-fires highlight on a real row
+                                    scroll=getattr(tbl, "_last_move_scrolled", True))
                     return
                 # No selectable session anywhere (empty state): show the label.
                 if _LIVE_TERM is not None:
