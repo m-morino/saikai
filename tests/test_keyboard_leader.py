@@ -3143,6 +3143,76 @@ def test_pilot_wheel_scroll_is_monotonic_under_constant_rebuilds():
     assert not back, f"wheel scroll went backwards {back} — offsets={offs}"
     assert offs[-1] > offs[0], f"wheel scroll made no progress: {offs}"
 
+def test_pilot_cursor_scroll_suppression_nests_across_overlapping_rebuilds():
+    """The cursor-scroll suppression must COUNT, because its windows overlap.
+
+    Each window closes on a queued callback (only FIFO puts it behind the
+    watcher's queued _scroll_cursor_into_view), so a rebuild that starts while the
+    previous one's callbacks are still draining opens a second window. With a
+    boolean, the FIRST window's end re-armed the second one's pending scroll:
+
+      rebuild1: clear -> queue A1 | move_cursor -> flag=True, queue B1, end1
+      rebuild2: clear -> queue A2 | move_cursor -> flag=True, queue B2, end2
+      drain:    A1 ok  B1 ok  end1 -> flag=False  A2 SCROLLED to the cursor row
+
+    ATTRIBUTED by recording every viewport move with its caller on the real app:
+    the surviving jump came from _scroll_cursor_into_view running OUTSIDE
+    _do_refresh_table with force=True (8 -> 1, the cursor's row). It needs the
+    overlap, so it only reproduced under load — the monotonic-wheel harness caught
+    it in 2 of 4 runs on a busy machine and 0 of 4 when idle. This asserts the
+    nesting directly instead of waiting for that race. (#suppression-depth)"""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_cursor_scroll_suppression_nests_across_overlapping_rebuilds")
+        return
+    import asyncio
+    from textual.app import App
+    for _ in range(40):
+        _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(120, 18)) as pilot:
+                await pilot.pause(0.4)
+                table = self.query_one("#table")
+                table.move_cursor(row=1, scroll=True)     # cursor near the top
+                table.scroll_to(y=12, animate=False)      # viewport away from it
+                await pilot.pause(0.2)
+                facts["start"] = table.scroll_offset.y
+                table._begin_cursor_scroll_suppression()  # rebuild 1's window
+                table._begin_cursor_scroll_suppression()  # rebuild 2 starts, 1 draining
+                table._end_cursor_scroll_suppression()    # rebuild 1's queued end
+                table._scroll_cursor_into_view()          # rebuild 2's queued scroll
+                facts["still_open"] = table.scroll_offset.y
+                table._end_cursor_scroll_suppression()    # rebuild 2's queued end
+                table._scroll_cursor_into_view()          # a real navigation
+                await pilot.pause(0.2)
+                facts["closed"] = table.scroll_offset.y
+                # An unpaired end must not push the depth negative: that would
+                # suppress cursor scrolling for the rest of the session.
+                table._end_cursor_scroll_suppression()
+                table._end_cursor_scroll_suppression()
+                facts["depth"] = table._cursor_scroll_depth
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+    assert facts.get("start", 0) > 0, f"test setup: table did not scroll: {facts}"
+    assert facts["still_open"] == facts["start"], \
+        ("the second window's scroll ran after the first window closed "
+         f"({facts['start']} -> {facts['still_open']})")
+    assert facts["closed"] < facts["start"], \
+        f"suppression never lifted — a real navigation cannot scroll: {facts}"
+    assert facts["depth"] == 0, f"depth went negative: {facts}"
+
 
 if __name__ == "__main__":
     test_resolve_leader_defaults_on()
@@ -3247,3 +3317,5 @@ if __name__ == "__main__":
     print("PASS test_pilot_rebuild_is_deferred_while_the_list_is_scrolling")
     test_pilot_wheel_scroll_is_monotonic_under_constant_rebuilds()
     print("PASS test_pilot_wheel_scroll_is_monotonic_under_constant_rebuilds")
+    test_pilot_cursor_scroll_suppression_nests_across_overlapping_rebuilds()
+    print("PASS test_pilot_cursor_scroll_suppression_nests_across_overlapping_rebuilds")

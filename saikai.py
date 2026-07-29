@@ -4875,7 +4875,23 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         # toward the cursor row, and mid-wheel that reads as the list jumping back.
         # MEASURED in a Textual harness: this path alone produced 3 A->B->A jumps in a
         # scroll even with the deferred restore removed. (#scroll-fight)
-        _suppress_cursor_scroll = False
+        #
+        # A DEPTH, not a flag: the windows OVERLAP. Each window ends on a queued
+        # callback (the watcher's scroll is queued too, and only FIFO puts our end
+        # behind it), so while one window is draining the next rebuild opens another —
+        # and a boolean let the FIRST end close the SECOND window:
+        #
+        #   rebuild1: clear -> queue A1 | move_cursor -> flag=True, queue B1, end1
+        #   rebuild2: clear -> queue A2 | move_cursor -> flag=True, queue B2, end2
+        #   drain:    A1 ok  B1 ok  end1 -> flag=False  A2 SCROLLS (window 2 was open)
+        #
+        # That is the last of the scroll oscillation: it needs a rebuild to start
+        # before the previous one's callbacks drain, so it only shows under load — the
+        # monotonic-wheel harness caught it in 2 of 4 runs while the machine was busy
+        # and 0 of 4 when idle, always as ONE sample at the cursor row. Counting
+        # nests the windows: end1 leaves the depth at 1, so A2 is still suppressed.
+        # (#scroll-fight #suppression-depth)
+        _cursor_scroll_depth = 0
 
         # Bumped on every wheel notch, so a rebuild can tell "the scroll position I
         # saved is still the user's" from "the user has moved since". Comparing
@@ -4968,7 +4984,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self._user_scroll_y = None
                 return super().move_cursor(row=row, column=column,
                                            animate=animate, scroll=scroll)
-            self._suppress_cursor_scroll = True
+            self._begin_cursor_scroll_suppression()
             try:
                 return super().move_cursor(row=row, column=column,
                                            animate=animate, scroll=scroll)
@@ -4981,13 +4997,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 try:
                     self.call_after_refresh(self._end_cursor_scroll_suppression)
                 except Exception:
-                    self._suppress_cursor_scroll = False
+                    self._end_cursor_scroll_suppression()
+
+        def _begin_cursor_scroll_suppression(self) -> None:
+            self._cursor_scroll_depth = getattr(self, "_cursor_scroll_depth", 0) + 1
 
         def _end_cursor_scroll_suppression(self) -> None:
-            self._suppress_cursor_scroll = False
+            # Clamped: an end whose begin was lost (the except path above, or a
+            # rebuild that raised between them) must not push the depth negative and
+            # leave cursor scrolling suppressed for the rest of the session.
+            self._cursor_scroll_depth = max(
+                0, getattr(self, "_cursor_scroll_depth", 0) - 1)
 
         def _scroll_cursor_into_view(self, animate: bool = False) -> None:
-            if self._suppress_cursor_scroll:
+            if getattr(self, "_cursor_scroll_depth", 0) > 0:
                 return
             return super()._scroll_cursor_into_view(animate=animate)
 
@@ -6574,10 +6597,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Suppress cursor-driven scrolling for the whole rebuild; re-enabled on a
             # queued callback below, which FIFO puts behind the watcher's. The FIRST
             # paint is exempt so the one-shot attention-home jump can still scroll.
+            # The suppression NESTS (see _cursor_scroll_depth): a rebuild that starts
+            # while the previous one's callbacks are still draining opens a second
+            # window, and closing it with a flag let the first end re-arm the
+            # watcher's queued scroll. (#scroll-fight #suppression-depth)
             _suppress_scroll = bool(getattr(self, "_did_attention_home", False))
             if _suppress_scroll:
                 try:
-                    table._suppress_cursor_scroll = True
+                    table._begin_cursor_scroll_suppression()
                 except Exception:
                     _suppress_scroll = False
             table.clear(columns=True)
@@ -6992,7 +7019,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     table.call_after_refresh(table._end_cursor_scroll_suppression)
                 except Exception:
                     try:
-                        table._suppress_cursor_scroll = False
+                        table._end_cursor_scroll_suppression()
                     except Exception:
                         pass
             self._update_subtitle()
