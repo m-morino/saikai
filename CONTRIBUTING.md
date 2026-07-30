@@ -42,6 +42,27 @@ git config core.hooksPath .githooks      # runs .githooks/pre-push on every push
 
 It blocks the push if any suite fails (override, discouraged: `SKIP_TESTS=1 git push`).
 
+Running the whole glob still is not the whole suite if a test is gated on the
+platform. A body behind `if sys.platform in ("win32", "darwin"): return` never runs on
+your machine, so nothing local can fail on it — CI on Linux finds it instead (a
+`ct.app = ...` assignment that raises "property 'app' has no setter", found exactly
+that way). Force the platform in the test rather than leaving the body to CI:
+
+```python
+rt.sys.platform = "darwin"      # in a try/finally that restores it
+```
+
+and for a widget attribute that is a read-only property (`app`, `size`, `has_focus`),
+stand it in on a throwaway subclass — a plain class attribute there shadows the
+property, so the instance assignment lands in `__dict__`:
+
+```python
+class _Pane(rt.ClaudeTerminal):
+    app = None
+ct = _Pane.__new__(_Pane)
+ct.app = _FakeApp()
+```
+
 Most suites also run without textual / pyte / a PTY backend through soft
 imports. With textual installed, `test_split_divider.py` and
 `test_keyboard_leader.py` additionally use `App.run_test()` + `Pilot` to verify

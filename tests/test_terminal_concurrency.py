@@ -3710,13 +3710,21 @@ def test_pane_copy_tries_native_linux_tools_before_osc52():
         print("SKIP test_pane_copy_tries_native_linux_tools_before_osc52 (needs the "
               "non-win32/darwin branch; the chain itself is covered above)")
         return
-    ct = rt.ClaudeTerminal.__new__(rt.ClaudeTerminal)
     used = []
 
     class _App:
         def copy_to_clipboard(self, text):
             used.append("osc52")
 
+    # Widget.app is a read-only PROPERTY, so it can only be stood in for on a
+    # throwaway subclass — a plain class attribute there shadows the property, and the
+    # instance assignment then lands in __dict__. Assigning ct.app directly raises
+    # "property 'app' has no setter", and because this test SKIPS on win32/darwin the
+    # local run never said so: CI on Linux did. (#linux-clipboard)
+    class _Pane(rt.ClaudeTerminal):
+        app = None
+
+    ct = _Pane.__new__(_Pane)
     ct.app = _App()
     saved = rt.set_clipboard_linux
     try:
@@ -3730,6 +3738,7 @@ def test_pane_copy_tries_native_linux_tools_before_osc52():
         assert used == ["native", "osc52"], "must fall back to OSC-52: %s" % used
     finally:
         rt.set_clipboard_linux = saved
+
 
 def test_a_query_split_at_a_csi_intermediate_is_held():
     """_hold_partial_escape must cover the CSI INTERMEDIATE bytes (0x20-0x2F), not just
