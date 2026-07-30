@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-07-30
+
 A cross-terminal audit of the pane's own contract: what it tells a child it is, and
 what it actually does. Every item is a place the two disagreed, so the symptom only
 appeared on some hosts or under some children.
