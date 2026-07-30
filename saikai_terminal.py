@@ -1713,6 +1713,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         # The (rows, cols) last applied to pyte + the pty, so a Resize that didn't
         # change anything can be ignored. (#resize-noop)
         self._last_winsize: Optional[tuple] = None
+        # Whether the pyte screen + child have been started. The start waits for the
+        # pane's real geometry (see on_mount), so it can arrive from three places —
+        # mount, the first Resize, or a deferred callback — and must happen once.
+        # (#startup-size)
+        self._started = False
         # Rows owed a repaint (see _refresh_dirty_rows) and the cursor row that
         # was last asked for, so a cursor MOVE — which dirties nothing in pyte —
         # still clears the cell it left behind.
@@ -1753,6 +1758,45 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
     def on_mount(self) -> None:
+        """Start the pane — but at its REAL size, not at mount time.
+
+        At mount the widget has not been laid out yet: MEASURED, ``self.size`` is 0x0
+        inside on_mount and the true geometry arrives on the first Resize (which lands
+        before even a call_after_refresh callback). Starting here therefore handed the
+        child an 80x24 PTY from _dims's fallback: claude drew its whole startup UI
+        wrapped at 80 columns into a pyte grid that was then resized to the real width,
+        and pyte does NOT reflow — so the pane opened visibly broken, and the child kept
+        laying out for a size the pane did not have until its next full redraw.
+
+        A HIDDEN pane is the case the fallback exists for: an inactive
+        TabbedContent/ContentSwitcher tab is display:none, so it stays 0x0 and gets no
+        Resize until it is shown, yet it must still start so its child renders and the
+        status classifier can see a gate. The deferred callback starts it with the
+        fallback, exactly as before. (#startup-size)"""
+        if self._has_real_size():
+            self._start()
+            return
+        try:
+            self.call_after_refresh(self._start_when_sized)
+        except Exception:
+            # No message pump (a bare widget in a test): start immediately, which is
+            # the pre-existing behaviour.
+            self._start()
+
+    def _has_real_size(self) -> bool:
+        """True once layout has given this widget a usable geometry (see _dims)."""
+        return int(self.size.width or 0) >= 8 and int(self.size.height or 0) >= 4
+
+    def _start_when_sized(self) -> None:
+        """Deferred start: a VISIBLE pane has its size by now; a hidden one does not
+        and takes _dims's 80x24 fallback. (#startup-size)"""
+        if not getattr(self, "_started", False) and not self.is_dead:
+            self._start()
+
+    def _start(self) -> None:
+        if getattr(self, "_started", False):
+            return
+        self._started = True
         rows, cols = self._dims()
         try:
             # HistoryScreen keeps scrolled-off lines in .history.top so the pane
@@ -1768,6 +1812,11 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         except Exception as e:
             self._fail(f"spawn failed: {e!r}")
             return
+        # What the child was TOLD, so the Resize that follows a start from the real
+        # geometry is recognised as a no-op instead of re-signalling it. A start from
+        # _dims's hidden-pane fallback records 24x80, so the Resize that arrives when
+        # the tab is shown still differs and applies. (#startup-size #resize-noop)
+        self._last_winsize = (rows, cols)
         self._reader = threading.Thread(
             target=self._read_loop, name=f"pty-read-{self.sid or 'new'}",
             daemon=True,
@@ -2833,6 +2882,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     # ── (3) widget resize -> pyte + PTY ────────────────────────────────────────
     def on_resize(self, event) -> None:  # events.Resize
         if self._screen is None:
+            # Not started yet, and THIS is the first real geometry — it arrives before
+            # the deferred start callback. Start from it, so the child is born at the
+            # pane's size instead of being resized just after it drew its first screen
+            # at the fallback width. (#startup-size)
+            if (not getattr(self, "_started", False) and not self.is_dead
+                    and self._has_real_size()):
+                self._start()
             return
         rows, cols = self._dims()
         # Textual re-posts Resize on any relayout, so this fires with UNCHANGED

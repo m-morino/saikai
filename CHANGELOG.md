@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **A pane no longer opens at the wrong size.** At mount a widget has no layout yet
+  (measured: `size` is 0x0, the real geometry arriving on the first Resize), so the
+  child was spawned into an 80x24 PTY from the fallback: it drew its startup screen
+  wrapped at 80 columns into a grid that was then resized, and pyte does not reflow —
+  the pane opened broken and the child kept composing for a size it did not have. The
+  start now waits for the geometry; an inactive tab, which never gets one, still starts
+  on the fallback so its child renders and can be classified.
 - **A session parked on claude's agents view is reported as "Needs input".** The view
   states its own aggregate in the OSC-0 title (`1 awaiting input · claude agents`), but
   with no title spinner and no permission prompt in the body every existing signal said

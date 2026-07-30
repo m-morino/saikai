@@ -3974,6 +3974,77 @@ def test_agents_view_title_reports_needs_input():
     term.last_input_ts = _t.monotonic()
     assert term._classify(body, "1 awaiting input · claude agents") == "idle"
 
+def test_pane_starts_at_its_real_size_not_the_prelayout_fallback():
+    """A pane must hand its child the pane's OWN size, not _dims's fallback.
+
+    MEASURED: inside on_mount a widget has not been laid out — self.size is 0x0, and
+    the real geometry arrives on the first Resize (which lands before even a
+    call_after_refresh callback). Spawning in on_mount therefore gave the child an
+    80x24 PTY: it drew its whole startup screen wrapped at 80 columns into a pyte grid
+    that was then resized to the real width, and pyte does not reflow — so the pane
+    opened visibly broken and the child laid out for a size the pane did not have until
+    its next full redraw.
+
+    The 80x24 fallback still has to apply to a HIDDEN pane (an inactive
+    ContentSwitcher/TabbedContent tab is display:none → 0x0 forever, no Resize until it
+    is shown), because such a pane must still run so its child renders and the status
+    classifier can see a gate. Both halves are asserted here. (#startup-size)"""
+    try:
+        from textual.app import App, ComposeResult
+        from textual.containers import Horizontal
+        from textual.widgets import Static, ContentSwitcher
+    except Exception:
+        print("SKIP test_pane_starts_at_its_real_size_not_the_prelayout_fallback")
+        return
+    import asyncio
+
+    spawned: list = []
+
+    class _Probe(rt.AgentTerminal):
+        def _spawn(self, rows, cols):        # record what the CHILD was given
+            spawned.append((self.id, rows, cols))
+            return super()._spawn(rows, cols)
+
+    argv = [sys.executable, "-u", "-c", "import time; time.sleep(1.5)"]
+
+    class _Harness(App):
+        CSS = "#side { width: 20; } AgentTerminal { width: 1fr; }"
+
+        def compose(self) -> ComposeResult:
+            with Horizontal():
+                yield Static("list", id="side")
+                with ContentSwitcher(initial="shown", id="cs"):
+                    yield _Probe(argv, id="shown",
+                                 status_classifier=rt.classify_pty_status)
+                    yield _Probe(argv, id="hidden",
+                                 status_classifier=rt.classify_pty_status)
+
+    async def go():
+        app = _Harness()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause(0.4)
+            shown = app.query_one("#shown", _Probe)
+            facts = {
+                "widget": (shown.size.height, shown.size.width),
+                "pyte": (shown._screen.lines, shown._screen.columns),
+            }
+            for probe in app.query(_Probe):
+                probe.kill()
+            return facts
+
+    facts = asyncio.run(go())
+    by_id = {sid: (rows, cols) for sid, rows, cols in spawned}
+    assert set(by_id) == {"shown", "hidden"}, spawned
+    # The VISIBLE pane's child was born at the pane's geometry, not 24x80.
+    assert by_id["shown"] == facts["widget"], \
+        "child spawned at %s but the pane is %s" % (by_id["shown"], facts["widget"])
+    assert by_id["shown"] != (24, 80), "spawned at the pre-layout fallback"
+    # …and pyte agrees, so no resize-after-first-paint is needed to fix it up.
+    assert facts["pyte"] == facts["widget"], facts
+    # The HIDDEN pane still starts, on the fallback, so its child renders and can be
+    # classified while backgrounded.
+    assert by_id["hidden"] == (24, 80), by_id["hidden"]
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -4208,3 +4279,5 @@ if __name__ == "__main__":
     print("PASS test_a_dropped_sixel_image_is_reported_once")
     test_agents_view_title_reports_needs_input()
     print("PASS test_agents_view_title_reports_needs_input")
+    test_pane_starts_at_its_real_size_not_the_prelayout_fallback()
+    print("PASS test_pane_starts_at_its_real_size_not_the_prelayout_fallback")
