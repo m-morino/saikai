@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **A session parked on claude's agents view is reported as "Needs input".** The view
+  states its own aggregate in the OSC-0 title (`1 awaiting input · claude agents`), but
+  with no title spinner and no permission prompt in the body every existing signal said
+  idle — so a session where an agent was waiting for an answer sat in the Idle section.
+  The counts in the title now decide: `N awaiting input` reads as needs-input (it
+  outranks the spinner, since claude is saying a human is blocked) and `N working` as
+  running. Read from the title only: "Agents" occurs thousands of times in ordinary
+  conversation text, so a body scan would flag every session that merely discusses
+  agents. Verified by replaying a real capture — the same bytes classified idle before
+  and needs-input after.
+
 ## [0.6.1] — 2026-07-30
 
 A cross-terminal audit of the pane's own contract: what it tells a child it is, and

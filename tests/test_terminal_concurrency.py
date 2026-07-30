@@ -3928,6 +3928,52 @@ def test_a_dropped_sixel_image_is_reported_once():
     t3._consume("0q" + "~" * 5000)
     assert len(notes3) == 1 and "sixel" in notes3[0].lower(), notes3
 
+def test_agents_view_title_reports_needs_input():
+    """A session parked on claude's AGENTS view classified as idle while claude was
+    saying, in its own title, that somebody had to come and answer.
+
+    Layout from a real capture (2026-07-29 diag run): the view sets the OSC-0 title to
+    "1 awaiting input · claude agents" and paints the header
+    "1 awaiting input · 1 working · 16 completed". No title spinner and no permission
+    prompt in the body, so every existing signal said idle.
+
+    Read the TITLE, never the body: "Agents" occurs 4311 times in the same captures as
+    ordinary conversation text, so a body scan would flag every session that merely
+    discusses agents. And the title verdict has to survive _classify's alt-screen
+    demotion, which tames a BODY-TEXT waiting — the agents view is on the alt screen and
+    its body carries no _WAITING_RE phrase, so the demotion would silence it every
+    time. (#agents-view-status)"""
+    import time as _t
+
+    body = ("     ▖▖ ▝▝    1 awaiting input · 1 working · 16 completed\n"
+            "  research-spike      awaiting input\n"
+            "  b2-implementation   working\n")
+
+    # The title's own count decides, and it outranks even the spinner: "awaiting
+    # input" is claude telling us a human is blocked.
+    assert rt.classify_pty_status(body, "1 awaiting input · claude agents") == "waiting"
+    assert rt.classify_pty_status(body, "⠻ 2 awaiting input · claude agents") == "waiting"
+    # Nothing awaiting but work in flight → busy, not idle.
+    assert rt.classify_pty_status(
+        body, "0 awaiting input · 3 working · claude agents") == "busy"
+    # Everything finished → no verdict from the title; the normal path decides.
+    assert rt.classify_pty_status(body, "0 awaiting input · claude agents") == "idle"
+    assert rt.classify_pty_status(body, "claude agents") == "idle"
+    # A CONVERSATION whose title mentions agents is not the agents view: no counts.
+    assert rt.classify_pty_status("just some output", "✳ claude agents の使い方") == "idle"
+    assert rt.classify_pty_status("just some output", "⠻ claude agents の調査") == "busy"
+    # …and the body alone never decides it.
+    assert rt.classify_pty_status(body, "✳ ready") == "idle"
+
+    # The verdict survives the alt-screen demotion (the view runs on the alt screen).
+    term = rt.AgentTerminal(["agent"], status_classifier=rt.classify_pty_status)
+    term._alt.in_alt = True
+    term.last_input_ts = 0.0
+    assert term._classify(body, "1 awaiting input · claude agents") == "waiting"
+    # But while the user is DRIVING the view, it stays quiet like any other TUI.
+    term.last_input_ts = _t.monotonic()
+    assert term._classify(body, "1 awaiting input · claude agents") == "idle"
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -4160,3 +4206,5 @@ if __name__ == "__main__":
     print("PASS test_arrow_keys_follow_the_child_s_decckm_state")
     test_a_dropped_sixel_image_is_reported_once()
     print("PASS test_a_dropped_sixel_image_is_reported_once")
+    test_agents_view_title_reports_needs_input()
+    print("PASS test_agents_view_title_reports_needs_input")

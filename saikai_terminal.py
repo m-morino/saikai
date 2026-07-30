@@ -705,6 +705,38 @@ _MENU_RE = re.compile(r"(?:^\s*\d+\.\s+\S.*$\n?){2,}", re.MULTILINE)
 # screen by its characteristic wording instead.
 _TRUST_RE = re.compile(r"trust (?:this folder|the files in this folder)", re.IGNORECASE)
 
+# claude's AGENTS view reports its own aggregate in the OSC-0 title, with counts:
+# "1 awaiting input · claude agents" (observed in a 2026-07-29 capture, alongside the
+# body header "1 awaiting input · 1 working · 16 completed"). A session parked there
+# classified as IDLE — no title spinner, and the body has no permission prompt — while
+# claude was saying in as many words that somebody had to come and answer.
+#
+# Read the TITLE, never the body: "Agents" appears 4311 times in the same captures as
+# ordinary conversation text, so a body scan would flag every session that so much as
+# discusses agents (the false "needs input" bug this classifier already carries scars
+# from). Requiring "claude agents" in the title AND a count keeps a conversation whose
+# own title mentions agents out of it. (#agents-view-status)
+_AGENTS_TITLE_RE = re.compile(r"claude\s+agents\b", re.IGNORECASE)
+_AGENTS_AWAITING_RE = re.compile(r"(\d+)\s+awaiting\s+input", re.IGNORECASE)
+_AGENTS_WORKING_RE = re.compile(r"(\d+)\s+working", re.IGNORECASE)
+
+
+def _agents_view_status(title: str) -> Optional[str]:
+    """claude's agents-view aggregate, or None if this title is not that view.
+
+    None also covers "the view says nothing actionable" (everything completed), so
+    the caller falls through to the normal screen-based classification rather than
+    asserting idle from a title alone. (#agents-view-status)"""
+    if not title or not _AGENTS_TITLE_RE.search(title):
+        return None
+    match = _AGENTS_AWAITING_RE.search(title)
+    if match and int(match.group(1)) > 0:
+        return "waiting"
+    match = _AGENTS_WORKING_RE.search(title)
+    if match and int(match.group(1)) > 0:
+        return "busy"
+    return None
+
 
 def classify_pty_status(screen_text: str, title: str = "") -> str:
     """Classify into ``"busy"`` / ``"waiting"`` / ``"idle"``.
@@ -719,9 +751,16 @@ def classify_pty_status(screen_text: str, title: str = "") -> str:
     must not flip an actively-working pane to "waiting" (the false "needs input"
     bug — it fired on essentially every multi-step session). Only when NOT
     generating does a visible permission/forced-choice prompt mean "waiting".
-    Priority: Busy (title spinner) > Waiting (visible prompt) > Busy (body
-    markers) > Idle. `screen_text` should be the CURRENT screen (pyte .display).
+    Priority: Agents view (title counts) > Busy (title spinner) > Waiting (visible
+    prompt) > Busy (body markers) > Idle. `screen_text` should be the CURRENT screen
+    (pyte .display).
     """
+    # The agents view states its own aggregate in the title, so it outranks even the
+    # spinner: "N awaiting input" is claude telling us a human is blocked, and unlike
+    # a body scrape it cannot be a half-streamed frame. (#agents-view-status)
+    agents = _agents_view_status(title)
+    if agents is not None:
+        return agents
     # claude's title spinner = actively working: the definitive real-time signal
     # (reliable, survives scrollback). Check it FIRST — and skip the screen
     # ANSI-strip entirely on the common busy tick (the .display can be huge).
@@ -3608,6 +3647,13 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         if st == "waiting" and alt is not None and alt.in_alt:
             if (time.monotonic() - getattr(self, "last_input_ts", 0.0)) < 4.0:
                 return "idle"                      # (a) user navigating a TUI
+            if _agents_view_status(title) == "waiting":
+                # (b) tames a BODY-TEXT waiting, and the agents view's verdict comes
+                # from the TITLE's own count — it cannot be a half-streamed frame or a
+                # finished answer that merely looks like a menu. Its body carries no
+                # _WAITING_RE phrase at all, so (b) would silence it every time.
+                # (#agents-view-status)
+                return st
             tail = _ANSI_RE.sub("", (txt or "")[-2000:])
             if not (_WAITING_RE.search(tail) or _TRUST_RE.search(txt or "")):
                 return "idle"                      # (b) bare numbered list
