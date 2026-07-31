@@ -4045,6 +4045,73 @@ def test_pane_starts_at_its_real_size_not_the_prelayout_fallback():
     # classified while backgrounded.
     assert by_id["hidden"] == (24, 80), by_id["hidden"]
 
+def test_a_stopped_pane_never_spawns_a_child_nobody_reaps():
+    """Closing a pane before its first layout must not still start a claude.
+
+    is_dead is NOT the "this pane is over" flag: kill() clears _pty/_pid and sets
+    _stop but leaves is_dead False (only _fail and _finalize set it). Since the start
+    now WAITS for the pane's real geometry, that opened a window: a pane closed with
+    Esc — or killed by kill_all() during quit — before its first Resize walked
+    straight into _start(), spawning a brand-new claude PTY for a widget already
+    unmounted and forgotten by LiveSessionManager. Nothing would ever reap it: saikai
+    exits and that child plus its node workers keep running invisibly, holding the
+    session file and RAM.
+
+    All three entry points are covered because the check lives in _start itself.
+    (#no-spawn-after-stop)"""
+    spawned: list = []
+
+    class _Probe(rt.AgentTerminal):
+        def _spawn(self, rows, cols):
+            spawned.append((rows, cols))     # never reached while stopped
+        def _dims(self):
+            return (24, 80)                  # no layout on a __new__-built widget
+        def _read_loop(self):
+            return None                      # no child to read from here
+
+    def _mk():
+        t = _Probe.__new__(_Probe)
+        t._started = False
+        t._stop = threading.Event()
+        t.is_dead = False
+        t._screen = None
+        t._spawn_error = None
+        return t
+
+    # 1. the deferred callback
+    t = _mk()
+    t._stop.set()                            # kill() got there first
+    t._start_when_sized()
+    assert spawned == [], "deferred start spawned into a stopped pane"
+    assert t._screen is None and not t._started
+
+    # 2. _start called directly (mount path)
+    t = _mk()
+    t._stop.set()
+    t._start()
+    assert spawned == [], "_start spawned into a stopped pane"
+
+    # 3. the Resize backstop — the pane is stopped, the geometry has just arrived
+    class _Sized(_Probe):
+        def _has_real_size(self):
+            return True
+
+    t = _Sized.__new__(_Sized)
+    t._started = False
+    t._stop = threading.Event()
+    t._stop.set()
+    t.is_dead = False
+    t._screen = None
+    t._spawn_error = None
+    t.on_resize(type("E", (), {})())
+    assert spawned == [], "the resize backstop spawned into a stopped pane"
+
+    # …and a pane that is NOT stopped still starts (the guard is not a blanket refusal)
+    live = _mk()
+    live.sid = "t"
+    live._start()
+    assert live._started is True and spawned == [(24, 80)],         "a live pane must still start: %r" % (spawned,)
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -4281,3 +4348,5 @@ if __name__ == "__main__":
     print("PASS test_agents_view_title_reports_needs_input")
     test_pane_starts_at_its_real_size_not_the_prelayout_fallback()
     print("PASS test_pane_starts_at_its_real_size_not_the_prelayout_fallback")
+    test_a_stopped_pane_never_spawns_a_child_nobody_reaps()
+    print("PASS test_a_stopped_pane_never_spawns_a_child_nobody_reaps")

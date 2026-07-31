@@ -1790,11 +1790,24 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
     def _start_when_sized(self) -> None:
         """Deferred start: a VISIBLE pane has its size by now; a hidden one does not
         and takes _dims's 80x24 fallback. (#startup-size)"""
-        if not getattr(self, "_started", False) and not self.is_dead:
-            self._start()
+        if not getattr(self, "_started", False):
+            self._start()      # _start itself refuses once _stop is set
 
     def _start(self) -> None:
         if getattr(self, "_started", False):
+            return
+        # is_dead is NOT the "this pane is over" flag: kill() clears _pty/_pid and
+        # sets _stop but leaves is_dead False (only _fail and _finalize set it). So a
+        # pane closed with Esc — or killed by kill_all() during quit — in the window
+        # before its first Resize used to walk straight into a spawn: a brand-new
+        # claude PTY for a widget already unmounted and forgotten by
+        # LiveSessionManager, which therefore NOTHING reaps. saikai exits and that
+        # child plus its node workers keep running invisibly. _stop is the flag every
+        # teardown path actually sets, and it is checked HERE so all three entry
+        # points (mount, the deferred callback, the Resize backstop) are covered.
+        # (#no-spawn-after-stop)
+        stop = getattr(self, "_stop", None)
+        if (stop is not None and stop.is_set()) or self.is_dead:
             return
         self._started = True
         rows, cols = self._dims()
@@ -2886,9 +2899,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # the deferred start callback. Start from it, so the child is born at the
             # pane's size instead of being resized just after it drew its first screen
             # at the fallback width. (#startup-size)
-            if (not getattr(self, "_started", False) and not self.is_dead
-                    and self._has_real_size()):
-                self._start()
+            if not getattr(self, "_started", False) and self._has_real_size():
+                self._start()  # _start itself refuses once _stop is set
             return
         rows, cols = self._dims()
         # Textual re-posts Resize on any relayout, so this fires with UNCHANGED
