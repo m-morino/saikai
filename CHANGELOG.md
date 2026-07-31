@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **A single bad frame no longer freezes the mirror for the session.** The drain thread
+  is the only consumer of the ingest queue and its body was unguarded, so one raise
+  ended it: browsers sat on their last frame forever while the local UI looked fine.
+  Mirror problems now also reach `saikai.log`.
+- **A single bad chunk no longer kills a pane and orphans its claude.** An exception
+  escaping `_consume` ended the reader loop, which marked the pane dead — and a dead
+  pane is forgotten, not killed, so its child outlived saikai untracked.
 - **A recycled pid can no longer get an unrelated process tree force-killed.** Nothing
   records `procStart` on Windows, so the agent-kill guard fell through to the image
   name — and `node.exe` is on the accepted list. On the machine this was found on, the

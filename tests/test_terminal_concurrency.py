@@ -4173,6 +4173,56 @@ def test_pane_reap_refuses_a_recycled_pid():
     finally:
         rt._proc_start_token = prev
 
+def test_reader_survives_a_chunk_that_raises():
+    """One bad chunk must cost the chunk, not the pane.
+
+    Only pty.read() was guarded, so anything escaping the long _consume pipeline (scrub
+    → pyte feed → query answers → classify → mirror tee) left the loop into
+    `finally: self._finalize()`. The pane went dead with an "x" and the host's exit
+    callback merely FORGETS it without killing the child, so that claude became
+    untracked: it outlived kill_all and join_all_reaps and kept running after saikai
+    exited. (#reader-survives-a-chunk)"""
+    import time as _time
+
+    chunks = ["one", "BOOM", "two", "BOOM", "three"]
+    fed: list = []
+    finalized: list = []
+
+    t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+    t._stop = threading.Event()
+    t._scroll = 0
+    t._frozen = False
+
+    class _Pty:
+        def read(self, _n):
+            if not chunks:
+                raise EOFError
+            return chunks.pop(0)
+
+        def isalive(self):
+            return True
+
+    t._pty = _Pty()
+
+    def _consume(chunk):
+        if chunk == "BOOM":
+            raise ValueError("bad chunk")
+        fed.append(chunk)
+        return True
+
+    t._consume = _consume
+    t._schedule_pane_refresh = lambda: None
+    t._flush_sync_output = lambda reason: False
+    t._finalize = lambda: finalized.append(True)
+
+    t._read_loop()
+
+    assert fed == ["one", "two", "three"], \
+        "the reader stopped after a bad chunk: %r" % (fed,)
+    assert getattr(t, "_consume_errors", 0) == 2, getattr(t, "_consume_errors", 0)
+    # It still finalizes on real EOF — the child ending must reach the host.
+    assert finalized == [True], "EOF no longer finalizes the pane"
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -4413,3 +4463,5 @@ if __name__ == "__main__":
     print("PASS test_a_stopped_pane_never_spawns_a_child_nobody_reaps")
     test_pane_reap_refuses_a_recycled_pid()
     print("PASS test_pane_reap_refuses_a_recycled_pid")
+    test_reader_survives_a_chunk_that_raises()
+    print("PASS test_reader_survives_a_chunk_that_raises")

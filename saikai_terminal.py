@@ -3042,7 +3042,24 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                         break
                     time.sleep(0.01)
                     continue
-                changed = self._consume(chunk)
+                try:
+                    changed = self._consume(chunk)
+                except Exception as exc:
+                    # A bad chunk costs the CHUNK, not the pane. Only pty.read() was
+                    # guarded, so anything escaping the long pipeline (scrub → pyte
+                    # feed → query answers → classify → mirror tee) left the loop into
+                    # `finally: self._finalize()`: the pane went dead with an "x", and
+                    # the host's exit callback merely FORGETS it without killing the
+                    # child — so that claude became untracked, outlived kill_all and
+                    # join_all_reaps, and kept running after saikai exited. Repaint
+                    # anyway (pyte may be half-fed) and keep reading.
+                    # (#reader-survives-a-chunk)
+                    self._consume_errors = getattr(self, "_consume_errors", 0) + 1
+                    if self._consume_errors <= 3 or self._consume_errors % 100 == 0:
+                        _log("pane %s: dropped a chunk (%s: %s) [%d total]"
+                             % ((getattr(self, "sid", None) or "?")[:8],
+                                type(exc).__name__, exc, self._consume_errors))
+                    changed = True
                 # NEVER touch the UI from this thread — marshal a COALESCED
                 # repaint so a fast stream of small chunks can't flood the UI.
                 # While scrolled back (copy mode) the pinned view shows the SAME

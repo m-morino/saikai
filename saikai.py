@@ -11143,6 +11143,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                   file=sys.stderr)
                     else:
                         _log("mirror tls: OFF by SAIKAI_MIRROR_TLS opt-out")
+                    # Mirror problems into saikai.log (the module is standalone
+                    # and has no logger of its own). (#drain-survives-a-frame)
+                    try:
+                        _mirror.LOG_HOOK = _log
+                    except Exception:
+                        pass
                     _hub = _mirror.MirrorHub(
                         token=_secrets.token_urlsafe(12), host=_mir_host,
                         port=_mirror.mirror_port(os.environ),

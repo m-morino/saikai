@@ -863,6 +863,52 @@ def test_hub_screen_keeps_text_after_a_width_zero_character():
         got = row0(h._screen)
         assert keep in got, "hub screen dropped the run after a width-0 char: %r" % got
 
+def test_drain_thread_survives_a_frame_that_raises():
+    """The mirror's drain thread is the ONLY consumer of the ingest queue.
+
+    Its body was unguarded, so one raise from the pyte feed, the frame synth or a pane
+    frame ended it for good. The local UI kept working, so the mirror looked alive from
+    the host side while every attached browser sat frozen on its last frame forever —
+    and the overflow recovery that would have asked for a repaint lives inside this
+    loop, so it died with it, while broadcast()/pane_feed() kept filling a queue nobody
+    read. (#drain-survives-a-frame)"""
+    import queue as _queue
+    import threading as _threading
+    import time as _time
+
+    hub = m.MirrorHub.__new__(m.MirrorHub)
+    hub._stopped = _threading.Event()
+    hub._ingest = _queue.Queue(64)
+    seen: list = []
+    logged: list = []
+
+    def _one(data):
+        if data == "BOOM":
+            raise ValueError("bad frame")
+        seen.append(data)
+
+    hub._drain_one = _one
+    prev_hook, m.LOG_HOOK = m.LOG_HOOK, logged.append
+    try:
+        t = _threading.Thread(target=hub._drain_loop, daemon=True)
+        t.start()
+        for item in ("a", "BOOM", "b", "BOOM", "c"):
+            hub._ingest.put(item)
+        deadline = _time.monotonic() + 5
+        while seen != ["a", "b", "c"] and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+        hub._stopped.set()
+        t.join(timeout=3)
+    finally:
+        m.LOG_HOOK = prev_hook
+
+    assert seen == ["a", "b", "c"], \
+        "the drain thread stopped consuming after a bad frame: %r" % (seen,)
+    assert not t.is_alive(), "the drain thread did not stop when asked"
+    assert getattr(hub, "_drain_errors", 0) == 2, hub.__dict__.get("_drain_errors")
+    assert any("dropped a frame" in m and "ValueError" in m for m in logged), logged
+    assert all(m.startswith("[mirror]") for m in logged), logged
+
 
 if __name__ == "__main__":
     test_set_size_broadcasts_and_dedups()
@@ -907,3 +953,5 @@ if __name__ == "__main__":
     print("PASS test_overflow_repaint_is_gated_on_a_viewer_and_rate_limited")
     test_hub_screen_keeps_text_after_a_width_zero_character()
     print("PASS test_hub_screen_keeps_text_after_a_width_zero_character")
+    test_drain_thread_survives_a_frame_that_raises()
+    print("PASS test_drain_thread_survives_a_frame_that_raises")

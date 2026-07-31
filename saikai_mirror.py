@@ -287,6 +287,21 @@ def _synth_pane_seed(screen: "pyte.Screen", cols: int, rows: int,
     return "".join(parts)
 
 
+# The host installs its logger here (saikai.py: _mirror.LOG_HOOK = _log), so a mirror
+# problem lands in saikai.log instead of nowhere. None = silent, which keeps this module
+# importable and testable on its own. (#drain-survives-a-frame)
+LOG_HOOK = None
+
+
+def _mlog(msg: str) -> None:
+    try:
+        hook = LOG_HOOK
+        if hook is not None:
+            hook("[mirror] " + msg)
+    except Exception:
+        pass
+
+
 class MirrorHub:
     def __init__(self, token: str, host: str = "127.0.0.1", port: int = 0,
                  cols: int = 80, rows: int = 24, ingest_cap: int = 256,
@@ -585,37 +600,61 @@ class MirrorHub:
                 pass
 
     def _drain_loop(self):
+        """Consume the ingest queue for the life of the hub.
+
+        Every frame is handled inside its own guard, because this is the ONLY thread
+        that drains the queue: one raise from the pyte feed, the frame synth or a pane
+        frame used to end it for good. The local UI kept working, so the mirror looked
+        alive from the host side while every attached browser sat frozen on its last
+        frame forever — and the overflow recovery that would have asked for a repaint
+        lives inside this loop, so it died with it. broadcast()/pane_feed() meanwhile
+        kept filling a queue nobody was reading. Drop the frame, record it, keep
+        draining. (#drain-survives-a-frame)"""
+        errors = 0
         while not self._stopped.is_set():
             try:
                 data = self._ingest.get(timeout=0.25)
             except queue.Empty:
                 continue
-            if isinstance(data, (_PaneData, _PaneReset, _PaneMeta)):
-                self._drain_pane_frame(data)
-                # A pane frame never touches the app pyte; fall through only to
-                # the overflow recovery below.
-                self._drain_overflow_recovery()
-                continue
-            with self._mirror_lock:
-                self._stream.feed(data)
-                with self._clients_lock:
-                    targets = list(self._clients)
-                snapshot = None      # computed lazily, under the lock, for resyncs
-                ctrl = None
-                for cq in targets:
-                    try:
-                        cq.put_nowait(data)
-                    except queue.Full:
-                        # Fallen behind: resync with a full repaint instead of
-                        # drop-oldest (which splices the diff stream into permanent
-                        # corruption). (#audit-mirror-sse-drop)
-                        if snapshot is None:
-                            snapshot = _synth_full_frame(self._screen, self._cols, self._rows)
-                            if self._control_enabled:
-                                ctrl = _Control(json.dumps(
-                                    {"on": True, "target": self._control_target}))
-                        self._resync_client(cq, snapshot, ctrl)
+            try:
+                self._drain_one(data)
+            except Exception as exc:
+                errors += 1
+                self._drain_errors = errors
+                # First few, then every hundredth: a frame that always raises would
+                # otherwise flood the log at queue speed.
+                if errors <= 3 or errors % 100 == 0:
+                    _mlog("drain: dropped a frame (%s: %s) [%d total]"
+                          % (type(exc).__name__, exc, errors))
+
+    def _drain_one(self, data) -> None:
+        """Handle ONE ingest item. Raising here costs a frame, not the thread."""
+        if isinstance(data, (_PaneData, _PaneReset, _PaneMeta)):
+            self._drain_pane_frame(data)
+            # A pane frame never touches the app pyte; fall through only to
+            # the overflow recovery below.
             self._drain_overflow_recovery()
+            return
+        with self._mirror_lock:
+            self._stream.feed(data)
+            with self._clients_lock:
+                targets = list(self._clients)
+            snapshot = None      # computed lazily, under the lock, for resyncs
+            ctrl = None
+            for cq in targets:
+                try:
+                    cq.put_nowait(data)
+                except queue.Full:
+                    # Fallen behind: resync with a full repaint instead of
+                    # drop-oldest (which splices the diff stream into permanent
+                    # corruption). (#audit-mirror-sse-drop)
+                    if snapshot is None:
+                        snapshot = _synth_full_frame(self._screen, self._cols, self._rows)
+                        if self._control_enabled:
+                            ctrl = _Control(json.dumps(
+                                {"on": True, "target": self._control_target}))
+                    self._resync_client(cq, snapshot, ctrl)
+        self._drain_overflow_recovery()
 
     def _strip_pane_chunk(self, strip, text: str) -> str:
         """Strip child terminal queries from a pane chunk, HOLDING a DCS split
