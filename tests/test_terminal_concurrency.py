@@ -4125,16 +4125,29 @@ def test_pane_reap_refuses_a_recycled_pid():
     field 22 on Linux. None means nothing live holds the pid, and reaping that is a
     harmless no-op — only a MISMATCH is fatal, and only that is refused.
     (#pid-identity)"""
-    # The token itself, against real processes.
+    # The token itself, against real processes. Windows reads the creation FILETIME
+    # and Linux /proc/<pid>/stat; macOS/BSD have neither, so there the token is None
+    # for everything and the guard degrades to "cannot verify → allow" — the pre-fix
+    # behaviour, asserted below as case (c). CI runs all three, so this has to state
+    # which contract each platform actually has instead of assuming the strongest.
+    # Derived from what this machine can actually do, NOT from a platform guess: a
+    # forced-platform test lies (a Windows box told to be "linux" still has no /proc),
+    # and a Linux container without /proc mounted would too. If a token exists it has
+    # to behave; if none does, the degraded "cannot verify → allow" path is case (c).
     mine = rt._proc_start_token(os.getpid())
-    assert mine, "no token for our own pid"
-    assert rt._proc_start_token(os.getpid()) == mine, "token is not stable"
-    assert rt._proc_start_token(999999999) is None, "a dead pid produced a token"
+    if mine:
+        assert rt._proc_start_token(os.getpid()) == mine, "token is not stable"
+        assert rt._proc_start_token(999999999) is None, "a dead pid produced a token"
     assert rt._proc_start_token(0) is None and rt._proc_start_token(None) is None
 
-    reaped: list = []
+    # What the pane does with the pid, whichever mechanism this platform uses:
+    # Windows force-kills the TREE (taskkill /F /T), POSIX signals the child's own
+    # process group and closes the pty off-thread. The invariant under test is the
+    # same on both — pid 4242 may be TARGETED only when the identity still matches
+    # (or cannot be checked at all) — so record every path and assert on the target.
+    targeted: list = []
 
-    def _mk(token, current):
+    def _mk(token):
         t = rt.AgentTerminal.__new__(rt.AgentTerminal)
         t._stop = threading.Event()
         t._write_lock = threading.Lock()
@@ -4144,34 +4157,44 @@ def test_pane_reap_refuses_a_recycled_pid():
         t._pid = 4242
         t._pid_token = token
         t.sid = "s"
-        t._reap_tree = lambda pid: reaped.append(pid)
-        t._token_now = current
+        t._reap_tree = lambda pid: targeted.append(("reap-tree", pid))
+        t._reap_posix = lambda pty, pid: targeted.append(("reap-posix", pid))
         return t
 
-    prev = rt._proc_start_token
+    prev_token, prev_signal = rt._proc_start_token, rt._post_signal
     try:
-        # (a) the pid now belongs to somebody else → refuse
+        rt._post_signal = lambda pid, sig: targeted.append(("signal", pid))
+
+        # (a) the pid now belongs to somebody else → it must not be targeted
         rt._proc_start_token = lambda pid: "NEW-PROCESS"
-        t = _mk("OURS", "NEW-PROCESS")
-        t.kill()
-        assert reaped == [], "reaped a recycled pid: %r" % (reaped,)
-        # (b) it is still our child → reap
+        thread = _mk("OURS").kill()
+        if thread is not None:
+            thread.join(timeout=5)
+        assert not any(e[1] == 4242 for e in targeted), \
+            "a recycled pid was targeted: %r" % (targeted,)
+
+        # (b) it is still our child → target it
+        targeted.clear()
         rt._proc_start_token = lambda pid: "OURS"
-        t = _mk("OURS", "OURS")
-        thread = t.kill()
+        thread = _mk("OURS").kill()
         if thread is not None:
             thread.join(timeout=5)
-        assert reaped == [4242], "our own child was not reaped: %r" % (reaped,)
-        # (c) nothing holds the pid → the reap is a no-op, so allow it
-        reaped.clear()
+        assert any(e[1] == 4242 for e in targeted), \
+            "our own child was not targeted: %r" % (targeted,)
+
+        # (c) no token available — nothing live holds the pid, or the platform cannot
+        # say (macOS/BSD). Allow it: this is the pre-fix behaviour and reaping a pid
+        # nothing holds finds nothing.
+        targeted.clear()
         rt._proc_start_token = lambda pid: None
-        t = _mk("OURS", None)
-        thread = t.kill()
+        thread = _mk("OURS").kill()
         if thread is not None:
             thread.join(timeout=5)
-        assert reaped == [4242], "a vacant pid should still be reaped (no-op)"
+        assert any(e[1] == 4242 for e in targeted), \
+            "an unverifiable pid should still be reaped: %r" % (targeted,)
     finally:
-        rt._proc_start_token = prev
+        rt._proc_start_token, rt._post_signal = prev_token, prev_signal
+
 
 def test_reader_survives_a_chunk_that_raises():
     """One bad chunk must cost the chunk, not the pane.

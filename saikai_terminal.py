@@ -350,9 +350,18 @@ def _proc_start_token(pid: Optional[int]) -> Optional[str]:
     Windows: the process creation time (FILETIME), read with
     PROCESS_QUERY_LIMITED_INFORMATION so it works without elevation.
     Linux: /proc/<pid>/stat field 22, the same token claude records as procStart.
-    None means "no live process with this pid", which is NOT a failure — a reap of a
-    pid nothing holds finds nothing. A MISMATCH is the dangerous case, and it is the
-    one this makes visible. (#pid-identity)"""
+    macOS/BSD: no token — there is no /proc and no cheap start-time source (a `ps`
+    subprocess on the UI thread is what closing a pane must NOT do). The check
+    therefore degrades to "cannot verify → allow", i.e. exactly the behaviour that
+    existed everywhere before. That is a deliberately smaller gap than it sounds:
+    Windows is where pids are recycled aggressively AND where the reap is a blanket
+    `taskkill /F /T` of a whole tree, while the POSIX reap signals the child's own
+    process group.
+
+    None means "no token available" — either nothing live holds the pid, or this
+    platform cannot say. Neither is a failure: a reap of a pid nothing holds finds
+    nothing. A MISMATCH is the dangerous case, and it is the one this makes visible.
+    (#pid-identity)"""
     if not pid or pid <= 0:
         return None
     if _IS_WIN:
