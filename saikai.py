@@ -2048,9 +2048,10 @@ def _proc_start_matches(pid: int, procstart: str) -> bool:
     """True if `pid` is STILL the process the registry recorded — the pid-reuse
     guard for a kill. claude stores the OS process-start identity in `procStart`;
     on Linux that's /proc/<pid>/stat field 22 (start time in clock ticks since
-    boot), compared exactly. Without a recorded procStart, or off Linux where we
-    can't cheaply read it, fall back to the image-name check (weaker but the only
-    cross-platform signal). Never raises. (#agent-kill)"""
+    boot), compared exactly. On Windows nothing records procStart (census
+    2026-07-31: absent from every live registry entry), so the identity is rebuilt
+    from the process snapshot instead — see the branch below; an ambiguous image name
+    is not accepted on its own. Never raises. (#agent-kill #pid-identity)"""
     if pid <= 0:
         return False
     ps = (procstart or "").strip()
@@ -2066,10 +2067,40 @@ def _proc_start_matches(pid: int, procstart: str) -> bool:
         except OSError:
             pass
     if sys.platform == "win32":
+        # No procStart to compare against: a census of this machine's live registry
+        # (2026-07-31) found the key absent from every entry, so the guard has to be
+        # built from what the OS tells us. The image name alone is NOT enough —
+        # _CLAUDE_PROC_NAMES includes node.exe, one of the most common images on a
+        # developer machine (a VS Code extension host, an MCP server, a dev server,
+        # another project's toolchain). A recycled pid that happened to be any node
+        # passed this check and was then killed with /T, taking its whole tree.
+        #
+        # claude.exe is unambiguous, so accept it on the name. For node.exe, require
+        # that the process belongs to US: an ancestor that is a claude process, or
+        # saikai itself (a pane child is spawned by saikai, so our pid IS its parent).
+        # A node with no such ancestor is somebody else's, and we refuse rather than
+        # kill — refusing only loses the ability to kill, which is the safe direction.
+        # (#pid-identity)
         idx = _win_pid_index()
         info = idx.get(pid) if idx else None
         nm = (info[0] if info else "")
-        return bool(nm) and (nm in _CLAUDE_PROC_NAMES or nm.startswith("claude"))
+        if not nm:
+            return False                      # not alive, or we could not look
+        if nm.startswith("claude"):
+            return True
+        if nm not in _CLAUDE_PROC_NAMES:
+            return False
+        own, cur, hops = os.getpid(), (info[1] if info else 0), 0
+        while cur and hops < 12:               # bounded: a cycle must not spin
+            if cur == own:
+                return True                    # our own descendant
+            parent = idx.get(cur)
+            if parent is None:
+                return False
+            if parent[0].startswith("claude"):
+                return True
+            cur, hops = parent[1], hops + 1
+        return False
     return _linux_pid_is_claude(pid) if sys.platform.startswith("linux") else _is_pid_alive(pid)
 
 

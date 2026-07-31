@@ -336,6 +336,62 @@ def _child_pty_env(base_env, is_win: Optional[bool] = None) -> dict:
     return env
 
 
+def _proc_start_token(pid: Optional[int]) -> Optional[str]:
+    """An identity token for (pid, when it started), or None if nothing live holds it.
+
+    A pid alone does not identify a process: Windows recycles pids aggressively, and a
+    pane with eleven siblings churning node workers goes through them fast. kill()
+    reaps `self._pid` with `taskkill /F /T`, and _finalize leaves _pid set when the
+    child exits on its own — so a dead pane left open long enough, then closed (or
+    caught by kill_all at quit), force-killed whatever now holds that number AND every
+    descendant it has. The app-side agent kill guards this with a recorded start
+    identity; the pane path had nothing.
+
+    Windows: the process creation time (FILETIME), read with
+    PROCESS_QUERY_LIMITED_INFORMATION so it works without elevation.
+    Linux: /proc/<pid>/stat field 22, the same token claude records as procStart.
+    None means "no live process with this pid", which is NOT a failure — a reap of a
+    pid nothing holds finds nothing. A MISMATCH is the dangerous case, and it is the
+    one this makes visible. (#pid-identity)"""
+    if not pid or pid <= 0:
+        return None
+    if _IS_WIN:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            k32 = ctypes.windll.kernel32
+            k32.OpenProcess.restype = wintypes.HANDLE
+            handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
+                                     int(pid))
+            if not handle:
+                return None
+            try:
+                creation = wintypes.FILETIME()
+                exit_t = wintypes.FILETIME()
+                kernel = wintypes.FILETIME()
+                user = wintypes.FILETIME()
+                ok = k32.GetProcessTimes(handle, ctypes.byref(creation),
+                                         ctypes.byref(exit_t), ctypes.byref(kernel),
+                                         ctypes.byref(user))
+                if not ok:
+                    return None
+                return "%d" % ((creation.dwHighDateTime << 32)
+                               | creation.dwLowDateTime)
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:
+            return None
+    try:
+        raw = open("/proc/%d/stat" % int(pid), encoding="utf-8",
+                   errors="replace").read()
+        # after "comm)" the fields are state ppid … starttime = field 22 = index 19
+        return raw.rsplit(")", 1)[-1].split()[19]
+    except Exception:
+        return None
+
+
 # ── global reap-thread registry ───────────────────────────────────────────────
 # Every kill() spawns a daemon thread running `taskkill /F /T` to reap the
 # child's grandchildren (claude's node workers). If saikai exits before that
@@ -1872,6 +1928,9 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             except Exception:
                 pass
         self._pid = getattr(self._pty, "pid", None)
+        # Identity, not just a number: compared before the reap so a recycled pid is
+        # never force-killed with its whole tree. (#pid-identity)
+        self._pid_token = _proc_start_token(self._pid)
         _log(f"spawn: sid={(getattr(self, 'sid', None) or '?')[:8]} pid={self._pid}")
 
     def _fail(self, msg: str) -> None:
@@ -4286,6 +4345,19 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return None
         if pid:
             _log(f"kill: sid={(getattr(self, 'sid', None) or '?')[:8]} pid={pid}")
+        # Refuse to reap a pid that is no longer OUR child. _finalize leaves _pid set
+        # when the child exits on its own, so a dead pane closed later — or caught by
+        # kill_all at quit — would otherwise taskkill /F /T whatever now holds that
+        # number, and every descendant of it. A None token means nothing live holds the
+        # pid, and reaping that is a harmless no-op; only a MISMATCH is fatal.
+        # (#pid-identity)
+        token = getattr(self, "_pid_token", None)
+        if pid and token is not None:
+            current = _proc_start_token(pid)
+            if current is not None and current != token:
+                _log(f"kill: pid {pid} is NOT our child any more (pid reuse) — "
+                     "skipping the reap")
+                pid = None
         if _IS_WIN:
             if pty is not None:
                 try:

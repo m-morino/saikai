@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **A recycled pid can no longer get an unrelated process tree force-killed.** Nothing
+  records `procStart` on Windows, so the agent-kill guard fell through to the image
+  name — and `node.exe` is on the accepted list. On the machine this was found on, the
+  only node.exe running belonged to Adobe and the old check accepted it. A node now has
+  to have a claude (or saikai) ancestor, and the pane's own reap records the child's
+  start time at spawn and refuses to reap a pid whose start time no longer matches.
 - **A watchdog false positive can no longer kill a healthy session.** A failed process
   snapshot and an empty one were the same value, so a transient enumeration failure
   under load counted as a confirmed terminal death — two in a row reaped saikai's own

@@ -1212,6 +1212,59 @@ def test_new_session_scan_runs_off_the_ui_thread():
     assert "_new_session_scanning" in body, \
         "no re-entry guard: holding the key would pile up scans"
 
+def test_windows_pid_guard_needs_more_than_an_image_name():
+    """A recycled pid that happens to be a node must not pass as our agent.
+
+    Nothing records procStart on Windows (census of this machine's live registry,
+    2026-07-31: absent from every entry), so the guard fell back to the image name —
+    and _CLAUDE_PROC_NAMES includes node.exe, one of the most common images on a
+    developer box. MEASURED on the machine this was found on: the only node.exe running
+    belonged to Adobe (node.exe < ccxprocess.exe < adobe desktop service.exe) and the
+    old check accepted it, so a stale agent row plus Shift+K would have run
+    `taskkill /PID <pid> /T /F` on Adobe's tree.
+
+    claude.exe is unambiguous and still passes on its name. node.exe has to belong to
+    us: an ancestor that is a claude process, or saikai itself (a pane child's parent IS
+    our pid). Refusing is the safe direction — it loses only the ability to kill.
+    (#pid-identity)"""
+    own = os.getpid()
+    #        pid: (image, ppid)
+    INDEX = {
+        own: ("python.exe", 900),
+        900: ("pwsh.exe", 800),
+        # a top-level claude, parented by a shell
+        11: ("claude.exe", 900),
+        # a claude-spawned agent that runs as node
+        12: ("node.exe", 11),
+        # a node saikai spawned itself (pane child)
+        13: ("node.exe", own),
+        # somebody else's node: VS Code / Adobe / an MCP server
+        14: ("node.exe", 500),
+        500: ("code.exe", 400),
+        400: ("explorer.exe", 1),
+        # an unrelated image that shares nothing
+        15: ("ccxprocess.exe", 500),
+        # a ppid cycle must not spin forever
+        16: ("node.exe", 17),
+        17: ("node.exe", 16),
+    }
+    prev_platform, prev_index = saikai.sys.platform, saikai._win_pid_index
+    try:
+        saikai.sys.platform = "win32"
+        saikai._win_pid_index = lambda **kw: INDEX
+        verdicts = {pid: saikai._proc_start_matches(pid, "") for pid in
+                    (11, 12, 13, 14, 15, 16, 999999)}
+    finally:
+        saikai.sys.platform, saikai._win_pid_index = prev_platform, prev_index
+
+    assert verdicts[11] is True, "a claude.exe must still verify"
+    assert verdicts[12] is True, "a node under claude is ours"
+    assert verdicts[13] is True, "a node under saikai itself is ours"
+    assert verdicts[14] is False, "someone else's node.exe was accepted as our agent"
+    assert verdicts[15] is False, "an unrelated image was accepted"
+    assert verdicts[16] is False, "a ppid cycle must terminate and refuse"
+    assert verdicts[999999] is False, "a pid the snapshot has never seen was accepted"
+
 
 if __name__ == "__main__":
     test_hostile_inputs_degrade_instead_of_raising()
@@ -1280,3 +1333,5 @@ if __name__ == "__main__":
     print("PASS test_agent_kill_batch_runs_off_the_ui_thread")
     test_new_session_scan_runs_off_the_ui_thread()
     print("PASS test_new_session_scan_runs_off_the_ui_thread")
+    test_windows_pid_guard_needs_more_than_an_image_name()
+    print("PASS test_windows_pid_guard_needs_more_than_an_image_name")

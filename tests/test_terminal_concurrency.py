@@ -4112,6 +4112,67 @@ def test_a_stopped_pane_never_spawns_a_child_nobody_reaps():
     live._start()
     assert live._started is True and spawned == [(24, 80)],         "a live pane must still start: %r" % (spawned,)
 
+def test_pane_reap_refuses_a_recycled_pid():
+    """kill() must not force-kill a pid that is no longer our child.
+
+    _finalize marks the pane dead but leaves _pid set, so a dead pane left open — long
+    enough for Windows to hand that number to something else — and then closed, or
+    caught by kill_all at quit, ran `taskkill /F /T /PID <recycled>`: an unrelated
+    process AND every descendant of it. The app-side agent kill guards this; the pane
+    path had nothing at all.
+
+    The token is (pid, when it started): the creation FILETIME on Windows, /proc stat
+    field 22 on Linux. None means nothing live holds the pid, and reaping that is a
+    harmless no-op — only a MISMATCH is fatal, and only that is refused.
+    (#pid-identity)"""
+    # The token itself, against real processes.
+    mine = rt._proc_start_token(os.getpid())
+    assert mine, "no token for our own pid"
+    assert rt._proc_start_token(os.getpid()) == mine, "token is not stable"
+    assert rt._proc_start_token(999999999) is None, "a dead pid produced a token"
+    assert rt._proc_start_token(0) is None and rt._proc_start_token(None) is None
+
+    reaped: list = []
+
+    def _mk(token, current):
+        t = rt.AgentTerminal.__new__(rt.AgentTerminal)
+        t._stop = threading.Event()
+        t._write_lock = threading.Lock()
+        t._write_q = []
+        t._write_q_chars = 0
+        t._pty = None
+        t._pid = 4242
+        t._pid_token = token
+        t.sid = "s"
+        t._reap_tree = lambda pid: reaped.append(pid)
+        t._token_now = current
+        return t
+
+    prev = rt._proc_start_token
+    try:
+        # (a) the pid now belongs to somebody else → refuse
+        rt._proc_start_token = lambda pid: "NEW-PROCESS"
+        t = _mk("OURS", "NEW-PROCESS")
+        t.kill()
+        assert reaped == [], "reaped a recycled pid: %r" % (reaped,)
+        # (b) it is still our child → reap
+        rt._proc_start_token = lambda pid: "OURS"
+        t = _mk("OURS", "OURS")
+        thread = t.kill()
+        if thread is not None:
+            thread.join(timeout=5)
+        assert reaped == [4242], "our own child was not reaped: %r" % (reaped,)
+        # (c) nothing holds the pid → the reap is a no-op, so allow it
+        reaped.clear()
+        rt._proc_start_token = lambda pid: None
+        t = _mk("OURS", None)
+        thread = t.kill()
+        if thread is not None:
+            thread.join(timeout=5)
+        assert reaped == [4242], "a vacant pid should still be reaped (no-op)"
+    finally:
+        rt._proc_start_token = prev
+
 
 if __name__ == "__main__":
     test_osc_notification_parsing_and_notify_host()
@@ -4350,3 +4411,5 @@ if __name__ == "__main__":
     print("PASS test_pane_starts_at_its_real_size_not_the_prelayout_fallback")
     test_a_stopped_pane_never_spawns_a_child_nobody_reaps()
     print("PASS test_a_stopped_pane_never_spawns_a_child_nobody_reaps")
+    test_pane_reap_refuses_a_recycled_pid()
+    print("PASS test_pane_reap_refuses_a_recycled_pid")
