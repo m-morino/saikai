@@ -6,66 +6,88 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-07-31
+
+saikai closed itself mid-session and left the terminal unusable, and nothing on disk
+said why. This release is the answer to that: the cause, the two reasons it was
+invisible, and — from a first-principles audit of every path by which saikai can
+suddenly die — the rest of the family it belonged to.
+
 ### Fixed
-- **A single bad frame no longer freezes the mirror for the session.** The drain thread
-  is the only consumer of the ingest queue and its body was unguarded, so one raise
-  ended it: browsers sat on their last frame forever while the local UI looked fine.
-  Mirror problems now also reach `saikai.log`.
-- **A single bad chunk no longer kills a pane and orphans its claude.** An exception
-  escaping `_consume` ended the reader loop, which marked the pane dead — and a dead
-  pane is forgotten, not killed, so its child outlived saikai untracked.
+- **A watchdog false positive can no longer kill a healthy session.** The
+  terminal-death watchdog reaps saikai's own tree when it can no longer find a shell
+  ancestor, and "the walk found nothing" and "the walk did not run" were the same
+  value: the snapshot helper returns `{}` for every failure, which the ancestor walk
+  reports as 0, which the watchdog reads as "the terminal is gone". A transient
+  `CreateToolhelp32Snapshot` failure — documented under heavy process churn, which is
+  what a saikai with eleven panes produces — therefore counted as a confirmed terminal
+  death, and two in a row killed every live pane. Failures now raise instead, so the
+  watchdog's own "inconclusive → reset the streak" branch finally works; a truncated
+  snapshot, or one that does not contain our own pid, counts as a failure too.
+- **An abrupt exit no longer leaves the terminal broken.** Two separate reasons the
+  cleanup never landed: the mode reset wrote to `sys.stderr`, which Textual replaces
+  for the app's whole life with a capture whose `isatty()` returns True on purpose — so
+  the mouse/paste/focus disables went to the app instead of the terminal, and a wheel
+  scroll at the recovered prompt sprayed escape sequences. And nothing ever sent
+  `?1049l`, so the shell prompt was drawn over the alternate screen with the scrollback
+  out of reach. The reset writes to `sys.__stderr__` now, and the paths that bypass
+  Textual's teardown leave the alternate buffer themselves.
+- **An abrupt exit explains itself in the log.** Unhandled exceptions on the main
+  thread AND in background threads (a pty reader, the mirror server, a reap — their
+  deaths were completely silent) are written to `saikai.log` with their traceback,
+  interpreter faults go to `crash.log` via faulthandler, and every clean exit logs
+  `stop: exiting`, so a log that simply stops is now itself a signal. The watchdog
+  logs when it arms, every miss, every NEAR miss — a session one poll from being
+  reaped — and the kill decision.
+- **Blocking work no longer freezes the UI.** The Windows clipboard fallback ran on the
+  UI thread with no timeout, and it is reached exactly when another process holds the
+  clipboard, i.e. when it is certain to block: the event loop stopped dead, with an
+  external kill as the only way out. It and the macOS one are bounded now. The
+  agent-kill batch (one `taskkill` per target, up to 10s each) moved to a worker that is
+  joined at exit, and the new-session candidate walk (`git worktree list` plus up to 40
+  directory stats) no longer runs inline.
 - **A recycled pid can no longer get an unrelated process tree force-killed.** Nothing
   records `procStart` on Windows, so the agent-kill guard fell through to the image
   name — and `node.exe` is on the accepted list. On the machine this was found on, the
-  only node.exe running belonged to Adobe and the old check accepted it. A node now has
-  to have a claude (or saikai) ancestor, and the pane's own reap records the child's
-  start time at spawn and refuses to reap a pid whose start time no longer matches.
-- **A watchdog false positive can no longer kill a healthy session.** A failed process
-  snapshot and an empty one were the same value, so a transient enumeration failure
-  under load counted as a confirmed terminal death — two in a row reaped saikai's own
-  tree. Failures are now distinguished (and a truncated snapshot, or one missing our
-  own pid, is a failure too).
-- **An abrupt exit leaves the alternate screen.** ?1049l is now sent on the paths that
-  bypass Textual's teardown, so the shell prompt is not drawn over the alt buffer with
-  the scrollback out of reach.
-- **Blocking work no longer freezes the UI.** The Windows/macOS clipboard fallbacks got
-  timeouts (the Windows one is reached exactly when another process holds the clipboard,
-  i.e. when it will block), the agent-kill batch moved to a tracked worker, and the
-  new-session candidate walk (`git worktree list` + up to 40 stats) no longer runs
-  inline.
-- **A pane closed before its first layout no longer spawns a child nobody reaps.**
-- **An abrupt exit no longer leaves the shell spraying escape sequences.** The mode
-  reset wrote to `sys.stderr`, which Textual replaces with a capture whose `isatty()`
-  returns True for the app's whole life — so the disable sequences went to the app, not
-  the terminal, and a wheel scroll at the recovered prompt printed garbage. It writes to
-  `sys.__stderr__` now.
-- **The terminal-death watchdog says what it did.** It exits with `os._exit`, so a
-  false positive killed a healthy session leaving the log ending on an ordinary line.
-  It now logs arming, every miss, every NEAR miss (a session one poll from being
-  reaped), and the kill decision.
-- **An abrupt exit now explains itself.** saikai closed mid-session and nothing on
-  disk said why: the log ended on an ordinary line, and the one handler that catches a
-  UI crash printed to stderr only. Unhandled exceptions (main thread AND background
-  threads, whose deaths were silent) are written to `saikai.log` with their traceback,
-  interpreter faults go to `crash.log` via faulthandler, and every clean exit logs
-  `stop: exiting` — so a log that simply stops is now itself a signal.
+  only node.exe running belonged to Adobe, and the old check accepted it as our agent. A
+  node now has to have a claude (or saikai) ancestor, and the pane's own reap records
+  the child's start time at spawn and refuses a pid whose start time no longer matches.
+- **A single bad frame no longer freezes the mirror for the rest of the session.** The
+  drain thread is the only consumer of the ingest queue and its body was unguarded, so
+  one raise ended it: attached browsers sat on their last frame forever while the local
+  UI looked perfectly fine. Mirror problems now also reach `saikai.log`.
+- **A single bad chunk no longer kills a pane and orphans its claude.** An exception
+  escaping `_consume` ended the reader loop, which marked the pane dead — and a dead
+  pane is forgotten, not killed, so its child outlived saikai untracked.
 - **A pane no longer opens at the wrong size.** At mount a widget has no layout yet
-  (measured: `size` is 0x0, the real geometry arriving on the first Resize), so the
-  child was spawned into an 80x24 PTY from the fallback: it drew its startup screen
-  wrapped at 80 columns into a grid that was then resized, and pyte does not reflow —
-  the pane opened broken and the child kept composing for a size it did not have. The
-  start now waits for the geometry; an inactive tab, which never gets one, still starts
-  on the fallback so its child renders and can be classified.
-- **A session parked on claude's agents view is reported as "Needs input".** The view
-  states its own aggregate in the OSC-0 title (`1 awaiting input · claude agents`), but
-  with no title spinner and no permission prompt in the body every existing signal said
-  idle — so a session where an agent was waiting for an answer sat in the Idle section.
-  The counts in the title now decide: `N awaiting input` reads as needs-input (it
-  outranks the spinner, since claude is saying a human is blocked) and `N working` as
-  running. Read from the title only: "Agents" occurs thousands of times in ordinary
-  conversation text, so a body scan would flag every session that merely discusses
-  agents. Verified by replaying a real capture — the same bytes classified idle before
-  and needs-input after.
+  (measured: `size` is 0x0, with the real geometry arriving on the first Resize), so the
+  child was spawned into an 80x24 PTY from the fallback: it drew its whole startup
+  screen wrapped at 80 columns into a grid that was then resized, and pyte does not
+  reflow. The start waits for the geometry now; an inactive tab, which never gets one,
+  still starts on the fallback so its child renders and can be classified.
+- **A pane closed before its first layout no longer spawns a child nobody reaps.**
+
+### Changed
+- **A session parked on claude's agents view reports "Needs input".** The view states
+  its own aggregate in the OSC-0 title (`1 awaiting input · claude agents`), but with no
+  title spinner and no permission prompt in the body every existing signal said idle —
+  so a session where an agent was waiting for an answer sat in the Idle section. The
+  counts in the title now decide: `N awaiting input` reads as needs-input and outranks
+  the spinner, `N working` as running. Read from the title only, never the body:
+  "Agents" occurs thousands of times in ordinary conversation text.
+- **The mirror's read token is half as long** — 8 url-safe characters instead of 16, so
+  the URL is 42 characters to type on a phone and its QR is sparser. The strength comes
+  from the hub's own guessing budget rather than the token: a bad read token arms a
+  per-source 30s lockout after 50 attempts, with the source normalised to an IPv6 /64 so
+  rotation cannot dodge it. The write-key is unchanged and still never appears in a URL,
+  file, QR or log.
+
+### Known limitations
+- The pid-identity guard is strong on Windows and Linux only. macOS/BSD have no cheap
+  process-start-time source (a `ps` subprocess on the UI thread is exactly what this
+  release removed elsewhere), so there it degrades to "cannot verify → proceed", which
+  is what every platform did before. Windows is where pids are recycled aggressively
+  AND where the reap is a blanket tree kill.
 
 ## [0.6.1] — 2026-07-30
 
