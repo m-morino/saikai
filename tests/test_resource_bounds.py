@@ -973,7 +973,8 @@ def test_terminal_watchdog_logs_before_it_kills():
     try:
         saikai.sys.platform = "win32"
         saikai._find_terminal_anchor = _fake_anchor
-        saikai._win_pid_index = lambda: {}
+        # accepts strict=: the watchdog poll asks for the strict index now
+        saikai._win_pid_index = lambda **kw: {os.getpid(): ("py.exe", 1)}
         saikai.subprocess.run = lambda *a, **kw: killed.append(("taskkill", a[0]))
         saikai.os._exit = _fake_exit
         saikai._start_terminal_watchdog(poll_sec=0.01)
@@ -994,6 +995,119 @@ def test_terminal_watchdog_logs_before_it_kills():
         added[-600:]
     assert any(k[0] == "exit" for k in killed), "the watchdog never reached the kill"
     assert any(k[0] == "taskkill" for k in killed), "own tree was not reaped"
+
+def test_snapshot_failure_is_not_read_as_a_dead_terminal():
+    """A failed process snapshot and an empty one are OPPOSITE conclusions.
+
+    _win_pid_index returned {} for every failure, _find_terminal_anchor({}) returns 0,
+    and the watchdog reads 0 as "the terminal is gone" — so a transient
+    CreateToolhelp32Snapshot failure (documented under heavy process churn, which 11
+    panes of claude + node workers create) was scored as a confirmed terminal death.
+    Two in a row and a healthy saikai taskkilled its own tree and os._exit(0)'d, taking
+    every live pane with it. The watchdog's own "inconclusive → reset the streak"
+    branch could never fire for that failure mode, because nothing ever raised.
+
+    Three ways a snapshot can lie, all asserted: it cannot be created; the walk stops
+    early (a TRUNCATED tree is how our own ancestors go missing); and the result does
+    not contain our own pid, which is impossible for a complete snapshot since we are
+    demonstrably running. Lenient mode keeps returning {} for all three, because for
+    the arm-time check and the pid verifier "no info" is the safe answer.
+    (#snapshot-failure-vs-empty)"""
+    import types
+
+    assert saikai._win_pid_index.__defaults__ == (False,), \
+        "strict must default OFF so the arm check and pid verifier stay lenient"
+    assert saikai._find_terminal_anchor({}, os.getpid()) == 0, \
+        "precondition: an empty index yields the same 0 as 'terminal gone'"
+
+    class _Fn:
+        """A stand-in for a ctypes function: callable AND attribute-assignable
+        (the real code sets .restype / .argtypes on these)."""
+        def __init__(self, ret):
+            self.ret, self.restype, self.argtypes = ret, None, None
+
+        def __call__(self, *a, **kw):
+            return self.ret
+
+    def _k32(snap, first, nxt, last_err):
+        k = types.SimpleNamespace()
+        k.CreateToolhelp32Snapshot = _Fn(snap)
+        k.Process32First = _Fn(first)
+        k.Process32Next = _Fn(nxt)
+        k.CloseHandle = _Fn(1)
+        k.GetLastError = _Fn(last_err)
+        return k
+
+    CASES = {
+        # snapshot handle refused outright
+        "CreateToolhelp32Snapshot": _k32(0, 0, 0, 6),
+        # walk ended for a reason OTHER than ERROR_NO_MORE_FILES(18) → truncated
+        "truncated": _k32(7, 1, 0, 6),
+        # complete-looking walk that does not contain us → incomplete by definition
+        "missing our own pid": _k32(7, 1, 0, 18),
+    }
+
+    import ctypes as _real_ctypes
+    prev = sys.modules.get("ctypes")
+    try:
+        for expect, k32 in CASES.items():
+            fake = types.ModuleType("ctypes")
+            for attr in dir(_real_ctypes):
+                setattr(fake, attr, getattr(_real_ctypes, attr))
+            fake.windll = types.SimpleNamespace(kernel32=k32)
+            sys.modules["ctypes"] = fake
+            assert saikai._win_pid_index() == {}, \
+                "lenient mode must stay quiet for %r" % (expect,)
+            try:
+                saikai._win_pid_index(strict=True)
+                raise AssertionError("strict mode swallowed: %s" % expect)
+            except saikai._SnapshotFailed as exc:
+                assert expect in str(exc), "%r not in %r" % (expect, str(exc))
+    finally:
+        if prev is not None:
+            sys.modules["ctypes"] = prev
+
+
+def test_abrupt_exit_leaves_the_alternate_screen():
+    """An exit that bypasses Textual's teardown has to send ?1049l itself.
+
+    The watchdog resets mouse/paste/focus and then os._exit(0)s, so nobody else takes
+    the terminal off the alternate buffer: the user was dropped at a shell prompt drawn
+    over the alt screen with their whole scrollback out of reach — "the terminal is
+    left broken" — curable only by printf '\\e[?1049l' or a new tab.
+
+    It stays OPT-IN: on a clean exit Textual has already left the buffer, and a second
+    ?1049l also performs a DECRC, restoring a cursor position we never saved.
+    (#leave-alt-on-abrupt-exit)"""
+    import io as _io
+
+    class _Tty(_io.StringIO):
+        def isatty(self):
+            return True
+
+    def _emit(**kw):
+        buf = _Tty()
+        prev_real, prev_platform = sys.__stderr__, saikai.sys.platform
+        try:
+            saikai.sys.platform = "linux"     # skip the win32 VT re-arm
+            sys.__stderr__ = buf
+            saikai._reset_terminal_modes(**kw)
+        finally:
+            sys.__stderr__ = prev_real
+            saikai.sys.platform = prev_platform
+        return buf.getvalue()
+
+    clean = _emit()
+    assert "\033[?1049l" not in clean, \
+        "a clean exit must not re-send ?1049l (its DECRC would move the cursor)"
+    assert clean.endswith("\033[?25h")
+
+    abrupt = _emit(leave_alt=True)
+    assert "\033[?1049l" in abrupt, "an abrupt exit left the terminal on the alt screen"
+    # Order matters: cursor visibility is per-buffer, so show it AFTER the switch back.
+    assert abrupt.index("\033[?1049l") < abrupt.index("\033[?25h"), abrupt
+    for mode in ("\033[?1003l", "\033[?1006l", "\033[?2004l"):
+        assert mode in abrupt, mode
 
 
 if __name__ == "__main__":
@@ -1053,3 +1167,7 @@ if __name__ == "__main__":
     print("PASS test_mode_reset_reaches_the_real_terminal_not_textuals_capture")
     test_terminal_watchdog_logs_before_it_kills()
     print("PASS test_terminal_watchdog_logs_before_it_kills")
+    test_snapshot_failure_is_not_read_as_a_dead_terminal()
+    print("PASS test_snapshot_failure_is_not_read_as_a_dead_terminal")
+    test_abrupt_exit_leaves_the_alternate_screen()
+    print("PASS test_abrupt_exit_leaves_the_alternate_screen")

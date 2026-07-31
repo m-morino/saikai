@@ -1688,12 +1688,42 @@ _TERM_EMULATOR_NAMES = frozenset({
 })
 
 
-def _win_pid_index() -> dict[int, tuple[str, int]]:
+class _SnapshotFailed(Exception):
+    """The process snapshot could not be taken, or completed only partway.
+
+    Exists because "the walk found no terminal ancestor" and "the walk did not run"
+    are OPPOSITE conclusions and used to be the same value. _win_pid_index returned
+    {} for every failure, _find_terminal_anchor({}) returns 0, and the watchdog reads
+    0 as "the terminal is gone" — so a transient CreateToolhelp32Snapshot failure was
+    scored as a confirmed terminal death. Two of those in a row and a perfectly
+    healthy saikai taskkilled its own tree and os._exit(0)'d, taking every live pane
+    with it. The watchdog's own "inconclusive → reset the streak" branch could never
+    fire for the most likely failure mode. (#snapshot-failure-vs-empty)"""
+
+
+def _win_pid_index(strict: bool = False) -> dict[int, tuple[str, int]]:
     """{pid: (image_name_lower, ppid)} from one CreateToolhelp32Snapshot call.
+
     Fast (~ms, no subprocess spawn — startup stays instant). Returns {} on any
-    failure so the caller treats it as "no anchor" and the watchdog stays off."""
+    failure so a lenient caller treats it as "no info": that is right for the arm-time
+    check (no anchor → the watchdog stays off) and for pid verification (cannot
+    confirm → do not kill).
+
+    With *strict*, a failure RAISES _SnapshotFailed instead. The watchdog's poll uses
+    that, because for it {} is not "no info" but "kill the session". Strict mode also
+    rejects a snapshot that completed only partway: the walk is checked for
+    ERROR_NO_MORE_FILES, and the result must contain our OWN pid — we demonstrably
+    exist, so an index without us is incomplete by definition.
+    (#snapshot-failure-vs-empty)"""
     import ctypes
     from ctypes import wintypes
+
+    ERROR_NO_MORE_FILES = 18
+
+    def _fail(reason: str) -> dict:
+        if strict:
+            raise _SnapshotFailed(reason)
+        return {}
 
     TH32CS_SNAPPROCESS = 0x00000002
     INVALID = ctypes.c_void_p(-1).value
@@ -1721,8 +1751,11 @@ def _win_pid_index() -> dict[int, tuple[str, int]]:
 
     snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if not snap or snap == INVALID:
-        return {}
+        # Documented to fail transiently under heavy process churn (ERROR_BAD_LENGTH),
+        # which is exactly the condition a saikai with many panes creates.
+        return _fail("CreateToolhelp32Snapshot failed")
     out: dict[int, tuple[str, int]] = {}
+    walk_err = ERROR_NO_MORE_FILES
     try:
         entry = PROCESSENTRY32()
         entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
@@ -1730,18 +1763,33 @@ def _win_pid_index() -> dict[int, tuple[str, int]]:
         # strict ctypes rejects byref's lightweight ref ("expected LP_… instance
         # instead of pointer to …"). pointer() yields a real LP_PROCESSENTRY32.
         ok = k32.Process32First(snap, ctypes.pointer(entry))
+        if not ok:
+            walk_err = int(k32.GetLastError())
         while ok:
             name = entry.szExeFile.decode("ascii", "replace").lower()
             out[int(entry.th32ProcessID)] = (name, int(entry.th32ParentProcessID))
             ok = k32.Process32Next(snap, ctypes.pointer(entry))
+            if not ok:
+                # Read IMMEDIATELY: any other ctypes call would clobber it. A walk
+                # that stopped for any reason other than "no more files" gave us a
+                # TRUNCATED tree, which is indistinguishable from a shrunken one —
+                # and a truncated tree is how our own ancestors go missing.
+                walk_err = int(k32.GetLastError())
     except Exception:
-        # Honour the documented "{} on any failure" contract — the snapshot-walk
-        # must never raise into callers (the watchdog AND the live-session reader
+        # Lenient callers keep the documented "{} on any failure" contract — the
+        # walk must never raise into them (the arm-time check and the pid verifier
         # both treat {} as "no info"). Previously only snapshot CREATION was
         # guarded, so a ctypes mismatch escaped. (#audit-pidreuse)
-        return {}
+        return _fail("snapshot walk raised")
     finally:
         k32.CloseHandle(snap)
+    if walk_err != ERROR_NO_MORE_FILES:
+        return _fail(f"snapshot walk truncated (err={walk_err})")
+    if os.getpid() not in out:
+        # We are running, so a complete snapshot contains us. Without us in it, the
+        # ancestor walk starts from a pid the index has never heard of and returns 0
+        # — the "terminal is gone" answer, from an index that is simply incomplete.
+        return _fail("snapshot is missing our own pid")
     return out
 
 
@@ -1801,7 +1849,8 @@ def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
             # re-walk, so on PID reuse the re-walk never ran at all. A live anchor
             # here → the tab/window is still open.
             try:
-                alive = bool(_find_terminal_anchor(_win_pid_index(), self_pid))
+                alive = bool(_find_terminal_anchor(
+                    _win_pid_index(strict=True), self_pid))
             except Exception:
                 # A transient enumeration failure is inconclusive — neither alive
                 # nor dead. RESET the miss streak: otherwise a failure sitting
@@ -1809,9 +1858,14 @@ def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
                 # two NON-consecutive misses reach the kill, defeating the "2
                 # consecutive confirmations" contract and os._exit-ing a healthy
                 # saikai. Erring toward a delayed reap is far safer than a false kill.
-                if misses:
-                    _log("watchdog: process enumeration failed mid-streak — "
-                         f"miss streak reset (was {misses})")
+                # Reached for a FAILED snapshot now, not only for a ctypes bug:
+                # _win_pid_index(strict=True) raises _SnapshotFailed rather than
+                # returning {}, so a transient enumeration failure is inconclusive
+                # (streak reset) instead of a confirmed terminal death.
+                # (#snapshot-failure-vs-empty)
+                _log("watchdog: process enumeration inconclusive (%s) — "
+                     "miss streak reset (was %d)"
+                     % (sys.exc_info()[1] or "?", misses))
                 misses = 0
                 continue
             if alive:
@@ -1848,7 +1902,9 @@ def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
             # included) and exit hard so a daemon thread blocked elsewhere can't
             # keep the interpreter alive.
             try:
-                _reset_terminal_modes()
+                # leave_alt: this exit skips Textual's teardown, so nobody else will
+                # take the terminal off the alternate buffer. (#leave-alt-on-abrupt-exit)
+                _reset_terminal_modes(leave_alt=True)
             except Exception:
                 pass
             try:
@@ -3517,7 +3573,7 @@ def display_table(sessions: list[dict], repo: Path | None, show_project: bool,
     print()
 
 
-def _reset_terminal_modes() -> None:
+def _reset_terminal_modes(leave_alt: bool = False) -> None:
     """Emit ANSI disable sequences for terminal modes the picker may have enabled.
 
     Targets focus tracking (?1004), all mouse tracking variants (?1000/1002/1003/
@@ -3571,9 +3627,18 @@ def _reset_terminal_modes() -> None:
                 vt_ok = False
             if not vt_ok:
                 return
+        # ?1049l is opt-in (leave_alt) rather than unconditional: on a CLEAN exit
+        # Textual has already left the alternate buffer, and a second ?1049l also
+        # performs the DECRC half of the sequence — restoring a cursor position we
+        # never saved, which would nudge the shell's cursor after a normal quit. The
+        # abrupt paths need it, because they bypass Textual's teardown entirely: the
+        # watchdog's os._exit left the user at a prompt drawn over the alt screen
+        # with their whole scrollback out of reach. (#leave-alt-on-abrupt-exit)
         out.write(
             "\033[?1000l\033[?1002l\033[?1003l\033[?1004l"
-            "\033[?1006l\033[?1015l\033[?2004l\033[?25h"
+            "\033[?1006l\033[?1015l\033[?2004l"
+            + ("\033[?1049l" if leave_alt else "")
+            + "\033[?25h"        # last: cursor visibility is per-buffer in xterm
         )
         out.flush()
     except Exception:
