@@ -721,6 +721,78 @@ def _log(msg: str) -> None:
         pass
 
 
+def _install_crash_logging() -> None:
+    """Make an abrupt exit self-explaining in saikai.log.
+
+    saikai died mid-session (2026-07-31 13:39) and NOTHING on disk could say why: the
+    log ended on an ordinary line, Windows had filed no error report, and the only
+    handler that did catch a UI crash printed the traceback to stderr — where it
+    scrolled away with the terminal. So the log could not answer "why did it close",
+    which is the one question it exists to answer.
+
+    Four holes, closed here:
+      * an unhandled exception on the main thread was never written to the log;
+      * an exception in a BACKGROUND thread (a pty reader, the mirror server, a reap)
+        killed that thread silently — threading's default hook only prints;
+      * a hard crash (interpreter fault) left nothing at all — faulthandler now
+        writes a native traceback next to the log;
+      * a clean quit logged nothing either, so a log that simply stops was
+        indistinguishable from one cut off. Every exit now says which it was.
+    Best-effort throughout: instrumentation must never be the thing that breaks the
+    app it is instrumenting. (#crash-trail)"""
+    import atexit
+    import faulthandler
+    import threading as _threading
+    import traceback as _traceback
+
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # Kept OPEN for the process's life on purpose: a fault handler cannot open a
+        # file while the interpreter is already crashing.
+        global _FAULT_FILE
+        _FAULT_FILE = open(CACHE_DIR / "crash.log", "a", encoding="utf-8")
+        _FAULT_FILE.write(f"\n=== saikai {__version__} started "
+                          f"{datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
+        _FAULT_FILE.flush()
+        faulthandler.enable(file=_FAULT_FILE, all_threads=True)
+    except Exception:
+        pass
+
+    _prev_hook = sys.excepthook
+
+    def _log_exc(kind: str, exc_type, exc, tb, extra: str = "") -> None:
+        try:
+            text = "".join(_traceback.format_exception(exc_type, exc, tb))
+            _log(f"CRASH ({kind}){extra}: {exc_type.__name__}: {exc}")
+            for line in text.rstrip().splitlines():
+                _log("  " + line)
+        except Exception:
+            pass
+
+    def _excepthook(exc_type, exc, tb):
+        _log_exc("main", exc_type, exc, tb)
+        try:
+            _prev_hook(exc_type, exc, tb)
+        except Exception:
+            pass
+
+    def _thread_hook(args) -> None:
+        name = getattr(args.thread, "name", "?")
+        _log_exc("thread", args.exc_type, args.exc_value, args.exc_traceback,
+                 extra=f" in {name}")
+
+    try:
+        sys.excepthook = _excepthook
+        _threading.excepthook = _thread_hook
+    except Exception:
+        pass
+    # A clean exit says so, so a log that just stops means it did NOT get here.
+    atexit.register(lambda: _log("stop: exiting"))
+
+
+_FAULT_FILE = None
+
+
 def _load_options() -> dict:
     raw = _read_json(OPTIONS_FILE, {})
     return raw if isinstance(raw, dict) else {}   # corrupt shape (#audit-codex-prefshape)
@@ -10828,6 +10900,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
     # the cursor so the shell isn't left echoing '[I' / stray SGR bytes.
     import atexit
     atexit.register(_reset_terminal_modes)
+    _install_crash_logging()
     # Wrap the app's run() so a Textual / Rich crash never leaves the user
     # at a frozen alternate screen with no way out. On exception: reset
     # terminal modes, leave alternate screen, dump the traceback so we can
@@ -10942,6 +11015,15 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         sys.stderr.write("\033c")          # RIS — last-ditch full reset
         sys.stderr.flush()
         log_path = CACHE_DIR / "textual-debug.log"
+        # Into the LOG as well, not just the screen: the stderr copy scrolls
+        # away with the terminal, and then nothing on disk says why saikai
+        # closed. (#crash-trail)
+        try:
+            _log("CRASH (ui): " + repr(sys.exc_info()[1]))
+            for _line in traceback.format_exc().rstrip().splitlines():
+                _log("  " + _line)
+        except Exception:
+            pass
         print(_c("\n  textual UI crashed:", RED), file=sys.stderr)
         traceback.print_exc()
         print(_c(f"  textual debug log: {log_path}", YELLOW), file=sys.stderr)

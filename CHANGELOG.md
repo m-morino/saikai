@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **An abrupt exit now explains itself.** saikai closed mid-session and nothing on
+  disk said why: the log ended on an ordinary line, and the one handler that catches a
+  UI crash printed to stderr only. Unhandled exceptions (main thread AND background
+  threads, whose deaths were silent) are written to `saikai.log` with their traceback,
+  interpreter faults go to `crash.log` via faulthandler, and every clean exit logs
+  `stop: exiting` — so a log that simply stops is now itself a signal.
 - **A pane no longer opens at the wrong size.** At mount a widget has no layout yet
   (measured: `size` is 0x0, the real geometry arriving on the first Resize), so the
   child was spawned into an 80x24 PTY from the fallback: it drew its startup screen

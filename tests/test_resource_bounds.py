@@ -848,6 +848,55 @@ def test_parse_session_extracts_agent_lineage():
     assert p2.get("parent_session_id") == "parent-123", \
         "old cache without lineage must force a re-parse"
 
+def test_crash_logging_records_a_crash_in_the_log():
+    """An abrupt exit has to explain itself in saikai.log.
+
+    saikai died mid-session (2026-07-31 13:39) and nothing on disk could say why: the
+    log ended on an ordinary auto-reload line, Windows had filed no error report, and
+    the one handler that did catch a UI crash printed the traceback to stderr only —
+    where it scrolled away with the terminal. The log exists to answer "why did it
+    close" and could not.
+
+    Both hooks are asserted, because the two failures look identical in the log
+    otherwise: a main-thread exception (the app dies) and a BACKGROUND-thread one (a
+    pty reader / the mirror server / a reap dies while the app keeps running, which is
+    the sneakier of the two). faulthandler covers the case where the interpreter itself
+    goes down with no Python frame left to log from. (#crash-trail)"""
+    import faulthandler
+    import threading
+
+    log = saikai.CACHE_DIR / "saikai.log"
+    prev_hook, prev_thread_hook = sys.excepthook, threading.excepthook
+    try:
+        saikai._install_crash_logging()
+        assert sys.excepthook is not prev_hook, "excepthook was not installed"
+
+        try:
+            raise RuntimeError("test-boom-main")
+        except RuntimeError:
+            sys.excepthook(*sys.exc_info())      # what the interpreter would call
+
+        def _raiser():
+            raise ValueError("test-boom-thread")
+
+        thread = threading.Thread(target=_raiser, name="pty-read-crashtest")
+        thread.start()
+        thread.join()
+
+        text = log.read_text(encoding="utf-8", errors="replace")
+        assert "CRASH (main): RuntimeError: test-boom-main" in text, text[-800:]
+        assert "raise RuntimeError(\"test-boom-main\")" in text, \
+            "the traceback body was not logged"
+        assert ("CRASH (thread) in pty-read-crashtest: ValueError: test-boom-thread"
+                in text), text[-800:]
+        # A hard crash leaves no Python frame, so faulthandler has to be armed and its
+        # file open — it cannot open one while the interpreter is already dying.
+        assert faulthandler.is_enabled(), "faulthandler not enabled"
+        assert (saikai.CACHE_DIR / "crash.log").exists(), "no crash.log for faults"
+    finally:
+        sys.excepthook, threading.excepthook = prev_hook, prev_thread_hook
+
+
 if __name__ == "__main__":
     test_hostile_inputs_degrade_instead_of_raising()
     print("PASS test_hostile_inputs_degrade_instead_of_raising")
@@ -899,3 +948,5 @@ if __name__ == "__main__":
     print("PASS test_bind_cleared_child_falsifiable_detection")
     test_bind_cleared_child_clear_ts_timezone_robust()
     print("PASS test_bind_cleared_child_clear_ts_timezone_robust")
+    test_crash_logging_records_a_crash_in_the_log()
+    print("PASS test_crash_logging_records_a_crash_in_the_log")
