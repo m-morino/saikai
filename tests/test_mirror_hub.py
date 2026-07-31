@@ -1,6 +1,7 @@
 import os, re, sys, threading
 import urllib.request, urllib.error, base64, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pathlib import Path
 import saikai_mirror as m
 
 
@@ -909,6 +910,43 @@ def test_drain_thread_survives_a_frame_that_raises():
     assert any("dropped a frame" in m and "ValueError" in m for m in logged), logged
     assert all(m.startswith("[mirror]") for m in logged), logged
 
+def test_read_token_is_short_enough_to_type_and_the_write_key_is_not():
+    """The read token is typed by hand on a phone; the write-key never is.
+
+    The URL is the QR's payload AND what someone types when the camera is not
+    convenient, so the read token is deliberately short: token_urlsafe(6) = 8 url-safe
+    chars = 48 bits. That is bounded by the hub's OWN guessing budget rather than by
+    hope — a bad read token arms a per-source 30s lockout after
+    _BAD_TOKEN_LOCKOUT_THRESHOLD attempts, and the source is normalised to an IPv6 /64
+    so rotation does not dodge it. At the resulting ~1.7 guesses/s, 2^47 is ~2.7 million
+    years, on a mirror that also idles itself off.
+
+    The write-key keeps its full length because it is never typed and never appears in
+    a URL, file, QR or log — the authority to TYPE into a pane must not be weakened by
+    a usability change to the READ link. (#short-token)"""
+    import re as _re
+
+    src = (Path(__file__).resolve().parent.parent / "saikai.py").read_text(
+        encoding="utf-8")
+    tok = _re.search(r"token=_secrets\.token_urlsafe\((\d+)\)", src)
+    assert tok, "the hub's read token is no longer generated here"
+    nbytes = int(tok.group(1))
+    assert nbytes == 6, "read token size changed: %d bytes" % nbytes
+
+    hub = m.MirrorHub(token="A" * 8, host="192.168.11.15", port=5112)
+    url = hub.url()
+    assert len(url) <= 44, "the URL got long enough to be annoying to type: %r" % url
+    assert "?token=AAAAAAAA" in url, url
+    # The write-key is long, is NOT the read token, and is nowhere in the link.
+    assert len(hub._write_key) >= 40, len(hub._write_key)
+    assert hub._write_key not in url
+    # …and the guessing budget the short token relies on is actually in force.
+    assert m._BAD_TOKEN_LOCKOUT_THRESHOLD <= 50, m._BAD_TOKEN_LOCKOUT_THRESHOLD
+    assert m._BAD_KEY_LOCKOUT_SECS >= 10.0, m._BAD_KEY_LOCKOUT_SECS
+    # The QR stays sparse enough for another PC's camera (the reason it is short).
+    rows = m.qr_matrix(url)
+    assert len(rows) <= 37, "QR grew to %dx%d modules" % (len(rows), len(rows[0]))
+
 
 if __name__ == "__main__":
     test_set_size_broadcasts_and_dedups()
@@ -955,3 +993,5 @@ if __name__ == "__main__":
     print("PASS test_hub_screen_keeps_text_after_a_width_zero_character")
     test_drain_thread_survives_a_frame_that_raises()
     print("PASS test_drain_thread_survives_a_frame_that_raises")
+    test_read_token_is_short_enough_to_type_and_the_write_key_is_not()
+    print("PASS test_read_token_is_short_enough_to_type_and_the_write_key_is_not")

@@ -11112,12 +11112,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 import saikai_mirror as _mirror
                 _mir_on, _mir_host = _mirror.mirror_config(os.environ)
                 if _mir_on:
-                    # token_urlsafe(12) → 16 url-safe chars (96 bits). Short on
-                    # purpose: the URL it lands in is the QR's payload, and a
-                    # 43-char token (token_urlsafe(32)) pushed the QR to a dense
-                    # version that another PC's camera couldn't resolve. 96 bits
-                    # is still infeasible to brute-force over HTTP for an
-                    # ephemeral, control-gated, idle-off LAN mirror.
+                    # token_urlsafe(6) → 8 url-safe chars (48 bits). Short on
+                    # purpose: this URL is the QR's payload AND what a phone user
+                    # types by hand, and a 43-char token (token_urlsafe(32)) pushed
+                    # the QR to a dense version another PC's camera could not
+                    # resolve. 48 bits is bounded by the hub's own guessing budget,
+                    # not by hope: a bad read token arms a per-source 30s lockout
+                    # after 50 attempts (_BAD_TOKEN_LOCKOUT_THRESHOLD), and the
+                    # source is normalised to an IPv6 /64 so rotation does not dodge
+                    # it — an effective ~1.7 guesses/s, i.e. ~2.7 MILLION years for
+                    # 2^47 on a mirror that also idles itself off after ten minutes.
+                    # The write-key is unaffected: it stays token_urlsafe(32) and
+                    # never appears in a URL, file, QR or log, so the authority to
+                    # TYPE into a pane keeps its full strength. (#short-token)
                     # TLS (default-on, opt-out via SAIKAI_MIRROR_TLS=0): encrypt the
                     # LAN transport so a passive sniffer can't harvest the token /
                     # write-key / keystrokes, and give the browser a secure context.
@@ -11150,7 +11157,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     except Exception:
                         pass
                     _hub = _mirror.MirrorHub(
-                        token=_secrets.token_urlsafe(12), host=_mir_host,
+                        token=_secrets.token_urlsafe(6), host=_mir_host,
                         port=_mirror.mirror_port(os.environ),
                         idle_secs=_mirror.mirror_idle_secs(os.environ), tls=_tls)
                     # LAN input is its own opt-in: a LAN-exposed mirror stays
