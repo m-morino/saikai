@@ -8428,16 +8428,45 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                             severity="warning", timeout=6)
                 return
             base = str(repo) if repo else str(Path.cwd())
-            cands = self._new_session_candidates()
 
             def _go(path):
                 if path:
                     self._open_new_live(path)
-            self.push_screen(NewSessionScreen(base, cands), _go)
+
+            # The candidate walk runs OFF the UI thread: it shells out to
+            # `git worktree list` (5s timeout) and then stats up to 40 recent session
+            # dirs. In a large repo, on a network share, or with a git lock held, doing
+            # that inline froze the picker and every live pane until it returned — the
+            # modal appeared late AND nothing repainted in the meantime. The modal is
+            # pushed from the callback, so the wait is now just latency instead of a
+            # hang. Re-entry is guarded so holding the key cannot pile up scans.
+            # (#ui-thread-subprocess)
+            if getattr(self, "_new_session_scanning", False):
+                return
+            self._new_session_scanning = True
+
+            def _show(cands) -> None:
+                self._new_session_scanning = False
+                self.push_screen(NewSessionScreen(base, cands), _go)
+
+            def _scan() -> None:
+                try:
+                    cands = self._new_session_candidates()
+                except Exception:
+                    cands = []
+                try:
+                    self.call_from_thread(_show, cands)
+                except Exception:
+                    self._new_session_scanning = False   # app gone mid-scan
+            threading.Thread(target=_scan, name="new-session-scan",
+                             daemon=True).start()
 
         def _new_session_candidates(self):
             """(label, path) rows for the new-session picker: git worktrees of the
-            current repo first, then distinct recent session dirs. Existing only."""
+            current repo first, then distinct recent session dirs. Existing only.
+
+            NOT for the UI thread: it shells out to git and stats up to 40 directories.
+            action_new_session runs it on a worker. (#ui-thread-subprocess)"""
             out, seen = [], set()
             try:
                 r = subprocess.run(
@@ -9078,19 +9107,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             head = targets[0]
 
-            def _do(ok: bool):
-                if not ok:
-                    return
-                done = gone = fail = 0
-                for pid, ps, _t in targets:
-                    res = _kill_agent_process(pid, ps)
-                    _log(f"kill agent pid={pid}: {res}")
-                    if res == "signalled":
-                        done += 1
-                    elif res in ("gone", "stale"):
-                        gone += 1
-                    else:
-                        fail += 1
+            def _report(done: int, gone: int, fail: int) -> None:
                 if fail:
                     self.notify(f"{done} terminating, {fail} failed",
                                 severity="error", title="saikai", timeout=6)
@@ -9100,6 +9117,50 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 else:
                     self.notify("agent(s) already ended", timeout=4)
                 self.set_timer(2.2, self.action_refresh)
+
+            def _do(ok: bool):
+                if not ok:
+                    return
+
+                # OFF the UI thread. A dismiss callback runs in Textual's message
+                # pump, and each _kill_agent_process spawns taskkill (up to its 10s
+                # timeout) plus a full process snapshot for the identity check — so
+                # confirming a batch of child agents froze the app for the SUM of
+                # those: no repaints of the live panes, keystrokes queued, mirror
+                # frames stalled. _kill_agent_process's own docstring says it belongs
+                # off the UI thread; the caller was what contradicted it.
+                #
+                # Tracked, not merely daemonised: a daemon thread dies with the
+                # interpreter, so quitting right after a kill would leave the target
+                # alive. _track_reap puts it in the same registry join_all_reaps
+                # drains at exit, which is exactly what pane kills already do.
+                # (#ui-thread-subprocess)
+                def _work() -> None:
+                    done = gone = fail = 0
+                    for pid, ps, _t in targets:
+                        res = _kill_agent_process(pid, ps)
+                        _log(f"kill agent pid={pid}: {res}")
+                        if res == "signalled":
+                            done += 1
+                        elif res in ("gone", "stale"):
+                            gone += 1
+                        else:
+                            fail += 1
+                    try:
+                        self.call_from_thread(_report, done, gone, fail)
+                    except Exception:
+                        # App already gone — the kills still happened; the toast is
+                        # the only thing lost.
+                        _log(f"kill agents: {done} signalled, {gone} gone, {fail} "
+                             "failed (app closed before the report)")
+
+                t = threading.Thread(target=_work, name="kill-agents", daemon=True)
+                t.start()
+                try:
+                    import saikai_terminal as _rt
+                    _rt._track_reap(t)
+                except Exception:
+                    pass
 
             # the modal names the batch (its title line = label, pid of the first)
             self.push_screen(KillAgentScreen(label, head[0]), _do)
@@ -9724,9 +9785,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     copied = False
                 if not copied:
                     try:
+                        # Bounded + windowless: this is a UI-thread action and
+                        # clip.exe blocks while another process holds the clipboard.
+                        # (#ui-thread-subprocess)
                         subprocess.run(["clip"], input=text.encode("utf-8"),
                                        check=True, stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL)
+                                       stderr=subprocess.DEVNULL, timeout=2.0,
+                                       creationflags=NO_WINDOW)
                         copied = True
                     except Exception:
                         copied = False
@@ -12269,7 +12334,8 @@ def cmd_sync_desktop() -> None:
             # bytes (no text decode): tasklist emits the console OEM codepage
             # (e.g. CP932 on JP Windows), which is not valid UTF-8.
             r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Claude.exe"],
-                               capture_output=True, creationflags=NO_WINDOW)
+                               capture_output=True, creationflags=NO_WINDOW,
+                               timeout=5)   # a wedged tasklist must not hang launch
             if b"Claude.exe" in (r.stdout or b""):
                 print(_c("  note: Claude Desktop appears to be running — restart it "
                          "afterwards to see the new sessions.", YELLOW), file=sys.stderr)

@@ -1109,6 +1109,109 @@ def test_abrupt_exit_leaves_the_alternate_screen():
     for mode in ("\033[?1003l", "\033[?1006l", "\033[?2004l"):
         assert mode in abrupt, mode
 
+def test_every_ui_thread_subprocess_is_bounded():
+    """A subprocess started from the UI thread must have a timeout.
+
+    The Windows clipboard fallback had none — and it is reached exactly when
+    OpenClipboard failed because ANOTHER process holds the clipboard (an RDP/VDI sync
+    agent, Office, a browser), at which point clip.exe does the same OpenClipboard and
+    blocks on the same holder. That call sits on the UI thread (on_mouse_up →
+    _copy_text), so the Textual event loop stopped dead: no keystrokes, no repaints, no
+    Ctrl+Q, leaving an external kill as the only way out — which then skips atexit and
+    leaves the terminal in mouse mode.
+
+    Asserted as a RULE over the source, not on one call site: the timeout kwarg is what
+    keeps the class fixed as more helpers get added. The known-intentional blocking
+    calls are listed explicitly, each with why. (#ui-thread-subprocess)"""
+    import re
+
+    root = Path(__file__).resolve().parent.parent
+    # (file, line-content substring) -> reason it may block without a timeout
+    ALLOWED = {
+        "subprocess.run([*ed.split(), str(p)])":
+            "the config editor runs inside app.suspend(); blocking IS the point",
+        "subprocess.run(claude_argv, env=env)":
+            "the resume handoff runs after the UI has exited",
+        "subprocess.Popen([opener, str(p)]":
+            "Popen without wait() does not block",
+        "with subprocess.Popen(cmd, stdin=subprocess.PIPE":
+            "bounded by communicate(timeout=...) below",
+    }
+    offenders = []
+    for name in ("saikai.py", "saikai_terminal.py", "saikai_mirror.py"):
+        src = (root / name).read_text(encoding="utf-8")
+        lines = src.splitlines()
+        for m in re.finditer(r"(?:subprocess|_sp)\.(?:run|Popen|check_output)\(", src):
+            start = src.count("\n", 0, m.start())
+            col = m.start() - (src.rindex("\n", 0, m.start()) + 1)
+            if "#" in lines[start][:col]:
+                continue            # a mention inside a comment, not a call
+            call = "\n".join(lines[start:start + 9])
+            depth = 0
+            for i in range(call.index("("), len(call)):
+                if call[i] == "(":
+                    depth += 1
+                elif call[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        call = call[:i + 1]
+                        break
+            flat = " ".join(call.split())
+            if "timeout" in flat:
+                continue
+            if any(k in flat for k in ALLOWED):
+                continue
+            offenders.append("%s:%d  %s" % (name, start + 1, flat[:100]))
+    assert not offenders, ("unbounded subprocess call(s) — each can freeze the UI "
+                           "thread:\n  " + "\n  ".join(offenders))
+
+
+def test_agent_kill_batch_runs_off_the_ui_thread():
+    """Killing a batch of agents must not run in the modal's dismiss callback.
+
+    That callback runs in Textual's message pump, and each _kill_agent_process spawns
+    taskkill (up to its 10s timeout) plus a full process snapshot for the identity
+    check — so confirming a parent row with several live children froze the app for the
+    SUM of those: no repaints of the live panes, keystrokes queued, mirror frames
+    stalled. _kill_agent_process's own docstring says it belongs off the UI thread.
+
+    The worker is also TRACKED, not merely daemonised: a daemon thread dies with the
+    interpreter, so quitting right after a kill would leave the target alive.
+    (#ui-thread-subprocess)"""
+    src = (Path(__file__).resolve().parent.parent / "saikai.py").read_text(
+        encoding="utf-8")
+    i = src.index("def _kill_agents(")
+    body = src[i:i + 8000]
+    j = body.index("def _do(")
+    do_body = body[j:body.index("self.push_screen(KillAgentScreen")]
+    assert "threading.Thread(" in do_body, \
+        "_do still kills inline on the UI thread"
+    assert "_track_reap" in do_body, \
+        "the kill worker is not tracked, so a quick quit can cut it short"
+    # The loop itself must live in the worker, not in _do.
+    loop_at = do_body.index("for pid, ps, _t in targets:")
+    work_at = do_body.index("def _work(")
+    assert work_at < loop_at, "the kill loop is outside the worker function"
+    # …and the toast has to be marshalled back to the UI thread.
+    assert "call_from_thread" in do_body, "the report is not marshalled to the UI"
+
+
+def test_new_session_scan_runs_off_the_ui_thread():
+    """The new-session picker's candidate walk shells out to git and stats up to 40
+    directories; doing it inline froze the picker and every live pane for up to the 5s
+    git timeout before the modal even appeared. (#ui-thread-subprocess)"""
+    src = (Path(__file__).resolve().parent.parent / "saikai.py").read_text(
+        encoding="utf-8")
+    i = src.index("def action_new_session(")
+    body = src[i:src.index("def _new_session_candidates(")]
+    assert "threading.Thread(" in body, "the scan still runs on the UI thread"
+    assert "call_from_thread" in body, "the modal is not pushed from the UI thread"
+    scan_at = body.index("self._new_session_candidates()")
+    thread_at = body.index("def _scan(")
+    assert thread_at < scan_at, "the walk is not inside the worker"
+    assert "_new_session_scanning" in body, \
+        "no re-entry guard: holding the key would pile up scans"
+
 
 if __name__ == "__main__":
     test_hostile_inputs_degrade_instead_of_raising()
@@ -1171,3 +1274,9 @@ if __name__ == "__main__":
     print("PASS test_snapshot_failure_is_not_read_as_a_dead_terminal")
     test_abrupt_exit_leaves_the_alternate_screen()
     print("PASS test_abrupt_exit_leaves_the_alternate_screen")
+    test_every_ui_thread_subprocess_is_bounded()
+    print("PASS test_every_ui_thread_subprocess_is_bounded")
+    test_agent_kill_batch_runs_off_the_ui_thread()
+    print("PASS test_agent_kill_batch_runs_off_the_ui_thread")
+    test_new_session_scan_runs_off_the_ui_thread()
+    print("PASS test_new_session_scan_runs_off_the_ui_thread")

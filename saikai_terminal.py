@@ -1548,8 +1548,12 @@ def set_clipboard_macos(text: str) -> bool:
     if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
         return False
     try:
+        # Bounded for the same reason as the Linux chain and the Windows fallback:
+        # this runs on the UI thread, and a pbcopy that blocks (a stalled clipboard
+        # server, a slow pasteboard daemon) would freeze the app. (#ui-thread-subprocess)
         subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=2.0)
         return True
     except Exception:
         return False
@@ -2644,8 +2648,20 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             try:
                 # Fallback if the Win32 path failed (e.g. clipboard locked). UTF-8
                 # because saikai.cmd sets chcp 65001; best-effort only.
+                #
+                # BOUNDED, and this is the case that needs it most: we get here
+                # exactly when OpenClipboard failed because another process holds the
+                # clipboard (an RDP/VDI sync agent, Office, a browser) — and clip.exe
+                # then does the same OpenClipboard and blocks on the same holder. This
+                # runs on the UI THREAD (on_mouse_up → _copy_text), so an unbounded
+                # wait freezes the whole app: no keystrokes, no repaints, no Ctrl+Q,
+                # leaving an external kill as the only way out. NO_WINDOW keeps the
+                # helper from flashing a console that steals focus. Same rule as
+                # set_clipboard_linux's timeout. (#ui-thread-subprocess)
                 subprocess.run(["clip"], input=text.encode("utf-8"), check=True,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=2.0,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 return
             except Exception:
                 pass

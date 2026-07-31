@@ -7,6 +7,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **A watchdog false positive can no longer kill a healthy session.** A failed process
+  snapshot and an empty one were the same value, so a transient enumeration failure
+  under load counted as a confirmed terminal death — two in a row reaped saikai's own
+  tree. Failures are now distinguished (and a truncated snapshot, or one missing our
+  own pid, is a failure too).
+- **An abrupt exit leaves the alternate screen.** ?1049l is now sent on the paths that
+  bypass Textual's teardown, so the shell prompt is not drawn over the alt buffer with
+  the scrollback out of reach.
+- **Blocking work no longer freezes the UI.** The Windows/macOS clipboard fallbacks got
+  timeouts (the Windows one is reached exactly when another process holds the clipboard,
+  i.e. when it will block), the agent-kill batch moved to a tracked worker, and the
+  new-session candidate walk (`git worktree list` + up to 40 stats) no longer runs
+  inline.
+- **A pane closed before its first layout no longer spawns a child nobody reaps.**
 - **An abrupt exit no longer leaves the shell spraying escape sequences.** The mode
   reset wrote to `sys.stderr`, which Textual replaces with a capture whose `isatty()`
   returns True for the app's whole life — so the disable sequences went to the app, not
