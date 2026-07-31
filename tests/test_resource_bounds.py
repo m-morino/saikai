@@ -896,6 +896,105 @@ def test_crash_logging_records_a_crash_in_the_log():
     finally:
         sys.excepthook, threading.excepthook = prev_hook, prev_thread_hook
 
+def test_mode_reset_reaches_the_real_terminal_not_textuals_capture():
+    """The disable sequences have to go to the TERMINAL, not to sys.stderr.
+
+    For the whole life of the app Textual replaces sys.stderr with its own
+    _PrintCapture, and that object's isatty() returns True deliberately ("Pretend
+    we're a terminal"). So this function passed its own isatty guard and handed the
+    mouse/paste/focus disables to app._print — the terminal got nothing. Every reset
+    from inside app mode was a silent no-op: after an abrupt exit the shell was left
+    with mouse tracking on, and a wheel scroll sprayed escape sequences at the
+    prompt. That is what the terminal-death watchdog's "reset first" was supposed to
+    prevent, and it ran in exactly the place the capture is installed.
+    (#reset-real-stderr)"""
+    import io as _io
+
+    class _LyingCapture(_io.StringIO):
+        """Textual's _PrintCapture: claims to be a terminal, isn't one."""
+        def isatty(self):
+            return True
+
+    capture, real = _LyingCapture(), _LyingCapture()
+    prev_err, prev_real, prev_platform = sys.stderr, sys.__stderr__, sys.platform
+    try:
+        # linux path: skip the win32 VT re-arm, which needs a real console handle
+        saikai.sys.platform = "linux"
+        sys.stderr = capture
+        sys.__stderr__ = real
+        saikai._reset_terminal_modes()
+    finally:
+        sys.stderr, sys.__stderr__ = prev_err, prev_real
+        saikai.sys.platform = prev_platform
+
+    assert capture.getvalue() == "", \
+        "wrote to Textual's capture, where the terminal never sees it: %r" % (
+            capture.getvalue(),)
+    got = real.getvalue()
+    for mode in ("\033[?1000l", "\033[?1002l", "\033[?1003l", "\033[?1004l",
+                 "\033[?1006l", "\033[?2004l", "\033[?25h"):
+        assert mode in got, "missing %r from the real terminal write: %r" % (mode, got)
+
+
+def test_terminal_watchdog_logs_before_it_kills():
+    """The watchdog exits with os._exit: nothing is written, nothing unwinds, no
+    atexit runs. saikai died that way on 2026-07-31 13:39 and the log simply stopped
+    on an ordinary line, so there was no way to tell this path from an external kill
+    — and it is the one path that CAN kill a healthy session, on two consecutive
+    failures of a process-tree walk under load.
+
+    So it has to say so in the log, which is the only channel that survives here
+    (stderr is Textual's capture and the screen is about to be gone). The near-miss
+    line matters just as much: it is the only signal that a session survived by one
+    poll. (#watchdog-trail)"""
+    import threading
+    import time as _time
+
+    log = saikai.CACHE_DIR / "saikai.log"
+    before = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+    killed: list = []
+    prev = (saikai.sys.platform, saikai._find_terminal_anchor,
+            saikai._win_pid_index, saikai.subprocess.run, saikai.os._exit)
+    seen = {"anchor": 0}
+
+    def _fake_anchor(index, pid):
+        seen["anchor"] += 1
+        # arm (1st call), then one MISS, one recovery, then two misses -> kill
+        return {1: 4242, 2: 0, 3: 4242}.get(seen["anchor"], 0)
+
+    def _fake_exit(code):
+        # The sentinel the test waits on is THIS one, not the taskkill: waiting on
+        # the taskkill would let the finally-block restore the real os._exit while
+        # the watchdog thread is still on its way to calling it — which would exit
+        # the whole test run silently.
+        killed.append(("exit", code))
+        raise SystemExit(code)      # ends the watchdog thread, not the test process
+
+    try:
+        saikai.sys.platform = "win32"
+        saikai._find_terminal_anchor = _fake_anchor
+        saikai._win_pid_index = lambda: {}
+        saikai.subprocess.run = lambda *a, **kw: killed.append(("taskkill", a[0]))
+        saikai.os._exit = _fake_exit
+        saikai._start_terminal_watchdog(poll_sec=0.01)
+        deadline = _time.monotonic() + 5.0
+        while not any(k[0] == "exit" for k in killed)                 and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+    finally:
+        (saikai.sys.platform, saikai._find_terminal_anchor, saikai._win_pid_index,
+         saikai.subprocess.run, saikai.os._exit) = prev
+
+    added = (log.read_text(encoding="utf-8", errors="replace")[len(before):]
+             if log.exists() else "")
+    assert "watchdog: armed" in added, added[-600:]
+    assert "watchdog: terminal ancestor back after 1 miss(es)" in added, added[-600:]
+    assert "watchdog: no live terminal ancestor (miss 1/2)" in added, added[-600:]
+    assert "watchdog: no live terminal ancestor (miss 2/2)" in added, added[-600:]
+    assert "watchdog: terminal gone — resetting modes, reaping own tree" in added, \
+        added[-600:]
+    assert any(k[0] == "exit" for k in killed), "the watchdog never reached the kill"
+    assert any(k[0] == "taskkill" for k in killed), "own tree was not reaped"
+
 
 if __name__ == "__main__":
     test_hostile_inputs_degrade_instead_of_raising()
@@ -950,3 +1049,7 @@ if __name__ == "__main__":
     print("PASS test_bind_cleared_child_clear_ts_timezone_robust")
     test_crash_logging_records_a_crash_in_the_log()
     print("PASS test_crash_logging_records_a_crash_in_the_log")
+    test_mode_reset_reaches_the_real_terminal_not_textuals_capture()
+    print("PASS test_mode_reset_reaches_the_real_terminal_not_textuals_capture")
+    test_terminal_watchdog_logs_before_it_kills()
+    print("PASS test_terminal_watchdog_logs_before_it_kills")

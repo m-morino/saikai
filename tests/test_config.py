@@ -217,26 +217,31 @@ def test_removed_cluster_mode_has_no_dangling_runtime_references():
 
 
 def test_reset_terminal_modes_guarded_and_emits():
-    """atexit/crash terminal restore: silent on a non-tty stderr (never pollutes
-    a redirected stream), emits the mouse/focus disable + show-cursor sequence on
-    a tty. Never raises."""
+    """atexit/crash terminal restore: silent on a non-tty stream (never pollutes a
+    redirected one), emits the mouse/focus disable + show-cursor sequence on a tty.
+    Never raises.
+
+    Asserted on sys.__stderr__, which is where it writes now: Textual replaces
+    sys.stderr with a capture whose isatty() returns True for the whole life of the
+    app, so writing there passed the guard and reached app._print instead of the
+    terminal. (#reset-real-stderr)"""
     import io
     import sys as _sys
-    saved = _sys.stderr
+    saved = _sys.__stderr__
     # non-tty → writes nothing
     buf = io.StringIO()                       # StringIO.isatty() is False
-    _sys.stderr = buf
+    _sys.__stderr__ = buf
     try:
         saikai._reset_terminal_modes()
     finally:
-        _sys.stderr = saved
+        _sys.__stderr__ = saved
     assert buf.getvalue() == ""
     # tty-like → emits the disable sequence, ending with show-cursor (?25h)
     class _Tty(io.StringIO):
         def isatty(self):
             return True
     tbuf = _Tty()
-    _sys.stderr = tbuf
+    _sys.__stderr__ = tbuf
     # Force non-win32 so the emit path runs deterministically on every OS. On real
     # win32 the function probes the OS console for VT via ctypes GetStdHandle(-12)/
     # GetConsoleMode and BAILS when that probe fails — which it does under a piped
@@ -248,7 +253,7 @@ def test_reset_terminal_modes_guarded_and_emits():
     try:
         saikai._reset_terminal_modes()
     finally:
-        _sys.stderr = saved
+        _sys.__stderr__ = saved
         saikai.sys.platform = _saved_platform
     out = tbuf.getvalue()
     assert "\033[?1003l" in out and "\033[?1006l" in out and "\033[?1004l" in out

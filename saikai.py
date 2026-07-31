@@ -1782,8 +1782,10 @@ def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
     except Exception:
         anchor = 0
     if not anchor:
+        _log("watchdog: no tab-shell ancestor found — terminal-death watchdog OFF")
         return
     self_pid = os.getpid()
+    _log(f"watchdog: armed (anchor pid={anchor}, poll={poll_sec}s)")
 
     def _watch() -> None:
         misses = 0
@@ -1807,9 +1809,17 @@ def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
                 # two NON-consecutive misses reach the kill, defeating the "2
                 # consecutive confirmations" contract and os._exit-ing a healthy
                 # saikai. Erring toward a delayed reap is far safer than a false kill.
+                if misses:
+                    _log("watchdog: process enumeration failed mid-streak — "
+                         f"miss streak reset (was {misses})")
                 misses = 0
                 continue
             if alive:
+                if misses:
+                    # A NEAR MISS is the number that matters: it says the kill was
+                    # one poll away. Without it there is no way to tell a healthy
+                    # session from one that survives on luck. (#watchdog-trail)
+                    _log(f"watchdog: terminal ancestor back after {misses} miss(es)")
                 misses = 0
                 continue
             # No live terminal ancestor → likely orphaned. os._exit (below) bypasses
@@ -1821,8 +1831,17 @@ def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
             # the 8s cadence, a middle ground between the old trigger-happy single
             # poll and the over-cautious 3-miss (~36s) debounce.
             misses += 1
+            # Logged BEFORE the decision, because the kill below is os._exit: it
+            # writes nothing, unwinds nothing, and runs no atexit. saikai died this
+            # way on 2026-07-31 13:39 and the log ended on an ordinary line, so
+            # there was no way to tell this path from an external kill. The log
+            # file is the only channel that survives — stderr is Textual's capture
+            # here, and the screen is about to be gone. (#watchdog-trail)
+            _log(f"watchdog: no live terminal ancestor (miss {misses}/2)")
             if misses < 2:
                 continue
+            _log("watchdog: terminal gone — resetting modes, reaping own tree "
+                 f"(pid={self_pid}) and exiting")
             # Genuinely orphaned (tab/window closed) → emulate SIGHUP. Restore the
             # terminal modes FIRST so even a residual false positive can't leave
             # mouse tracking on, THEN kill our OWN subtree (the resumed claude child
@@ -3513,9 +3532,22 @@ def _reset_terminal_modes() -> None:
     exception exit, so this is belt-and-suspenders for the paths that bypass its
     teardown (driver crash, SystemExit, watchdog). Hard kills (taskkill/OOM)
     can't run atexit — a fresh terminal is the only cure there. Guarded on
-    isatty so a redirected stderr never receives escape bytes."""
+    isatty so a redirected stderr never receives escape bytes.
+
+    Writes to sys.__stderr__, NOT sys.stderr: for the whole life of the app Textual
+    replaces sys.stderr with its own _PrintCapture (app.py: redirect_stderr around
+    the message loop), and that object's isatty() returns True on purpose
+    ("Pretend we're a terminal"). So this passed its own guard and then handed the
+    disable sequences to app._print — the terminal received NOTHING. Every reset
+    from inside app mode was a silent no-op, which is why an abrupt exit left the
+    shell with mouse tracking still on and a wheel scroll spraying escape
+    sequences. The terminal-death watchdog calls this immediately before killing
+    the process, i.e. exactly where the capture is installed. (#reset-real-stderr)
+    """
     try:
-        out = sys.stderr
+        # __stderr__ is the interpreter's original stream; fall back to the current
+        # one only if the interpreter never had it (pythonw, embedded).
+        out = sys.__stderr__ or sys.stderr
         if out is None or (hasattr(out, "isatty") and not out.isatty()):
             return
         if sys.platform == "win32":

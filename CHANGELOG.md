@@ -7,6 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- **An abrupt exit no longer leaves the shell spraying escape sequences.** The mode
+  reset wrote to `sys.stderr`, which Textual replaces with a capture whose `isatty()`
+  returns True for the app's whole life — so the disable sequences went to the app, not
+  the terminal, and a wheel scroll at the recovered prompt printed garbage. It writes to
+  `sys.__stderr__` now.
+- **The terminal-death watchdog says what it did.** It exits with `os._exit`, so a
+  false positive killed a healthy session leaving the log ending on an ordinary line.
+  It now logs arming, every miss, every NEAR miss (a session one poll from being
+  reaped), and the kill decision.
 - **An abrupt exit now explains itself.** saikai closed mid-session and nothing on
   disk said why: the log ended on an ordinary line, and the one handler that catches a
   UI crash printed to stderr only. Unhandled exceptions (main thread AND background
