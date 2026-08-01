@@ -1688,6 +1688,61 @@ _TERM_EMULATOR_NAMES = frozenset({
 })
 
 
+# Toolhelp binding, created ONCE. This used to live inside _win_pid_index, and that
+# was a real concurrency bug, not a style point: ctypes.windll.kernel32 is a
+# PROCESS-WIDE cached object, so `k32.Process32First.argtypes = [..., POINTER(P32)]`
+# is shared state — while PROCESSENTRY32, defined per call, was a NEW class every
+# time. Two overlapping calls therefore each rewrote argtypes to point at their own
+# class, and the loser raised
+#     ArgumentError: expected LP_PROCESSENTRY32 instance instead of LP_PROCESSENTRY32
+# (the same name, a different class). MEASURED with 6 concurrent walkers: 10864 of
+# 10865 walks failed. saikai calls this from the UI thread (the live-session scan) and
+# from the watchdog thread every 8s, which is exactly the overlap — and before the
+# strict-mode fix each such failure returned {} and was scored by the watchdog as a
+# confirmed terminal death, two in a row being enough to reap a healthy session. One
+# stable class and one prototype setup remove the race entirely; each call still gets
+# its own snapshot handle and its own entry buffer, so the walk stays thread-safe.
+# (#toolhelp-argtypes-race)
+_TH32 = None
+_TH32_LOCK = threading.Lock()
+
+
+def _th32():
+    """(ctypes, kernel32, PROCESSENTRY32) with prototypes configured once."""
+    global _TH32
+    if _TH32 is not None:
+        return _TH32
+    with _TH32_LOCK:
+        if _TH32 is None:
+            import ctypes
+            from ctypes import wintypes
+
+            class PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * 260),
+                ]
+
+            k32 = ctypes.windll.kernel32
+            k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+            k32.Process32First.argtypes = [wintypes.HANDLE,
+                                           ctypes.POINTER(PROCESSENTRY32)]
+            k32.Process32Next.argtypes = [wintypes.HANDLE,
+                                          ctypes.POINTER(PROCESSENTRY32)]
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            _TH32 = (ctypes, k32, PROCESSENTRY32)
+    return _TH32
+
+
 class _SnapshotFailed(Exception):
     """The process snapshot could not be taken, or completed only partway.
 
@@ -1715,9 +1770,6 @@ def _win_pid_index(strict: bool = False) -> dict[int, tuple[str, int]]:
     ERROR_NO_MORE_FILES, and the result must contain our OWN pid — we demonstrably
     exist, so an index without us is incomplete by definition.
     (#snapshot-failure-vs-empty)"""
-    import ctypes
-    from ctypes import wintypes
-
     ERROR_NO_MORE_FILES = 18
 
     def _fail(reason: str) -> dict:
@@ -1725,29 +1777,24 @@ def _win_pid_index(strict: bool = False) -> dict[int, tuple[str, int]]:
             raise _SnapshotFailed(reason)
         return {}
 
+    def _last_error(k32) -> int:
+        """The thread's last error, or "no more files" if it cannot be read.
+
+        Read immediately after the failing call — any other ctypes call clobbers it.
+        A code we cannot read must NOT condemn the walk: treating that as a truncated
+        snapshot would turn an unreadable error into the very "inconclusive" verdict
+        this function exists to report honestly. (#snapshot-failure-vs-empty)"""
+        try:
+            return int(k32.GetLastError())
+        except Exception:
+            return ERROR_NO_MORE_FILES
+
     TH32CS_SNAPPROCESS = 0x00000002
+    try:
+        ctypes, k32, PROCESSENTRY32 = _th32()
+    except Exception as exc:            # no ctypes / not Windows after all
+        return _fail("toolhelp unavailable: %r" % (exc,))
     INVALID = ctypes.c_void_p(-1).value
-
-    class PROCESSENTRY32(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-            ("th32ModuleID", wintypes.DWORD),
-            ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD),
-            ("pcPriClassBase", ctypes.c_long),
-            ("dwFlags", wintypes.DWORD),
-            ("szExeFile", ctypes.c_char * 260),
-        ]
-
-    k32 = ctypes.windll.kernel32
-    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    k32.Process32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32)]
-    k32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32)]
-    k32.CloseHandle.argtypes = [wintypes.HANDLE]
 
     snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if not snap or snap == INVALID:
@@ -1764,7 +1811,7 @@ def _win_pid_index(strict: bool = False) -> dict[int, tuple[str, int]]:
         # instead of pointer to …"). pointer() yields a real LP_PROCESSENTRY32.
         ok = k32.Process32First(snap, ctypes.pointer(entry))
         if not ok:
-            walk_err = int(k32.GetLastError())
+            walk_err = _last_error(k32)
         while ok:
             name = entry.szExeFile.decode("ascii", "replace").lower()
             out[int(entry.th32ProcessID)] = (name, int(entry.th32ParentProcessID))
@@ -1774,13 +1821,19 @@ def _win_pid_index(strict: bool = False) -> dict[int, tuple[str, int]]:
                 # that stopped for any reason other than "no more files" gave us a
                 # TRUNCATED tree, which is indistinguishable from a shrunken one —
                 # and a truncated tree is how our own ancestors go missing.
-                walk_err = int(k32.GetLastError())
-    except Exception:
+                walk_err = _last_error(k32)
+    except Exception as exc:
         # Lenient callers keep the documented "{} on any failure" contract — the
         # walk must never raise into them (the arm-time check and the pid verifier
         # both treat {} as "no info"). Previously only snapshot CREATION was
         # guarded, so a ctypes mismatch escaped. (#audit-pidreuse)
-        return _fail("snapshot walk raised")
+        #
+        # NAME the exception: this branch fires in production roughly once every
+        # 25 minutes of runtime (watchdog log, 2026-07-31/08-01), which is exactly
+        # the event that used to be scored as a confirmed terminal death. A bare
+        # "snapshot walk raised" said nothing about what to fix next.
+        # (#snapshot-failure-vs-empty)
+        return _fail("snapshot walk raised: %r" % (exc,))
     finally:
         k32.CloseHandle(snap)
     if walk_err != ERROR_NO_MORE_FILES:

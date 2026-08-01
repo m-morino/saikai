@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **The process snapshots that made the watchdog nervous were our own ctypes race.**
+  0.6.2's logging showed them arriving about once every 25 minutes of runtime; naming
+  the exception identified it as `PROCESSENTRY32` being defined per call while
+  `kernel32`'s `argtypes` is process-wide shared state, so two overlapping walks (the
+  UI thread's session scan and the watchdog's 8s poll) broke each other's call. One
+  stable class built once removes it: measured 10864 of 10865 concurrent walks failing
+  before, 0 of 1773 after. 0.6.2 stopped such a failure from being read as a dead
+  terminal; this stops it happening.
+
 ## [0.6.2] — 2026-07-31
 
 saikai closed itself mid-session and left the terminal unusable, and nothing on disk

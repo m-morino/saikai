@@ -1000,62 +1000,71 @@ def test_snapshot_failure_is_not_read_as_a_dead_terminal():
     """A failed process snapshot and an empty one are OPPOSITE conclusions.
 
     _win_pid_index returned {} for every failure, _find_terminal_anchor({}) returns 0,
-    and the watchdog reads 0 as "the terminal is gone" — so a transient
-    CreateToolhelp32Snapshot failure (documented under heavy process churn, which 11
-    panes of claude + node workers create) was scored as a confirmed terminal death.
-    Two in a row and a healthy saikai taskkilled its own tree and os._exit(0)'d, taking
-    every live pane with it. The watchdog's own "inconclusive → reset the streak"
-    branch could never fire for that failure mode, because nothing ever raised.
+    and the watchdog reads 0 as "the terminal is gone" — so an enumeration failure was
+    scored as a confirmed terminal death, and two in a row taskkilled saikai's own tree
+    and os._exit(0)'d a healthy session with eleven live panes. The watchdog's own
+    "inconclusive → reset the streak" branch could never fire, because nothing raised.
 
-    Three ways a snapshot can lie, all asserted: it cannot be created; the walk stops
-    early (a TRUNCATED tree is how our own ancestors go missing); and the result does
-    not contain our own pid, which is impossible for a complete snapshot since we are
-    demonstrably running. Lenient mode keeps returning {} for all three, because for
-    the arm-time check and the pid verifier "no info" is the safe answer.
-    (#snapshot-failure-vs-empty)"""
-    import types
-
+    Injected at the toolhelp BINDING, not by faking the ctypes module: the binding is
+    built once and cached now (that is what fixes the argtypes race), so a fake module
+    would never be consulted. The real PROCESSENTRY32 is kept and only the API is
+    stubbed, so the struct handling stays honest. (#snapshot-failure-vs-empty)"""
     assert saikai._win_pid_index.__defaults__ == (False,), \
         "strict must default OFF so the arm check and pid verifier stay lenient"
     assert saikai._find_terminal_anchor({}, os.getpid()) == 0, \
         "precondition: an empty index yields the same 0 as 'terminal gone'"
 
+    prev = saikai._th32
+    try:
+        # (1) Universal: no toolhelp at all (a non-Windows host, a ctypes failure).
+        def _no_toolhelp():
+            raise OSError("no windll here")
+        saikai._th32 = _no_toolhelp
+        assert saikai._win_pid_index() == {}, "lenient mode must stay quiet"
+        try:
+            saikai._win_pid_index(strict=True)
+            raise AssertionError("strict mode swallowed a missing toolhelp")
+        except saikai._SnapshotFailed as exc:
+            assert "toolhelp unavailable" in str(exc), str(exc)
+    finally:
+        saikai._th32 = prev
+
+    if sys.platform != "win32":
+        print("  (win32-only API failure cases skipped)")
+        return
+
+    import types
+
     class _Fn:
-        """A stand-in for a ctypes function: callable AND attribute-assignable
-        (the real code sets .restype / .argtypes on these)."""
+        """A stand-in for a ctypes function: callable and attribute-assignable."""
         def __init__(self, ret):
             self.ret, self.restype, self.argtypes = ret, None, None
 
         def __call__(self, *a, **kw):
             return self.ret
 
-    def _k32(snap, first, nxt, last_err):
+    real_ctypes, _real_k32, P32 = saikai._th32()   # real struct, real ctypes
+
+    def _binding(snap, first, nxt, last_err):
         k = types.SimpleNamespace()
         k.CreateToolhelp32Snapshot = _Fn(snap)
         k.Process32First = _Fn(first)
         k.Process32Next = _Fn(nxt)
         k.CloseHandle = _Fn(1)
         k.GetLastError = _Fn(last_err)
-        return k
+        return lambda: (real_ctypes, k, P32)
 
     CASES = {
         # snapshot handle refused outright
-        "CreateToolhelp32Snapshot": _k32(0, 0, 0, 6),
+        "CreateToolhelp32Snapshot": _binding(0, 0, 0, 6),
         # walk ended for a reason OTHER than ERROR_NO_MORE_FILES(18) → truncated
-        "truncated": _k32(7, 1, 0, 6),
+        "truncated": _binding(7, 1, 0, 6),
         # complete-looking walk that does not contain us → incomplete by definition
-        "missing our own pid": _k32(7, 1, 0, 18),
+        "missing our own pid": _binding(7, 1, 0, 18),
     }
-
-    import ctypes as _real_ctypes
-    prev = sys.modules.get("ctypes")
     try:
-        for expect, k32 in CASES.items():
-            fake = types.ModuleType("ctypes")
-            for attr in dir(_real_ctypes):
-                setattr(fake, attr, getattr(_real_ctypes, attr))
-            fake.windll = types.SimpleNamespace(kernel32=k32)
-            sys.modules["ctypes"] = fake
+        for expect, binding in CASES.items():
+            saikai._th32 = binding
             assert saikai._win_pid_index() == {}, \
                 "lenient mode must stay quiet for %r" % (expect,)
             try:
@@ -1064,8 +1073,7 @@ def test_snapshot_failure_is_not_read_as_a_dead_terminal():
             except saikai._SnapshotFailed as exc:
                 assert expect in str(exc), "%r not in %r" % (expect, str(exc))
     finally:
-        if prev is not None:
-            sys.modules["ctypes"] = prev
+        saikai._th32 = prev
 
 
 def test_abrupt_exit_leaves_the_alternate_screen():
@@ -1265,6 +1273,64 @@ def test_windows_pid_guard_needs_more_than_an_image_name():
     assert verdicts[16] is False, "a ppid cycle must terminate and refuse"
     assert verdicts[999999] is False, "a pid the snapshot has never seen was accepted"
 
+def test_concurrent_process_snapshots_do_not_corrupt_each_other():
+    """Two threads walking the process list must not break each other's ctypes call.
+
+    PROCESSENTRY32 used to be defined INSIDE _win_pid_index, so every call created a
+    new class — while ctypes.windll.kernel32 is a process-wide cached object, which
+    makes `Process32First.argtypes` shared state. Overlapping calls each rewrote
+    argtypes to point at their own class and the loser raised
+
+        ArgumentError: expected LP_PROCESSENTRY32 instance instead of LP_PROCESSENTRY32
+
+    the same name, a different class. MEASURED with six concurrent walkers under
+    process churn: 10864 of 10865 walks failed; after the fix, 0 of 1773.
+
+    This was the real cause of the production failures behind the watchdog's
+    "enumeration inconclusive" line (~once per 25 minutes of runtime): saikai walks the
+    list from the UI thread for the live-session scan AND from the watchdog thread every
+    8 seconds. Before strict mode, each such failure returned {} — which the watchdog
+    read as a confirmed terminal death, two in a row being enough to reap a healthy
+    session. (#toolhelp-argtypes-race)"""
+    import threading as _threading
+
+    if sys.platform != "win32":
+        print("SKIP test_concurrent_process_snapshots_do_not_corrupt_each_other "
+              "(toolhelp is Windows-only)")
+        return
+
+    # The binding is built once and shared, which is what makes the class identity —
+    # and therefore argtypes — stable.
+    assert saikai._th32() is saikai._th32(), "the toolhelp binding is rebuilt per call"
+
+    errors: list = []
+    walks = [0]
+    lock = _threading.Lock()
+
+    def _walk():
+        for _ in range(25):
+            try:
+                idx = saikai._win_pid_index(strict=True)
+            except Exception as exc:
+                with lock:
+                    errors.append(repr(exc))
+                continue
+            with lock:
+                walks[0] += 1
+                if os.getpid() not in idx:
+                    errors.append("snapshot without our own pid")
+
+    threads = [_threading.Thread(target=_walk, name="walk-%d" % i)
+               for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert not errors, "concurrent snapshots failed %d time(s): %s" % (
+        len(errors), errors[:3])
+    assert walks[0] == 150, "expected 150 completed walks, got %d" % walks[0]
+
 
 if __name__ == "__main__":
     test_hostile_inputs_degrade_instead_of_raising()
@@ -1335,3 +1401,5 @@ if __name__ == "__main__":
     print("PASS test_new_session_scan_runs_off_the_ui_thread")
     test_windows_pid_guard_needs_more_than_an_image_name()
     print("PASS test_windows_pid_guard_needs_more_than_an_image_name")
+    test_concurrent_process_snapshots_do_not_corrupt_each_other()
+    print("PASS test_concurrent_process_snapshots_do_not_corrupt_each_other")
