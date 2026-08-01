@@ -721,6 +721,50 @@ def _log(msg: str) -> None:
         pass
 
 
+def _instrument_app_mode(app) -> None:
+    """Log every transition out of (and back into) Textual's application mode.
+
+    2026-08-01 19:07: the TUI vanished and the user was left looking at a shell, while
+    the process stayed completely healthy — py-spy showed the event loop running, the
+    input thread waiting on the console and every worker idle, and the log kept ticking
+    over. Nothing in the crash trail fires for that, because nothing crashed: the app
+    simply stopped being on screen. It also kept 8 claude children and the mirror port,
+    so a "restart" then collides with an instance the user cannot see.
+
+    The only way out of application mode is the driver's stop_application_mode (which
+    App.suspend and App.run's teardown both go through), so wrapping it on the live
+    driver catches every case — a suspend, a driver stop, or something calling it
+    directly — and pairs it with the resume. The terminal-death watchdog cannot see
+    this: it asks whether a shell ANCESTOR is alive, and in that incident the launching
+    shell was alive the whole time (it was waiting on `uv run saikai`).
+    (#app-mode-trail)"""
+    try:
+        driver = getattr(app, "_driver", None)
+        if driver is None or getattr(driver, "_saikai_mode_logged", False):
+            return
+        stop = getattr(driver, "stop_application_mode", None)
+        start = getattr(driver, "start_application_mode", None)
+        suspend = getattr(driver, "suspend_application_mode", None)
+        if stop is None:
+            return
+
+        def _wrap(fn, what):
+            def _logged(*a, **kw):
+                _log("app-mode: %s (%s)" % (what, getattr(fn, "__name__", "?")))
+                return fn(*a, **kw)
+            return _logged
+
+        driver.stop_application_mode = _wrap(stop, "LEFT the screen")
+        if start is not None:
+            driver.start_application_mode = _wrap(start, "back on screen")
+        if suspend is not None:
+            driver.suspend_application_mode = _wrap(suspend, "suspended")
+        driver._saikai_mode_logged = True
+        _log("app-mode: instrumented (%s)" % type(driver).__name__)
+    except Exception:
+        pass
+
+
 def _install_crash_logging() -> None:
     """Make an abrupt exit self-explaining in saikai.log.
 
@@ -6436,6 +6480,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 pass
 
         def on_mount(self) -> None:
+            # Say so in the log the moment the TUI stops being on screen: the app can
+            # go on running healthily with nothing visible, holding its panes and the
+            # mirror port, and no other channel reports that. (#app-mode-trail)
+            _instrument_app_mode(self)
             # Enable DEC 2026 synchronized output on Windows. Textual's Windows driver
             # never PROBES for ?2026 support — only its linux/web drivers call
             # _request_terminal_sync_mode_support — so _sync_available stays False and

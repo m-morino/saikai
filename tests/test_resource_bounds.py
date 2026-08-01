@@ -1391,6 +1391,59 @@ def test_process_snapshots_are_shared_but_never_stale_for_a_kill():
     assert calls == [0.0], \
         "the kill guard asked for a cached snapshot: max_age=%r" % (calls,)
 
+def test_leaving_the_screen_is_logged():
+    """A TUI that stops being on screen must say so in the log.
+
+    2026-08-01 19:07: the TUI vanished and the user was left at a shell, while the
+    process stayed completely healthy — py-spy showed the event loop running, the input
+    thread waiting on the console and every worker idle, and the log kept ticking. No
+    crash channel fires for that, because nothing crashed: the app just stopped being
+    visible. It also kept 8 claude children and the mirror port, so the user's "restart"
+    then collides with an instance they cannot see. The terminal-death watchdog is blind
+    to it: it asks whether a shell ANCESTOR is alive, and in that incident the launching
+    shell was alive the whole time, waiting on `uv run saikai`.
+
+    Everything that leaves application mode goes through the driver's
+    stop_application_mode — App.suspend and App.run's own teardown included — so
+    wrapping it on the live driver catches every route out. (#app-mode-trail)"""
+    log = saikai.CACHE_DIR / "saikai.log"
+    before = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+
+    class _Driver:
+        def __init__(self):
+            self.calls = []
+
+        def start_application_mode(self):
+            self.calls.append("start")
+
+        def stop_application_mode(self):
+            self.calls.append("stop")
+
+        def suspend_application_mode(self):
+            self.calls.append("suspend")
+
+    class _App:
+        pass
+
+    app = _App()
+    app._driver = driver = _Driver()
+    saikai._instrument_app_mode(app)
+    saikai._instrument_app_mode(app)          # idempotent: no double wrapping
+
+    driver.stop_application_mode()
+    driver.start_application_mode()
+    driver.suspend_application_mode()
+
+    added = log.read_text(encoding="utf-8", errors="replace")[len(before):]
+    assert "app-mode: instrumented" in added, added[-400:]
+    assert added.count("app-mode: LEFT the screen") == 1, added[-400:]
+    assert "app-mode: back on screen" in added, added[-400:]
+    assert "app-mode: suspended" in added, added[-400:]
+    # The real methods still run — the instrument observes, it does not replace.
+    assert driver.calls == ["stop", "start", "suspend"], driver.calls
+    # A driverless app must not raise (an early mount, a headless run).
+    saikai._instrument_app_mode(_App())
+
 
 if __name__ == "__main__":
     test_hostile_inputs_degrade_instead_of_raising()
@@ -1465,3 +1518,5 @@ if __name__ == "__main__":
     print("PASS test_concurrent_process_snapshots_do_not_corrupt_each_other")
     test_process_snapshots_are_shared_but_never_stale_for_a_kill()
     print("PASS test_process_snapshots_are_shared_but_never_stale_for_a_kill")
+    test_leaving_the_screen_is_logged()
+    print("PASS test_leaving_the_screen_is_logged")
