@@ -1009,8 +1009,12 @@ def test_snapshot_failure_is_not_read_as_a_dead_terminal():
     built once and cached now (that is what fixes the argtypes race), so a fake module
     would never be consulted. The real PROCESSENTRY32 is kept and only the API is
     stubbed, so the struct handling stays honest. (#snapshot-failure-vs-empty)"""
-    assert saikai._win_pid_index.__defaults__ == (False,), \
+    import inspect
+    _params = inspect.signature(saikai._win_pid_index).parameters
+    assert _params["strict"].default is False, \
         "strict must default OFF so the arm check and pid verifier stay lenient"
+    assert _params["max_age"].default == 0.0, \
+        "max_age must default to 0 so a caller opts IN to a cached snapshot"
     assert saikai._find_terminal_anchor({}, os.getpid()) == 0, \
         "precondition: an empty index yields the same 0 as 'terminal gone'"
 
@@ -1331,6 +1335,62 @@ def test_concurrent_process_snapshots_do_not_corrupt_each_other():
         len(errors), errors[:3])
     assert walks[0] == 150, "expected 150 completed walks, got %d" % walks[0]
 
+def test_process_snapshots_are_shared_but_never_stale_for_a_kill():
+    """One recent snapshot serves the callers that can tolerate a stale view.
+
+    MEASURED on the machine this was found on: 9 ms and 409 processes per enumeration,
+    taken on EVERY reload (the log shows reloads 2-15s apart) plus one per watchdog poll
+    — about 30 a minute, ~12,000 process records a minute, forever, with 9 ms of it on
+    the UI thread each time. Two reasons to stop: it is pure waste, and continuously
+    enumerating the whole process table is one of the behaviours an endpoint-protection
+    agent scores against a process — a bad trait for a tool that also force-kills
+    process trees.
+
+    Two things must NOT be cached, and both are asserted: a failure (it would hand the
+    watchdog a stale "terminal is gone" for the whole TTL) and a kill decision's
+    verification, which always takes a fresh snapshot. (#pid-index-cache)"""
+    import time as _time
+
+    if sys.platform != "win32":
+        print("SKIP test_process_snapshots_are_shared_but_never_stale_for_a_kill "
+              "(toolhelp is Windows-only)")
+        return
+
+    first = saikai._win_pid_index(max_age=5.0)
+    assert saikai._win_pid_index(max_age=5.0) is first, \
+        "a fresh-enough snapshot was re-enumerated"
+    assert saikai._win_pid_index() is not first, \
+        "max_age defaults to 0, so the default call must enumerate"
+    _time.sleep(0.35)
+    assert saikai._win_pid_index(max_age=0.2) is not first, \
+        "an expired snapshot was reused"
+
+    # A FAILURE must not land in the cache.
+    good = saikai._win_pid_index(max_age=5.0)
+    prev = saikai._th32
+    try:
+        saikai._th32 = lambda: (_ for _ in ()).throw(OSError("no toolhelp"))
+        assert saikai._win_pid_index() == {}, "lenient failure changed shape"
+        assert saikai._win_pid_index(max_age=5.0) is good, \
+            "a failure evicted or replaced the cached snapshot"
+    finally:
+        saikai._th32 = prev
+
+    # The kill guard verifies against a FRESH snapshot: it must not accept a pid that
+    # only a stale view still contains.
+    calls = []
+    prev_index = saikai._win_pid_index
+    try:
+        def _counting(strict=False, max_age=0.0):
+            calls.append(max_age)
+            return {}
+        saikai._win_pid_index = _counting
+        saikai._proc_start_matches(4242, "")
+    finally:
+        saikai._win_pid_index = prev_index
+    assert calls == [0.0], \
+        "the kill guard asked for a cached snapshot: max_age=%r" % (calls,)
+
 
 if __name__ == "__main__":
     test_hostile_inputs_degrade_instead_of_raising()
@@ -1403,3 +1463,5 @@ if __name__ == "__main__":
     print("PASS test_windows_pid_guard_needs_more_than_an_image_name")
     test_concurrent_process_snapshots_do_not_corrupt_each_other()
     print("PASS test_concurrent_process_snapshots_do_not_corrupt_each_other")
+    test_process_snapshots_are_shared_but_never_stale_for_a_kill()
+    print("PASS test_process_snapshots_are_shared_but_never_stale_for_a_kill")

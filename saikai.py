@@ -1705,6 +1705,17 @@ _TERM_EMULATOR_NAMES = frozenset({
 # (#toolhelp-argtypes-race)
 _TH32 = None
 _TH32_LOCK = threading.Lock()
+# One recent snapshot, shared by every caller that can tolerate a slightly stale view.
+# MEASURED on this machine: 9 ms and 409 processes per enumeration, and saikai took one
+# on EVERY reload (the log shows reloads 2-15s apart) plus one per watchdog poll — about
+# 30 a minute, i.e. ~12,000 process records a minute, forever, 9 ms of it on the UI
+# thread each time. Two reasons to stop doing that: it is pure waste, and continuously
+# enumerating the whole process table is one of the behaviours an endpoint-protection
+# agent scores against a process, which is a bad thing for a tool that ALSO force-kills
+# process trees. Kill decisions still take a fresh snapshot — see _proc_start_matches.
+# (#pid-index-cache)
+_PID_INDEX_CACHE = None            # (taken_at_monotonic, index)
+_PID_INDEX_LOCK = threading.Lock()
 
 
 def _th32():
@@ -1756,7 +1767,8 @@ class _SnapshotFailed(Exception):
     fire for the most likely failure mode. (#snapshot-failure-vs-empty)"""
 
 
-def _win_pid_index(strict: bool = False) -> dict[int, tuple[str, int]]:
+def _win_pid_index(strict: bool = False,
+                   max_age: float = 0.0) -> dict[int, tuple[str, int]]:
     """{pid: (image_name_lower, ppid)} from one CreateToolhelp32Snapshot call.
 
     Fast (~ms, no subprocess spawn — startup stays instant). Returns {} on any
@@ -1769,7 +1781,15 @@ def _win_pid_index(strict: bool = False) -> dict[int, tuple[str, int]]:
     rejects a snapshot that completed only partway: the walk is checked for
     ERROR_NO_MORE_FILES, and the result must contain our OWN pid — we demonstrably
     exist, so an index without us is incomplete by definition.
-    (#snapshot-failure-vs-empty)"""
+    *max_age* reuses a snapshot that recent (in seconds) instead of taking a new one;
+    0, the default, always enumerates. The returned dict is SHARED when it comes from
+    the cache — every caller only reads it, and it must stay that way.
+    (#snapshot-failure-vs-empty #pid-index-cache)"""
+    global _PID_INDEX_CACHE
+    if max_age > 0.0:
+        cached = _PID_INDEX_CACHE
+        if cached is not None and (time.monotonic() - cached[0]) <= max_age:
+            return cached[1]
     ERROR_NO_MORE_FILES = 18
 
     def _fail(reason: str) -> dict:
@@ -1843,6 +1863,10 @@ def _win_pid_index(strict: bool = False) -> dict[int, tuple[str, int]]:
         # ancestor walk starts from a pid the index has never heard of and returns 0
         # — the "terminal is gone" answer, from an index that is simply incomplete.
         return _fail("snapshot is missing our own pid")
+    # Only a COMPLETE snapshot is cached: caching a failure would hand the watchdog a
+    # stale "terminal is gone" for as long as the TTL. (#pid-index-cache)
+    with _PID_INDEX_LOCK:
+        _PID_INDEX_CACHE = (time.monotonic(), out)
     return out
 
 
@@ -1902,8 +1926,11 @@ def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
             # re-walk, so on PID reuse the re-walk never ran at all. A live anchor
             # here → the tab/window is still open.
             try:
+                # Up to 2s stale against an 8s poll: it can delay noticing a closed
+                # terminal by that much, which is nothing next to the 2-poll debounce.
+                # (#pid-index-cache)
                 alive = bool(_find_terminal_anchor(
-                    _win_pid_index(strict=True), self_pid))
+                    _win_pid_index(strict=True, max_age=2.0), self_pid))
             except Exception:
                 # A transient enumeration failure is inconclusive — neither alive
                 # nor dead. RESET the miss streak: otherwise a failure sitting
@@ -2003,7 +2030,9 @@ def _load_active_sessions() -> dict[str, str]:
     # still Claude processes — defends against Windows PID reuse. Empty snapshot =
     # failure → None so _is_session_pid_live falls back to a bare liveness check
     # rather than marking every session dead. (#audit-pidreuse)
-    pid_index = _win_pid_index() if sys.platform == "win32" else None
+    # A reload fires every few seconds and only needs to know which pids are live, so
+    # a snapshot up to a second old is as good as a new one. (#pid-index-cache)
+    pid_index = _win_pid_index(max_age=1.0) if sys.platform == "win32" else None
     if not pid_index:
         pid_index = None
     try:
