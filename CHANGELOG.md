@@ -6,34 +6,79 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-- **The outbox download sends exactly what it promised, from the file it checked.**
-  Tapping a file while it was still being copied in streamed more bytes than the
-  advertised length, corrupting both the saved file and the next request on the
-  connection; a filename containing CR/LF could inject HTTP headers; the checks applied
-  to a path that could change before the read; a 20s socket timeout killed slow large
-  transfers; the startup litter sweep deleted outbox files named `*.tmp.*`; and the
-  files button covered the on-screen keyboard's Enter key.
+## [0.6.3] — 2026-08-02
+
+A pane is a terminal emulator, and this release finally treats it like one: the whole
+input path is a single bounded VT tokenizer that dispatches modes, queries, notifications
+and presentation in the order the child wrote them, instead of a stack of independent
+scrubs. Plus a way to hand a file from a pane to your phone.
+
+### Requires
+- **Two new dependencies: `regex` and `rich`.** Run `uv sync` (or reinstall) before
+  starting — without them the module still imports and then fails at first use with
+  `TypeError: 'NoneType' object is not callable`. Note `uv sync` cannot replace
+  `Scripts/saikai.exe` while saikai is running, so stop it first.
 
 ### Added
+- **A bounded incremental VT tokenizer.** One parser retains only incomplete control
+  strings, fails malformed or oversize input open as literal data, and dispatches in
+  stream order — so APC, PM, SOS, DCS, OSC, CSI and C1 forms can no longer leak embedded
+  controls or answer a query out of turn. A cancelled control string reaches nothing.
+- **Grapheme-correct presentation.** Extended grapheme clusters (`regex` `\X`) with
+  Rich's cell widths: a cluster occupies one leader cell plus as many continuation cells
+  as Rich reports — not an assumed two — so pyte's cursor, the native cursor/IME anchor,
+  CPR, selection and the browser mirror agree on combining marks, variation selectors,
+  emoji modifiers, ZWJ sequences, keycaps, flags and wider conjuncts. The mirror installs
+  the same width table over xterm.js.
+- **MAIN and ALT are separate screen/stream pairs**, so switching buffers no longer
+  destroys MAIN history or cursor state.
+- **One persistent per-pane FIFO writer.** Every child input source — keys, paste, mouse,
+  focus, terminal replies, mirror control — enqueues into it, accounted in encoded UTF-8
+  bytes in O(1); no caller blocks in `pty.write()`.
 - **Hand a file to your phone through the mirror.** Anything dropped in
-  `~/.cache/saikai/outbox` shows up in the mirror page's file panel and downloads
-  from there — so claude can leave a pptx for you the moment it finishes and you pick
-  it up later from the phone. Offering IS putting the file there, which is why it works
-  with nobody at the keyboard. No request carries a path, only a name inside that one
-  directory, so nothing else on the filesystem is reachable; files stop being served
-  after 24h (they are not deleted), 512 MB each, three concurrent downloads counted
-  apart from the screen stream, and every transfer is logged.
+  `~/.cache/saikai/outbox` appears in the mirror page's file panel and downloads from
+  there, so claude can leave a pptx for you the moment it finishes and you pick it up
+  later. Offering IS putting the file there, which is why it works with nobody at the
+  keyboard. No request carries a path, only a name inside that one directory; files stop
+  being served after 24h (they are not deleted), 512 MB each, three concurrent downloads
+  counted apart from the screen stream, every transfer logged.
 
 ### Fixed
-- **The process snapshots that made the watchdog nervous were our own ctypes race.**
-  0.6.2's logging showed them arriving about once every 25 minutes of runtime; naming
-  the exception identified it as `PROCESSENTRY32` being defined per call while
-  `kernel32`'s `argtypes` is process-wide shared state, so two overlapping walks (the
-  UI thread's session scan and the watchdog's 8s poll) broke each other's call. One
-  stable class built once removes it: measured 10864 of 10865 concurrent walks failing
-  before, 0 of 1773 after. 0.6.2 stopped such a failure from being read as a dead
-  terminal; this stops it happening.
+- **A watchdog false positive can no longer kill a healthy session, and the failures that
+  caused it are gone.** The process-snapshot helper reported failure as an empty result,
+  which the watchdog read as "the terminal is gone"; the failures themselves turned out
+  to be our own ctypes race (`PROCESSENTRY32` defined per call while `kernel32`'s
+  `argtypes` is process-wide shared state — measured 10864 of 10865 concurrent walks
+  failing, 0 of 1773 after). Failure and emptiness are now distinct, a truncated snapshot
+  counts as a failure, and one stable binding removes the race.
+- **The mirror survives a bad frame, and a pane survives a bad chunk.** Both loops ran
+  their body unguarded, so one raise froze every browser on its last frame or killed a
+  pane and orphaned its claude.
+- **Terminal state that was previously approximated**: RIS is a real hard reset applied at
+  the reset position, saved mode state is restored, the software caret gets its DECSCUSR
+  shape and keeps its cell width, Alt+punctuation is no longer dropped, and the pane
+  reports an honest size.
+- **The Primary DA reply stops claiming capabilities the pane lacks** (sixel, selective
+  erase, macros, rectangular editing). Measured on-device: the caret tracking that the
+  IME anchor depends on is driven by the WT identity in the child's env, not by this
+  reply, so honesty costs nothing.
+- **Blocking work stays off the UI thread** (clipboard fallbacks, the agent-kill batch,
+  the new-session candidate walk), and process snapshots are shared with a short TTL
+  instead of re-enumerating ~30 times a minute.
+- **An abrupt exit explains itself**: unhandled exceptions on any thread land in
+  `saikai.log` with their traceback, interpreter faults in `crash.log`, every clean exit
+  logs `stop: exiting`, and leaving the screen without exiting is logged too — the app can
+  keep running healthily with nothing visible, holding its panes and the mirror port.
+- **A recycled pid can no longer get an unrelated process tree force-killed**, on either
+  the agent-kill or the pane-reap path.
+- **Panes start at their real size** rather than an 80x24 fallback, and a pane closed
+  before its first layout no longer spawns a child nobody reaps.
+- **A session parked on claude's agents view reports "Needs input"**, read from the view's
+  own title counts.
+
+### Changed
+- The mirror's read token is 8 characters instead of 16; the strength comes from the hub's
+  per-source lockout rather than the token length, and the write-key is unchanged.
 
 ## [0.6.2] — 2026-07-31
 

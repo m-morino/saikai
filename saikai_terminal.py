@@ -5686,6 +5686,21 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 # VT500 class plus ANSI colour only. Do not claim sixel (4),
                 # selective erase (6), UDK/DRCS/macros (8), or rectangular
                 # editing (28), none of which the pane implements.
+                #
+                # This reply used to be byte-identical to Windows Terminal
+                # (?61;4;6;7;14;21;22;23;24;28;32;42;52c) on the theory that looking
+                # exactly like WT is what makes claude pick the renderer that tracks
+                # the input caret — the caret the IME anchor follows. MEASURED
+                # 2026-08-02, one real claude per reply in a 30x100 PTY through this
+                # same responder, changing ONLY this string: the two runs are
+                # behaviourally identical — ?1049h x1, ?2026h x11, ?25h x10, ?25l x9,
+                # mouse x6, CUP x28 in both, the whole control-sequence profile equal,
+                # and after typing three characters the cursor sits at (26, 6) in both
+                # (advancing with the text, i.e. tracking). So the caret behaviour is
+                # driven by the WT identity in the ENV (see _child_pty_env), NOT by
+                # this reply, and honesty about capabilities costs nothing here.
+                # claude does BLOCK on the answer (it stops drawing until one
+                # arrives) — it needs a reply, just not that reply. (#da1-not-caret)
                 return "\x1b[?62;22c"
             if params in (">", ">0"):
                 return "\x1b[>0;10;1c"
