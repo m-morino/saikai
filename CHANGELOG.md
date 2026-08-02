@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Hand a file to your phone through the mirror.** Anything dropped in
+  `~/.cache/saikai/outbox` shows up in the mirror page's file panel and downloads
+  from there — so claude can leave a pptx for you the moment it finishes and you pick
+  it up later from the phone. Offering IS putting the file there, which is why it works
+  with nobody at the keyboard. No request carries a path, only a name inside that one
+  directory, so nothing else on the filesystem is reachable; files stop being served
+  after 24h (they are not deleted), 512 MB each, three concurrent downloads counted
+  apart from the screen stream, and every transfer is logged.
+
 ### Fixed
 - **The process snapshots that made the watchdog nervous were our own ctypes race.**
   0.6.2's logging showed them arriving about once every 25 minutes of runtime; naming

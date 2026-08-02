@@ -88,6 +88,16 @@ _MAX_SSE_CLIENTS = 8        # concurrent /stream viewers
 _MAX_CONNECTIONS = 48       # concurrent accepted sockets, all sources
 _MAX_CONN_PER_IP = 12       # concurrent accepted sockets from one source IP
 _CONN_TIMEOUT = 20          # seconds; a socket idle on header/body reads is dropped
+# Outbox (file hand-off to the phone). "Offering" a file IS putting it in this one
+# directory: claude does it the moment it produces something (`cp report.pptx
+# ~/.cache/saikai/outbox/`), the user can do it from any shell, and the phone lists
+# exactly that directory. Nothing else on the filesystem is ever reachable, and no
+# request carries a path — only a bare NAME inside the outbox — so there is no
+# traversal surface to defend, just a name to validate. (#outbox)
+_OUTBOX_TTL_SECS = 86400.0        # a file older than this stops being served (not deleted)
+_OUTBOX_MAX_BYTES = 512 * 1024 * 1024
+_MAX_DOWNLOADS = 3                # concurrent, counted SEPARATELY from the SSE slots so a
+                                  # big transfer cannot starve the screen stream
 
 
 def _paste_framing_ok(data: str) -> bool:
@@ -305,7 +315,8 @@ def _mlog(msg: str) -> None:
 class MirrorHub:
     def __init__(self, token: str, host: str = "127.0.0.1", port: int = 0,
                  cols: int = 80, rows: int = 24, ingest_cap: int = 256,
-                 idle_secs: float = 600.0, tls: "tuple[str, str] | None" = None) -> None:
+                 idle_secs: float = 600.0, tls: "tuple[str, str] | None" = None,
+                 outbox: "str | None" = None) -> None:
         self._token = token
         self._host = host
         self._port = port
@@ -315,6 +326,11 @@ class MirrorHub:
         self._scheme = "https" if tls else "http"
         self._cols = cols
         self._rows = rows
+        # Outbox: the directory whose contents the phone may download. None = the
+        # feature is off, which is what every existing caller gets. (#outbox)
+        self._outbox = outbox
+        self._dl_lock = threading.Lock()
+        self._dl_active = 0
         self._ingest: queue.Queue[str] = queue.Queue(ingest_cap)
         self._mirror_lock = threading.Lock()
         # saikai's screen, not a stock pyte one: pyte's draw BREAKS on the first
@@ -1223,6 +1239,83 @@ class MirrorHub:
     def _host_is_loopback(self) -> bool:
         return self._host in ("127.0.0.1", "localhost", "::1", "")
 
+    # ── outbox ───────────────────────────────────────────────────────────────
+    def outbox_entries(self) -> list:
+        """[(name, size, mtime)] for the files the phone may download right now.
+
+        Plain files DIRECTLY in the outbox only: no subdirectories (so a name is
+        always just a name), no symlinks (they would point outside), nothing over the
+        size cap, nothing past the TTL. Sorted newest first, because the thing you
+        want is almost always the thing claude just produced. (#outbox)"""
+        root = self._outbox
+        if not root:
+            return []
+        import os
+        import time as _t          # the module imports time locally, as here
+        out = []
+        try:
+            names = os.listdir(root)
+        except OSError:
+            return []
+        now = _t.time()
+        for name in names:
+            path = os.path.join(root, name)
+            try:
+                if os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                st = os.stat(path)
+            except OSError:
+                continue
+            if st.st_size > _OUTBOX_MAX_BYTES or (now - st.st_mtime) > _OUTBOX_TTL_SECS:
+                continue
+            out.append((name, int(st.st_size), float(st.st_mtime)))
+        out.sort(key=lambda e: e[2], reverse=True)
+        return out
+
+    def outbox_resolve(self, name: str) -> "str | None":
+        """The absolute path for *name*, or None if it is not servable.
+
+        The request carries a NAME, never a path, so the first check is that it still
+        IS one: anything with a separator, a drive letter, a "..", or a NUL is refused
+        outright rather than normalised — normalising is where traversal bugs live. The
+        realpath check afterwards is the backstop, not the defence. (#outbox)"""
+        root = self._outbox
+        if not root or not name:
+            return None
+        import os
+        if (name in (".", "..") or "/" in name or "\\" in name or "\x00" in name
+                or ":" in name or name != os.path.basename(name)):
+            return None
+        path = os.path.join(root, name)
+        try:
+            if os.path.islink(path) or not os.path.isfile(path):
+                return None
+            real, real_root = os.path.realpath(path), os.path.realpath(root)
+            if os.path.dirname(real) != real_root:
+                return None
+            st = os.stat(real)
+        except OSError:
+            return None
+        if st.st_size > _OUTBOX_MAX_BYTES:
+            return None
+        import time as _t
+        if (_t.time() - st.st_mtime) > _OUTBOX_TTL_SECS:
+            return None
+        return real
+
+    def take_download_slot(self) -> bool:
+        """Reserve one of the download slots, or refuse. Bounded separately from the
+        SSE viewers so a phone pulling a 300 MB file cannot stall the screen."""
+        with self._dl_lock:
+            if self._dl_active >= _MAX_DOWNLOADS:
+                return False
+            self._dl_active += 1
+            return True
+
+    def release_download_slot(self) -> None:
+        with self._dl_lock:
+            self._dl_active = max(0, self._dl_active - 1)
+
     def url(self) -> str:
         # 0.0.0.0/"" is a bind wildcard, not browsable — resolve a reachable host
         # (the primary LAN/egress IP) so the URL works from another device.
@@ -1669,8 +1762,24 @@ flex:0 0 auto;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 #kb-arrows{display:grid;grid-template-areas:". up ." "left down right";gap:4px;flex:0 0 auto}
 #kb-arrows>[data-k="up"]{grid-area:up}#kb-arrows>[data-k="down"]{grid-area:down}
 #kb-arrows>[data-k="left"]{grid-area:left}#kb-arrows>[data-k="right"]{grid-area:right}
-#kb-arrows>button{min-width:58px;padding:13px 0;flex:0 0 auto}</style></head>
+#kb-arrows>button{min-width:58px;padding:13px 0;flex:0 0 auto}
+/* Outbox panel: files claude (or you) dropped in ~/.cache/saikai/outbox. Hidden
+   until tapped, so it never competes with the terminal for room. */
+#fb{position:fixed;right:8px;bottom:8px;z-index:20;min-height:40px;min-width:40px;
+padding:8px 12px;font:bold 15px monospace;border:1px solid #557;border-radius:6px;
+background:#223;color:#cce;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+#fb.has{border-color:#4a4;color:#9f9}
+#fl{position:fixed;right:8px;bottom:56px;z-index:20;display:none;max-width:min(92vw,520px);
+max-height:60vh;overflow:auto;padding:8px;border:1px solid #557;border-radius:8px;
+background:#111;color:#ddd;font:14px monospace}
+#fl.open{display:block}
+#fl a{display:block;padding:9px 6px;color:#9cf;text-decoration:none;
+border-bottom:1px solid #333;word-break:break-all}
+#fl a:active{background:#123}
+#fl .meta{color:#888;font-size:12px}
+#fl .empty{color:#888;padding:6px}</style></head>
 <body data-cols="__COLS__" data-rows="__ROWS__"><div id="t"></div>
+<button id="fb" title="files">⤓</button><div id="fl"></div>
 <script src="/xterm.min.js"></script>
 <script src="/addon-canvas.js"></script>
 <script>
@@ -1794,6 +1903,69 @@ if (new URLSearchParams(location.search).get('debug') === '1') {
       ' scrollTop=' + (el ? el.scrollTop : '-');
   }, 300);
 }
+// ── outbox: download what claude left in ~/.cache/saikai/outbox ──────────────
+// Polled rather than pushed: a list this small is cheaper to re-fetch than to keep
+// in sync over the event stream, and it stays correct if a file is dropped in while
+// the page is closed. Only while the panel is OPEN (plus once on load, to light the
+// button when something is waiting), so a phone in a pocket costs nothing.
+const fb = document.getElementById('fb'), fl = document.getElementById('fl');
+let fileTimer = null;
+function fmtSize(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+  return (n / 1073741824).toFixed(2) + ' GB';
+}
+async function loadFiles(render) {
+  let data;
+  try {
+    const r = await fetch('/files?token=' + encodeURIComponent(token),
+                          {cache: 'no-store'});
+    if (!r.ok) return;
+    data = await r.json();
+  } catch (e) { return; }
+  const files = (data && data.files) || [];
+  fb.classList.toggle('has', files.length > 0);
+  fb.textContent = files.length ? '⤓ ' + files.length : '⤓';
+  if (!render) return;
+  fl.innerHTML = '';
+  if (!files.length) {
+    const d = document.createElement('div');
+    d.className = 'empty';
+    d.textContent = 'outbox is empty';
+    fl.appendChild(d);
+    return;
+  }
+  for (const f of files) {
+    const a = document.createElement('a');
+    a.href = '/file/' + encodeURIComponent(f.name) +
+             '?token=' + encodeURIComponent(token);
+    a.setAttribute('download', f.name);
+    a.textContent = f.name;                       // textContent: never innerHTML
+    const m = document.createElement('div');
+    m.className = 'meta';
+    m.textContent = fmtSize(f.size) + '  ' +
+                    new Date(f.mtime * 1000).toLocaleString();
+    a.appendChild(m);
+    fl.appendChild(a);
+  }
+}
+fb.addEventListener('click', (e) => {
+  e.preventDefault();
+  const open = fl.classList.toggle('open');
+  if (open) {
+    loadFiles(true);
+    fileTimer = setInterval(() => loadFiles(true), 15000);
+  } else if (fileTimer) {
+    clearInterval(fileTimer);
+    fileTimer = null;
+  }
+});
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) loadFiles(fl.classList.contains('open'));
+});
+loadFiles(false);
+
 const es = new EventSource('/stream?token=' + encodeURIComponent(token) +
                            (paneView ? '&view=pane' : ''));
 
@@ -3276,8 +3448,72 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif path == "/stream":
             self._stream()
+        elif path == "/files":
+            self._serve_outbox_list()
+        elif path.startswith("/file/"):
+            from urllib.parse import unquote
+            self._serve_outbox_file(unquote(path[len("/file/"):]))
         else:
             self.send_error(404)
+
+    def _serve_outbox_list(self) -> None:
+        """The outbox, as JSON, for the page's file panel. (#outbox)"""
+        hub = self.server.hub
+        rows = [{"name": n, "size": sz, "mtime": mt} for n, sz, mt in
+                hub.outbox_entries()]
+        body = json.dumps({"files": rows}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_outbox_file(self, name: str) -> None:
+        """Send one outbox file as an attachment. (#outbox)"""
+        hub = self.server.hub
+        src = self.client_address[0] if self.client_address else "?"
+        path = hub.outbox_resolve(name)
+        if path is None:
+            _mlog("outbox: refused %r from %s" % (name[:80], src))
+            self.send_error(404)
+            return
+        if not hub.take_download_slot():
+            _mlog("outbox: %d downloads already in flight — refused %r"
+                  % (_MAX_DOWNLOADS, name[:80]))
+            self.send_error(503, "too many downloads")
+            return
+        try:
+            import os
+            from urllib.parse import quote
+            size = os.path.getsize(path)
+            # Both forms: an ASCII fallback for old clients and RFC 5987 filename* so
+            # a Japanese name survives. The fallback is deliberately crude ("file"),
+            # because guessing a transliteration is worse than being obviously generic.
+            ascii_name = name.encode("ascii", "ignore").decode("ascii") or "file"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition",
+                             "attachment; filename=\"%s\"; filename*=UTF-8''%s"
+                             % (ascii_name.replace('"', ""), quote(name, safe="")))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            sent = 0
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
+            _mlog("outbox: served %r (%d/%d bytes) to %s" % (name[:80], sent, size, src))
+        except Exception as exc:
+            # A phone that closes the tab mid-transfer is normal, not an error worth
+            # a traceback; the slot release below is what matters.
+            _mlog("outbox: transfer of %r ended early (%s)" % (name[:80], exc))
+        finally:
+            hub.release_download_slot()
 
     def _serve_static(self, path, ctype):
         import os

@@ -11286,10 +11286,23 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         _mirror.LOG_HOOK = _log
                     except Exception:
                         pass
+                    # Outbox: the ONE directory the phone may download from.
+                    # "Offering" a file is putting it here — claude does it the moment
+                    # it produces something, the user can from any shell — so the
+                    # hand-off works while nobody is at the keyboard, and nothing else
+                    # on the filesystem is ever reachable. It PERSISTS across restarts
+                    # (a file dropped for you is still there tomorrow); a file stops
+                    # being served after 24h without being deleted. (#outbox)
+                    _outbox = CACHE_DIR / "outbox"
+                    try:
+                        _outbox.mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        _outbox = None
                     _hub = _mirror.MirrorHub(
                         token=_secrets.token_urlsafe(6), host=_mir_host,
                         port=_mirror.mirror_port(os.environ),
-                        idle_secs=_mirror.mirror_idle_secs(os.environ), tls=_tls)
+                        idle_secs=_mirror.mirror_idle_secs(os.environ), tls=_tls,
+                        outbox=(str(_outbox) if _outbox else None))
                     # LAN input is its own opt-in: a LAN-exposed mirror stays
                     # read-only unless SAIKAI_MIRROR_ALLOW_LAN_INPUT=1. Loopback
                     # always permits input.
@@ -11330,6 +11343,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                              YELLOW), file=sys.stderr)
                     if _url_file is not None:
                         print(_c(f"    (also saved to {_url_file})", YELLOW), file=sys.stderr)
+                    if _outbox is not None:
+                        print(_c(f"    files to hand to the phone: {_outbox}",
+                                 YELLOW), file=sys.stderr)
             except Exception as _mir_err:   # mirror is best-effort; never block launch
                 _hub = None
                 _app_kwargs = {}

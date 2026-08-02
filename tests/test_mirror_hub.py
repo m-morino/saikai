@@ -947,6 +947,117 @@ def test_read_token_is_short_enough_to_type_and_the_write_key_is_not():
     rows = m.qr_matrix(url)
     assert len(rows) <= 37, "QR grew to %dx%d modules" % (len(rows), len(rows[0]))
 
+def test_outbox_serves_only_what_was_dropped_in_it():
+    """File hand-off to the phone: the outbox directory, and nothing else.
+
+    "Offering" a file IS putting it in ~/.cache/saikai/outbox — claude does that the
+    moment it produces something, so the hand-off works while nobody is at the keyboard,
+    and the user can do it from any shell. The phone lists exactly that directory.
+
+    No request ever carries a PATH, only a bare name inside the outbox, so there is no
+    traversal to defend — just a name to validate. Asserted end to end over real HTTP,
+    because that is the layer an attacker meets: the token gate, the refusals (../ and
+    ..\\ and an absolute path and a subdirectory), the TTL, and a Japanese filename
+    surviving as RFC 5987 filename*. (#outbox)"""
+    import json as _json
+    import os
+    import tempfile
+    import time as _t
+    from urllib.parse import quote
+
+    box = tempfile.mkdtemp(prefix="saikai-outbox-test-")
+    with open(os.path.join(box, "report.pptx"), "wb") as f:
+        f.write(b"PPTX" * 100)
+    jp = "日本語 レポート.xlsx"
+    with open(os.path.join(box, jp), "wb") as f:
+        f.write(b"XLSX" * 50)
+    stale = os.path.join(box, "stale.txt")
+    with open(stale, "wb") as f:
+        f.write(b"old")
+    os.utime(stale, (_t.time() - 90000, _t.time() - 90000))   # past the 24h TTL
+    os.mkdir(os.path.join(box, "subdir"))
+    with open(os.path.join(box, "subdir", "hidden.txt"), "wb") as f:
+        f.write(b"nope")
+
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, outbox=box)
+    port = hub.serve()
+    base = "http://127.0.0.1:%d" % port
+    try:
+        # The listing shows the fresh plain files, newest first, and nothing else.
+        with _get(base + "/files?token=secret") as r:
+            listed = _json.loads(r.read().decode("utf-8"))["files"]
+        names = [f["name"] for f in listed]
+        assert names == [jp, "report.pptx"] or names == ["report.pptx", jp], names
+        assert "stale.txt" not in names, "a file past the TTL was offered"
+        assert "subdir" not in names, "a directory was offered"
+        assert all(f["size"] > 0 and f["mtime"] > 0 for f in listed), listed
+
+        # A download comes back whole, as an attachment.
+        with _get(base + "/file/report.pptx?token=secret") as r:
+            body = r.read()
+            disp = r.headers.get("Content-Disposition") or ""
+        assert body == b"PPTX" * 100, len(body)
+        assert disp.startswith("attachment;"), disp
+
+        # A Japanese name survives via filename* (and the ASCII fallback is present).
+        with _get(base + "/file/" + quote(jp) + "?token=secret") as r:
+            body = r.read()
+            disp = r.headers.get("Content-Disposition") or ""
+        assert body == b"XLSX" * 50, len(body)
+        assert "filename*=UTF-8''" in disp, disp
+        assert quote(jp, safe="") in disp, disp
+
+        # Everything else is refused. The token gate first: without it, not even the
+        # listing (which would otherwise disclose file names).
+        for label, path, token in (
+                ("listing without a token", "/files", False),
+                ("file without a token", "/file/report.pptx", False),
+                ("../ traversal", "/file/" + quote("../saikai.log"), True),
+                ("..\\ traversal", "/file/" + quote("..\\saikai.log"), True),
+                ("absolute path", "/file/" + quote("C:\\Windows\\win.ini"), True),
+                ("a subdirectory", "/file/" + quote("subdir/hidden.txt"), True),
+                ("past the TTL", "/file/stale.txt", True),
+                ("not there", "/file/nope.bin", True),
+                ("no name at all", "/file/", True),
+        ):
+            url = base + path + ("?token=secret" if token else "")
+            try:
+                _get(url)
+                raise AssertionError("%s was served" % label)
+            except urllib.error.HTTPError as e:
+                assert e.code in (403, 404), "%s -> %d" % (label, e.code)
+                if not token:
+                    assert e.code == 403, "%s -> %d (want 403)" % (label, e.code)
+
+        # Download slots are counted apart from the SSE viewers, so a big transfer
+        # cannot starve the screen stream.
+        assert m._MAX_DOWNLOADS >= 1 and m._MAX_DOWNLOADS < m._MAX_CONNECTIONS
+        taken = [hub.take_download_slot() for _ in range(m._MAX_DOWNLOADS)]
+        assert all(taken), taken
+        assert hub.take_download_slot() is False, "the download cap does not hold"
+        for _ in range(m._MAX_DOWNLOADS):
+            hub.release_download_slot()
+        assert hub.take_download_slot() is True, "slots are not released"
+        hub.release_download_slot()
+
+        # An oversize file is not offered (the cap is on the hub, not the browser).
+        big = os.path.join(box, "big.bin")
+        with open(big, "wb") as f:
+            f.write(b"x")
+        real_cap = m._OUTBOX_MAX_BYTES
+        try:
+            m._OUTBOX_MAX_BYTES = 0
+            assert hub.outbox_resolve("big.bin") is None, "oversize file was resolved"
+            assert "big.bin" not in [f[0] for f in hub.outbox_entries()]
+        finally:
+            m._OUTBOX_MAX_BYTES = real_cap
+    finally:
+        hub.stop()
+
+    # With no outbox configured the feature is simply off — every existing caller.
+    off = m.MirrorHub(token="t", host="127.0.0.1", port=0)
+    assert off.outbox_entries() == [] and off.outbox_resolve("x") is None
+
 
 if __name__ == "__main__":
     test_set_size_broadcasts_and_dedups()
@@ -995,3 +1106,5 @@ if __name__ == "__main__":
     print("PASS test_drain_thread_survives_a_frame_that_raises")
     test_read_token_is_short_enough_to_type_and_the_write_key_is_not()
     print("PASS test_read_token_is_short_enough_to_type_and_the_write_key_is_not")
+    test_outbox_serves_only_what_was_dropped_in_it()
+    print("PASS test_outbox_serves_only_what_was_dropped_in_it")
