@@ -1032,6 +1032,13 @@ def test_outbox_serves_only_what_was_dropped_in_it():
         # Download slots are counted apart from the SSE viewers, so a big transfer
         # cannot starve the screen stream.
         assert m._MAX_DOWNLOADS >= 1 and m._MAX_DOWNLOADS < m._MAX_CONNECTIONS
+        # The handler releases its slot in a finally that runs AFTER the client has
+        # read the body, so a slot can still be held for a moment here. Wait for the
+        # drain rather than asserting into that race.
+        _deadline = _t.monotonic() + 3.0
+        while hub._dl_active and _t.monotonic() < _deadline:
+            _t.sleep(0.02)
+        assert hub._dl_active == 0, "a download slot was never released"
         taken = [hub.take_download_slot() for _ in range(m._MAX_DOWNLOADS)]
         assert all(taken), taken
         assert hub.take_download_slot() is False, "the download cap does not hold"
@@ -1057,6 +1064,135 @@ def test_outbox_serves_only_what_was_dropped_in_it():
     # With no outbox configured the feature is simply off — every existing caller.
     off = m.MirrorHub(token="t", host="127.0.0.1", port=0)
     assert off.outbox_entries() == [] and off.outbox_resolve("x") is None
+
+def test_outbox_name_rule_covers_more_than_separators():
+    """A name is refused for what it CAN do, not only for looking like a path.
+
+    The first version screened `/ \\ : NUL ..` and stopped there, so two classes walked
+    straight through:
+
+    * CONTROL CHARACTERS. \\r and \\n are legal in POSIX filenames, they are ASCII (so
+      the "strip non-ASCII" fallback kept them), and send_header does no validation —
+      a file named "a\\r\\nContent-Length: 0\\r\\n\\r\\n<html>…" made the server emit
+      attacker-chosen headers and a body of its choosing, rendered by the phone under
+      the mirror's own origin: the token-authenticated context that hands out the
+      write-key.
+    * Windows device names and the trailing dot/space forms. They traverse nowhere, but
+      "NUL" or "a.txt." opens something that is not the file listed.
+
+    The listing applies the SAME rule now: it used to filter on stat alone, so a POSIX
+    file called "notes: draft.md" was offered as a tappable link that always 404'd, with
+    the reason in a host-side log the phone user cannot read.
+    (#outbox-header-injection #outbox)"""
+    ok = m.MirrorHub.outbox_name_ok
+    for good in ("report.pptx", "日本語 レポート.xlsx", "a-b_c (1).txt", ".hidden",
+                 "x" * 200):
+        assert ok(good) is True, good
+    for bad, why in (
+            ("", "empty"),
+            (".", "dot"),
+            ("..", "dotdot"),
+            ("a/b", "slash"),
+            ("a\\\\b", "backslash"),
+            ("C:x", "drive letter"),
+            ("a\\x00b", "NUL"),
+            ("a\\r\\nContent-Length: 0", "CRLF header injection"),
+            ("a\\tb", "tab"),
+            ("a\\x1bb", "escape"),
+            ("a.txt.", "trailing dot"),
+            ("a.txt ", "trailing space"),
+            ("NUL", "device"),
+            ("con.txt", "device with an extension"),
+            ("COM1", "device"),
+            ("a?b", "wildcard"),
+            ('a"b', "quote"),
+    ):
+        assert ok(bad) is False, "%s (%s) was accepted" % (bad, why)
+
+    # And the header builder is safe on its own, not merely because of that rule.
+    disp = m._Handler._attachment_disposition("a\\r\\nX-Evil: 1.txt")
+    assert "\\r" not in disp and "\\n" not in disp, disp
+    jp = m._Handler._attachment_disposition("日本語 レポート.xlsx")
+    assert "filename*=UTF-8''" in jp, jp
+    # A fully non-ASCII name must still yield a usable ASCII fallback — not ".xlsx",
+    # which some clients would save as a hidden file.
+    assert 'filename="file.xlsx"' in jp, jp
+
+
+def test_outbox_download_sends_exactly_what_it_promised():
+    """Content-Length and the body must agree, and the checks must apply to the bytes.
+
+    Reading to EOF against a length captured earlier meant that tapping an entry while
+    `cp` was still running streamed MORE than advertised: the browser stopped at the
+    promised length, kept the keep-alive connection, and the surplus was parsed as the
+    NEXT response. A short file left the phone waiting for bytes that never come.
+
+    And the validation now happens on the OPEN HANDLE. The outbox is writable by any
+    local process, so a path checked a moment ago can be a symlink to
+    ~/.claude/.credentials.json by the time it is read. (#outbox-toctou)"""
+    import os
+    import tempfile
+
+    box = tempfile.mkdtemp(prefix="saikai-outbox-fix-")
+    body = b"A" * 5000
+    with open(os.path.join(box, "grow.bin"), "wb") as f:
+        f.write(body)
+    hub = m.MirrorHub(token="secret", host="127.0.0.1", port=0, outbox=box)
+    port = hub.serve()
+    base = "http://127.0.0.1:%d" % port
+    try:
+        # A file that GROWS between the open and the read: the response must still be
+        # exactly Content-Length, never the extra bytes.
+        real_open = hub.outbox_open
+
+        def _grow_after_open(name):
+            handle, size = real_open(name)
+            if handle is not None:
+                with open(os.path.join(box, name), "ab") as g:
+                    g.write(b"B" * 4000)       # grew AFTER we committed to `size`
+            return (handle, size)
+
+        hub.outbox_open = _grow_after_open
+        with _get(base + "/file/grow.bin?token=secret") as r:
+            got = r.read()
+            assert int(r.headers["Content-Length"]) == len(body), r.headers
+        assert got == body, "sent %d bytes for a %d-byte promise" % (len(got), len(body))
+        hub.outbox_open = real_open
+
+        # A symlink is refused even when it is planted after a resolve would have
+        # passed: the handle's device+inode must match the pre-open lstat.
+        if hasattr(os, "symlink"):
+            secret = os.path.join(box, "..", "secret.txt")
+            with open(secret, "wb") as f:
+                f.write(b"TOPSECRET")
+            link = os.path.join(box, "link.bin")
+            try:
+                os.symlink(secret, link)
+            except (OSError, NotImplementedError):
+                pass                            # no symlink privilege on this host
+            else:
+                assert hub.outbox_open("link.bin")[0] is None, "a symlink was opened"
+                assert "link.bin" not in [e[0] for e in hub.outbox_entries()]
+    finally:
+        hub.stop()
+
+
+def test_the_outbox_is_not_swept_as_litter():
+    """The startup litter sweep must not delete files handed to the phone.
+
+    _sweep_cache_litter matches `*.tmp.*` recursively under CACHE_DIR and predates the
+    outbox living there, so "report.tmp.xlsx" was deleted at the next start — against
+    the outbox's whole promise that it survives one. The 5-minute age gate made it
+    worse: a file left overnight was guaranteed to go. (#outbox-not-litter)"""
+    src = (Path(__file__).resolve().parent.parent / "saikai.py").read_text(
+        encoding="utf-8")
+    i = src.index("def _sweep_cache_litter(")
+    body = src[i:i + 2500]
+    assert 'rglob("*.tmp.*")' in body, "the sweep no longer looks like this"
+    assert "outbox" in body, "the sweep does not exempt the outbox"
+    guard = body.index("outbox")
+    unlink = body.index(".unlink()")
+    assert guard < unlink, "the outbox guard comes after the unlink"
 
 
 if __name__ == "__main__":
@@ -1108,3 +1244,9 @@ if __name__ == "__main__":
     print("PASS test_read_token_is_short_enough_to_type_and_the_write_key_is_not")
     test_outbox_serves_only_what_was_dropped_in_it()
     print("PASS test_outbox_serves_only_what_was_dropped_in_it")
+    test_outbox_name_rule_covers_more_than_separators()
+    print("PASS test_outbox_name_rule_covers_more_than_separators")
+    test_outbox_download_sends_exactly_what_it_promised()
+    print("PASS test_outbox_download_sends_exactly_what_it_promised")
+    test_the_outbox_is_not_swept_as_litter()
+    print("PASS test_the_outbox_is_not_swept_as_litter")

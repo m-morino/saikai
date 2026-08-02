@@ -1842,16 +1842,21 @@ def _win_pid_index(strict: bool = False,
         return {}
 
     def _last_error(k32) -> int:
-        """The thread's last error, or "no more files" if it cannot be read.
+        """The thread's last error, or 0 ("unknown") if it cannot be read.
 
         Read immediately after the failing call — any other ctypes call clobbers it.
-        A code we cannot read must NOT condemn the walk: treating that as a truncated
-        snapshot would turn an unreadable error into the very "inconclusive" verdict
-        this function exists to report honestly. (#snapshot-failure-vs-empty)"""
+        Unknown must NOT be substituted with ERROR_NO_MORE_FILES: that certified a walk
+        that stopped early as a COMPLETE one, which is exactly the verdict strict mode
+        exists to refuse. If the table is truncated and happens to still contain our own
+        pid, the ancestor walk returns 0, the watchdog reads that as a dead terminal,
+        and the cached result feeds the next poll the same answer — two polls being all
+        it takes to reap a healthy session. 0 is not ERROR_NO_MORE_FILES, so an
+        unreadable code fails INCONCLUSIVE, which is the safe direction.
+        (#snapshot-failure-vs-empty #fail-inconclusive)"""
         try:
             return int(k32.GetLastError())
         except Exception:
-            return ERROR_NO_MORE_FILES
+            return 0
 
     TH32CS_SNAPPROCESS = 0x00000002
     try:
@@ -12584,8 +12589,16 @@ def _sweep_cache_litter() -> None:
     tmp_cutoff = now - 300
     cache_cutoff = now - 90 * 86400
     try:
+        outbox_dir = CACHE_DIR / "outbox"
         for f in CACHE_DIR.rglob("*.tmp.*"):
             try:
+                # NEVER the outbox. This sweep predates it and matches by name, so a
+                # file handed to the phone as "report.tmp.xlsx" was deleted at the next
+                # start — the outbox's whole promise is that it survives one. The 5
+                # minute age gate made it worse, not better: a file left overnight was
+                # guaranteed to go. (#outbox-not-litter)
+                if outbox_dir in f.parents:
+                    continue
                 if f.is_file() and f.stat().st_mtime < tmp_cutoff:
                     f.unlink()
             except OSError:

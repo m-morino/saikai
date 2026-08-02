@@ -94,6 +94,18 @@ _CONN_TIMEOUT = 20          # seconds; a socket idle on header/body reads is dro
 # exactly that directory. Nothing else on the filesystem is ever reachable, and no
 # request carries a path — only a bare NAME inside the outbox — so there is no
 # traversal surface to defend, just a name to validate. (#outbox)
+# Windows opens these as DEVICES no matter the directory, so they are never a file
+# we can hand over. They cannot traverse anywhere; they just are not files. (#outbox)
+_WIN_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CLOCK$"]
+    + ["COM%d" % i for i in range(1, 10)]
+    + ["LPT%d" % i for i in range(1, 10)])
+# A transfer may stall this long before we give up on it. NOT _CONN_TIMEOUT (20s):
+# that is a HEADER-read budget, and it applies to wfile.write too, so a phone that
+# locked its screen or roamed Wi-Fi mid-download had the transfer aborted — with a
+# 512 MB cap and no Range support, any file big enough to outlast a screen timeout
+# was effectively undownloadable. (#outbox-stall)
+_DOWNLOAD_STALL_SECS = 180.0
 _OUTBOX_TTL_SECS = 86400.0        # a file older than this stops being served (not deleted)
 _OUTBOX_MAX_BYTES = 512 * 1024 * 1024
 _MAX_DOWNLOADS = 3                # concurrent, counted SEPARATELY from the SSE slots so a
@@ -1240,6 +1252,44 @@ class MirrorHub:
         return self._host in ("127.0.0.1", "localhost", "::1", "")
 
     # ── outbox ───────────────────────────────────────────────────────────────
+    @staticmethod
+    def outbox_name_ok(name: str) -> bool:
+        """True if *name* is a name we will both LIST and SERVE.
+
+        One rule for both, because they disagreed: the listing filtered on stat only,
+        so a POSIX file called "notes: draft.md" was offered as a tappable link that
+        the resolver then refused — a download that always 404s, with the reason in a
+        host-side log the phone user cannot read.
+
+        Refused outright rather than normalised (normalising is where traversal bugs
+        live): anything that is not a bare name, and:
+          * CONTROL CHARACTERS — \r and \n are legal in POSIX filenames and went
+            straight into the Content-Disposition header, where send_header does no
+            validation: a file named "a\r\nContent-Length: 0\r\n\r\n<html>…" made the
+            server emit attacker-chosen headers and body under the mirror's own
+            origin, i.e. inside the token-authenticated context that hands out the
+            write-key. (#outbox-header-injection)
+          * Windows device names and the trailing dot/space forms, which do not
+            traverse anywhere but can open a DEVICE instead of a file.
+        (#outbox)"""
+        import os
+        if not name or name in (".", ".."):
+            return False
+        if name != os.path.basename(name):
+            return False
+        if any(ch in name for ch in ("/", "\\", ":", "\x00")):
+            return False
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+            return False
+        if any(ch in name for ch in ('*', '?', '"', "<", ">", "|")):
+            return False
+        if name != name.rstrip(". "):          # "a.txt." / "a.txt " resolve elsewhere
+            return False
+        stem = name.split(".", 1)[0].upper()
+        if stem in _WIN_DEVICE_NAMES:
+            return False
+        return True
+
     def outbox_entries(self) -> list:
         """[(name, size, mtime)] for the files the phone may download right now.
 
@@ -1259,6 +1309,8 @@ class MirrorHub:
             return []
         now = _t.time()
         for name in names:
+            if not self.outbox_name_ok(name):   # same rule the download applies (#7)
+                continue
             path = os.path.join(root, name)
             try:
                 if os.path.islink(path) or not os.path.isfile(path):
@@ -1272,36 +1324,65 @@ class MirrorHub:
         out.sort(key=lambda e: e[2], reverse=True)
         return out
 
+    def outbox_open(self, name: str) -> tuple:
+        """(open file, size) for *name*, or (None, 0) if it is not servable.
+
+        OPENS FIRST, then validates the open HANDLE — every earlier check described a
+        path, while the bytes came from a later open() of that same name. The outbox is
+        a writable directory any local process can touch, so between the two a name
+        could become a symlink to ~/.claude/.credentials.json (defeating the
+        no-symlinks guarantee outright) or grow past the size cap. os.fstat on the
+        handle, tied to a pre-open lstat by device+inode, makes the thing checked the
+        thing sent. (#outbox-toctou)"""
+        root = self._outbox
+        if not root or not self.outbox_name_ok(name):
+            return (None, 0)
+        import os
+        import stat as _stat
+        import time as _t
+        path = os.path.join(root, name)
+        handle = None
+        try:
+            lst = os.lstat(path)               # BEFORE opening: catch a symlink
+            if _stat.S_ISLNK(lst.st_mode) or not _stat.S_ISREG(lst.st_mode):
+                return (None, 0)
+            handle = open(path, "rb")
+            st = os.fstat(handle.fileno())     # everything below is about the HANDLE
+            if not _stat.S_ISREG(st.st_mode):
+                raise OSError("not a regular file")
+            if (st.st_dev, st.st_ino) != (lst.st_dev, lst.st_ino):
+                raise OSError("replaced between lstat and open")
+            if st.st_size > _OUTBOX_MAX_BYTES:
+                raise OSError("over the size cap")
+            if (_t.time() - st.st_mtime) > _OUTBOX_TTL_SECS:
+                raise OSError("past the TTL")
+            # The realpath check is the backstop, not the defence.
+            real, real_root = os.path.realpath(path), os.path.realpath(root)
+            if os.path.dirname(real) != real_root:
+                raise OSError("outside the outbox")
+            return (handle, int(st.st_size))
+        except OSError:
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+            return (None, 0)
+
     def outbox_resolve(self, name: str) -> "str | None":
         """The absolute path for *name*, or None if it is not servable.
 
-        The request carries a NAME, never a path, so the first check is that it still
-        IS one: anything with a separator, a drive letter, a "..", or a NUL is refused
-        outright rather than normalised — normalising is where traversal bugs live. The
-        realpath check afterwards is the backstop, not the defence. (#outbox)"""
-        root = self._outbox
-        if not root or not name:
+        Kept for callers that only need to ASK (a TUI hint, a test): the serving path
+        uses outbox_open, because a path can stop being true between the check and the
+        read. (#outbox-toctou)"""
+        handle, _size = self.outbox_open(name)
+        if handle is None:
             return None
         import os
-        if (name in (".", "..") or "/" in name or "\\" in name or "\x00" in name
-                or ":" in name or name != os.path.basename(name)):
-            return None
-        path = os.path.join(root, name)
         try:
-            if os.path.islink(path) or not os.path.isfile(path):
-                return None
-            real, real_root = os.path.realpath(path), os.path.realpath(root)
-            if os.path.dirname(real) != real_root:
-                return None
-            st = os.stat(real)
-        except OSError:
-            return None
-        if st.st_size > _OUTBOX_MAX_BYTES:
-            return None
-        import time as _t
-        if (_t.time() - st.st_mtime) > _OUTBOX_TTL_SECS:
-            return None
-        return real
+            return os.path.realpath(os.path.join(self._outbox, name))
+        finally:
+            handle.close()
 
     def take_download_slot(self) -> bool:
         """Reserve one of the download slots, or refuse. Bounded separately from the
@@ -1765,11 +1846,15 @@ flex:0 0 auto;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 #kb-arrows>button{min-width:58px;padding:13px 0;flex:0 0 auto}
 /* Outbox panel: files claude (or you) dropped in ~/.cache/saikai/outbox. Hidden
    until tapped, so it never competes with the terminal for room. */
-#fb{position:fixed;right:8px;bottom:8px;z-index:20;min-height:40px;min-width:40px;
+/* TOP right, not bottom right: #kb is a fixed bottom bar whose last row ends in the
+   tall green Enter key 4px from that same corner, and this button's higher z-index
+   won the hit test over it — a thumb tap on Enter opened the file panel instead of
+   sending Enter, and the panel then covered the keyboard. (#outbox-hit-test) */
+#fb{position:fixed;right:8px;top:8px;z-index:20;min-height:40px;min-width:40px;
 padding:8px 12px;font:bold 15px monospace;border:1px solid #557;border-radius:6px;
 background:#223;color:#cce;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
 #fb.has{border-color:#4a4;color:#9f9}
-#fl{position:fixed;right:8px;bottom:56px;z-index:20;display:none;max-width:min(92vw,520px);
+#fl{position:fixed;right:8px;top:56px;z-index:20;display:none;max-width:min(92vw,520px);
 max-height:60vh;overflow:auto;padding:8px;border:1px solid #557;border-radius:8px;
 background:#111;color:#ddd;font:14px monospace}
 #fl.open{display:block}
@@ -3470,50 +3555,108 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_outbox_file(self, name: str) -> None:
-        """Send one outbox file as an attachment. (#outbox)"""
+        """Send one outbox file as an attachment.
+
+        Order matters here, and the first version got it wrong three ways:
+
+        * The file is OPENED before any status is sent. It used to send 200 plus a
+          Content-Length and only then open(), so a file removed or locked in that
+          window produced a 200 promising N bytes and delivering zero — a stuck or
+          0-byte download instead of the 404 the phone could have reported.
+        * Exactly Content-Length bytes are sent, and no more. It used to read to EOF
+          against a length captured earlier, so tapping an entry mid-`cp` streamed MORE
+          than advertised: the browser stopped at the promised length, kept the
+          keep-alive connection, and the surplus bytes were parsed as the NEXT
+          response (the 15s /files poll). A short file now ends the connection instead
+          of leaving the phone waiting forever on bytes that will never come.
+        * The stall budget is the download's, not the header-read timeout. 20s applied
+          to wfile.write too, so a phone that locked its screen mid-transfer lost it.
+
+        (#outbox #outbox-toctou #outbox-stall)"""
         hub = self.server.hub
         src = self.client_address[0] if self.client_address else "?"
-        path = hub.outbox_resolve(name)
-        if path is None:
-            _mlog("outbox: refused %r from %s" % (name[:80], src))
-            self.send_error(404)
-            return
         if not hub.take_download_slot():
             _mlog("outbox: %d downloads already in flight — refused %r"
                   % (_MAX_DOWNLOADS, name[:80]))
             self.send_error(503, "too many downloads")
             return
+        handle = None
+        prev_timeout = None
         try:
-            import os
-            from urllib.parse import quote
-            size = os.path.getsize(path)
-            # Both forms: an ASCII fallback for old clients and RFC 5987 filename* so
-            # a Japanese name survives. The fallback is deliberately crude ("file"),
-            # because guessing a transliteration is worse than being obviously generic.
-            ascii_name = name.encode("ascii", "ignore").decode("ascii") or "file"
+            handle, size = hub.outbox_open(name)
+            if handle is None:
+                _mlog("outbox: refused %r from %s" % (name[:80], src))
+                self.send_error(404)
+                return
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(size))
-            self.send_header("Content-Disposition",
-                             "attachment; filename=\"%s\"; filename*=UTF-8''%s"
-                             % (ascii_name.replace('"', ""), quote(name, safe="")))
+            self.send_header("Content-Disposition", self._attachment_disposition(name))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
+            # A slow phone is not a broken phone: give the transfer its own budget.
+            try:
+                prev_timeout = self.connection.gettimeout()
+                self.connection.settimeout(_DOWNLOAD_STALL_SECS)
+            except OSError:
+                prev_timeout = None
             sent = 0
-            with open(path, "rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    sent += len(chunk)
-            _mlog("outbox: served %r (%d/%d bytes) to %s" % (name[:80], sent, size, src))
+            while sent < size:
+                chunk = handle.read(min(65536, size - sent))
+                if not chunk:
+                    break                      # file shrank under us
+                self.wfile.write(chunk)
+                sent += len(chunk)
+            if sent != size:
+                # The framing promise is already broken; the only honest repair is to
+                # stop reusing this connection so no half-response is parsed as the
+                # next one.
+                self.close_connection = True
+                _mlog("outbox: %r ended short (%d/%d bytes) — closing the connection"
+                      % (name[:80], sent, size))
+            else:
+                _mlog("outbox: served %r (%d bytes) to %s" % (name[:80], size, src))
         except Exception as exc:
-            # A phone that closes the tab mid-transfer is normal, not an error worth
-            # a traceback; the slot release below is what matters.
-            _mlog("outbox: transfer of %r ended early (%s)" % (name[:80], exc))
+            # A phone closing the tab is normal; a disk error is not, but by here the
+            # status is already out, so the only thing left is to stop reusing the
+            # connection and say what happened.
+            self.close_connection = True
+            _mlog("outbox: transfer of %r ended early (%s: %s)"
+                  % (name[:80], type(exc).__name__, exc))
         finally:
+            if prev_timeout is not None:
+                try:
+                    self.connection.settimeout(prev_timeout)
+                except OSError:
+                    pass
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
             hub.release_download_slot()
+
+    @staticmethod
+    def _attachment_disposition(name: str) -> str:
+        """Content-Disposition for *name*, with a whitelisted ASCII fallback.
+
+        The fallback is built from an ALLOWED set rather than by stripping what looked
+        dangerous: the strip version kept CR/LF (they are ASCII), and send_header does
+        no validation, so a filename could inject headers. Names are already screened
+        by outbox_name_ok; this is the second wall, because a header builder that is
+        only safe when its input was screened elsewhere is one refactor from being
+        unsafe. (#outbox-header-injection)"""
+        from urllib.parse import quote
+        keep = ("abcdefghijklmnopqrstuvwxyz"
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._- ()[]")
+        ascii_name = "".join(ch for ch in name if ch in keep).strip()
+        if not ascii_name or ascii_name.startswith("."):
+            # A fully non-ASCII name leaves only its extension (".xlsx"), which some
+            # clients would save as a hidden file. Keep the extension, name the file.
+            ascii_name = "file" + ascii_name
+        
+        return ("attachment; filename=\"%s\"; filename*=UTF-8''%s"
+                % (ascii_name, quote(name, safe="")))
 
     def _serve_static(self, path, ctype):
         import os

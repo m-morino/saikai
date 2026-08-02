@@ -3177,6 +3177,7 @@ def test_pilot_cursor_scroll_suppression_nests_across_overlapping_rebuilds():
             async with self.run_test(size=(120, 18)) as pilot:
                 await pilot.pause(0.4)
                 table = self.query_one("#table")
+                facts["ran"] = True            # so a skip cannot stand in for "never ran"
                 table.move_cursor(row=1, scroll=True)     # cursor near the top
                 # The assertion below is "a real navigation scrolls BACK to the
                 # cursor", which only means anything if the viewport starts far
@@ -3215,6 +3216,12 @@ def test_pilot_cursor_scroll_suppression_nests_across_overlapping_rebuilds():
     finally:
         App.run = orig
         sys.argv = orig_argv
+    # "The table cannot scroll" and "the pilot never ran" both left room == 0, and the
+    # skip swallowed each of them: a Textual upgrade, a renamed #table or a raise in
+    # on_mount would have printed SKIP and gone green, shipping the nesting invariant
+    # completely unexercised. Assert the body ran FIRST; only then may a small table
+    # excuse the assertions. (#skip-not-a-pass)
+    assert facts.get("ran"), f"the pilot body never ran: {facts}"
     if facts.get("room", 0) < 5:
         print("SKIP test_pilot_cursor_scroll_suppression_nests_across_overlapping"
               "_rebuilds (table can only scroll %d rows — nothing to observe)"

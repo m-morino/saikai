@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **The outbox download sends exactly what it promised, from the file it checked.**
+  Tapping a file while it was still being copied in streamed more bytes than the
+  advertised length, corrupting both the saved file and the next request on the
+  connection; a filename containing CR/LF could inject HTTP headers; the checks applied
+  to a path that could change before the read; a 20s socket timeout killed slow large
+  transfers; the startup litter sweep deleted outbox files named `*.tmp.*`; and the
+  files button covered the on-screen keyboard's Enter key.
+
 ### Added
 - **Hand a file to your phone through the mirror.** Anything dropped in
   `~/.cache/saikai/outbox` shows up in the mirror page's file panel and downloads
