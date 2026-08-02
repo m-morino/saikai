@@ -3179,6 +3179,14 @@ def test_pilot_cursor_scroll_suppression_nests_across_overlapping_rebuilds():
                 table = self.query_one("#table")
                 facts["ran"] = True            # so a skip cannot stand in for "never ran"
                 table.move_cursor(row=1, scroll=True)     # cursor near the top
+                # SETTLE the cursor move before positioning the viewport. move_cursor
+                # QUEUES a _scroll_cursor_into_view, and MEASURED here: it lands ~0.3s
+                # later and pulls the offset back to the cursor row (12 -> 1). On this
+                # machine it happened to land before the scroll_to below and the test
+                # passed; on the ubuntu runner it landed after, so the setup silently
+                # produced start=1 with 267 rows of room available and the assertion
+                # blamed the table. Wait for it, THEN scroll away. (#test-setup-race)
+                await pilot.pause(0.3)
                 # The assertion below is "a real navigation scrolls BACK to the
                 # cursor", which only means anything if the viewport starts far
                 # enough away. CI (ubuntu py3.12) once had a table that could only
