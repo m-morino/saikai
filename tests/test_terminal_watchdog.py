@@ -130,7 +130,21 @@ def test_watchdog_startup_does_not_arm_from_unknown_snapshot():
 
 
 def test_win_pid_index_distinguishes_empty_from_failed_snapshot():
-    """Snapshot failures are quiet for readers and explicit for destructive checks."""
+    """Snapshot failures are quiet for readers and explicit for destructive checks.
+
+    Injected at saikai._th32, NOT by replacing ctypes.windll. Two reasons, both found
+    the hard way:
+
+    * ctypes.windll does not exist off Windows, so touching it failed the whole file on
+      every ubuntu and macos job — while the contract under test (lenient returns {},
+      strict raises) is platform-independent and worth checking everywhere.
+    * _th32 CACHES its binding for the process, so a fake kernel32 installed through
+      ctypes.windll is captured on first use and then serves every later caller. The
+      cached binding is saved and restored here so the fake cannot outlive the test.
+
+    The struct is built from plain ctypes types rather than wintypes for the same
+    portability reason; _win_pid_index only needs sizeof/pointer and three fields.
+    (#windll-not-portable)"""
     import ctypes
 
     class _Fn:
@@ -150,10 +164,25 @@ def test_win_pid_index_distinguishes_empty_from_failed_snapshot():
             self.GetLastError = _Fn(last_error)
             self.CloseHandle = _Fn(1)
 
-    original = ctypes.windll
+    class _Entry(ctypes.Structure):
+        """PROCESSENTRY32's shape, without wintypes (absent off Windows)."""
+        _fields_ = [
+            ("dwSize", ctypes.c_uint32),
+            ("cntUsage", ctypes.c_uint32),
+            ("th32ProcessID", ctypes.c_uint32),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", ctypes.c_uint32),
+            ("cntThreads", ctypes.c_uint32),
+            ("th32ParentProcessID", ctypes.c_uint32),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", ctypes.c_uint32),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    original = saikai._TH32
     try:
         def assert_failed(kernel):
-            ctypes.windll = type("_Windll", (), {"kernel32": kernel})()
+            saikai._TH32 = (ctypes, kernel, _Entry)
             assert saikai._win_pid_index() == {}
             try:
                 saikai._win_pid_index(strict=True)
@@ -173,7 +202,7 @@ def test_win_pid_index_distinguishes_empty_from_failed_snapshot():
         ):
             assert_failed(kernel)
     finally:
-        ctypes.windll = original
+        saikai._TH32 = original
 
 
 def test_live_session_pid_keeps_unknown_windows_snapshot_alive():

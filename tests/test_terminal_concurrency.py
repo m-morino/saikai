@@ -2842,7 +2842,19 @@ def test_retired_sync_deadline_cannot_feed_or_repaint_in_flight():
 
 
 def test_sync_deadline_retire_linearizes_with_authorized_flush():
-    """If expiry already owns dispatch, retirement waits through feed/repaint."""
+    """If expiry already owns dispatch, retirement waits through feed/repaint.
+
+    The claim is about ORDER, not about which thread wins. Feeding "?2026h" arms
+    saikai's OWN deadline thread (sync-deadline-new), so that thread and the manual
+    expiry below are two legitimate racers for the same frame — and asserting that the
+    manual one presented it made this test flaky: MEASURED 12 runs, the frame was
+    presented exactly once and 'retired' came last in ALL of them, while the winner
+    varied (4 of 12 were the real deadline thread, which returns False from the manual
+    call because there was nothing left to present).
+
+    So the assertions pin what must hold: exactly one feed, exactly one repaint, both
+    strictly before retirement returns, and the manual expiry's return value agreeing
+    with whether IT was the one that presented. (#sync-deadline-race)"""
     entered = threading.Event()
     release = threading.Event()
 
@@ -2860,8 +2872,13 @@ def test_sync_deadline_retire_linearizes_with_authorized_flush():
         ["agent"], status_classifier=lambda _text, _title: "idle")
     terminal._sync_output = GateStager(max_age=60.0)
     order, result = [], []
-    terminal._consume_ready = lambda _text: order.append("feed")
-    terminal._schedule_pane_refresh = lambda: order.append("repaint")
+
+    def _record(step):
+        # WHICH thread acted decides what the return value may be, so record it.
+        order.append((step, threading.current_thread().name))
+
+    terminal._consume_ready = lambda _text: _record("feed")
+    terminal._schedule_pane_refresh = lambda: _record("repaint")
     terminal._marshal = lambda fn: fn()
     terminal._consume("\x1b[?2026hpartial")
     generation = terminal._sync_deadline_generation
@@ -2873,7 +2890,8 @@ def test_sync_deadline_retire_linearizes_with_authorized_flush():
             terminal._sync_deadline_opened_at = terminal._sync_output._opened_at
 
     expirer = threading.Thread(
-        target=lambda: result.append(terminal._expire_sync_output(generation)))
+        target=lambda: result.append(terminal._expire_sync_output(generation)),
+        name="test-expirer")
     expirer.start()
     assert entered.wait(1.0), "expiry did not reach the final active check"
 
@@ -2881,10 +2899,10 @@ def test_sync_deadline_retire_linearizes_with_authorized_flush():
 
     def retire():
         terminal._retire_sync_deadline()
-        order.append("retired")
+        _record("retired")
         retired.set()
 
-    retire_thread = threading.Thread(target=retire)
+    retire_thread = threading.Thread(target=retire, name="test-retirer")
     retire_thread.start()
     assert not retired.wait(0.05), (
         "retirement returned while an authorized expiry could still present")
@@ -2893,8 +2911,17 @@ def test_sync_deadline_retire_linearizes_with_authorized_flush():
     retire_thread.join(timeout=1.0)
 
     assert not expirer.is_alive() and not retire_thread.is_alive()
-    assert result == [True]
-    assert order == ["feed", "repaint", "retired"], order
+    steps = [step for step, _who in order]
+    assert steps == ["feed", "repaint", "retired"], order
+    presenter = order[0][1]
+    if presenter == "test-expirer":
+        assert result == [True], (result, order)
+    else:
+        # saikai's own deadline thread got there first; the manual call correctly
+        # reports that it presented nothing. The frame still went out exactly once,
+        # and retirement still waited for it.
+        assert result == [False], (result, order)
+        assert order[1][1] == presenter, order
 
 
 def test_protocol_marshalling_runs_after_sync_dispatch_unlocks():
