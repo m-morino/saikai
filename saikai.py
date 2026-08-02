@@ -3,10 +3,14 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "textual>=0.50",
+#   "rich>=15.0.0",                       # grapheme-aware cell widths + mirror width table
 #   "pyte>=0.8",                          # PTY byte-stream -> screen grid (split-live)
+#   "regex>=2024.11.6",                   # Unicode grapheme segmentation (terminal rendering)
 #   "pywinpty>=2.0 ; sys_platform == 'win32'",   # Windows ConPTY backend
 #   "ptyprocess>=0.7 ; sys_platform != 'win32'", # POSIX PTY backend
 #   "platformdirs>=3.6",                  # cross-platform config dir (textual transitive)
+#   "segno>=1.6.6",                        # QR code generation (mirror join URL)
+#   "cryptography>=41",                    # in-process TLS certificates (LAN mirror)
 # ]
 # ///
 """
@@ -1865,7 +1869,10 @@ def _win_pid_index(strict: bool = False,
         return _fail("toolhelp unavailable: %r" % (exc,))
     INVALID = ctypes.c_void_p(-1).value
 
-    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    try:
+        snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    except Exception as exc:
+        return _fail("CreateToolhelp32Snapshot raised: %r" % (exc,))
     if not snap or snap == INVALID:
         # Documented to fail transiently under heavy process churn (ERROR_BAD_LENGTH),
         # which is exactly the condition a saikai with many panes creates.
@@ -1919,6 +1926,85 @@ def _win_pid_index(strict: bool = False,
     return out
 
 
+def _win_process_start(pid: int) -> "str | None":
+    """Return Claude's Windows ``procStart`` identity for *pid*.
+
+    Claude records ``Win32_Process.CreationDate.Ticks``: local-wall-clock .NET
+    ticks, at CIM's microsecond precision. Read the authoritative creation
+    FILETIME without spawning PowerShell, convert it to the same representation,
+    and fail closed whenever the process cannot be queried.
+    """
+    if pid <= 0:
+        return None
+    handle = None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        from datetime import datetime, timezone
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        FILETIME_UNIX_EPOCH = 116444736000000000
+        FILETIME_DOTNET_EPOCH = 504911232000000000
+        TICKS_PER_SECOND = 10000000
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [
+                ("dwLowDateTime", wintypes.DWORD),
+                ("dwHighDateTime", wintypes.DWORD),
+            ]
+
+        k32 = ctypes.windll.kernel32
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.GetProcessTimes.restype = wintypes.BOOL
+        k32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+            ctypes.POINTER(FILETIME),
+        ]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        handle = k32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return None
+        created = FILETIME()
+        exited = FILETIME()
+        kernel = FILETIME()
+        user = FILETIME()
+        if not k32.GetProcessTimes(
+                handle, ctypes.pointer(created), ctypes.pointer(exited),
+                ctypes.pointer(kernel), ctypes.pointer(user)):
+            return None
+        filetime = (
+            int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        if filetime < FILETIME_UNIX_EPOCH:
+            return None
+
+        # CIM exposes CreationDate as a local DateTime. Its .Ticks therefore
+        # contains the wall-clock timezone offset, and its resolution is one
+        # microsecond (the final 100 ns digit is always zero).
+        unix_seconds = (filetime - FILETIME_UNIX_EPOCH) // TICKS_PER_SECOND
+        offset = datetime.fromtimestamp(
+            unix_seconds, timezone.utc).astimezone().utcoffset()
+        if offset is None:
+            return None
+        ticks = (filetime + FILETIME_DOTNET_EPOCH
+                 + int(offset.total_seconds()) * TICKS_PER_SECOND)
+        return str(ticks - (ticks % 10))
+    except Exception:
+        return None
+    finally:
+        if handle:
+            try:
+                k32.CloseHandle(handle)
+            except Exception:
+                pass
+
+
 def _find_terminal_anchor(pid_index: dict[int, tuple[str, int]], start_pid: int,
                           shell_names: frozenset = _SHELL_ANCESTOR_NAMES,
                           term_names: frozenset = _TERM_EMULATOR_NAMES) -> int:
@@ -1945,14 +2031,36 @@ def _find_terminal_anchor(pid_index: dict[int, tuple[str, int]], start_pid: int,
     return anchor
 
 
+def _terminal_watchdog_poll(
+        misses: int, pid_index: "dict[int, tuple[str, int]] | None",
+        self_pid: int) -> tuple[int, bool]:
+    """Apply one watchdog snapshot without performing its terminal side effects.
+
+    ``None`` and a snapshot omitting this process are inconclusive, so they
+    reset rather than bridge two terminal-missing observations.
+    """
+    if pid_index is None or self_pid not in pid_index:
+        return 0, False
+    try:
+        live_anchor = bool(_find_terminal_anchor(pid_index, self_pid))
+    except Exception:
+        return 0, False
+    if live_anchor:
+        return 0, False
+    misses = max(0, int(misses)) + 1
+    return misses, misses >= 2
+
+
 def _start_terminal_watchdog(poll_sec: float = 8.0) -> None:
     """Start the Windows terminal-death watchdog. No-op on POSIX (real SIGHUP),
     when no tab shell is found (headless), or when SAIKAI_NO_TERMINAL_WATCHDOG is
     set. See the module comment above _SHELL_ANCESTOR_NAMES for the why."""
     if sys.platform != "win32" or os.environ.get("SAIKAI_NO_TERMINAL_WATCHDOG"):
         return
+    pid_index = _win_pid_index()
     try:
-        anchor = _find_terminal_anchor(_win_pid_index(), os.getpid())
+        anchor = (_find_terminal_anchor(pid_index, os.getpid())
+                  if pid_index is not None else 0)
     except Exception:
         anchor = 0
     if not anchor:
@@ -2179,10 +2287,10 @@ def _proc_start_matches(pid: int, procstart: str) -> bool:
     """True if `pid` is STILL the process the registry recorded — the pid-reuse
     guard for a kill. claude stores the OS process-start identity in `procStart`;
     on Linux that's /proc/<pid>/stat field 22 (start time in clock ticks since
-    boot), compared exactly. On Windows nothing records procStart (census
-    2026-07-31: absent from every live registry entry), so the identity is rebuilt
-    from the process snapshot instead — see the branch below; an ambiguous image name
-    is not accepted on its own. Never raises. (#agent-kill #pid-identity)"""
+    boot); on Windows it's Win32_Process.CreationDate.Ticks. Both are compared
+    exactly. Windows fails closed when the token is missing, malformed, or
+    unreadable: an image name or ancestry alone cannot exclude PID reuse.
+    Never raises. (#agent-kill #pid-identity)"""
     if pid <= 0:
         return False
     ps = (procstart or "").strip()
@@ -2198,41 +2306,73 @@ def _proc_start_matches(pid: int, procstart: str) -> bool:
         except OSError:
             pass
     if sys.platform == "win32":
-        # No procStart to compare against: a census of this machine's live registry
-        # (2026-07-31) found the key absent from every entry, so the guard has to be
-        # built from what the OS tells us. The image name alone is NOT enough —
-        # _CLAUDE_PROC_NAMES includes node.exe, one of the most common images on a
-        # developer machine (a VS Code extension host, an MCP server, a dev server,
-        # another project's toolchain). A recycled pid that happened to be any node
-        # passed this check and was then killed with /T, taking its whole tree.
-        #
-        # claude.exe is unambiguous, so accept it on the name. For node.exe, require
-        # that the process belongs to US: an ancestor that is a claude process, or
-        # saikai itself (a pane child is spawned by saikai, so our pid IS its parent).
-        # A node with no such ancestor is somebody else's, and we refuse rather than
-        # kill — refusing only loses the ability to kill, which is the safe direction.
-        # (#pid-identity)
-        idx = _win_pid_index()
-        info = idx.get(pid) if idx else None
-        nm = (info[0] if info else "")
-        if not nm:
-            return False                      # not alive, or we could not look
-        if nm.startswith("claude"):
-            return True
-        if nm not in _CLAUDE_PROC_NAMES:
+        if not ps.isdigit():
             return False
-        own, cur, hops = os.getpid(), (info[1] if info else 0), 0
-        while cur and hops < 12:               # bounded: a cycle must not spin
-            if cur == own:
-                return True                    # our own descendant
-            parent = idx.get(cur)
-            if parent is None:
-                return False
-            if parent[0].startswith("claude"):
-                return True
-            cur, hops = parent[1], hops + 1
-        return False
+        try:
+            idx = _win_pid_index(strict=True)
+        except _SnapshotFailed:
+            return False       # unknown identity must never authorize taskkill
+        if not isinstance(idx, dict):
+            return False
+        info = idx.get(pid)
+        nm = (info[0] if info else "")
+        if not nm or not (nm in _CLAUDE_PROC_NAMES or nm.startswith("claude")):
+            return False
+        observed = _win_process_start(pid)
+        return observed is not None and observed == ps
     return _linux_pid_is_claude(pid) if sys.platform.startswith("linux") else _is_pid_alive(pid)
+
+
+_AGENT_REAP_GRACE = 1.5
+_AGENT_REAP_POLL = 0.1
+_AGENT_REAP_THREADS: list[threading.Thread] = []
+_AGENT_REAP_LOCK = threading.Lock()
+
+
+def _track_agent_reap(thread: threading.Thread) -> None:
+    """Track every agent kill/reap worker with bounded retention."""
+    with _AGENT_REAP_LOCK:
+        _AGENT_REAP_THREADS[:] = [
+            worker for worker in _AGENT_REAP_THREADS if worker.is_alive()]
+        _AGENT_REAP_THREADS.append(thread)
+
+
+def join_agent_reaps(timeout: float = 3.0) -> None:
+    """Bounded-join agent kill/reap workers and prune completed workers."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    current = threading.current_thread()
+    # A tracked batch worker starts and tracks one escalation worker per
+    # signalled process. Re-snapshot until no live worker remains so escalators
+    # registered while their parent is being joined receive the same bounded
+    # shutdown budget.
+    while True:
+        with _AGENT_REAP_LOCK:
+            _AGENT_REAP_THREADS[:] = [
+                worker for worker in _AGENT_REAP_THREADS
+                if worker.is_alive()]
+            workers = [
+                worker for worker in _AGENT_REAP_THREADS
+                if worker is not current]
+        if not workers:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            break
+        for worker in workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            try:
+                worker.join(timeout=min(0.05, remaining))
+            except Exception:
+                pass
+    with _AGENT_REAP_LOCK:
+        _AGENT_REAP_THREADS[:] = [
+            worker for worker in _AGENT_REAP_THREADS if worker.is_alive()]
+
+
+import atexit as _agent_reap_atexit
+_agent_reap_atexit.register(join_agent_reaps)
 
 
 def _kill_agent_process(pid: int, procstart: str) -> str:
@@ -2263,19 +2403,54 @@ def _kill_agent_process(pid: int, procstart: str) -> str:
         return "error"
 
     def _escalate():
-        import time as _t
-        for _ in range(15):                 # ~1.5s grace for a clean SIGTERM exit
-            _t.sleep(0.1)
+        deadline = time.monotonic() + max(0.0, float(_AGENT_REAP_GRACE))
+        poll = max(0.001, float(_AGENT_REAP_POLL))
+        while time.monotonic() < deadline:
+            time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
             if not _is_pid_alive(pid):
                 return
         if _proc_start_matches(pid, procstart):   # re-verify before the hard kill
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, getattr(signal, "SIGKILL", 9))
             except Exception:
                 pass
-    import threading as _thr
-    _thr.Thread(target=_escalate, daemon=True, name="saikai-agent-reap").start()
+    worker = threading.Thread(
+        target=_escalate, daemon=True, name="saikai-agent-reap")
+    worker.start()
+    _track_agent_reap(worker)
     return "signalled"
+
+
+def _start_agent_kill_batch(targets: list, on_done=None) -> threading.Thread:
+    """Run a confirmed agent-kill batch outside the caller/UI thread.
+
+    ``on_done`` receives ``(signalled, gone_or_stale, failed)`` on the worker
+    thread. The caller is responsible for marshalling UI work from that callback.
+    """
+    batch = tuple(targets)
+
+    def _work() -> None:
+        done = gone = fail = 0
+        for pid, procstart, _title in batch:
+            result = _kill_agent_process(pid, procstart)
+            _log(f"kill agent pid={pid}: {result}")
+            if result == "signalled":
+                done += 1
+            elif result in ("gone", "stale"):
+                gone += 1
+            else:
+                fail += 1
+        if on_done is not None:
+            try:
+                on_done((done, gone, fail))
+            except Exception:
+                pass
+
+    worker = threading.Thread(
+        target=_work, daemon=True, name="saikai-agent-kill-batch")
+    worker.start()
+    _track_agent_reap(worker)
+    return worker
 
 
 def _active_remote_sessions() -> set[str]:
@@ -4957,6 +5132,26 @@ class _MirrorControl:
                     self.post_message(events.Key(ch, ch))
                 except Exception:
                     pass
+
+    def _mirror_inject_raw(self, data: str) -> None:
+        """Enqueue pane-view bytes verbatim through the pane's public writer."""
+        if not self._control_enabled or not isinstance(data, str) or not data:
+            return
+        term = getattr(self, "_mirror_pane_term", None)
+        if (term is None or getattr(term, "is_dead", False)
+                or getattr(term, "_pty", None) is None):
+            # The followed pane closed/died. Refresh mirror metadata immediately
+            # rather than silently targeting a stale pane until the next poll.
+            try:
+                self._mirror_sync_pane()
+            except Exception:
+                pass
+            return
+        term._note_input()
+        try:
+            term.write(data)
+        except Exception:
+            pass
 
     def _mirror_inject_mouse(self, col: int, row: int, button: int, kind: str) -> None:
         """Post a synthesized Textual mouse event into the App so it routes
@@ -9086,31 +9281,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     pass
 
-        def _mirror_inject_raw(self, data: str) -> None:
-            """Write pane-view browser bytes VERBATIM to the followed pane's
-            child PTY — the browser xterm is that child's terminal, so arrows,
-            mouse reports and bracketed paste arrive exactly as a local terminal
-            would produce them. No Textual key translation, no focus routing:
-            the bytes go to the pane the browser is LOOKING AT, regardless of
-            local focus. Re-checks the authoritative control gate. (#pane-direct)"""
-            if not self._control_enabled or not isinstance(data, str) or not data:
-                return
-            t = getattr(self, "_mirror_pane_term", None)
-            if t is None or getattr(t, "is_dead", False) \
-                    or getattr(t, "_pty", None) is None:
-                # The followed pane closed/died (kill() nulls _pty immediately;
-                # is_dead lags until the reader's _finalize) — refresh the
-                # mirror's model NOW so meta flips to closed and a next pane can
-                # attach, instead of dropping bytes silently until the poll
-                # notices. (#review-dead-pane-window)
-                self._mirror_sync_pane()
-                return
-            t.last_input_ts = time.monotonic()   # remote typing defers rebuilds too (#linux-state-regroup)
-            try:
-                t._send_to_child(data)
-            except Exception:
-                pass
-
         def _resync_mirror_target(self) -> None:
             """Keep the mirror CONTROL banner ('typing into: X') honest when focus
             moves or the focused pane closes/dies while control is ON — otherwise
@@ -9277,12 +9447,6 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if fail:
                     self.notify(f"{done} terminating, {fail} failed",
                                 severity="error", title="saikai", timeout=6)
-                elif done:
-                    self.notify(f"terminating {done} agent(s)"
-                                + (f", {gone} already ended" if gone else ""), timeout=5)
-                else:
-                    self.notify("agent(s) already ended", timeout=4)
-                self.set_timer(2.2, self.action_refresh)
 
             def _do(ok: bool):
                 if not ok:
@@ -13110,6 +13274,8 @@ def main():
         except Exception:
             pass
         sys.exit(0)
+    finally:
+        join_agent_reaps()
 
 
 if __name__ == "__main__":

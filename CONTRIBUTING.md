@@ -19,8 +19,10 @@ is the easiest path:
 uv run saikai.py            # run in place (deps auto-installed from the PEP-723 header)
 ```
 
-Dependencies: `textual`, `pyte`, `platformdirs`, and a PTY backend
-(`pywinpty` on Windows, `ptyprocess` elsewhere).
+Dependencies: `textual`, `rich>=15`, `pyte`, `regex`, `platformdirs`, `segno`,
+`cryptography`, and a PTY backend (`pywinpty` on Windows, `ptyprocess`
+elsewhere). Keep this list, `pyproject.toml`, and `saikai.py`'s PEP 723 block
+in parity.
 
 ## Tests — run them before every push
 
@@ -85,12 +87,20 @@ In short:
 1. **Never** call `call_from_thread` / marshal — or any blocking cross-thread
    call — while holding `self._lock`. Compute under the lock, marshal outside it.
 2. Never join the reader or close a POSIX `ptyprocess` from the UI thread.
-3. Every process-tree reap must be tracked and joined at process exit.
-4. Coalesce UI work driven by PTY output.
+3. Treat `(pty, pid, generation)` as one ownership tuple. Reader EOF and
+   explicit kill must detach it atomically; only the winner may reap it.
+4. Route every child write through the pane's bounded FIFO writer. UI and
+   reader threads must never call a potentially blocking `pty.write()` inline.
+5. Every process-tree reap, close helper, and escalation worker must be tracked
+   and bounded-joined at process exit.
+6. Coalesce UI work driven by PTY output.
 
 If you change threading, lock, or async behavior, **verify it yourself**
-headlessly (see `tests/test_terminal_concurrency.py`) — don't ship an untested
-batch, and don't "fix" a cosmetic race with a lock that can deadlock.
+headlessly. After terminal changes, `tests/test_terminal_concurrency.py`,
+`tests/test_resource_bounds.py`, `tests/test_terminal_protocol.py`,
+`tests/test_terminal_watchdog.py`, and the real-backend
+`tests/test_pty_backend.py` are mandatory — don't ship an untested batch, and
+don't "fix" a cosmetic race with a lock that can deadlock.
 
 ## The rendering invariants
 

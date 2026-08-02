@@ -812,6 +812,270 @@ def test_memory_safety_presets_and_override():
                 os.environ[k] = v
 
 
+def test_vt_tokenizer_string_carry_is_bounded():
+    """Malformed OSC/DCS streams fail open under a cap instead of retaining a
+    whole unbounded PTY stream in tokenizer carry state."""
+    import saikai_terminal as _terminal
+    for opener in ("\x1b]", "\x1bP", "\x1b_", "\x1b^", "\x1bX",
+                   "\x9d", "\x90", "\x9f", "\x9e", "\x98"):
+        tokenizer = _terminal.VTTokenizer(max_carry=32, max_dropped_string=48)
+        emitted = tokenizer.feed(opener + "x" * 1_000)
+        assert emitted, f"{opener!r} remained wholly buffered"
+        assert len(tokenizer.carry) <= 32
+        assert tokenizer.dropped_string_chars <= 48
+
+
+def test_terminal_color_cache_is_bounded_and_skips_arbitrary_truecolor():
+    import saikai_terminal as _terminal
+
+    _terminal._COLOR_CACHE.clear()
+    for value in range(_terminal._COLOR_CACHE_MAX * 4):
+        assert _terminal._pyte_color(f"unknown-color-{value}") is None
+    assert len(_terminal._COLOR_CACHE) <= _terminal._COLOR_CACHE_MAX
+
+    before = len(_terminal._COLOR_CACHE)
+    for value in range(1000):
+        color = f"{value:06x}"
+        assert _terminal._pyte_color(color) == "#" + color
+    assert len(_terminal._COLOR_CACHE) == before, \
+        "arbitrary truecolor values must not occupy the global palette cache"
+
+
+def test_incremental_grapheme_candidate_is_bounded():
+    import pyte
+    import saikai_terminal as _terminal
+
+    screen = _terminal._HistoryScreenBase(20, 2, history=2)
+    stream = pyte.Stream(screen)
+    stream.feed("e")
+    for _ in range(_terminal._EGC_MAX_CODEPOINTS * 20):
+        stream.feed("\u0301")
+
+    candidate = screen._egc_candidate
+    assert candidate is not None
+    assert len(candidate[0]) <= _terminal._EGC_MAX_CODEPOINTS
+    assert len(screen.buffer[0][0].data) <= _terminal._EGC_MAX_CODEPOINTS
+
+
+def test_overwritten_osc8_cell_metadata_is_bounded():
+    """A hyperlink repaint storm cannot retain every historical pyte Char."""
+    import pyte
+    import saikai_terminal as _terminal
+
+    screen = _terminal._HistoryScreenBase(8, 2, history=2)
+    stream = pyte.Stream(screen)
+    for index in range(5000):
+        screen._saikai_active_hyperlink = (
+            f"id={index}", f"https://example.test/{index}")
+        stream.feed("\rX")
+
+    assert len(screen._saikai_hyperlink_refs) <= 1024
+    links = screen._refresh_saikai_hyperlinks()
+    assert links[(0, 0)] == (
+        "id=4999", "https://example.test/4999")
+
+
+def test_terminal_saved_cursor_slot_is_bounded():
+    import pyte
+    import saikai_terminal as _terminal
+
+    screen = _terminal._HistoryScreenBase(20, 2, history=2)
+    stream = pyte.Stream(screen)
+    for _ in range(10_000):
+        stream.feed("\x1b7")
+    assert len(screen.savepoints) <= 1
+
+
+def test_pty_writer_worker_count_and_shutdown_are_bounded():
+    """Repeated panes keep one writer each and retire it without retained bytes."""
+    import threading
+    import time
+    import saikai_terminal as _terminal
+
+    baseline = {
+        thread.ident for thread in threading.enumerate()
+        if thread.name.startswith("saikai-pty-write-")
+    }
+    workers = []
+    for index in range(24):
+        pane = _terminal.AgentTerminal(
+            ["agent"], status_classifier=lambda _text, _title: "idle")
+        pane._pty = type("P", (), {"write": lambda self, data: None})()
+        pane.is_dead = False
+        pane.sid = f"resource-{index}"
+        pane._start_writer()
+        first = pane._writer
+        pane._start_writer()
+        assert pane._writer is first
+        assert pane._writer_workers_started == 1
+        assert pane.write("界" * 2000) is True
+        deadline = time.monotonic() + 3.0
+        while pane._write_pending_bytes and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert pane._write_pending_bytes == 0
+        worker = pane._stop_writer()
+        if worker is not None:
+            workers.append(worker)
+
+    for worker in workers:
+        worker.join(timeout=3.0)
+        assert not worker.is_alive()
+    _terminal.join_all_pty_writers(timeout=1.0)
+    leaked = [
+        thread for thread in threading.enumerate()
+        if thread.name.startswith("saikai-pty-write-")
+        and thread.ident not in baseline
+    ]
+    assert leaked == [], [thread.name for thread in leaked]
+
+
+def test_agent_kill_escalation_is_tracked_and_bounded():
+    """A SIGTERM-ignoring registered agent cannot leave an untracked helper."""
+    import signal
+
+    original_platform = saikai.sys.platform
+    original_match = saikai._proc_start_matches
+    original_alive = saikai._is_pid_alive
+    original_kill = saikai.os.kill
+    original_grace = saikai._AGENT_REAP_GRACE
+    original_poll = saikai._AGENT_REAP_POLL
+    sent = []
+    try:
+        saikai.sys.platform = "linux"
+        saikai._proc_start_matches = lambda pid, procstart: True
+        saikai._is_pid_alive = lambda pid: True
+        saikai.os.kill = lambda pid, sig: sent.append((pid, sig))
+        saikai._AGENT_REAP_GRACE = 0.0
+        saikai._AGENT_REAP_POLL = 0.0
+        with saikai._AGENT_REAP_LOCK:
+            saikai._AGENT_REAP_THREADS.clear()
+
+        assert saikai._kill_agent_process(7171, "stable-start") == "signalled"
+        with saikai._AGENT_REAP_LOCK:
+            workers = list(saikai._AGENT_REAP_THREADS)
+        assert len(workers) == 1
+        saikai.join_agent_reaps(timeout=3.0)
+        assert (7171, signal.SIGTERM) in sent
+        assert (7171, getattr(signal, "SIGKILL", 9)) in sent
+        assert not workers[0].is_alive()
+        with saikai._AGENT_REAP_LOCK:
+            assert saikai._AGENT_REAP_THREADS == []
+    finally:
+        saikai._AGENT_REAP_GRACE = original_grace
+        saikai._AGENT_REAP_POLL = original_poll
+        saikai.os.kill = original_kill
+        saikai._is_pid_alive = original_alive
+        saikai._proc_start_matches = original_match
+        saikai.sys.platform = original_platform
+
+
+def test_agent_kill_batch_runs_in_a_tracked_worker():
+    """A slow Windows taskkill batch must not block the Textual/UI caller."""
+    import threading
+    import time
+
+    original_kill = saikai._kill_agent_process
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    caller_ident = threading.get_ident()
+    calls = []
+    results = []
+
+    def slow_kill(pid, procstart):
+        calls.append((pid, procstart, threading.get_ident()))
+        entered.set()
+        assert release.wait(timeout=3.0)
+        return "signalled" if pid == 41 else "stale"
+
+    try:
+        saikai._kill_agent_process = slow_kill
+        with saikai._AGENT_REAP_LOCK:
+            saikai._AGENT_REAP_THREADS.clear()
+
+        started = time.monotonic()
+        worker = saikai._start_agent_kill_batch(
+            [(41, "start-41", "one"), (42, "start-42", "two")],
+            lambda counts: (results.append(
+                (counts, threading.get_ident())), completed.set()))
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.5
+        assert entered.wait(timeout=1.0)
+        assert completed.is_set() is False
+        with saikai._AGENT_REAP_LOCK:
+            assert worker in saikai._AGENT_REAP_THREADS
+        assert calls[0][:2] == (41, "start-41")
+        assert calls[0][2] != caller_ident
+
+        release.set()
+        saikai.join_agent_reaps(timeout=3.0)
+        assert completed.wait(timeout=1.0)
+        assert [call[:2] for call in calls] == [
+            (41, "start-41"), (42, "start-42")]
+        assert results == [((1, 1, 0), worker.ident)]
+        assert not worker.is_alive()
+        with saikai._AGENT_REAP_LOCK:
+            assert saikai._AGENT_REAP_THREADS == []
+    finally:
+        release.set()
+        saikai.join_agent_reaps(timeout=3.0)
+        saikai._kill_agent_process = original_kill
+
+
+def test_join_agent_reaps_reaches_workers_registered_while_joining():
+    """Shutdown must include escalators registered by an in-flight kill batch."""
+    import threading
+
+    parent_release = threading.Event()
+    nested_release = threading.Event()
+    nested_joined = threading.Event()
+    nested_holder = []
+
+    class _Nested(threading.Thread):
+        def join(self, timeout=None):
+            nested_joined.set()
+            nested_release.set()
+            return super().join(timeout)
+
+        def run(self):
+            nested_release.wait(3.0)
+
+    class _Parent(threading.Thread):
+        def join(self, timeout=None):
+            parent_release.set()
+            return super().join(timeout)
+
+        def run(self):
+            parent_release.wait(3.0)
+            nested = _Nested(name="saikai-agent-reap-nested")
+            nested_holder.append(nested)
+            nested.start()
+            saikai._track_agent_reap(nested)
+
+    with saikai._AGENT_REAP_LOCK:
+        saikai._AGENT_REAP_THREADS.clear()
+    parent = _Parent(name="saikai-agent-kill-batch-parent")
+    parent.start()
+    saikai._track_agent_reap(parent)
+    try:
+        saikai.join_agent_reaps(timeout=2.0)
+        assert nested_holder
+        assert nested_joined.is_set(), \
+            "join_agent_reaps missed a worker registered during its first join"
+        assert not nested_holder[0].is_alive()
+        with saikai._AGENT_REAP_LOCK:
+            assert not any(t.is_alive() for t in saikai._AGENT_REAP_THREADS)
+    finally:
+        parent_release.set()
+        nested_release.set()
+        parent.join(timeout=3.0)
+        for nested in nested_holder:
+            nested.join(timeout=3.0)
+        with saikai._AGENT_REAP_LOCK:
+            saikai._AGENT_REAP_THREADS.clear()
+
+
 
 def test_parse_session_extracts_agent_lineage():
     """Agent lineage (#agent-lineage): parse_session pulls parentSessionId /
@@ -1225,57 +1489,34 @@ def test_new_session_scan_runs_off_the_ui_thread():
         "no re-entry guard: holding the key would pile up scans"
 
 def test_windows_pid_guard_needs_more_than_an_image_name():
-    """A recycled pid that happens to be a node must not pass as our agent.
+    """Windows kill authority needs an allowed image and exact creation ticks.
 
-    Nothing records procStart on Windows (census of this machine's live registry,
-    2026-07-31: absent from every entry), so the guard fell back to the image name —
-    and _CLAUDE_PROC_NAMES includes node.exe, one of the most common images on a
-    developer box. MEASURED on the machine this was found on: the only node.exe running
-    belonged to Adobe (node.exe < ccxprocess.exe < adobe desktop service.exe) and the
-    old check accepted it, so a stale agent row plus Shift+K would have run
-    `taskkill /PID <pid> /T /F` on Adobe's tree.
-
-    claude.exe is unambiguous and still passes on its name. node.exe has to belong to
-    us: an ancestor that is a claude process, or saikai itself (a pane child's parent IS
-    our pid). Refusing is the safe direction — it loses only the ability to kill.
-    (#pid-identity)"""
-    own = os.getpid()
-    #        pid: (image, ppid)
+    A recycled PID can have the same image or ancestry as the recorded agent. Only
+    the registry's procStart matching the live Win32 creation time proves identity;
+    missing, stale, or unreadable tokens fail closed. (#pid-identity)"""
     INDEX = {
-        own: ("python.exe", 900),
-        900: ("pwsh.exe", 800),
-        # a top-level claude, parented by a shell
-        11: ("claude.exe", 900),
-        # a claude-spawned agent that runs as node
+        11: ("claude.exe", 1),
         12: ("node.exe", 11),
-        # a node saikai spawned itself (pane child)
-        13: ("node.exe", own),
-        # somebody else's node: VS Code / Adobe / an MCP server
-        14: ("node.exe", 500),
-        500: ("code.exe", 400),
-        400: ("explorer.exe", 1),
-        # an unrelated image that shares nothing
-        15: ("ccxprocess.exe", 500),
-        # a ppid cycle must not spin forever
-        16: ("node.exe", 17),
-        17: ("node.exe", 16),
+        15: ("ccxprocess.exe", 1),
     }
+    observed = {11: "1100", 12: "1200", 15: "1500"}
     prev_platform, prev_index = saikai.sys.platform, saikai._win_pid_index
+    prev_start = saikai._win_process_start
     try:
         saikai.sys.platform = "win32"
         saikai._win_pid_index = lambda **kw: INDEX
-        verdicts = {pid: saikai._proc_start_matches(pid, "") for pid in
-                    (11, 12, 13, 14, 15, 16, 999999)}
+        saikai._win_process_start = lambda pid: observed.get(pid)
+        assert saikai._proc_start_matches(11, "1100") is True
+        assert saikai._proc_start_matches(12, "1200") is True
+        assert saikai._proc_start_matches(12, "1199") is False
+        assert saikai._proc_start_matches(12, "") is False
+        assert saikai._proc_start_matches(15, "1500") is False
+        assert saikai._proc_start_matches(999999, "999") is False
+        observed[12] = None
+        assert saikai._proc_start_matches(12, "1200") is False
     finally:
         saikai.sys.platform, saikai._win_pid_index = prev_platform, prev_index
-
-    assert verdicts[11] is True, "a claude.exe must still verify"
-    assert verdicts[12] is True, "a node under claude is ours"
-    assert verdicts[13] is True, "a node under saikai itself is ours"
-    assert verdicts[14] is False, "someone else's node.exe was accepted as our agent"
-    assert verdicts[15] is False, "an unrelated image was accepted"
-    assert verdicts[16] is False, "a ppid cycle must terminate and refuse"
-    assert verdicts[999999] is False, "a pid the snapshot has never seen was accepted"
+        saikai._win_process_start = prev_start
 
 def test_concurrent_process_snapshots_do_not_corrupt_each_other():
     """Two threads walking the process list must not break each other's ctypes call.
@@ -1385,7 +1626,7 @@ def test_process_snapshots_are_shared_but_never_stale_for_a_kill():
             calls.append(max_age)
             return {}
         saikai._win_pid_index = _counting
-        saikai._proc_start_matches(4242, "")
+        saikai._proc_start_matches(4242, "123456789")
     finally:
         saikai._win_pid_index = prev_index
     assert calls == [0.0], \
@@ -1460,6 +1701,24 @@ if __name__ == "__main__":
     print("PASS test_no_unguarded_jsonl_record_loops")
     test_memory_safety_presets_and_override()
     print("PASS test_memory_safety_presets_and_override")
+    test_vt_tokenizer_string_carry_is_bounded()
+    print("PASS test_vt_tokenizer_string_carry_is_bounded")
+    test_terminal_color_cache_is_bounded_and_skips_arbitrary_truecolor()
+    print("PASS test_terminal_color_cache_is_bounded_and_skips_arbitrary_truecolor")
+    test_incremental_grapheme_candidate_is_bounded()
+    print("PASS test_incremental_grapheme_candidate_is_bounded")
+    test_overwritten_osc8_cell_metadata_is_bounded()
+    print("PASS test_overwritten_osc8_cell_metadata_is_bounded")
+    test_terminal_saved_cursor_slot_is_bounded()
+    print("PASS test_terminal_saved_cursor_slot_is_bounded")
+    test_pty_writer_worker_count_and_shutdown_are_bounded()
+    print("PASS test_pty_writer_worker_count_and_shutdown_are_bounded")
+    test_agent_kill_escalation_is_tracked_and_bounded()
+    print("PASS test_agent_kill_escalation_is_tracked_and_bounded")
+    test_agent_kill_batch_runs_in_a_tracked_worker()
+    print("PASS test_agent_kill_batch_runs_in_a_tracked_worker")
+    test_join_agent_reaps_reaches_workers_registered_while_joining()
+    print("PASS test_join_agent_reaps_reaches_workers_registered_while_joining")
     test_na_cache_is_bounded()
     print("PASS test_na_cache_is_bounded")
     test_load_severity_bands()
