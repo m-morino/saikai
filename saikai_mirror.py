@@ -3582,7 +3582,7 @@ kbBar.style.cssText =
 // Ergonomic v3 (user-flow measured): three tiers by thumb reach.
 //   Row 1 (stretch zone, smaller): rare keys — Tab / Leader / Ctrl / Select / More.
 //   Row 2 (shoulder, thumb side):  the LOOP keys — ☰List (pane→list, the only
-//     way back: typed text rides to the pane) and !Next (shift+f3, jump to the
+//     way back: typed text rides to the pane) and !Next (shift+f1, jump to the
 //     next needs-you session — saikai's hero flow, cyan like the TUI accent).
 //   Row 3 (prime band): Esc far-left (rare + high-stakes interrupt: MAXIMUM
 //     separation from confirm = error prevention), d-pad + tall green Enter in
@@ -3615,7 +3615,7 @@ kbBar.innerHTML =
   '</div>'+
   '<div class="kb-row" id="kb-row2">'+
     '<button class="mid" data-k="ctrl+right_square_bracket">&#9776; List</button>'+
-    '<button class="mid next" data-k="shift+f3">! Next</button>'+
+    '<button class="mid next" data-k="shift+f1">! Next</button>'+
   '</div>'+
   '<div class="kb-row" id="kb-row3">'+
     '<button class="esc" data-k="escape">Esc</button>'+
@@ -3687,7 +3687,7 @@ if (paneView) {   // the toggle names the view a press switches TO
   // Esc/Enter/Tab) and the view/hand toggles stay. (#review-invisible-app-keys)
   const appOnly = ['slash', 'f5', 'f10', 'f9', 'shift+f2', 'shift+f4', 'f11',
                    'shift+f11', 'checkpoint', 'f12',
-                   'ctrl+right_square_bracket', 'shift+f3'];
+                   'ctrl+right_square_bracket', 'shift+f1'];
   kbBar.querySelectorAll('button[data-k]').forEach((b) => {
     if (appOnly.indexOf(b.getAttribute('data-k')) >= 0) b.style.display = 'none';
   });

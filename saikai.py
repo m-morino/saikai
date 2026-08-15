@@ -5633,7 +5633,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  [yellow]Enter[/yellow]      Open / focus the live claude pane\n"
                 "  [yellow]␣n[/yellow] [dim]⇧F8[/dim]    New claude session in a folder / git worktree\n"
                 "  [yellow]␣p[/yellow] [dim]⇧F4[/dim]    Reopen the panes from your last session (resume) — anytime\n"
-                "  [yellow]␣\\[ ␣][/yellow] [dim]F2/F3[/dim] Prev / next live tab   ·   [yellow]␣a[/yellow] [dim]⇧F3[/dim]  Next pane needing attention (?/!)\n"
+                "  [yellow]␣\\[ ␣][/yellow] [dim]F2/F3[/dim] Prev / next live tab   ·   [yellow]␣a[/yellow] [dim]⇧F1[/dim]  Next pane needing attention (?/!)\n"
                 "  [yellow]␣l[/yellow] [dim]F4[/dim]     Hide / show the session list\n"
                 "  [yellow]Alt-←/→[/yellow]    Resize the list/pane split — or drag the divider (persists)\n"
                 "  [yellow]Ctrl-][/yellow]     Return focus: pane → list  (SAIKAI_RELEASE_KEY to change)\n"
@@ -6407,7 +6407,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             Binding("K", "kill_agent", "Kill agent", id="kill_agent", show=False, priority=True),
             Binding("f2", "prev_tab", "◀Tab", id="prev_tab", show=False, priority=True),
             Binding("f3", "next_tab", "Tab▶", id="next_tab", show=False, priority=True),
-            Binding("shift+f3", "next_attention", "Next!", id="attention", show=False, priority=True),
+            # NOT Shift+F3: a POSIX terminal spells F3-with-any-modifier
+            # `CSI 1;<mod>R`, and that final R is the cursor-position report —
+            # Textual's parser eats the whole sequence as a DSR reply, so the
+            # binding never fired on Linux/macOS. It only ever worked on Windows
+            # (native key events) and on kitty-protocol terminals, which spell F3
+            # `CSI 13;<mod>~` precisely to dodge the same collision. Shift+F1 is
+            # the one shifted F-key left that survives every encoding; the id and
+            # the ␣a leader letter are unchanged, so [keys] configs still bind.
+            # tests/test_keyboard_leader.py round-trips the whole F-key set through
+            # the terminal encoding to keep the next one from going dark. (#f3-cpr)
+            Binding("shift+f1", "next_attention", "Next!", id="attention", show=False, priority=True),
             Binding("f4", "toggle_list", "Hide list", id="toggle_list", show=False, priority=True),
             Binding("shift+f2", "rename", "Rename", id="rename", show=False, priority=True),
             # Keyboard divider — footer-hidden (documented in ? help); the
@@ -8970,7 +8980,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     and sid in getattr(self, "_unread", ()))
 
         def on_tabbed_content_tab_activated(self, event) -> None:
-            # A live tab became active (F2/F3, Shift+F3, click) → move the list
+            # A live tab became active (F2/F3, Shift+F1, click) → move the list
             # cursor to the matching session so you can see WHICH one it is.
             # Deliberately does NOT clear the "!" finished-marker — that stays until
             # you respond (input → claude busy, handled in _on_live_status). The
@@ -9626,7 +9636,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._cycle_tab(-1)
 
         def action_next_attention(self) -> None:
-            """Shift+F3: jump to the next live pane needing attention — waiting (?)
+            """Shift+F1: jump to the next live pane needing attention — waiting (?)
             or finished-unread (!) — in tab order, wrapping. Toast if none. Lets you
             step through exactly the panes that need you instead of every tab."""
             if _LIVE_TERM is None or self._live is None:
@@ -10970,7 +10980,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         # _unread / _busy_seen bookkeeping stays consistent while the
                         # handoff turn drives the parent busy→idle — else the parent is
                         # left busy+in_unread, a state the normal flow never produces and
-                        # which mis-counts in Shift+F3 / the !M badge. (#audit-b2-setstatus)
+                        # which mis-counts in Shift+F1 / the !M badge. (#audit-b2-setstatus)
                         self._apply_live_status(b2["sid"], _ts)
                     except Exception:
                         pass

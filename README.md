@@ -145,7 +145,7 @@ can't get stuck; everything else is on screen (the footer, `?` for the full
 list, and the `␣` menu that pops up when you pause).
 
 The everyday keys are the ones you'd guess: `↑` `↓` move · `Enter` open/resume ·
-`F2`/`F3` switch panes · `Shift+F3` jump to the next pane needing attention · `/`
+`F2`/`F3` switch panes · `Shift+F1` jump to the next pane needing attention · `/`
 or any character searches · `Tab` toggles the preview.
 
 **`Space` is the menu.** Press `Space` in the list, then one mnemonic letter;

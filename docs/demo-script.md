@@ -63,7 +63,7 @@ python scripts/record_demo.py --record-real --root /home/demo/saikai-demo \
 - **Caption:** *"See what's working, what's waiting, what needs you — at a glance."*
 
 ### A5 — Jump to what needs you
-- **Action:** `Shift+F3` (or `Space` then `a`) — next-attention.
+- **Action:** `Shift+F1` (or `Space` then `a`) — next-attention.
 - **Show:** focus jumping straight to the `?`/`!` pane, skipping idle ones.
 - **Caption:** *"Jump only to the sessions that actually need a human."*
 

@@ -144,7 +144,7 @@ reset of a bloated session. One theme, two beats; do not tour every feature.
    running as live panes. Do not begin with help or a menu.
 2. Flip between two live panes (`F3`/`F2`); show the status markers `~` working /
    `?` waiting / `!` finished-needs-you, grouped/sorted by status.
-3. Next-attention (`Shift+F3`) jumps straight to the pane that needs you.
+3. Next-attention (`Shift+F1`) jumps straight to the pane that needs you.
    Caption: **"Every Claude Code session, across every repo — live, grouped by
    what needs you."**
 

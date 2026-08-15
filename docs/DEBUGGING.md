@@ -110,6 +110,33 @@ wrong in exactly this way, and each cost a round of blind patching:
   glyphs and returns to earlier ones; an A→B→A detector needs a rule for that or it
   reports dozens of false positives.
 
+## A key that does nothing
+
+"The binding is wrong" is almost never the answer. A modified F-key crosses three layers
+before saikai sees it, and each can destroy it — so measure the layers instead of editing
+the binding. Run `cat -v` in the same terminal, press the key, then Enter:
+
+- **Nothing printed.** The key died upstream. Re-run `cat -v` *outside* the multiplexer to
+  find out which layer ate it: zellij 0.44 forwards F1–F12 and silently drops the F13–F24
+  codes (`ESC[25~`…`ESC[31~`); tmux and screen have their own gaps.
+- **`^[[26~`-style output** (a bare `CSI <n> ~` for n ≥ 23). The terminal is folding
+  `Shift+Fn` onto the F11–F20 codes and sending no modifier at all. Nothing downstream can
+  recover the Shift — Textual decodes `CSI 25~`…`CSI 31~` as raw control characters, and
+  `CSI 23~`/`CSI 24~` as plain F11/F12, so the key silently fires the WRONG action. Fix it
+  at the terminal (PuTTY: Keyboard → **Xterm 216+**), not in saikai.
+- **`^[[1;2S`-style output** (`CSI 1;<mod><final>` or `CSI <n>;<mod>~`). The terminal is
+  doing its job; the fault is below it. Feed the exact bytes to `textual._xterm_parser`
+  `XTermParser().feed(seq)` and check the key name that comes back.
+
+That last step catches the collisions the encoding itself cannot avoid: `CSI 1;<mod>R` is
+both "F3 with a modifier" and the cursor-position report, so **F3 with any modifier is
+undeliverable on a POSIX terminal** and Textual swallows it (`#f3-cpr` — it cost
+`next_attention` a year on `Shift+F3`). `test_pilot_fkey_bindings_survive_posix_terminal_encoding`
+in `tests/test_keyboard_leader.py` now round-trips every F-key binding through that
+encoding, so the next undeliverable key fails in CI. Note what it cannot see: the Windows
+driver reports key events natively and kitty-protocol terminals use a different spelling,
+so **a key working on your machine is not evidence it works on a POSIX terminal**.
+
 ## Regression tests
 
 `tests/test_terminal_concurrency.py` and `tests/test_flag_width.py` hold the invariant

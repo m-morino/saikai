@@ -145,7 +145,7 @@ def fake_run(self, *a, **kw):
                 await pilot.pause(0.1)            # (+ the 2-tick debounce settling to ?)
             await snap(pilot, 1900)              # the ? (needs-you) marker on the list
             # Beat 6 — jump straight to the pane that needs you.
-            await pilot.press("shift+f3")        # next-attention
+            await pilot.press("shift+f1")        # next-attention
             for _ in range(8):
                 await pilot.pause(0.1)
             await snap(pilot, 1800)

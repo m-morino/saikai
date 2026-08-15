@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Next-attention moved from `Shift+F3` to `Shift+F1`** (`⇧F1`; the `␣a` leader and the
+  mirror's `! Next` button are unchanged, as is the `attention` id you bind in `[keys]`).
+  `Shift+F3` could never fire on a POSIX terminal: xterm spells F3-with-any-modifier
+  `CSI 1;<mod>R`, and that final `R` is the cursor-position report, so Textual's parser
+  consumed it as a DSR reply. It worked only on Windows (native key events) and on
+  kitty-protocol terminals — which spell F3 `CSI 13;<mod>~` precisely to dodge the same
+  collision — so the dead key hid in plain sight. A new test round-trips saikai's WHOLE
+  F-key set through the terminal's own encoding and back through Textual's parser, so a
+  future binding the terminal cannot deliver fails in CI instead of in your hands.
+
+### Note for PuTTY users
+- If Shift+F-keys do nothing, set **Terminal → Keyboard → "The Function keys and keypad"**
+  to a mode that sends modifiers (**Xterm 216+**). PuTTY's older modes fold `Shift+Fn`
+  onto the F11–F20 codes, which carry no modifier at all: multiplexers drop the F13+ ones
+  outright (zellij 0.44 does) and the rest arrive as the WRONG key — `Shift+F2` lands as
+  plain `F12` and opens the mirror QR. The `␣` leader (e.g. `␣p`, `␣a`) works in every
+  mode.
+
 ## [0.6.3] — 2026-08-02
 
 A pane is a terminal emulator, and this release finally treats it like one: the whole

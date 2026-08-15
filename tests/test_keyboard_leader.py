@@ -3245,7 +3245,113 @@ def test_pilot_cursor_scroll_suppression_nests_across_overlapping_rebuilds():
     assert facts["depth"] == 0, f"depth went negative: {facts}"
 
 
+# What a legacy (non-kitty-protocol) POSIX terminal actually SENDS for an F-key:
+# F1-F4 ride a final letter (SS3 unmodified, CSI 1;<mod> modified), F5-F12 the
+# CSI <code>;<mod>~ form. This is xterm's modifyFunctionKeys encoding — what
+# PuTTY ("Xterm 216+"), xterm, VTE, tmux and zellij all speak.
+_FKEY_FINAL = {"f1": "P", "f2": "Q", "f3": "R", "f4": "S"}
+_FKEY_CODE = {"f5": 15, "f6": 17, "f7": 18, "f8": 19, "f9": 20,
+              "f10": 21, "f11": 23, "f12": 24}
+_FKEY_MODS = {"": 1, "shift+": 2, "alt+": 3, "ctrl+": 5, "ctrl+shift+": 6}
+
+
+def _posix_fkey_sequence(key: str):
+    """The bytes a legacy POSIX terminal sends for the Textual key name `key`,
+    or None when `key` is not a plain/modified F-key (arrows, letters, Esc… are
+    out of scope here)."""
+    import re as _re
+    m = _re.fullmatch(r"((?:ctrl\+)?(?:alt\+)?(?:shift\+)?)(f\d{1,2})", key)
+    if not m:
+        return None
+    mod, fkey = m.group(1), m.group(2)
+    if mod not in _FKEY_MODS:
+        return None
+    n = _FKEY_MODS[mod]
+    if fkey in _FKEY_FINAL:
+        final = _FKEY_FINAL[fkey]
+        return f"\x1bO{final}" if n == 1 else f"\x1b[1;{n}{final}"
+    if fkey in _FKEY_CODE:
+        code = _FKEY_CODE[fkey]
+        return f"\x1b[{code}~" if n == 1 else f"\x1b[{code};{n}~"
+    return None
+
+
+def test_pilot_fkey_bindings_survive_posix_terminal_encoding():
+    """Every F-key saikai binds must SURVIVE the round trip through a real POSIX
+    terminal: encode the key the way the terminal sends it, parse it back with
+    Textual's own XTermParser, and demand the SAME key name out.
+
+    Shift+F3 failed this. xterm spells it CSI 1;2R, whose final `R` is the
+    cursor-position report — Textual's parser eats it as a DSR reply, so the
+    binding could never fire on Linux/macOS. It only ever worked on Windows
+    (native key events) and on kitty-protocol terminals (which spell F3 as
+    CSI 13;<mod>~ precisely to dodge this collision), which is why it looked
+    fine for a year. F3 with ANY modifier is unreachable, so the fix is to not
+    bind one — hence next_attention lives on Shift+F1. (#f3-cpr)
+
+    This guards the whole CLASS: any future F-key binding the terminal cannot
+    deliver fails here instead of silently doing nothing in the user's hands."""
+    try:
+        from textual.app import App  # noqa: F401
+        from textual._xterm_parser import XTermParser
+        from textual.events import Key
+    except Exception:
+        print("SKIP test_pilot_fkey_bindings_survive_posix_terminal_encoding "
+              "(textual unavailable)")
+        return
+
+    import asyncio
+    from textual.app import App
+
+    _write_demo_session()          # the app exits early with an empty history
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.2)
+                facts["bindings"] = [
+                    (b.key, b.action) for b in type(self).BINDINGS
+                ]
+        asyncio.run(go())
+
+    orig, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig
+        sys.argv = orig_argv
+
+    # The pilot body must have RUN — an empty binding list would sail through
+    # every assertion below and ship the invariant unexercised. (#skip-not-a-pass)
+    assert facts.get("bindings"), f"the pilot body never ran: {facts}"
+
+    checked, dead = [], []
+    for key, action in facts["bindings"]:
+        seq = _posix_fkey_sequence(key)
+        if seq is None:
+            continue
+        parser = XTermParser()
+        # The trailing 'a' flushes any sequence the parser is still buffering,
+        # so a swallowed key shows up as [] rather than "needs more input".
+        got = [e.key for e in parser.feed(seq + "a") if isinstance(e, Key)]
+        checked.append(key)
+        if got[:1] != [key]:
+            dead.append((key, action, seq, got))
+
+    assert len(checked) >= 20, \
+        f"expected saikai's full F-key set, only saw {checked}"
+    assert not dead, (
+        "these bindings can never fire on a POSIX terminal — the terminal's own "
+        "encoding does not survive Textual's parser:\n  " +
+        "\n  ".join(f"{k} ({a}): sent {s!r} -> parsed {g}" for k, a, s, g in dead))
+
+
 if __name__ == "__main__":
+    test_pilot_fkey_bindings_survive_posix_terminal_encoding()
+    print("PASS test_pilot_fkey_bindings_survive_posix_terminal_encoding")
     test_resolve_leader_defaults_on()
     print("PASS test_resolve_leader_defaults_on")
     test_resolve_leader_disable_and_custom_key()

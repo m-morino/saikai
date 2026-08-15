@@ -842,9 +842,9 @@ def test_page_routes_mouse_and_has_key_bar():
 
 def test_page_key_bar_has_saikai_action_keys():
     """The on-screen key bar must expose saikai's OWN actions so a phone can DRIVE
-    saikai, not just type into a pane: refresh (f5), next-attention (shift+f3),
+    saikai, not just type into a pane: refresh (f5), next-attention (shift+f1),
     close pane (f10), copy (f9), restore (shift+f4), open search (slash), and fast
-    list paging (pageup/pagedown). f5/f9/f10/shift+f3/shift+f4 are priority
+    list paging (pageup/pagedown). f5/f9/f10/shift+f1/shift+f4 are priority
     bindings (fire even with a pane focused); slash + paging work when the list is
     focused. They sit behind a 'More' toggle so the default bar stays compact.
     (Manual phone verification covers real action firing.)"""
@@ -857,7 +857,7 @@ def test_page_key_bar_has_saikai_action_keys():
         ).read().decode("utf-8")
     finally:
         hub.stop()
-    for k in ('data-k="f5"', 'data-k="shift+f3"', 'data-k="f10"', 'data-k="f9"',
+    for k in ('data-k="f5"', 'data-k="shift+f1"', 'data-k="f10"', 'data-k="f9"',
               'data-k="shift+f2"', 'data-k="shift+f4"', 'data-k="f11"',
               'data-k="shift+f11"',
               'data-k="slash"', 'data-k="pageup"', 'data-k="pagedown"'):
@@ -1070,7 +1070,7 @@ def test_page_key_bar_flow_and_labels():
         and 'id="kb-row3"' in page, "three-tier bar missing"
     r2 = page[page.index('id="kb-row2"'):page.index('id="kb-row3"')]
     assert 'data-k="ctrl+right_square_bracket"' in r2 \
-        and 'data-k="shift+f3"' in r2, "loop keys (List/Next) must ride row 2"
+        and 'data-k="shift+f1"' in r2, "loop keys (List/Next) must ride row 2"
     r3 = page[page.index('id="kb-row3"'):page.index('id="kb2"')]
     assert r3.index('data-k="escape"') < r3.index('id="kb-arrows"') \
         < r3.index('data-k="enter"'), \
