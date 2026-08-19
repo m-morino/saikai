@@ -2427,8 +2427,14 @@ def test_copy_to_host_clipboard_picks_tool_and_reports():
     orig = subprocess.run
     # On Linux the tool order is wl-copy (Wayland) -> xclip -> xsel; unset
     # WAYLAND_DISPLAY so this deterministically asserts the X11 path (xclip)
-    # regardless of the CI runner's session type.
-    orig_wl = os.environ.pop("WAYLAND_DISPLAY", None)
+    # regardless of the CI runner's session type. Clear the SSH markers for the
+    # same reason: _copy_to_host_clipboard DECLINES over SSH (the host clipboard
+    # is the server's — #ssh-clipboard), so with an ambient SSH_CONNECTION it
+    # returns False before running any tool and every assertion below reads an
+    # empty `calls` — a spurious red whenever the suite is run over SSH (the
+    # dev-on-Pi case), exactly as the macOS clipboard tests above already guard.
+    old_env = {k: os.environ.pop(k, None) for k in
+               ("WAYLAND_DISPLAY", "SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT")}
     try:
         subprocess.run = lambda cmd, input=None, **kw: (calls.append((cmd, input)) or _R(0))
         ok = saikai._copy_to_host_clipboard("http://x/?token=abc")
@@ -2444,8 +2450,9 @@ def test_copy_to_host_clipboard_picks_tool_and_reports():
         assert saikai._copy_to_host_clipboard("x") is False
     finally:
         subprocess.run = orig
-        if orig_wl is not None:
-            os.environ["WAYLAND_DISPLAY"] = orig_wl
+        for _k, _v in old_env.items():
+            if _v is not None:
+                os.environ[_k] = _v
 
 
 def test_paste_text_wraps_and_submits():
