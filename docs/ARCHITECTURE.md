@@ -1,9 +1,17 @@
 # Architecture
 
-saikai is a local-first session index and terminal host for Claude Code. It
-reads Claude's existing transcript history and keeps its own preferences as
-small overlays. It does not rewrite the canonical transcripts or require a
-daemon or database.
+saikai is a self-hosted control room for Claude Code: a session index and
+terminal host that runs on the machine the sessions run on. It reads Claude's
+existing transcript history, keeps its own preferences as small overlays, and
+keeps its own record of sessions Claude has since deleted. It does not rewrite
+the canonical transcripts or require a daemon or database.
+
+The product boundary this implies, decided in the 2026-08 competitive audit:
+saikai invests in what runs on YOUR machines (live panes side by side, the
+browser mirror, remote roots, cross-agent history) and in the history Claude
+does not keep. It does NOT build task orchestration, worktree creation, PR/CI
+review flows, agent teams or loop execution — Claude Code owns those, and
+duplicating them is how this project would become a worse copy of its host.
 
 ## Runtime modules
 

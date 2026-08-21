@@ -8,10 +8,11 @@
 
 **English** | [日本語](https://github.com/m-morino/saikai/blob/master/README.ja.md)
 
-> ## A live cockpit for every Claude Code session you have running.
-> **See which one needs you — across all your repos and worktrees — and jump
-> straight into it.** One searchable list on the left; the session you pick
-> running live, right beside it.
+> ## The self-hosted control room for your Claude Code work.
+> **Your machine, your terminal, your history.** Several sessions running live
+> side by side, one glance at which of them needs you across every repo and
+> worktree — and the sessions Claude Code already deleted still findable. One
+> searchable list on the left; the session you pick running live, right beside it.
 
 ![saikai in motion — the session list on the left flags who needs you; pick one and it runs live on the right, jump between the fleet, checkpoint a bloated session](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-demo.gif)
 
@@ -23,6 +24,8 @@ Live busy/waiting/idle status is available for panes hosted by saikai;
 sessions running elsewhere use registry and transcript heuristics.
 See Claude's [session picker](https://code.claude.com/docs/en/sessions)
 and [agent view](https://code.claude.com/docs/en/agent-view).
+It also keeps listing the sessions Claude Code deletes after 30 days
+(`cleanupPeriodDays`) — see *Sessions Claude deleted are still here* below.
 
 ## Who it's for
 
