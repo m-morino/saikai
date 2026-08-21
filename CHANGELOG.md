@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Sessions Claude deleted are still findable.** Claude Code removes
+  `~/.claude/projects/**/<sid>.jsonl` once it is `cleanupPeriodDays` old — 30 days by
+  default, swept at startup with no warning. The code and the git history survive
+  that; the reasoning trail does not, and there is no official search over it either.
+  saikai now keeps its own parsed record of every session it has seen, and recovers
+  the sessions it never saw from `~/.claude/history.jsonl` — the one per-machine file
+  Claude Code appends to and never prunes. They list as `-` **expired**: readable,
+  searchable, sortable, favourite-able like any other row, and refused for resume with
+  the reason (`claude --resume` on a deleted transcript just exits 1). `:expired`
+  filters to them; State grouping gives them their own section. On the author's machine
+  this turned 12 visible sessions into 74, back to December — 62 sessions that were
+  unrecoverable a minute earlier.
+  - No transcript is written, moved or resurrected, and a session whose transcript
+    still exists is always served from the transcript.
+  - No daemon and no database: the record is the `parsed/<sid>.json` saikai already
+    wrote, now carrying the project dir that used to come from the file's path.
+  - The cache sweep no longer prunes a record whose transcript is gone — that record
+    is the last copy, so age-pruning it was the same silent data loss. Bounded by
+    count (`[history] archive_max`, default 2000) instead.
+  - `[history] archive = false` restores the previous behaviour exactly.
+
 ## [0.7.0] — 2026-09-06
 
 ### Added

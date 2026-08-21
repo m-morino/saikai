@@ -72,6 +72,13 @@ default.
 - **Quit without losing your work.** Reopen the same working set later with
   `Shift+F4`. No daemon, no database — it just reads Claude's own history files
   (AI summaries are opt-in).
+- **Sessions Claude deleted are still here.** Claude Code removes its transcripts
+  after 30 days (`cleanupPeriodDays`) — silently, on startup. saikai keeps its own
+  record of every session it has seen, and recovers the ones it never saw from
+  `~/.claude/history.jsonl`, the prompt log Claude Code never prunes. They list as
+  `-` **expired**: readable, searchable and starred like any other row, just not
+  resumable. On the author's machine that turned 12 visible sessions into 74, back
+  to December. Turn it off with `[history] archive = false`.
 - **★ (experimental) Reset a bloated session in one keystroke.** Each pane shows
   its real context fill — the actual numbers Claude records, not a `chars/4`
   guess (`ctx 662K/1.0M (66%)`, green/yellow/red). `Shift+F11` drops a `/compact`;
@@ -120,7 +127,7 @@ actionable:
 
 - **needs you** (cyan): `?` waiting for input · `!` finished, awaiting your reply · `&` background agent blocked
 - **running now** (normal): `~` working · `@` responding in another window
-- **quiet** (dim): `=` idle live pane · `@` open elsewhere · `$` running a shell · `R` Remote Control · `+` active · `.` recent · `&` background agent
+- **quiet** (dim): `=` idle live pane · `@` open elsewhere · `$` running a shell · `R` Remote Control · `+` active · `.` recent · `&` background agent · `-` **expired** (Claude deleted the transcript; saikai kept the record)
 - **tags** (separate column): `*` favorite · `x` hidden
 
 ![The list grouped by state — Needs input first — with the cyan "needs you" accent, a ★ favorite, and the sort/group state in the status bar](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-browse.svg)
@@ -187,7 +194,7 @@ nothing to memorize). Every other session and pane action lives here:
 | `d` diff (changes) | `l` hide/show list | `x` close tab · `[` `]` tabs |
 | `r` refresh | `,` settings · `/` hide/show bar | `Space` mark for batch launch |
 
-Search tokens `:fav` `:hidden` `:open` `:active` `:recent` (combine with text),
+Search tokens `:fav` `:hidden` `:open` `:active` `:recent` `:expired` (combine with text),
 `Alt+←/→` to nudge the list/pane divider, full mouse support (column sort, row
 click, drag-to-copy inside a pane), and key/leader remaps via `config.toml`'s
 `[keys]` — all covered by `?` and [Configuration](#configuration-environment-variables).

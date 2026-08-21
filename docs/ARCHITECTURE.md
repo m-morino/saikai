@@ -55,6 +55,36 @@ Important rules:
 - Optional summary generation is opt-in. Core discovery and resume must work
   without an LLM call.
 
+### Session memory (expired sessions)
+
+Claude Code deletes a transcript once it is `cleanupPeriodDays` old (30 by
+default), so the transcript glob is not the whole session universe — it is only
+the part Claude has not collected yet. saikai therefore keeps its own record and
+lists sessions from two sources:
+
+- `parsed/<sid>.json`, written whenever saikai parses a transcript. It carries
+  the title, timestamps, cwd, branch, lineage and the user's own prompts, and it
+  now also carries the project dir name so it can place the session on the list
+  after the file it was derived from is gone.
+- `~/.claude/history.jsonl`, the per-machine prompt log Claude Code appends to
+  and does not prune. It reaches sessions destroyed before saikai was installed.
+  Indexed on (mtime, size) into `history-index.json`; prompts pass the same
+  `_is_real_user_msg` admission test transcripts do.
+
+Rules:
+
+- A session whose transcript still exists is ALWAYS served from the transcript.
+  `_live_transcript_sids()` is the authority; a transcript that merely moved
+  project dirs can never be mistaken for a deleted one.
+- An expired row mirrors `_enrich_session`'s field set exactly (as
+  `_new_session_stub` does) so render, sort, group and forest cannot choke on a
+  missing key. Everything describing live state is pinned False.
+- Expired sessions are not resumable. `_resume_block_reason` is the one place
+  that decides this and both resume paths consult it.
+- Retention is bounded by COUNT, not age — outliving Claude's age sweep is the
+  point, so age cannot also be saikai's bound.
+- Nothing is written to, moved within, or resurrected into Claude's own dirs.
+
 ## Split-live lifecycle
 
 Each split-live pane starts a real provider process in a PTY. A background

@@ -314,6 +314,12 @@ _CONFIG_TEMPLATE = (
     "split_live   = true       # false = list-only browser (Enter = full-takeover resume)\n"
     'color_by     = "project"  # title hue: project | worktree | topic | none\n'
     "split_ratio  = 0.34       # initial list share; dragging / Alt+arrows persists over it\n\n"
+    "[history]                     # what saikai remembers after Claude forgets\n"
+    "archive             = true    # keep a session findable after Claude Code deletes\n"
+    "#                               its transcript (cleanupPeriodDays, 30 days by default)\n"
+    "archive_max         = 2000    # most remembered sessions to list / keep on disk\n"
+    "archive_min_prompts = 2       # a history-only session needs this many prompts to\n"
+    "#                               count as work (1 = also list `claude -p` one-shots)\n\n"
     "[launch]\n"
     "auto_permission = false   # true = add --permission-mode auto in frequent workspaces\n\n"
     "[limits]                       # live-pane memory safety\n"
@@ -564,6 +570,9 @@ _CONFIG_SPECS = [
     ("limits", "scrollback_lines", "SAIKAI_SCROLLBACK", 2000),
     ("keys", "release", "SAIKAI_RELEASE_KEY", "ctrl+]"),
     ("checkpoint", "handoff_prompt_file", "SAIKAI_HANDOFF_PROMPT_FILE", ""),
+    ("history", "archive", "SAIKAI_ARCHIVE", True),
+    ("history", "archive_max", "SAIKAI_ARCHIVE_MAX", 2000),
+    ("history", "archive_min_prompts", "SAIKAI_ARCHIVE_MIN_PROMPTS", 2),
 ]
 
 
@@ -2585,6 +2594,17 @@ def parse_session(jsonl_path: Path) -> dict | None:
             and "parent_session_id" in cached):   # lineage added 2026-07-06 (#agent-lineage)
         if _is_hook_session(cached.get("real_msgs", []), len(cached.get("real_msgs") or [])):
             return None
+        # A record has to name its own project dir to survive the transcript that
+        # named it (#session-memory). Backfill it in place rather than adding
+        # project_name to the freshness keys above: that would force a full
+        # re-parse of every cached session — a quarter-gigabyte of JSONL here —
+        # for one string already sitting in the path we were handed.
+        if not cached.get("project_name"):
+            cached["project_name"] = jsonl_path.parent.name
+            try:
+                _write_json(cache_file, cached)
+            except Exception:
+                pass
         return _enrich_session(sid, cached, jsonl_path, mtime)
 
     # Preserve topics across re-parse (JSONL append shouldn't invalidate Haiku-derived topics)
@@ -2688,6 +2708,10 @@ def parse_session(jsonl_path: Path) -> dict | None:
         "parent_session_id": parent_session_id or "",
         "agent_id": agent_id or "",
         "is_sidechain": is_sidechain,
+        # The project dir this transcript lived in. Written so the record can
+        # still place the session on the list after Claude deletes the file it
+        # was derived from. (#session-memory)
+        "project_name": jsonl_path.parent.name,
     }
     if prior_topics:
         parsed["topics"] = prior_topics
@@ -2741,6 +2765,345 @@ PROJECTS_ROOT = _ACTIVE_PROVIDER.history_roots()[0]
 # read as dead/closed, contradicting the documented CLAUDE_CONFIG_DIR support
 # (README / CHANGELOG). (#recon-configdir)
 CLAUDE_CONFIG_ROOT = PROJECTS_ROOT.parent
+
+
+# ── Session memory: what saikai keeps after Claude deletes the transcript ────
+# Claude Code removes ~/.claude/projects/**/<sid>.jsonl once it is
+# `cleanupPeriodDays` old — 30 days by default, swept at startup, with no
+# warning (anthropics/claude-code#62476, open since 2026-05-26). The code and
+# the git history survive that; the reasoning trail does not, and there is no
+# official search over it either.
+#
+# saikai already parses every transcript into PARSED_DIR/<sid>.json — title,
+# timestamps, cwd, branch, lineage and the user's own prompts. That record is a
+# whole session in a few kilobytes, so the only things standing between saikai
+# and a durable memory were that it enumerated sessions from the transcript
+# glob and swept its own copies on the same assumption Claude breaks ("they
+# self-heal via re-parse if the session still exists").
+#
+# Two sources feed the memory, in this order of preference:
+#   parsed  — a record saikai wrote while the transcript still existed. Rich.
+#   history — ~/.claude/history.jsonl, the one per-machine file Claude Code
+#             appends to and never prunes: {display, timestamp, project,
+#             sessionId} per prompt. Coarse, but it reaches sessions destroyed
+#             before saikai was ever installed, which is what makes the memory
+#             useful on day one instead of in a month.
+#
+# Both are READ. No transcript is written, moved or resurrected, and a session
+# whose transcript still exists is never served from memory. (#session-memory)
+HISTORY_FILE = CLAUDE_CONFIG_ROOT / "history.jsonl"
+HISTORY_INDEX_FILE = CACHE_DIR / "history-index.json"
+_ARCHIVE_PROMPT_CAP = 40      # prompts kept per history-backfilled session
+_ARCHIVE_TEXT_CAP = 800       # chars per prompt — the cap real_msgs already uses
+_history_index_cache = None   # (file key, {sid: rec}) — process-lifetime memo
+_HISTORY_INDEX_SCHEMA = 2     # bump to invalidate a persisted index of an older shape
+
+
+def _archive_enabled() -> bool:
+    """False turns the memory off completely: no expired rows, and the cache
+    sweep prunes exactly as it did before."""
+    return _cfg_bool(_cfg("history", "archive", "SAIKAI_ARCHIVE", True, str), True)
+
+
+def _archive_max() -> int:
+    """Upper bound on remembered sessions, so the memory can never swamp the
+    live ones it sits beside (or the disk it sits on)."""
+    try:
+        return max(0, int(_cfg("history", "archive_max", "SAIKAI_ARCHIVE_MAX", 2000, int)))
+    except Exception:
+        return 2000
+
+
+def _archive_min_prompts() -> int:
+    """Prompts a history-only session needs before it counts as work. The
+    default of 2 excludes `claude -p` one-shots, which dominate history.jsonl on
+    any machine running automation (3,298 of 3,352 sessions on the author's)."""
+    try:
+        return max(1, int(_cfg("history", "archive_min_prompts",
+                               "SAIKAI_ARCHIVE_MIN_PROMPTS", 2, int)))
+    except Exception:
+        return 2
+
+
+def _history_index_cache_clear() -> None:
+    """Drop the memoised prompt index (tests, and an in-app refresh)."""
+    global _history_index_cache
+    _history_index_cache = None
+
+
+def _history_prompt_index() -> dict:
+    """{sid: {"prompts": [...], "project": str, "first_ms": int, "last_ms": int}}
+    from ~/.claude/history.jsonl.
+
+    Keyed on (mtime, size) and persisted to HISTORY_INDEX_FILE so a long file is
+    re-read only when Claude appends to it. Every line is guarded individually:
+    the file is appended by a live Claude Code process, so the last line can be
+    a torn half-record, and losing one prompt must not lose the index."""
+    global _history_index_cache
+    try:
+        st = HISTORY_FILE.stat()
+        key = [_HISTORY_INDEX_SCHEMA, st.st_mtime, st.st_size]
+    except OSError:
+        return {}
+    if _history_index_cache and _history_index_cache[0] == key:
+        return _history_index_cache[1]
+    disk = _read_json(HISTORY_INDEX_FILE, None)
+    if isinstance(disk, dict) and disk.get("key") == key \
+            and isinstance(disk.get("sessions"), dict):
+        _history_index_cache = (key, disk["sessions"])
+        return disk["sessions"]
+
+    out: dict = {}
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue                    # torn tail / stray blank line
+                if not isinstance(d, dict):
+                    continue
+                sid = d.get("sessionId")
+                text = d.get("display")
+                if not isinstance(sid, str) or not sid or not isinstance(text, str):
+                    continue
+                # Same admission test the transcript path applies, so a prompt
+                # means the same thing whichever source a row came from.
+                if not _is_real_user_msg(text):
+                    continue
+                rec = out.get(sid)
+                if rec is None:
+                    rec = out[sid] = {"prompts": [], "project": "",
+                                      "first_ms": 0, "last_ms": 0, "n": 0}
+                rec["n"] += 1
+                if len(rec["prompts"]) < _ARCHIVE_PROMPT_CAP:
+                    rec["prompts"].append(text[:_ARCHIVE_TEXT_CAP].replace("\n", " "))
+                if isinstance(d.get("project"), str) and d["project"]:
+                    rec["project"] = d["project"]
+                ts = d.get("timestamp")
+                if isinstance(ts, (int, float)) and ts > 0:
+                    rec["first_ms"] = min(rec["first_ms"] or ts, ts)
+                    rec["last_ms"] = max(rec["last_ms"], ts)
+    except OSError:
+        return {}
+    try:
+        _write_json(HISTORY_INDEX_FILE, {"key": key, "sessions": out})
+    except Exception:
+        pass                                    # cache is an optimisation only
+    _history_index_cache = (key, out)
+    return out
+
+
+def _descriptive_prompt(prompts) -> str:
+    """The first prompt that says what the session was ABOUT.
+
+    A history-only row has no AI title to fall back on, so its first prompt
+    becomes the row title — and sessions routinely open with `/model`, `/usage`
+    or `/plugin`, which name nothing. Skip bare commands (a leading `/` or `!`
+    with at most two tokens on the first line) and use the first prompt that
+    carries content; fall back to the first prompt when none does."""
+    for text in prompts or ():
+        head = (text or "").strip().split("\n", 1)[0]
+        if head[:1] in ("/", "!") and len(head.split()) <= 2:
+            continue
+        if head:
+            return text
+    return (prompts or [""])[0] if prompts else ""
+
+
+def _live_transcript_sids() -> set:
+    """Every session id whose transcript is on disk right now. One shallow glob
+    per project dir — the authority on 'this session is NOT expired', and the
+    reason a transcript that merely moved project dirs can't be mistaken for a
+    deleted one."""
+    live = set()
+    try:
+        for d in PROJECTS_ROOT.iterdir():
+            if not d.is_dir():
+                continue
+            try:
+                for f in d.glob("*.jsonl"):
+                    live.add(f.stem)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return live
+
+
+def _ms_to_iso(ms) -> str:
+    """history.jsonl epoch-ms → the UTC ISO string the rest of saikai sorts on."""
+    try:
+        return datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _expired_session(sid: str, parsed: dict, source: str,
+                     project_name: str = "") -> dict:
+    """A session row built from memory instead of a transcript.
+
+    Mirrors _enrich_session's field set exactly — render, sort, group and forest
+    all read these keys, and a missing one surfaces as a crash three layers from
+    here (which is why _new_session_stub does the same thing for new sessions).
+    Everything that describes LIVE state is pinned False: an expired session has
+    no process, no pane and no reply due."""
+    proj = project_name or parsed.get("project_name") or ""
+    cwd = parsed.get("cwd", "") or ""
+    s = {
+        "id": sid,
+        "provider": parsed.get("provider") or _ACTIVE_PROVIDER.id,
+        "first_ts": parsed.get("first_ts") or parsed.get("last_ts") or "",
+        "last_ts": parsed.get("last_ts") or parsed.get("first_ts") or "",
+        "ai_title": parsed.get("ai_title", ""),
+        "custom_title": _load_custom_titles().get(sid, ""),
+        "real_msgs": list(parsed.get("real_msgs") or []),
+        "n_turns": len(parsed.get("real_msgs") or []),
+        # Where the transcript USED to be. Nothing opens it (every reader guards
+        # on is_expired first) but the path keeps project/worktree derivation and
+        # any .parent.name lookup working on a row like every other.
+        "jsonl_path": PROJECTS_ROOT / (proj or "-") / f"{sid}.jsonl",
+        "mtime": float(parsed.get("mtime") or 0.0),
+        "cwd": cwd,
+        "origin_cwd": parsed.get("origin_cwd") or cwd,
+        "worktree_origin_cwd": parsed.get("worktree_origin_cwd", ""),
+        "git_branch": parsed.get("git_branch", ""),
+        "claude_name": "",
+        "is_open": False,
+        "is_remote_control": False,
+        "remote_origin": bool(proj.startswith("ssh-")),
+        "parent_session_id": parsed.get("parent_session_id", ""),
+        "agent_id": parsed.get("agent_id", ""),
+        "is_sidechain": bool(parsed.get("is_sidechain")),
+        "is_bg": False,
+        "live_kind": "",
+        "session_status": "expired",
+        "is_active": False,
+        "is_recent": False,
+        "is_expired": True,
+        "expired_source": source,
+        "project_name": proj,
+        "worktree_label": "",
+        "summary": parsed.get("ai_title") or (
+            (parsed.get("real_msgs") or [""])[0] if parsed.get("real_msgs") else ""),
+        "topics": list(parsed.get("topics") or []),
+        "primary_topic": "",
+        "parent_id": None,
+        "parent_score": 0.0,
+        "parent_reasons": [],
+    }
+    s["last_active_dt"] = _compute_last_active_dt(s)
+    return s
+
+
+def load_expired_sessions(known_sids, since=None, project_names=None) -> list[dict]:
+    """Sessions saikai remembers whose transcript Claude has since deleted.
+
+    `known_sids` are the ids already in the caller's list (never re-served from
+    memory); `since` applies the same --days window live rows get;
+    `project_names`, when given, scopes the memory to those project dirs so
+    --here stays --here. Newest first, capped by [history] archive_max."""
+    if not _archive_enabled():
+        return []
+    known = set(known_sids or ())
+    live = _live_transcript_sids()
+    scope = set(project_names) if project_names else None
+    rows: dict = {}
+
+    # (1) saikai's own parsed records — the rich source.
+    try:
+        parsed_files = list(PARSED_DIR.glob("*.json"))
+    except OSError:
+        parsed_files = []
+    for f in parsed_files:
+        sid = f.stem
+        if sid in known or sid in live:
+            continue
+        rec = _read_json(f, None)
+        if not isinstance(rec, dict) or not rec.get("first_ts"):
+            continue
+        proj = rec.get("project_name") or ""
+        if scope is not None and proj not in scope:
+            continue
+        rows[sid] = _expired_session(sid, rec, "parsed", proj)
+
+    # (2) history.jsonl — sessions destroyed before saikai ever saw them. The
+    # prompts are all it has, which is exactly what a "which session was that?"
+    # search matches on.
+    min_prompts = _archive_min_prompts()
+    for sid, h in _history_prompt_index().items():
+        if sid in known or sid in live or sid in rows:
+            continue
+        prompts = h.get("prompts") or []
+        if max(len(prompts), int(h.get("n") or 0)) < min_prompts:
+            continue
+        # `claude -p` automation leaves the same footprint here as in projects/;
+        # the scan filters those out, so the memory must not reintroduce them.
+        if _is_hook_session(prompts, len(prompts)):
+            continue
+        cwd = h.get("project") or ""
+        proj = _encode_project_dir(cwd) if cwd else ""
+        if scope is not None and proj not in scope:
+            continue
+        last_ms = h.get("last_ms") or 0
+        rows[sid] = _expired_session(sid, {
+            "first_ts": _ms_to_iso(h.get("first_ms") or last_ms),
+            "last_ts": _ms_to_iso(last_ms),
+            "real_msgs": prompts,
+            "ai_title": _descriptive_prompt(prompts)[:120],
+            "cwd": cwd, "origin_cwd": cwd,
+            "mtime": (float(last_ms) / 1000.0) if last_ms else 0.0,
+            "project_name": proj,
+        }, "history", proj)
+
+    out = list(rows.values())
+    if since is not None:
+        cut = since.replace(tzinfo=None) if since.tzinfo else since
+        out = [s for s in out
+               if (s.get("last_active_dt") or datetime.min) >= cut]
+    out.sort(key=lambda s: s.get("last_active_dt") or datetime.min, reverse=True)
+    cap = _archive_max()
+    return out[:cap] if cap else []
+
+
+def _encode_project_dir(cwd: str) -> str:
+    """Claude's project-dir encoding: the cwd with non-alphanumerics replaced by
+    '-'. Used to map a history.jsonl `project` path back onto a project dir so
+    --here scoping and the Project column agree with a live row's."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+
+
+def _session_matches_text(s: dict, text: str) -> bool:
+    """Does the free-text part of a search query match this session?
+
+    One function so the list filter and every other caller agree on what "search"
+    covers: the names a human gave it, the project/worktree it ran in, its id,
+    and the user's own prompts — which for an EXPIRED session is all that is left
+    of it, and is exactly what "which session was that?" remembers. Assistant
+    replies and tool output are deliberately not in scope: they are the bulk of a
+    transcript and the noisiest part of it."""
+    if not text:
+        return True
+    t = text.lower()
+    return (t in (s.get("custom_title") or "").lower()
+            or t in (s.get("ai_title") or "").lower()
+            or t in " ".join(s.get("real_msgs") or []).lower()
+            or t in (s.get("id") or "")
+            or t in (s.get("project_name") or "").lower()
+            or t in (s.get("worktree_label") or "").lower())
+
+
+def _resume_block_reason(s: dict) -> str:
+    """Why this session cannot be resumed, or "" when it can. `claude --resume`
+    on a deleted transcript reports 'No conversation found with session ID' and
+    exits 1; saying so up front beats launching into that."""
+    if s and s.get("is_expired"):
+        return ("Claude deleted this session's transcript (cleanupPeriodDays), so "
+                "there is nothing left to resume — saikai kept the record so you "
+                "can still read and search it.")
+    return ""
+
 
 
 # UUID v4 shape — prevents glob metacharacters in `claude -p` JSON output
@@ -3714,6 +4077,7 @@ _MARKER_COLOR.update({
     "&": "dim",              # bg agent/job (job STATE re-tints via _marker_tint)
     "+": "dim",              # recently active
     ".": "dim",              # recent (dormant)
+    "-": "dim",              # expired: transcript deleted by Claude, record kept
 })
 
 
@@ -3741,9 +4105,13 @@ _TABLE_NA_CACHE: dict = {}   # mtime-keyed reply-due cache for the --table activ
 
 
 def _activity_marker(s: dict) -> str:
-    """Activity column: bg / Remote Control / open / active / reply-due / recent."""
+    """Activity column: expired / bg / Remote Control / open / active / reply-due / recent."""
     # Three tiers of colour only: ATTENTION accent (needs you) · default (running
     # now) · DIM (quiet / open-elsewhere / background). RED = genuine failure only.
+    if s.get("is_expired"):
+        # Claude deleted the transcript; saikai kept the record. Calm tier — it is
+        # readable and searchable, it just cannot be resumed. (#session-memory)
+        return _c("-", DIM)
     if s.get("is_bg"):
         # Same glyph '&' (no new marker — '?' already means live-waiting); the bg
         # JOB state is conveyed by COLOUR so it can't collide with other markers.
@@ -3789,7 +4157,10 @@ def _marker_legend(s: dict, favorites: set, hidden: set) -> list:
     preview can explain its own +/./*/@/&/… glyphs in context. At most one
     activity entry + one state entry (the two columns each show one glyph)."""
     out = []
-    if s.get("is_bg"):
+    if s.get("is_expired"):
+        out.append("- Claude deleted this transcript; saikai kept the record "
+                   "(readable and searchable, not resumable)")
+    elif s.get("is_bg"):
         out.append("& agents/bg session (owned by another claude — resumable when it ends)"
                    if s.get("live_kind") == "agent" else "& background agent/job")
     elif s.get("remote_origin"):
@@ -5656,7 +6027,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  Status    Active / Archived / All\n"
                 "  Age       last 1d / 3d / 7d / 30d / All time\n"
                 "  Search    [yellow]/[/yellow] or type to open the bar; tokens AND with text + each other —\n"
-                "            :fav  :hidden  :open  :active  :recent   (Esc clears)\n"
+                "            :fav  :hidden  :open  :active  :recent  :expired   (Esc clears)\n"
                 "  Markers   [bold cyan]needs you[/bold cyan] (cyan): [bold cyan]?[/bold cyan] waiting · [bold cyan]![/bold cyan] reply due · [bold cyan]&[/bold cyan] bg blocked\n"
                 "            running (normal): ~ busy · @ responding elsewhere\n"
                 "            quiet (dim): = idle · @ open · $ shell · R remote · + active · . recent · & bg\n"
@@ -6531,7 +6902,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def compose(self) -> ComposeResult:
             with Horizontal(id="searchrow"):
                 yield Input(placeholder="Search title / msg / SID / proj    "
-                                        "•  :fav  :hidden  :open  :active  :recent",
+                                        "•  :fav  :hidden  :open  :active  :recent  :expired",
                             id="search")
                 yield SearchClear("✕", id="search-clear")
                 # Initialise each dropdown to the persisted selection so the box
@@ -7061,7 +7432,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         # Status-filter prefixes: typed alongside text in the search input.
         # `:fav python` = favorites whose searchable text matches "python".
         # `:hidden` alone surfaces sessions normally skipped by default view.
-        _STATUS_TOKENS = {":fav", ":hidden", ":open", ":active", ":recent"}
+        _STATUS_TOKENS = {":fav", ":hidden", ":open", ":active", ":recent",
+                          ":expired"}
 
         def _parse_query(self, q: str) -> tuple[set[str], str]:
             tokens = q.strip().lower().split()
@@ -7095,13 +7467,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     return False
                 if ":recent" in statuses and not _is_recent_now(s, now_ts):
                     return False
+                if ":expired" in statuses and not s.get("is_expired"):
+                    return False
                 if text:
-                    return (text in (s.get("custom_title") or "").lower()
-                            or text in (s.get("ai_title") or "").lower()
-                            or text in " ".join(s.get("real_msgs") or []).lower()
-                            or text in sid
-                            or text in (s.get("project_name") or "").lower()
-                            or text in (s.get("worktree_label") or "").lower())
+                    return _session_matches_text(s, text)
                 return True
 
             return [s for s in all_sessions if keep(s)]
@@ -7305,6 +7674,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                              if self._live is not None else "")
                     if _s["id"] in hidden:
                         _s["_state"] = "Archived"
+                    elif _s.get("is_expired"):
+                        # Claude deleted the transcript; only saikai's record is
+                        # left. Its own section — it is neither actionable nor
+                        # merely idle. (#session-memory)
+                        _s["_state"] = "Expired"
                     elif _live == "busy":
                         _s["_state"] = "Running"
                     elif _live == "waiting":
@@ -8280,6 +8654,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if _LIVE_TERM is None:
                 sid = self._cursor_sid()
                 if sid:
+                    if self._expired_block(sid):         # transcript deleted (#session-memory)
+                        return
                     if self._remote_origin_block(sid):   # Desktop-SSH mirror (#remote-origin)
                         return
                     # Probe BEFORE tearing down the picker: here resume runs only
@@ -8305,6 +8681,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             sid = self._cursor_sid()
             if sid:
                 self._open_or_attach_live(sid)
+
+        def _expired_block(self, sid: str) -> bool:
+            """True (+ an explanatory toast) when sid is remembered but no longer
+            resumable. `claude --resume` would report 'No conversation found with
+            session ID' and exit 1; the row is still worth opening for its
+            preview and its prompts. (#session-memory)"""
+            s = self._sid_index.get(sid)
+            why = _resume_block_reason(s) if s else ""
+            if not why:
+                return False
+            try:
+                self.notify(why, title="expired session",
+                            severity="warning", timeout=8)
+            except Exception:
+                pass
+            return True
 
         def _remote_origin_block(self, sid: str) -> bool:
             """True (+ an explanatory toast) when sid is a Desktop-SSH mirror of a
@@ -8504,6 +8896,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             already running). True means accepted, False refused, None awaiting
             user confirmation. Acceptance is not proof that async mount succeeded."""
             assert _LIVE_TERM is not None and self._live is not None
+            if self._expired_block(sid):             # transcript deleted (#session-memory)
+                return
             if self._remote_origin_block(sid):       # Desktop-SSH mirror (#remote-origin)
                 return False
             if self._live.has(sid):                  # already running → switch
@@ -13105,6 +13499,31 @@ def cmd_sync_desktop() -> None:
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
+def _trim_remembered_sessions(live_sids: set) -> None:
+    """Bound the memory by COUNT (archive_max), dropping the least recently
+    active first. Age can't bound it — outliving Claude's age sweep is the whole
+    point — so this is what keeps a years-old cache dir finite. Best-effort."""
+    cap = _archive_max()
+    try:
+        gone = [f for f in PARSED_DIR.glob("*.json") if f.stem not in live_sids]
+    except OSError:
+        return
+    if len(gone) <= cap:
+        return
+
+    def _key(f):
+        rec = _read_json(f, None)
+        if isinstance(rec, dict):
+            return _iso_sort_key(rec.get("last_ts") or rec.get("first_ts") or "")
+        return ""
+
+    for f in sorted(gone, key=_key, reverse=True)[cap:]:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
 def _sweep_cache_litter() -> None:
     """Startup housekeeping (run in a daemon; best-effort, never raises).
 
@@ -13146,16 +13565,27 @@ def _sweep_cache_litter() -> None:
                 pass
     except Exception:
         pass
+    # A parsed record whose transcript is GONE is the only copy of that session
+    # left on this machine, so the "it self-heals via re-parse" reasoning behind
+    # this sweep does not apply to it — pruning it is silent data loss, the exact
+    # thing Claude's own cleanup is criticised for. Keep those; bound them by
+    # count instead of age below. (#session-memory)
+    remembered = _archive_enabled()
+    live_sids = _live_transcript_sids() if remembered else set()
     for d in (PARSED_DIR, PREVIEW_DIR, PREVIEW_FULL_DIR):
         try:
             for f in d.glob("*"):
                 try:
+                    if remembered and d is PARSED_DIR and f.stem not in live_sids:
+                        continue
                     if f.is_file() and f.stat().st_mtime < cache_cutoff:
                         f.unlink()
                 except OSError:
                     pass
         except Exception:
             pass
+    if remembered:
+        _trim_remembered_sessions(live_sids)
 
 
 def _main():
@@ -13475,6 +13905,9 @@ def _main():
         # the screen on run(), so this only shows during the pre-UI gap).
         print(_c(f"  scanning {projects_root} …", DIM), file=sys.stderr, flush=True)
     sessions = []
+    # Which project dirs this run actually looked at — the scope the remembered
+    # sessions must honour, so --here stays --here. (#session-memory)
+    _scanned_project_names: set = set()
     if args.all_projects:
         for d in _project_dirs(projects_root):
             sessions.extend(load_sessions_in_dir(d, since))
@@ -13485,6 +13918,7 @@ def _main():
             print("Use --project PATH (or omit --here for all projects)", file=sys.stderr)
             sys.exit(1)
         sessions = load_sessions_in_dir(target, since)
+        _scanned_project_names.add(target.name)
         for s in sessions:
             s["worktree_label"] = ""   # main checkout → blank Wt cell
         # Also include sessions from other git worktrees of the same repo.
@@ -13494,12 +13928,20 @@ def _main():
         if not args.project:
             for wt_dir, wt_label in _worktree_project_dirs(cwd, projects_root,
                                                             exclude=target):
+                _scanned_project_names.add(wt_dir.name)
                 extra = load_sessions_in_dir(wt_dir, since)
                 for s in extra:
                     s["worktree_label"] = wt_label
                 if extra:
                     sessions.extend(extra)
 
+    # Sessions Claude has since deleted, from saikai's own records and from the
+    # prompt log Claude keeps. Appended AFTER the live scan and filtered against
+    # it, so a transcript that still exists is always served from the transcript.
+    # (#session-memory)
+    sessions.extend(load_expired_sessions(
+        {s["id"] for s in sessions}, since,
+        project_names=None if args.all_projects else _scanned_project_names))
     # Collapse any sid that surfaced from >1 project dir (case-variant encoded dirs
     # on a case-insensitive FS) BEFORE the table keys rows by sid — else DuplicateKey. (#H2)
     sessions = _dedup_sessions_by_id(sessions)
@@ -13607,6 +14049,9 @@ def _main():
             # case-insensitive FS) must collapse HERE too, not just at initial
             # load — DataTable.add_row(key=sid) raises on a duplicate key, so a
             # reappearing sid broke the list only AFTER an F5/auto-refresh. (#audit-codex-reload-dedup)
+            fresh.extend(load_expired_sessions(
+                {s["id"] for s in fresh}, since,
+                project_names=None if args.all_projects else _scanned_project_names))
             fresh = _dedup_sessions_by_id(fresh)
             fresh.sort(key=lambda s: _iso_sort_key(s["first_ts"]), reverse=True)
             for s in fresh:
