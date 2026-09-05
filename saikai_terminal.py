@@ -3725,8 +3725,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             # Graceful failure surface: show the error on row 0, blanks below.
             if y == 0:
                 text = f" ⚠ terminal unavailable: {self._spawn_error}"
-                return Strip([Segment(text[:width] if width else text)])
-            return Strip.blank(width)
+                return Strip([Segment(text[:width] if width else text, Style())])
+            return Strip.blank(width, Style())
         frame = getattr(self, "_frame", None)
         # Read the frame pinned by render_lines — one generation for every row of
         # this frame, no lock. Only when there is no frame (a render_line outside
@@ -3752,7 +3752,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 # lock, so a pre-lock reference can point at the wrong buffer.
                 screen = getattr(self, "_screen", None)
                 if screen is None or y >= screen.lines:
-                    return Strip.blank(width)
+                    return Strip.blank(width, Style())
                 cols = screen.columns
                 lines = screen.lines
                 # Clamp into the (possibly just-resized) grid — pyte does NOT clamp
@@ -3786,7 +3786,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             return Strip([Segment(msg[:width] if width else msg, Style(reverse=True))])
 
         if cells is None:
-            return Strip.blank(width)
+            return Strip.blank(width, Style())
         if s == 0 and y == cursor_y and 0 <= cursor_x < cols:
             # Addressing the right half of a wide cell lands on pyte's empty
             # stub. Draw the software caret over the complete grapheme's leader.

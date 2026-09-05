@@ -6811,6 +6811,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Previous session's open panes — for the Shift+F4 restore (split-live).
             self._restore_candidates = ((_read_json(OPEN_PANES_FILE, []) or [])
                                         if _LIVE_TERM is not None else [])
+            if not isinstance(self._restore_candidates, list):
+                self._restore_candidates = []
             # Live-terminal bookkeeping (None-safe: only used when _LIVE_TERM is
             # available). Pure data structure; the TabbedContent is the UI.
             self._live = (_LIVE_TERM.LiveSessionManager(max_live=self.MAX_LIVE)
@@ -8487,34 +8489,35 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
 
-        def _open_or_attach_live(self, sid: str, refresh: bool = True) -> None:
+        def _open_or_attach_live(self, sid: str, refresh: bool = True) -> bool | None:
             """Resume an existing session as a live pane (or switch to it if it's
-            already running)."""
+            already running). True means accepted, False refused, None awaiting
+            user confirmation. Acceptance is not proof that async mount succeeded."""
             assert _LIVE_TERM is not None and self._live is not None
             if self._remote_origin_block(sid):       # Desktop-SSH mirror (#remote-origin)
-                return
+                return False
             if self._live.has(sid):                  # already running → switch
                 tabs = self.query_one("#right", TabbedContent)
                 tabs.active = self._live.pane_id(sid)
                 self._opening_live_sid = sid
                 self.call_after_refresh(lambda: self._focus_live_pane(sid))
-                return
+                return True
             if sid in self._opening_sids:
                 # an open is already in flight for this sid (mount worker pending);
                 # a second Enter / wheel must not spawn a duplicate — the worker
                 # focuses it once mounted.
-                return
+                return True
             s = self._sid_index.get(sid)
             title = _pane_title(s, sid)
 
-            def _spawn() -> None:
+            def _spawn() -> bool:
                 try:
                     argv, cwd, env = _build_resume_invocation(sid, all_sessions)
                 except Exception as e:
                     self.notify(f"could not build resume command: {e!r}",
                                 severity="error", timeout=8)
-                    return
-                self._spawn_live_pane(sid, argv, cwd, env, title, refresh=refresh)
+                    return False
+                return self._spawn_live_pane(sid, argv, cwd, env, title, refresh=refresh)
 
             # A running BACKGROUND agent/job (kind=bg, the & marker): it's a headless
             # live session owned by its bg process — there is no interactive window to
@@ -8534,7 +8537,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     self.notify("running background agent — can't resume a live session "
                                 "(resume it after the bg job finishes)",
                                 severity="warning", title="saikai", timeout=8)
-                return
+                return False
             # Already open in another Claude window/instance (the @ marker): a second
             # `claude --resume` on the same JSONL can interleave/corrupt it. Confirm.
             if s and s.get("is_open"):
@@ -8542,7 +8545,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.push_screen(OpenElsewhereScreen(title),
                                  lambda ok: _spawn() if ok else None)
                 return
-            _spawn()
+            return _spawn()
 
         def _open_new_live(self, target_cwd: str) -> None:
             """Start a FRESH claude session in target_cwd as a live pane. A
@@ -8752,9 +8755,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             stub injected with its saved cwd so resume targets the right dir."""
             if _LIVE_TERM is None or self._live is None:
                 return
-            cands = list(getattr(self, "_restore_candidates", []) or [])
+            cands = getattr(self, "_restore_candidates", [])
+            cands = list(cands) if isinstance(cands, list) else []
             opened = 0
-            skipped = {"no_id": 0, "already_live": 0, "no_cwd": 0}
+            pending = 0
+            skipped = {"no_id": 0, "already_live": 0, "no_cwd": 0, "refused": 0}
             for row in cands:
                 sid = row.get("id") if isinstance(row, dict) else row
                 if not isinstance(sid, str) or not sid:
@@ -8762,12 +8767,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # not TypeError later at sid[:8]. (#audit-hostile-files)
                     skipped["no_id"] += 1
                     continue
-                if self._live.has(sid):
+                if self._live.has(sid) or sid in self._opening_sids:
                     skipped["already_live"] += 1
                     continue
                 cwd = row.get("cwd", "") if isinstance(row, dict) else ""
                 if sid not in self._sid_index:
-                    if cwd and Path(cwd).is_dir():
+                    try:
+                        usable_cwd = isinstance(cwd, str) and bool(cwd) and Path(cwd).is_dir()
+                    except (OSError, ValueError):
+                        usable_cwd = False
+                    if usable_cwd:
                         stub = _new_session_stub(sid, cwd, Path(cwd).name or sid[:8])
                         all_sessions.append(stub)
                         self._sid_index[sid] = stub
@@ -8776,18 +8785,22 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         # lossy restore is diagnosable instead of silent. (#restore-diag)
                         skipped["no_cwd"] += 1
                         _log(f"restore SKIP {sid[:8]}: not in index, cwd={cwd!r} "
-                             f"is_dir={bool(cwd) and Path(cwd).is_dir()}")
+                             f"is_dir={usable_cwd}")
                         continue
-                self._open_or_attach_live(sid, refresh=False)
-                opened += 1
-            _log(f"restore: candidates={len(cands)} opened={opened} skipped={skipped}")
+                accepted = self._open_or_attach_live(sid, refresh=False)
+                if accepted is True:
+                    opened += 1
+                elif accepted is None:
+                    pending += 1
+                else:
+                    skipped["refused"] += 1
+            _log(f"restore: candidates={len(cands)} queued={opened} "
+                 f"pending={pending} skipped={skipped}")
             if opened:
                 self._refresh_table()
-                self.notify(f"reopened {opened} pane(s) from last session", timeout=4)
-            elif skipped["no_cwd"]:
-                self.notify(f"couldn't restore {skipped['no_cwd']} pane(s) — their "
-                            f"folder couldn't be resolved (see saikai.log)",
-                            severity="warning", timeout=6)
+            if opened or pending or any(skipped.values()):
+                self.notify(f"restore: queued {opened} pane(s), {pending} awaiting confirmation, "
+                            f"{sum(skipped.values())} skipped (see saikai.log)", timeout=6)
             else:
                 self.notify("nothing to restore", timeout=3)
 

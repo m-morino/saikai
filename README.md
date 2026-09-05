@@ -15,19 +15,22 @@
 
 ![saikai in motion — the session list on the left flags who needs you; pick one and it runs live on the right, jump between the fleet, checkpoint a bloated session](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-demo.gif)
 
-**vs. `claude --resume`:** `-r` opens *one* session in the folder you're in.
-saikai watches **all** of them at once — every repo and worktree — runs several
-**live** side by side, and shows at a glance (one cyan accent) which is working,
-which is waiting, and which finished and needs your reply. It's the difference
-between reopening a file and a control room.
+**Alongside Claude's built-in tools:** the current `claude --resume` picker
+supports search, preview, and an all-projects view (`Ctrl+A`), while
+`claude agents` manages running agents. saikai adds its own favorites,
+transcript-content search, saved pane restoration, and embedded live panes.
+Live busy/waiting/idle status is available for panes hosted by saikai;
+sessions running elsewhere use registry and transcript heuristics.
+See Claude's [session picker](https://code.claude.com/docs/en/sessions)
+and [agent view](https://code.claude.com/docs/en/agent-view).
 
 ## Who it's for
 
 You're running Claude Code across several repos and worktrees and you keep
 losing track: which session was I in, which one is stuck waiting on me, where
-did that half-finished change go? `claude --resume` can't answer that — it only
-knows the current folder, with no search, no preview, no cross-session view.
-That gap is the whole reason saikai exists. You'll want it if you'd like to:
+did that half-finished change go? saikai provides a terminal workspace for
+finding those conversations and restoring the set you return to.
+You'll want it if you'd like to:
 
 - **see who needs you** — every running session's state at a glance, and one key
   to jump to the next one waiting on a human;
