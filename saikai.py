@@ -426,13 +426,15 @@ DEFAULT_LEADER_LETTERS = {           # action id -> letter (config orientation)
     # flow that ends in a destructive /clear. b1's plain Shift+F11 stays
     # /compact-only; b2 is its own entry-point sharing b1's idle-gate helpers.
     "checkpoint": "c",
+    "worksets": "w",
 }
 # Leader-only action ids (no Binding / F-key behind them): id -> action name.
 LEADER_VIRTUAL_ACTIONS = {"sort": "sort", "order": "order", "mark": "toggle_mark",
                           "settings": "settings",
                           "search_bar": "toggle_search_bar",
                           "checkpoint": "checkpoint",
-                          "copy_summary": "copy_summary"}
+                          "copy_summary": "copy_summary",
+                          "worksets": "manage_worksets"}
 
 # Leader families: action name -> family, in display order. The which-key hint
 # and the ? help render the map grouped this way (Session / View / Panes)
@@ -450,6 +452,7 @@ LEADER_FAMILY_OF = {
     "new_session": "Panes", "restore_panes": "Panes", "freeze_pane": "Panes",
     "next_attention": "Panes", "close_live": "Panes", "prev_tab": "Panes",
     "next_tab": "Panes", "toggle_mark": "Panes", "checkpoint": "Panes",
+    "manage_worksets": "Panes",
 }
 
 
@@ -5311,6 +5314,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         from rich.text import Text
         from textual.content import Content  # markup-safe title/label type (TabPane
         #   rejects rich Text: render_str→_strip_control_codes calls str.translate)
+        from saikai_workset_ui import (WorksetConfirmScreen, WorksetListScreen,
+                                       WorksetNameScreen)
+        from saikai_workspace import (ResumeTarget, StoreConflictError, Workset,
+                                      WorksetEntry, WorkspaceStore)
     except ImportError as e:
         print(_c(f"  textual is required but not installed ({e}). "
                  f"Install it with: uv tool install textual "
@@ -6603,6 +6610,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             "next_attention", "toggle_list", "rename", "shrink_list",
             "grow_list", "notifications", "open_parent", "context_refresh",
             "checkpoint", "copy_response",
+            "manage_worksets", "save_workset",
         })
 
         def check_action(self, action: str, parameters):
@@ -8747,6 +8755,257 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _write_json(OPEN_PANES_FILE, [merged[k] for k in sorted(merged)])
             except Exception:
                 pass
+
+        def _workspace_store(self):
+            """Return the named-workset store without touching disk."""
+            override = getattr(self, "_workspace_store_override", None)
+            if override is not None:
+                return override
+            import platformdirs
+            return WorkspaceStore(Path(platformdirs.user_data_dir("saikai")) /
+                                  "workspaces.json")
+
+        def _snapshot_current_workset(self):
+            """Copy registered live panes on the UI thread, preserving tab order."""
+            entries, skipped = [], []
+            terms = tuple(self._live.all_terms()) if self._live is not None else ()
+            for term in terms:
+                sid = getattr(term, "sid", None)
+                cwd = getattr(term, "_cwd", None)
+                if not isinstance(sid, str) or not sid.strip():
+                    skipped.append("pane without a Claude session ID")
+                    continue
+                if not isinstance(cwd, str) or not cwd.strip():
+                    skipped.append(f"{sid[:8]} has no saved cwd")
+                    continue
+                session = self._sid_index.get(sid)
+                title = _pane_title(session, sid, term)
+                entries.append(WorksetEntry(str(uuid.uuid4()), "pending", cwd, "claude",
+                                            ResumeTarget("id", sid), title))
+            return tuple(entries), tuple(skipped)
+
+        def _snapshot_previous_workset(self):
+            """Copy the startup snapshot; never re-read or rewrite open-panes.json."""
+            entries, skipped = [], []
+            rows = getattr(self, "_restore_candidates", [])
+            rows = tuple(rows) if isinstance(rows, list) else ()
+            for row in rows:
+                sid = row.get("id") if isinstance(row, dict) else None
+                cwd = row.get("cwd") if isinstance(row, dict) else None
+                if not isinstance(sid, str) or not sid.strip():
+                    skipped.append("previous pane without a Claude session ID")
+                    continue
+                if not isinstance(cwd, str) or not cwd.strip():
+                    skipped.append(f"{sid[:8]} has no saved cwd")
+                    continue
+                session = self._sid_index.get(sid)
+                entries.append(WorksetEntry(str(uuid.uuid4()), "pending", cwd, "claude",
+                                            ResumeTarget("id", sid),
+                                            _pane_title(session, sid)))
+            return tuple(entries), tuple(skipped)
+
+        @staticmethod
+        def _entries_for_host(entries, host_id):
+            from dataclasses import replace
+            return tuple(replace(entry, host_id=host_id) for entry in entries)
+
+        def _write_new_workset(self, revision, name, entries):
+            """Worker-only CAS write; exposed narrowly for focused store tests."""
+            if not entries:
+                raise ValueError("A workset needs at least one valid pane")
+            from dataclasses import replace
+            store = self._workspace_store()
+            current = store.read()
+            hosted = self._entries_for_host(tuple(entries), current.host_id)
+            new_set = Workset(str(uuid.uuid4()), name, hosted)
+            return store.update(revision, lambda state: replace(
+                state, worksets=state.worksets + (new_set,)))
+
+        def _workset_error(self, operation, exc):
+            if isinstance(exc, StoreConflictError):
+                detail = "changed in another window; reopen Worksets and retry"
+            else:
+                detail = str(exc) or repr(exc)
+            self.notify(f"workset {operation} failed: {detail}", severity="error", timeout=8)
+
+        @staticmethod
+        def _validate_workset_entries(entries, skipped=()):
+            """Worker-only cwd validation for a UI-copied pane snapshot."""
+            valid, rejected = [], list(skipped)
+            for entry in entries:
+                try:
+                    usable = Path(entry.cwd).is_dir()
+                except (OSError, ValueError):
+                    usable = False
+                if usable:
+                    valid.append(entry)
+                else:
+                    sid = entry.target.session_id or entry.id
+                    rejected.append(f"{sid[:8]} cwd is unavailable")
+            return tuple(valid), tuple(rejected)
+
+        def _prepare_workset_entries(self, entries, skipped, callback):
+            copied, reasons = tuple(entries), tuple(skipped)
+            def work():
+                result = self._validate_workset_entries(copied, reasons)
+                try:
+                    self.call_from_thread(callback, *result)
+                except Exception:
+                    pass
+            self.run_worker(work, thread=True, exit_on_error=False,
+                            name="workset-cwd-check")
+
+        def _load_worksets(self, callback):
+            """Read/initialize off the UI thread and return immutable state."""
+            def work():
+                try:
+                    store = self._workspace_store()
+                    state = store.read() if store.path.exists() else store.initialize()
+                except Exception as exc:
+                    self.call_from_thread(self._workset_error, "load", exc)
+                else:
+                    self.call_from_thread(callback, state)
+            self.run_worker(work, thread=True, exit_on_error=False,
+                            name="worksets-load")
+
+        def _save_workset_entries(self, entries, skipped=(), *, preview=False):
+            if getattr(self, "_opening_sids", set()):
+                self.notify("workset save paused — wait for panes to finish opening",
+                            severity="warning", timeout=6)
+                return
+            def validated(valid_entries, rejected):
+                if not valid_entries:
+                    reason = rejected[0] if rejected else "no registered live panes"
+                    self.notify(f"workset not saved: {reason}", severity="warning", timeout=6)
+                    return
+                if preview:
+                    details = "\n".join(f"• {entry.target.session_id}: {entry.cwd}"
+                                        for entry in valid_entries)
+                    text = (f"Import {len(valid_entries)} previous pane(s)"
+                            f"; skip {len(rejected)}?\n{details}")
+                    self.push_screen(WorksetConfirmScreen(text),
+                                     lambda ok: self._name_and_save_workset(
+                                         valid_entries, rejected) if ok else None)
+                else:
+                    self._name_and_save_workset(valid_entries, rejected)
+            self._prepare_workset_entries(tuple(entries), tuple(skipped), validated)
+
+        def _name_and_save_workset(self, entries, skipped):
+            def loaded(state):
+                names = tuple(item.name for item in state.worksets)
+                def named(name):
+                    if name is None:
+                        return
+                    def work():
+                        try:
+                            self._write_new_workset(state.revision, name, entries)
+                        except Exception as exc:
+                            self.call_from_thread(self._workset_error, "save", exc)
+                        else:
+                            suffix = f"; skipped {len(skipped)}" if skipped else ""
+                            self.call_from_thread(self.notify,
+                                                  f"saved workset: {name}{suffix}", timeout=4)
+                    self.run_worker(work, thread=True, exit_on_error=False,
+                                    name="workset-save")
+                self.push_screen(WorksetNameScreen(names), named)
+            self._load_worksets(loaded)
+
+        def action_save_workset(self) -> None:
+            entries, skipped = self._snapshot_current_workset()
+            self._save_workset_entries(entries, skipped)
+
+        def action_manage_worksets(self) -> None:
+            if self._focused_terminal() is not None or isinstance(self.focused, (Input, Select)):
+                raise SkipAction()
+            def loaded(state):
+                self._workset_manage_state = state
+                def selected(set_id):
+                    if set_id:
+                        self.notify("restoring named worksets is available in the next stage",
+                                    severity="warning", timeout=6)
+                self.push_screen(WorksetListScreen(state.worksets), selected)
+            self._load_worksets(loaded)
+
+        def on_workset_list_screen_manage(self, event) -> None:
+            event.stop()
+            action, set_id = event.action, event.set_id
+            state = getattr(self, "_workset_manage_state", None)
+            if action == "save_current":
+                self.action_save_workset()
+                return
+            if action == "save_previous":
+                entries, skipped = self._snapshot_previous_workset()
+                self._save_workset_entries(entries, skipped, preview=True)
+                return
+            if state is None or not set_id:
+                self.notify("select a workset first", severity="warning", timeout=4)
+                return
+            target = next((item for item in state.worksets if item.id == set_id), None)
+            if target is None:
+                self.notify("workset changed; reopen Worksets", severity="warning", timeout=5)
+                return
+            if action == "rename":
+                others = tuple(item.name for item in state.worksets if item.id != set_id)
+                def named(name):
+                    if name is not None:
+                        self._mutate_workset(state, target, "rename", name=name)
+                self.push_screen(WorksetNameScreen(others, target.name), named)
+            elif action == "update":
+                if getattr(self, "_opening_sids", set()):
+                    self.notify("workset update paused — wait for panes to finish opening",
+                                severity="warning", timeout=6)
+                    return
+                entries, skipped = self._snapshot_current_workset()
+                def checked(valid_entries, rejected):
+                    if not valid_entries:
+                        self.notify("workset not updated: no valid registered panes",
+                                    severity="warning", timeout=6)
+                        return
+                    text = (f"Update {target.name}?\nOld: {len(target.entries)} panes\n"
+                            f"New: {len(valid_entries)} panes\nSkipped: {len(rejected)}")
+                    self.push_screen(WorksetConfirmScreen(text),
+                                     lambda ok: self._mutate_workset(
+                                         state, target, "update",
+                                         entries=valid_entries) if ok else None)
+                self._prepare_workset_entries(entries, skipped, checked)
+            elif action == "delete":
+                text = f"Delete {target.name}?\nSaved panes: {len(target.entries)}"
+                self.push_screen(WorksetConfirmScreen(text),
+                                 lambda ok: self._mutate_workset(
+                                     state, target, "delete") if ok else None)
+
+        def _mutate_workset(self, state, target, operation, *, name=None, entries=None):
+            """Apply a revision-captured rename/update/delete in a thread worker."""
+            from dataclasses import replace
+            def work():
+                try:
+                    store = self._workspace_store()
+                    def change(current):
+                        changed = []
+                        found = False
+                        for item in current.worksets:
+                            if item.id != target.id:
+                                changed.append(item)
+                                continue
+                            found = True
+                            if operation == "delete":
+                                continue
+                            if operation == "rename":
+                                changed.append(replace(item, name=name))
+                            else:
+                                hosted = self._entries_for_host(tuple(entries), current.host_id)
+                                changed.append(replace(item, entries=hosted))
+                        if not found:
+                            raise StoreConflictError("Workset no longer exists")
+                        return replace(current, worksets=tuple(changed))
+                    store.update(state.revision, change)
+                except Exception as exc:
+                    self.call_from_thread(self._workset_error, operation, exc)
+                else:
+                    self.call_from_thread(self.notify, f"workset {operation}d: {target.name}",
+                                          timeout=4)
+            self.run_worker(work, thread=True, exit_on_error=False,
+                            name=f"workset-{operation}")
 
         def action_restore_panes(self) -> None:
             """Shift+F4: reopen the PREVIOUS session's panes (snapshot loaded at
