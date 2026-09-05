@@ -18,6 +18,24 @@ daemon or database.
 Keep the boundary one-way: application policy may use the provider and terminal
 layers, but terminal code must not import application policy.
 
+## Explicit workspace data
+
+`saikai_workspace.py` owns versioned project/workset models and the durable
+`platformdirs.user_data_dir("saikai")/workspaces.json` store. It imports no
+application or terminal code. `saikai_workset_ui.py` owns workset modals;
+PickerApp collects live terminal metadata and routes launches through its
+existing provider and resource gates.
+
+Named worksets are ordered snapshots, modified only by explicit save, update,
+rename, or delete. The previous-pane cache and terminal exit callbacks never
+write them. Store operations and folder checks run in workers. A modal retains
+the revision it read; stale edits fail rather than silently replacing newer
+state. Writers use a persistent sidecar OS lock (two-second deadline), then
+validate and atomically replace the JSON through a same-directory temporary
+file. Malformed or unknown-schema data must never be reinitialized as empty.
+Saved cwd and host identity belong to each snapshot entry; another host's
+entries are unavailable, and restoring does not prune failed entries.
+
 ## History model
 
 Claude transcript JSONL files are the source of truth. saikai discovers them,

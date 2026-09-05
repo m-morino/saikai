@@ -20,6 +20,7 @@ import saikai
 from saikai_workspace import (ResumeTarget, StoreConflictError, Workset,
                               WorksetEntry, WorkspaceStore)
 from saikai_workset_ui import WorksetConfirmScreen, WorksetListScreen, WorksetNameScreen
+from saikai_workset_ui import RestoreWorksetScreen, build_restore_rows
 from textual.app import App
 
 
@@ -307,6 +308,210 @@ class PickerWorksets(unittest.TestCase):
                              ResumeTarget("id", "session-a"), "A")
         with self.assertRaises(StoreConflictError):
             self.app._write_new_workset(first.revision, "stale", (entry,))
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+
+class WorksetRestore(unittest.TestCase):
+    setUp = PickerWorksets.setUp
+    tearDown = PickerWorksets.tearDown
+
+    def entries(self, *sids):
+        host = self.store.read().host_id
+        return tuple(WorksetEntry(str(i), host, str(self.root), "claude",
+                                  ResumeTarget("id", sid), sid)
+                     for i, sid in enumerate(sids))
+
+    async def preview(self, pilot):
+        for _ in range(50):
+            await pilot.pause(0.02)
+            if (isinstance(self.app.screen, RestoreWorksetScreen) and
+                    self.app.screen.query("#restore-confirm") and
+                    self.app.screen.query_one("#restore-confirm").region.width > 0):
+                await pilot.pause()
+                return
+        self.fail("restore preview never appeared")
+
+    def save(self, entries):
+        state = self.store.read()
+        self.store.update(state.revision, lambda s: replace(
+            s, worksets=(Workset("set-a", "restart", entries),)))
+
+    async def restored(self, pilot):
+        for _ in range(50):
+            await pilot.pause(0.02)
+            if any("workset restore:" in m for m in self.messages):
+                return
+        self.fail(f"restore did not finish: {self.messages}")
+
+    def test_preview_classifies_missing_foreign_duplicate_open_and_capacity(self):
+        entries = self.entries("a", "missing", "foreign", "a", "open", "opening", "full")
+        entries = list(entries)
+        entries[1] = replace(entries[1], cwd=str(self.root / "missing"))
+        entries[2] = replace(entries[2], host_id="other-host")
+        rows = build_restore_rows(tuple(entries), self.store.read().host_id,
+                                  frozenset({"open"}), frozenset({"opening"}), 1)
+        self.assertEqual([r.disposition for r in rows],
+                         ["ready", "unavailable", "unavailable", "unavailable",
+                          "already_open", "unavailable", "ready"])
+        self.assertIn("duplicate", rows[3].reason)
+        self.assertIn("capacity", rows[6].reason)
+        self.assertFalse(rows[6].initially_selected)
+
+    def test_capacity_one_can_select_later_entry_instead(self):
+        rows = build_restore_rows(self.entries("a", "b"), self.store.read().host_id,
+                                  frozenset(), frozenset(), 1)
+        async def go():
+            app = _ScreenApp(RestoreWorksetScreen(rows))
+            async with app.run_test(size=(60, 24)) as pilot:
+                await pilot.pause()
+                a = app.screen.query_one("#restore-row-0")
+                b = app.screen.query_one("#restore-row-1")
+                self.assertFalse(b.disabled)
+                self.assertTrue(a.value)
+                self.assertFalse(b.value)
+                await pilot.click("#restore-row-0")
+                await pilot.click("#restore-row-1")
+                await pilot.click("#restore-confirm")
+                await pilot.pause()
+            self.assertEqual(app.result, (rows[1].entry.id,))
+        asyncio.run(go())
+
+    def test_partial_restore_retains_bytes_and_saved_cwd_after_fresh_app(self):
+        entries = list(self.entries("a", "missing", "full"))
+        entries[1] = replace(entries[1], cwd=str(self.root / "missing"))
+        self.save(tuple(entries))
+        before = self.store.path.read_bytes()
+        launched = []
+        async def go():
+            async with self.app.run_test() as pilot:
+                await pilot.pause()
+                self.app._workspace_store_override = WorkspaceStore(self.store.path)
+                self.app._remote_origin_block = lambda sid: False
+                self.app._refresh_table = lambda: None
+                def spawn(sid, argv, cwd, env, title, **kw):
+                    if sid == "full":
+                        return False
+                    launched.append((sid, cwd))
+                    self.app._opening_sids.add(sid)
+                    return True
+                self.app._spawn_live_pane = spawn
+                with patch.object(saikai, "_build_claude_invocation",
+                                  side_effect=lambda args, cwd, sessions: (args, cwd, {})):
+                    self.app.action_restore_workset("set-a")
+                    await self.preview(pilot)
+                    await pilot.click("#restore-confirm")
+                    await self.restored(pilot)
+                self.app._opening_sids.clear()
+        asyncio.run(go())
+        self.assertEqual(launched, [("a", str(self.root))])
+        self.assertEqual(self.store.path.read_bytes(), before)
+        self.assertTrue(any("queued 1" in m and "skipped" in m for m in self.messages))
+
+    def test_inflight_after_preview_cannot_be_started_twice(self):
+        self.save(self.entries("a", "a"))
+        before = self.store.path.read_bytes()
+        called = []
+        async def go():
+            async with self.app.run_test() as pilot:
+                await pilot.pause()
+                self.app._open_or_attach_live = lambda *a, **k: called.append(a) or True
+                self.app.action_restore_workset("set-a")
+                await self.preview(pilot)
+                self.app._opening_sids.add("a")
+                await pilot.click("#restore-confirm")
+                await self.restored(pilot)
+                self.app._opening_sids.clear()
+        asyncio.run(go())
+        self.assertEqual(called, [])
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_elsewhere_confirmation_keeps_saved_cwd_without_mutating_history(self):
+        self.save(self.entries("a"))
+        before = self.store.path.read_bytes()
+        launched = []
+        wrong = str(self.root / "indexed-folder")
+        async def go():
+            async with self.app.run_test() as pilot:
+                await pilot.pause()
+                indexed = saikai._new_session_stub("a", wrong, "already running")
+                self.app._sid_index["a"] = indexed
+                self.app._remote_origin_block = lambda sid: False
+                self.app._spawn_live_pane = lambda sid, argv, cwd, env, title, **kw: launched.append(cwd) or True
+                with patch.object(saikai, "_build_claude_invocation",
+                                  side_effect=lambda args, cwd, sessions: (args, cwd, {})):
+                    self.app.action_restore_workset("set-a")
+                    await self.preview(pilot)
+                    await pilot.click("#restore-confirm")
+                    await self.restored(pilot)
+                    self.assertEqual(launched, [])
+                    self.assertTrue(any("1 awaiting confirmation" in m for m in self.messages))
+                    self.assertEqual(type(self.app.screen).__name__, "OpenElsewhereScreen")
+                    await pilot.press("enter")
+                    await pilot.pause()
+                self.assertEqual(indexed["cwd"], wrong)
+        asyncio.run(go())
+        self.assertEqual(launched, [str(self.root)])
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_actual_capacity_gate_rechecks_after_preview(self):
+        self.save(self.entries("a"))
+        before = self.store.path.read_bytes()
+        import saikai_terminal
+        async def go():
+            async with self.app.run_test() as pilot:
+                await pilot.pause()
+                self.app._remote_origin_block = lambda sid: False
+                with patch.object(saikai, "_build_claude_invocation",
+                                  side_effect=lambda args, cwd, sessions: (args, cwd, {})), \
+                        patch.object(saikai_terminal.AgentTerminal, "__init__",
+                                     side_effect=AssertionError("capacity gate must prevent construction")) as terminal:
+                    self.app.action_restore_workset("set-a")
+                    await self.preview(pilot)
+                    self.app._live.max_live = 0
+                    await pilot.click("#restore-confirm")
+                    await self.restored(pilot)
+                    terminal.assert_not_called()
+                self.assertTrue(any("backstop" in m for m in self.messages), self.messages)
+        asyncio.run(go())
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_unindexed_background_session_keeps_existing_refusal_gate(self):
+        self.save(self.entries("a"))
+        before = self.store.path.read_bytes()
+        called = []
+        async def go():
+            async with self.app.run_test() as pilot:
+                await pilot.pause()
+                self.app._spawn_live_pane = lambda *a, **k: called.append(a) or True
+                self.app._remote_origin_block = lambda sid: False
+                with patch.object(saikai, "_load_active_sessions", return_value={"a": "busy"}), \
+                        patch.object(saikai, "_active_session_kinds", return_value={"a": "bg"}):
+                    self.app.action_restore_workset("set-a")
+                    await self.preview(pilot)
+                    await pilot.click("#restore-confirm")
+                    await self.restored(pilot)
+        asyncio.run(go())
+        self.assertEqual(called, [])
+        self.assertTrue(any("background agent" in m for m in self.messages), self.messages)
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_folder_removed_after_preview_is_skipped(self):
+        folder = self.root / "vanished"
+        folder.mkdir()
+        self.save((replace(self.entries("a")[0], cwd=str(folder)),))
+        before = self.store.path.read_bytes()
+        called = []
+        async def go():
+            async with self.app.run_test() as pilot:
+                await pilot.pause()
+                self.app._open_or_attach_live = lambda *a, **k: called.append(a) or True
+                self.app.action_restore_workset("set-a")
+                await self.preview(pilot)
+                folder.rmdir()
+                await pilot.click("#restore-confirm")
+                await self.restored(pilot)
+        asyncio.run(go())
+        self.assertEqual(called, [])
         self.assertEqual(self.store.path.read_bytes(), before)
 
 

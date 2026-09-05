@@ -86,6 +86,29 @@ uv tool install saikai
 saikai
 ```
 
+### Named worksets
+
+From the session list, press `Space` then `w` to open **Worksets**. Save the
+currently running Claude panes under a name, then select that name after a
+restart to preview and restore the saved sessions in their saved folders.
+You can also explicitly import the previous-pane snapshot, rename a set,
+replace its contents with the current panes, or delete it. Updating a set
+requires confirmation; an empty set of live panes cannot overwrite one.
+
+Closing a pane or skipping an unavailable session during restore never removes
+it from a named set. Missing folders, entries from another host, unsupported
+providers, and duplicates are shown in the preview. Existing pane limits,
+memory checks, and confirmation for sessions open elsewhere still apply.
+Queued launches are not reported as completed launches.
+
+Worksets use `platformdirs.user_data_dir("saikai")/workspaces.json`, separate
+from the cache and the automatic `Shift+F4` previous-pane snapshot. Changes are
+explicit, locked, and atomically saved; conflicting edits ask you to reload
+instead of overwriting newer data. Invalid files are preserved and reported.
+Run saikai on the SSH host whose sessions you want to restore. This feature
+restores Claude panes on that host; it does not add an SSH connection or migrate
+conversations between agents.
+
 ### Reading the list
 
 By default, sessions from the same project share a title color, so related work

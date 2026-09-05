@@ -47,7 +47,7 @@ if [ -z "$SKIP_TESTS" ]; then
     else PY=python; fi
 
     echo "pre-push: py_compile + full test suite via $PY (SKIP_TESTS=1 to skip)…" >&2
-    if ! "$PY" -m py_compile saikai.py saikai_terminal.py saikai_provider.py saikai_mirror.py; then
+    if ! "$PY" -m py_compile saikai.py saikai_terminal.py saikai_provider.py saikai_mirror.py saikai_workspace.py saikai_workset_ui.py; then
         echo "pre-push BLOCKED: py_compile failed." >&2
         exit 1
     fi

@@ -31,7 +31,7 @@ subset (a subset misses tests in files you forgot, which is how green-locally /
 red-in-CI happens):
 
 ```bash
-python -m py_compile saikai.py saikai_terminal.py saikai_provider.py saikai_mirror.py
+python -m py_compile saikai.py saikai_terminal.py saikai_provider.py saikai_mirror.py saikai_workspace.py saikai_workset_ui.py
 for t in tests/test_*.py; do echo "== $t =="; uv run python "$t" || break; done
 ```
 

@@ -1,14 +1,18 @@
 """Small Textual screens for named worksets."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
+
 from textual import on
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.content import Content
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, ListItem, ListView, Static
+from textual.widgets import Button, Checkbox, Input, Label, ListItem, ListView, Static
 
-from saikai_workspace import Workset
+from saikai_workspace import Workset, WorksetEntry
 
 
 class WorksetNameScreen(ModalScreen[str | None]):
@@ -87,7 +91,7 @@ class WorksetListScreen(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="workset-list-box"):
-            yield Label("Named worksets — Enter restores (available in the next stage)")
+            yield Label("Named worksets — Enter previews restoration")
             yield ListView(*[
                 ListItem(Label(f"{item.name}  ({len(item.entries)} panes)", markup=False), id=f"workset-row-{i}")
                 for i, item in enumerate(self.worksets)
@@ -153,3 +157,93 @@ class WorksetConfirmScreen(ModalScreen[bool]):
 
     def key_escape(self) -> None:
         self.dismiss(False)
+
+
+@dataclass(frozen=True)
+class RestoreRow:
+    entry: WorksetEntry
+    disposition: str
+    reason: str
+    initially_selected: bool = True
+
+
+def build_restore_rows(entries: tuple[WorksetEntry, ...], host_id: str,
+                       opened: frozenset[str], opening: frozenset[str],
+                       capacity: int) -> tuple[RestoreRow, ...]:
+    """Worker-only folder checks using a snapshot of the UI's live state."""
+    result, seen = [], set()
+    for entry in entries:
+        sid = entry.target.session_id
+        disposition, reason = "unavailable", ""
+        selected = False
+        if entry.host_id != host_id:
+            reason = "another host"
+        elif entry.provider != "claude" or entry.target.mode != "id":
+            reason = "only Claude session IDs can be restored here"
+        elif sid in seen:
+            reason = "duplicate session"
+        else:
+            seen.add(sid)
+            if sid in opened:
+                disposition, reason = "already_open", "already open"
+            elif sid in opening:
+                reason = "already opening"
+            else:
+                try:
+                    usable = Path(entry.cwd).is_absolute() and Path(entry.cwd).is_dir()
+                except (OSError, ValueError):
+                    usable = False
+                if not usable:
+                    reason = "saved folder unavailable"
+                elif capacity <= 0:
+                    disposition = "ready"
+                    reason = "capacity: select instead of an earlier pane, or close a live pane"
+                else:
+                    disposition, reason = "ready", "ready (launch checks still apply)"
+                    selected = True
+                    capacity -= 1
+        result.append(RestoreRow(entry, disposition, reason, selected))
+    return tuple(result)
+
+
+class RestoreWorksetScreen(ModalScreen[tuple[str, ...] | None]):
+    """Review every saved entry; only available entries can be selected."""
+    CSS = """
+    RestoreWorksetScreen { align: center middle; }
+    #restore-box { width: 95%; max-width: 90; height: 90%; padding: 1; border: solid $accent; background: $panel; }
+    #restore-rows { height: 1fr; }
+    #restore-rows Checkbox { width: 100%; height: auto; }
+    #restore-buttons { height: 3; }
+    """
+
+    def __init__(self, rows: tuple[RestoreRow, ...]):
+        super().__init__()
+        self.rows = rows
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="restore-box"):
+            yield Label("Restore saved panes")
+            yield Static("Unavailable entries stay saved. Uncheck any pane to skip it.", markup=False)
+            with VerticalScroll(id="restore-rows"):
+                for i, row in enumerate(self.rows):
+                    entry = row.entry
+                    text = (f"{entry.title or entry.target.session_id} — {row.reason}\n"
+                            f"{entry.cwd}  ({entry.target.session_id or entry.target.mode})")
+                    yield Checkbox(Content(text), value=row.disposition == "ready" and row.initially_selected,
+                                   disabled=row.disposition != "ready", id=f"restore-row-{i}")
+            with Horizontal(id="restore-buttons"):
+                yield Button("Restore selected", id="restore-confirm", variant="primary",
+                             disabled=not any(r.disposition == "ready" for r in self.rows))
+                yield Button("Cancel", id="restore-cancel")
+
+    @on(Button.Pressed)
+    def button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "restore-confirm":
+            self.dismiss(tuple(row.entry.id for i, row in enumerate(self.rows)
+                               if row.disposition == "ready" and
+                               self.query_one(f"#restore-row-{i}", Checkbox).value))
+        elif event.button.id == "restore-cancel":
+            self.dismiss(None)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)

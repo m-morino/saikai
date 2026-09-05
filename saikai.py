@@ -5315,7 +5315,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         from textual.content import Content  # markup-safe title/label type (TabPane
         #   rejects rich Text: render_str→_strip_control_codes calls str.translate)
         from saikai_workset_ui import (WorksetConfirmScreen, WorksetListScreen,
-                                       WorksetNameScreen)
+                                       WorksetNameScreen, RestoreWorksetScreen,
+                                       build_restore_rows)
         from saikai_workspace import (ResumeTarget, StoreConflictError, Workset,
                                       WorksetEntry, WorkspaceStore)
     except ImportError as e:
@@ -8497,7 +8498,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
 
-        def _open_or_attach_live(self, sid: str, refresh: bool = True) -> bool | None:
+        def _open_or_attach_live(self, sid: str, refresh: bool = True, *,
+                                 saved_cwd: str | None = None) -> bool | None:
             """Resume an existing session as a live pane (or switch to it if it's
             already running). True means accepted, False refused, None awaiting
             user confirmation. Acceptance is not proof that async mount succeeded."""
@@ -8520,7 +8522,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
             def _spawn() -> bool:
                 try:
-                    argv, cwd, env = _build_resume_invocation(sid, all_sessions)
+                    if saved_cwd is None:
+                        argv, cwd, env = _build_resume_invocation(sid, all_sessions)
+                    else:
+                        # Named snapshots keep their reviewed cwd even when the
+                        # history index changes while an elsewhere gate is open.
+                        argv, cwd, env = _build_claude_invocation(
+                            ["--resume", sid], saved_cwd, all_sessions)
                 except Exception as e:
                     self.notify(f"could not build resume command: {e!r}",
                                 severity="error", timeout=8)
@@ -8921,8 +8929,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self._workset_manage_state = state
                 def selected(set_id):
                     if set_id:
-                        self.notify("restoring named worksets is available in the next stage",
-                                    severity="warning", timeout=6)
+                        self.action_restore_workset(set_id)
                 self.push_screen(WorksetListScreen(state.worksets), selected)
             self._load_worksets(loaded)
 
@@ -9006,6 +9013,85 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                           timeout=4)
             self.run_worker(work, thread=True, exit_on_error=False,
                             name=f"workset-{operation}")
+
+        def action_restore_workset(self, set_id: str) -> None:
+            """Read a named snapshot without changing the previous-pane cache."""
+            if _LIVE_TERM is None or self._live is None:
+                self.notify("restoring worksets needs split-live", severity="warning")
+                return
+            opened = frozenset(t.sid for t in self._live.all_terms())
+            opening = frozenset(self._opening_sids)
+            capacity = max(0, self._live.max_live - self._live.count - len(opening))
+            def work():
+                try:
+                    state = self._workspace_store().read()
+                    target = next((w for w in state.worksets if w.id == set_id), None)
+                    if target is None:
+                        raise StoreConflictError("Workset no longer exists")
+                    rows = build_restore_rows(target.entries, state.host_id,
+                                              opened, opening, capacity)
+                except Exception as exc:
+                    self.call_from_thread(self._workset_error, "restore", exc)
+                else:
+                    self.call_from_thread(self._preview_workset_restore, rows, state.host_id)
+            self.run_worker(work, thread=True, exit_on_error=False, name="workset-restore-preview")
+
+        def _preview_workset_restore(self, rows, host_id):
+            def selected(entry_ids):
+                if entry_ids is None:
+                    return
+                selected_ids = frozenset(entry_ids)
+                candidates = tuple(r.entry for r in rows
+                                   if r.disposition == "ready" and r.entry.id in selected_ids)
+                skipped = len(rows) - len(candidates)
+                # Recheck disk in a worker, then live/in-flight state on the UI.
+                # No saved file is written at any point in restoration.
+                def work():
+                    try:
+                        checked = build_restore_rows(candidates, host_id, frozenset(),
+                                                     frozenset(), len(candidates))
+                        active = dict(_load_active_sessions())
+                        kinds = dict(_active_session_kinds())
+                        self.call_from_thread(self._launch_workset_rows, checked, skipped,
+                                              active, kinds)
+                    except Exception as exc:
+                        self.call_from_thread(self._workset_error, "restore", exc)
+                self.run_worker(work, thread=True, exit_on_error=False, name="workset-restore-check")
+            self.push_screen(RestoreWorksetScreen(rows), selected)
+
+        def _launch_workset_rows(self, rows, skipped=0, active=None, kinds=None):
+            queued = pending = 0
+            seen = set()
+            active, kinds = active or {}, kinds or {}
+            for row in rows:
+                entry, sid = row.entry, row.entry.target.session_id
+                if (row.disposition != "ready" or sid in seen or self._live is None or
+                        self._live.has(sid) or sid in self._opening_sids):
+                    skipped += 1
+                    continue
+                seen.add(sid)
+                if sid not in self._sid_index:
+                    stub = _new_session_stub(sid, entry.cwd, entry.title or sid[:8])
+                    # _new_session_stub describes a NEW, already launched pane.
+                    # A restore candidate has not launched: derive ownership from
+                    # the existing registry reader instead of inventing is_open.
+                    kind = kinds.get(sid) or ""
+                    stub.update(is_open=sid in active, is_active=sid in active,
+                                session_status=active.get(sid, ""), live_kind=kind,
+                                is_bg=bool(kind) and kind != "interactive")
+                    all_sessions.append(stub)
+                    self._sid_index[sid] = stub
+                accepted = self._open_or_attach_live(sid, refresh=False, saved_cwd=entry.cwd)
+                if accepted is True:
+                    queued += 1
+                elif accepted is None:
+                    pending += 1
+                else:
+                    skipped += 1
+            if queued:
+                self._refresh_table()
+            self.notify(f"workset restore: queued {queued} pane(s), {pending} awaiting confirmation, "
+                        f"{skipped} skipped; saved set unchanged", timeout=6)
 
         def action_restore_panes(self) -> None:
             """Shift+F4: reopen the PREVIOUS session's panes (snapshot loaded at

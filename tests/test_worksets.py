@@ -318,6 +318,17 @@ class WorkspaceStoreTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), original)
         self.assertEqual(list(self.root.glob("*.tmp")), [])
 
+    def test_invalid_update_preserves_noncanonical_json_bytes(self):
+        store = WorkspaceStore(self.path)
+        initial = store.initialize()
+        original = json.dumps(json.loads(self.path.read_text()),
+                              separators=(",", ":"), sort_keys=True).encode() + b"\n\n"
+        self.path.write_bytes(original)
+        with self.assertRaises(StoreCorruptError):
+            store.update(initial.revision,
+                         lambda state: replace(state, worksets=(Workset("a", " ", ()),)))
+        self.assertEqual(self.path.read_bytes(), original)
+
 
 if __name__ == "__main__":
     unittest.main()
