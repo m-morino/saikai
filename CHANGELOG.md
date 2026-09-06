@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-06
+
+### Added
+- **Named worksets.** Press `Space` then `w` in the session list to save,
+  rename, update, delete, or restore a named set of Claude panes. Saved session
+  IDs and working directories survive pane closure and partial restoration.
+  Previous-pane snapshots can be explicitly imported after preview.
+- **Restoration preview.** Select individual entries, see unavailable folders,
+  duplicate sessions and host mismatches, and retain the existing capacity,
+  memory and open-elsewhere checks. Named snapshots use a durable data file
+  with atomic writes, a bounded OS lock and revision conflict detection.
+
+### Fixed
+- Restore notifications distinguish queued launches, pending confirmation and
+  skipped entries. Malformed previous-pane data no longer aborts restoration.
+- Terminal error and blank rows render correctly with monochrome filters.
+- Pre-push tests clear inherited Git repository variables so demo fixtures do
+  not accidentally modify the repository being pushed.
+
 ### Changed
 - **Next-attention moved from `Shift+F3` to `Shift+F1`** (`⇧F1`; the `␣a` leader and the
   mirror's `! Next` button are unchanged, as is the `attention` id you bind in `[keys]`).
