@@ -41,6 +41,12 @@ fi
 if [ -z "$SKIP_TESTS" ]; then
     root=$(git rev-parse --show-toplevel) || exit 1
     cd "$root" || exit 1
+    # Hooks inherit GIT_DIR/GIT_WORK_TREE and other repository-local variables.
+    # Tests create temporary repositories; leaking these redirects their git
+    # init/add/commit into THIS checkout despite subprocess cwd=the fixture.
+    for git_var in $(git rev-parse --local-env-vars); do
+        unset "$git_var"
+    done
     if   [ -x .venv/Scripts/python.exe ]; then PY=.venv/Scripts/python.exe   # Windows venv
     elif [ -x .venv/bin/python ];        then PY=.venv/bin/python            # POSIX venv
     elif command -v python3 >/dev/null 2>&1; then PY=python3
