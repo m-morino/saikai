@@ -341,6 +341,113 @@ def test_history_prompts_use_the_same_admission_test_as_transcripts():
         row["real_msgs"]
 
 
+# ── review findings (2026-09-24) ─────────────────────────────────────────────
+
+def test_state_grouping_keeps_expired_rows():
+    """_build_groups emitted a FIXED section list without 'Expired', so State
+    grouping silently dropped every remembered row."""
+    rows = [{"id": "a", "_state": "Expired", "mtime": 0, "last_ts": ""},
+            {"id": "b", "_state": "Idle", "mtime": 0, "last_ts": ""}]
+    groups = saikai._build_groups(rows, "state", set(), datetime.now())
+    shown = [s["id"] for _, members in groups for s in members]
+    assert sorted(shown) == ["a", "b"], groups
+    assert "Expired" in [label for label, _ in groups], groups
+
+
+def test_trim_survives_a_corrupt_record():
+    """The count bound sorted str ('' for an unreadable record) against datetime:
+    one torn parsed/<sid>.json raised TypeError and the cap never applied."""
+    _reset()
+    for i in range(4):
+        sid = f"7777{i:04d}-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        _write_transcript(sid, [f"work {i}"], days_ago=50 + i)
+    saikai.load_sessions_in_dir(PROJ, None)
+    for f in PROJ.glob("*.jsonl"):
+        f.unlink()
+    (saikai.PARSED_DIR / "77770000-aaaa-4aaa-8aaa-aaaaaaaaaaaa.json").write_text(
+        "{torn", encoding="utf-8")
+    os.environ["SAIKAI_ARCHIVE_MAX"] = "2"
+    try:
+        saikai._trim_remembered_sessions(set())
+    finally:
+        os.environ.pop("SAIKAI_ARCHIVE_MAX", None)
+    left = sorted(f.stem[4:8] for f in saikai.PARSED_DIR.glob("*.json"))
+    assert left == ["0001", "0002"], left      # newest two readable ones kept
+
+
+def test_since_window_is_compared_in_local_time():
+    """`since` is UTC-aware and last_active_dt is local-naive; stripping the zone
+    without converting shifted --days by the UTC offset (9h in JST)."""
+    since = datetime.now(timezone.utc) - timedelta(days=30)
+    cut = saikai._since_local_naive(since)
+    expect = since.astimezone().replace(tzinfo=None)
+    assert cut == expect, (cut, expect)
+    assert saikai._since_local_naive(None) is None
+
+
+def test_record_without_project_name_is_placed_from_its_cwd():
+    """Records written before project_name existed, whose transcript was already
+    gone at upgrade — exactly the rows recovered on first run — had no project."""
+    _reset()
+    sid = "88880000-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    _write_transcript(sid, ["legacy one", "legacy two"])
+    saikai.load_sessions_in_dir(PROJ, None)
+    rec_path = saikai.PARSED_DIR / f"{sid}.json"
+    rec = json.loads(rec_path.read_text(encoding="utf-8"))
+    rec.pop("project_name")
+    rec_path.write_text(json.dumps(rec), encoding="utf-8")
+    (PROJ / f"{sid}.jsonl").unlink()
+    row = saikai.load_expired_sessions(set())[0]
+    assert row["project_name"] == PROJ.name, row["project_name"]
+    assert saikai.load_expired_sessions(set(), project_names={PROJ.name})
+
+
+def test_expired_rows_do_not_count_against_the_forest_limit():
+    """archive_max (2000) could push a list past the 1000-session forest limit and
+    silently disable tree view and parent linking for LIVE sessions."""
+    live = [{"id": f"l{i}"} for i in range(900)]
+    gone = [{"id": f"e{i}", "is_expired": True} for i in range(900)]
+    cands = saikai._forest_candidates(live + gone)
+    assert len(cands) == 900 and all(not s.get("is_expired") for s in cands)
+
+
+def test_history_index_reads_only_what_was_appended():
+    """Claude appends to history.jsonl on every prompt in every session, so a
+    (mtime, size) key missed on practically every F5 and re-read the whole file
+    on the UI thread. An append must cost only the appended bytes."""
+    _reset()
+    sid = "99990000-cccc-4ccc-8ccc-cccccccccccc"
+    _write_history([(sid, "/home/me/app", "first prompt here", 10),
+                    (sid, "/home/me/app", "second prompt here", 9)])
+    assert len(saikai._history_prompt_index()[sid]["prompts"]) == 2
+    reads = []
+    real_open = saikai._history_open_at
+    saikai._history_open_at = lambda off: (reads.append(off), real_open(off))[1]
+    try:
+        with open(saikai.HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"display": "third prompt here", "timestamp":
+                                int(time.time() * 1000), "project": "/home/me/app",
+                                "sessionId": sid}) + "\n")
+        idx = saikai._history_prompt_index()
+    finally:
+        saikai._history_open_at = real_open
+    assert len(idx[sid]["prompts"]) == 3, idx[sid]
+    assert reads and reads[-1] > 0, f"re-read from the start: {reads}"
+
+
+def test_history_index_rebuilds_when_the_file_is_replaced():
+    """A rewritten / truncated file is not an append — rebuild from scratch."""
+    _reset()
+    a = "aaaa0000-dddd-4ddd-8ddd-dddddddddddd"
+    b = "bbbb0000-dddd-4ddd-8ddd-dddddddddddd"
+    _write_history([(a, "/p", "alpha prompt one", 5), (a, "/p", "alpha prompt two", 4)])
+    assert a in saikai._history_prompt_index()
+    saikai.HISTORY_FILE.write_text(json.dumps({"display": "beta prompt one",
+        "timestamp": 1, "project": "/p", "sessionId": b}) + "\n", encoding="utf-8")
+    idx = saikai._history_prompt_index()
+    assert a not in idx and b in idx, idx
+
+
 if __name__ == "__main__":
     for _name, _fn in sorted(list(globals().items())):
         if _name.startswith("test_") and callable(_fn):

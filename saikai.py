@@ -1347,7 +1347,8 @@ def _build_groups(sessions: list[dict], group_by: str, favorites: set, now):
             # recency order within one parent's brood) so one parent's agents
             # read as a block (#agent-lineage)
             buckets["Agents"].sort(key=lambda x: x.get("parent_session_id") or x["id"])
-        for l in ("Needs input", "Running", "Open", "Agents", "Idle", "Archived"):
+        for l in ("Needs input", "Running", "Open", "Agents", "Idle", "Expired",
+                  "Archived"):
             if buckets.get(l):
                 groups.append((l, buckets[l]))
     else:  # project
@@ -2795,8 +2796,8 @@ HISTORY_FILE = CLAUDE_CONFIG_ROOT / "history.jsonl"
 HISTORY_INDEX_FILE = CACHE_DIR / "history-index.json"
 _ARCHIVE_PROMPT_CAP = 40      # prompts kept per history-backfilled session
 _ARCHIVE_TEXT_CAP = 800       # chars per prompt — the cap real_msgs already uses
-_history_index_cache = None   # (file key, {sid: rec}) — process-lifetime memo
-_HISTORY_INDEX_SCHEMA = 2     # bump to invalidate a persisted index of an older shape
+_history_index_cache = None   # (offset, head, {sid: rec}) — process-lifetime memo
+_HISTORY_INDEX_SCHEMA = 3     # bump to invalidate a persisted index of an older shape
 
 
 def _archive_enabled() -> bool:
@@ -2831,68 +2832,112 @@ def _history_index_cache_clear() -> None:
     _history_index_cache = None
 
 
+def _history_open_at(offset: int):
+    """Open history.jsonl in binary at `offset` (a seam for the append test)."""
+    f = open(HISTORY_FILE, "rb")
+    f.seek(offset)
+    return f
+
+
+def _history_ingest(out: dict, line: bytes) -> None:
+    """Fold one history.jsonl line into the index. Guarded per line: the file is
+    appended by a live Claude Code process, and losing one prompt must not lose
+    the index."""
+    try:
+        d = json.loads(line.decode("utf-8", errors="replace"))
+    except Exception:
+        return
+    if not isinstance(d, dict):
+        return
+    sid = d.get("sessionId")
+    text = d.get("display")
+    if not isinstance(sid, str) or not sid or not isinstance(text, str):
+        return
+    # Same admission test the transcript path applies, so a prompt means the
+    # same thing whichever source a row came from.
+    if not _is_real_user_msg(text):
+        return
+    rec = out.get(sid)
+    if rec is None:
+        rec = out[sid] = {"prompts": [], "project": "",
+                          "first_ms": 0, "last_ms": 0, "n": 0}
+    rec["n"] += 1
+    if len(rec["prompts"]) < _ARCHIVE_PROMPT_CAP:
+        rec["prompts"].append(text[:_ARCHIVE_TEXT_CAP].replace("\n", " "))
+    if isinstance(d.get("project"), str) and d["project"]:
+        rec["project"] = d["project"]
+    ts = d.get("timestamp")
+    if isinstance(ts, (int, float)) and ts > 0:
+        rec["first_ms"] = min(rec["first_ms"] or ts, ts)
+        rec["last_ms"] = max(rec["last_ms"], ts)
+
+
+_HISTORY_HEAD_BYTES = 4096
+
+
+def _history_head(n: int) -> str:
+    """Fingerprint of the file's first bytes. An append never changes them; a
+    rewrite, truncation or replacement almost certainly does — that is how an
+    append is told apart from a new file without re-reading the whole thing."""
+    import hashlib
+    try:
+        with open(HISTORY_FILE, "rb") as f:
+            return hashlib.sha1(f.read(min(n, _HISTORY_HEAD_BYTES))).hexdigest()
+    except OSError:
+        return ""
+
+
 def _history_prompt_index() -> dict:
     """{sid: {"prompts": [...], "project": str, "first_ms": int, "last_ms": int}}
     from ~/.claude/history.jsonl.
 
-    Keyed on (mtime, size) and persisted to HISTORY_INDEX_FILE so a long file is
-    re-read only when Claude appends to it. Every line is guarded individually:
-    the file is appended by a live Claude Code process, so the last line can be
-    a torn half-record, and losing one prompt must not lose the index."""
+    INCREMENTAL. Claude appends to this file on every prompt in every session,
+    so a whole-file (mtime, size) key missed on practically every refresh and
+    re-read the file on the UI thread (F5). The index instead remembers the byte
+    offset of the last COMPLETE line it consumed plus a fingerprint of the file's
+    head: an append costs only the appended bytes, and a rewritten / truncated /
+    replaced file (head changed, or shorter than the offset) is rebuilt. A torn
+    last line is not consumed — the next read picks it up once it is whole."""
     global _history_index_cache
     try:
-        st = HISTORY_FILE.stat()
-        key = [_HISTORY_INDEX_SCHEMA, st.st_mtime, st.st_size]
+        size = HISTORY_FILE.stat().st_size
     except OSError:
         return {}
-    if _history_index_cache and _history_index_cache[0] == key:
-        return _history_index_cache[1]
-    disk = _read_json(HISTORY_INDEX_FILE, None)
-    if isinstance(disk, dict) and disk.get("key") == key \
-            and isinstance(disk.get("sessions"), dict):
-        _history_index_cache = (key, disk["sessions"])
-        return disk["sessions"]
-
-    out: dict = {}
+    state = _history_index_cache
+    if state is None:
+        disk = _read_json(HISTORY_INDEX_FILE, None)
+        if (isinstance(disk, dict) and disk.get("v") == _HISTORY_INDEX_SCHEMA
+                and isinstance(disk.get("sessions"), dict)
+                and isinstance(disk.get("offset"), int)):
+            state = (disk["offset"], disk.get("head", ""), disk["sessions"])
+    if state is not None and state[0] == size:
+        _history_index_cache = state
+        return state[2]
+    # Fingerprint the SAME prefix the stored one covered (the bytes already
+    # consumed, capped): hashing min(size, 4096) would change on every append
+    # to a small file and misread the append as a rewrite.
+    if state is not None and state[0] <= size and state[1] \
+            and _history_head(state[0]) == state[1]:
+        offset, out = state[0], state[2]           # an append: read only the tail
+    else:
+        offset, out = 0, {}                        # new / rewritten file: rebuild
     try:
-        with open(HISTORY_FILE, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue                    # torn tail / stray blank line
-                if not isinstance(d, dict):
-                    continue
-                sid = d.get("sessionId")
-                text = d.get("display")
-                if not isinstance(sid, str) or not sid or not isinstance(text, str):
-                    continue
-                # Same admission test the transcript path applies, so a prompt
-                # means the same thing whichever source a row came from.
-                if not _is_real_user_msg(text):
-                    continue
-                rec = out.get(sid)
-                if rec is None:
-                    rec = out[sid] = {"prompts": [], "project": "",
-                                      "first_ms": 0, "last_ms": 0, "n": 0}
-                rec["n"] += 1
-                if len(rec["prompts"]) < _ARCHIVE_PROMPT_CAP:
-                    rec["prompts"].append(text[:_ARCHIVE_TEXT_CAP].replace("\n", " "))
-                if isinstance(d.get("project"), str) and d["project"]:
-                    rec["project"] = d["project"]
-                ts = d.get("timestamp")
-                if isinstance(ts, (int, float)) and ts > 0:
-                    rec["first_ms"] = min(rec["first_ms"] or ts, ts)
-                    rec["last_ms"] = max(rec["last_ms"], ts)
+        with _history_open_at(offset) as f:
+            data = f.read(max(0, size - offset))
     except OSError:
-        return {}
+        return state[2] if state else {}
+    cut = data.rfind(b"\n") + 1                  # stop at the last COMPLETE line
+    for line in data[:cut].splitlines():
+        _history_ingest(out, line)
+    offset += cut
+    head = _history_head(offset)
+    _history_index_cache = (offset, head, out)
     try:
-        _write_json(HISTORY_INDEX_FILE, {"key": key, "sessions": out})
+        _write_json(HISTORY_INDEX_FILE, {"v": _HISTORY_INDEX_SCHEMA, "offset": offset,
+                                         "head": head, "sessions": out})
     except Exception:
-        pass                                    # cache is an optimisation only
-    _history_index_cache = (key, out)
+        pass                                       # cache is an optimisation only
     return out
-
 
 def _descriptive_prompt(prompts) -> str:
     """The first prompt that says what the session was ABOUT.
@@ -3023,7 +3068,12 @@ def load_expired_sessions(known_sids, since=None, project_names=None) -> list[di
         rec = _read_json(f, None)
         if not isinstance(rec, dict) or not rec.get("first_ts"):
             continue
-        proj = rec.get("project_name") or ""
+        # Records written before project_name existed — and whose transcript
+        # was already gone at upgrade, i.e. exactly the rows recovered on the
+        # first run — carry only a cwd. Claude's project dir IS the encoded cwd
+        # the session was indexed under (origin_cwd). (#session-memory)
+        proj = (rec.get("project_name")
+                or _encode_project_dir(rec.get("origin_cwd") or rec.get("cwd") or ""))
         if scope is not None and proj not in scope:
             continue
         rows[sid] = _expired_session(sid, rec, "parsed", proj)
@@ -3058,8 +3108,8 @@ def load_expired_sessions(known_sids, since=None, project_names=None) -> list[di
         }, "history", proj)
 
     out = list(rows.values())
-    if since is not None:
-        cut = since.replace(tzinfo=None) if since.tzinfo else since
+    cut = _since_local_naive(since)
+    if cut is not None:
         out = [s for s in out
                if (s.get("last_active_dt") or datetime.min) >= cut]
     out.sort(key=lambda s: s.get("last_active_dt") or datetime.min, reverse=True)
@@ -3067,11 +3117,29 @@ def load_expired_sessions(known_sids, since=None, project_names=None) -> list[di
     return out[:cap] if cap else []
 
 
+def _since_local_naive(since):
+    """--days cutoff as LOCAL naive time, the frame last_active_dt is in. `since`
+    is UTC-aware; stripping the zone without converting shifted the window by
+    the UTC offset (9h in JST)."""
+    if since is None:
+        return None
+    return since.astimezone().replace(tzinfo=None) if since.tzinfo else since
+
+
+def _forest_candidates(sessions: list) -> list:
+    """The sessions the cross-session forest is built over, and the ones its
+    1000-session limit counts. Expired rows are excluded: they keep parent_id
+    None (roots), and archive_max (2000) must not be able to push a history past
+    the limit and silently switch tree view and parent linking off for the LIVE
+    sessions. (#session-memory)"""
+    return [s for s in sessions if not s.get("is_expired")]
+
+
 def _encode_project_dir(cwd: str) -> str:
     """Claude's project-dir encoding: the cwd with non-alphanumerics replaced by
     '-'. Used to map a history.jsonl `project` path back onto a project dir so
     --here scoping and the Project column agree with a live row's."""
-    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd)) if cwd else ""
 
 
 def _session_matches_text(s: dict, text: str) -> bool:
@@ -7248,7 +7316,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # Build the cross-session forest OFF the pre-paint path (it only feeds
             # tree display + the related-header). parent_id was pre-set to None so
             # the flat list is correct meanwhile; this repaints once when done.
-            if len(all_sessions) <= 1000 and not getattr(self, "_forest_built", False):
+            if len(_forest_candidates(all_sessions)) <= 1000 \
+                    and not getattr(self, "_forest_built", False):
                 _thr.Thread(target=self._build_forest_bg, daemon=True).start()
             # If background summarization is running, start a watcher thread
             # that refreshes the table when it finishes.
@@ -7377,7 +7446,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             lands; reads of a half-assigned forest are GIL-atomic (None or a valid
             id), never torn."""
             try:
-                _build_forest(all_sessions)
+                _build_forest(_forest_candidates(all_sessions))
                 self._forest_built = True
             except Exception:
                 return
@@ -7556,7 +7625,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                            if s["id"] in favorites
                            or (_last_active_dt(s) or datetime.min) >= _cut]
             view_mode = _get_view_mode()
-            tree_mode = _get_tree_mode() and len(all_sessions) <= 1000
+            tree_mode = _get_tree_mode() and len(_forest_candidates(all_sessions)) <= 1000
             group_by = _get_group_by()
             # Tree is its own layout and takes precedence; otherwise apply the
             # Claude-Desktop-style grouping (Pinned + date/project/state).
@@ -8722,6 +8791,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             terminal (alternate screen handed off). Kept as an escape hatch for
             users who want a full-screen claude instead of the split pane."""
             sid = self._cursor_sid()
+            if self._expired_block(sid or ""):          # transcript deleted (#session-memory)
+                return
             if self._remote_origin_block(sid or ""):    # Desktop-SSH mirror (#remote-origin)
                 return
             if sid:
@@ -13515,7 +13586,7 @@ def _trim_remembered_sessions(live_sids: set) -> None:
         rec = _read_json(f, None)
         if isinstance(rec, dict):
             return _iso_sort_key(rec.get("last_ts") or rec.get("first_ts") or "")
-        return ""
+        return _TS_EPOCH          # unreadable → oldest; never mix str with datetime
 
     for f in sorted(gone, key=_key, reverse=True)[cap:]:
         try:
@@ -13996,8 +14067,8 @@ def _main():
     # static --table path needs it now; the interactive picker initialises it
     # cheaply here and builds the real forest in the background after mount (see
     # on_mount / _build_forest_bg), so a large history doesn't gate the first frame.
-    if args.table and len(sessions) <= 1000:
-        _build_forest(sessions)
+    if args.table and len(_forest_candidates(sessions)) <= 1000:
+        _build_forest(_forest_candidates(sessions))
     else:
         for s in sessions:
             s["parent_id"] = None
@@ -14007,7 +14078,7 @@ def _main():
     # Display mode (flat / nested-tree). The saved mode is the source of truth
     # so Shift-F5 inside the picker can toggle it in place. CLI --tree is a
     # one-shot override for the initial invocation only.
-    use_tree = (args.tree or _get_tree_mode()) and len(sessions) <= 1000
+    use_tree = (args.tree or _get_tree_mode()) and len(_forest_candidates(sessions)) <= 1000
     flat = not use_tree
     # Apply user-configurable sort only in flat mode. Tree mode is structural,
     # so a free-form sort would override its layout.
@@ -14059,8 +14130,8 @@ def _main():
                           if not s.get("is_open") else None)
                 s["summary"] = (cached if cached and not _looks_like_refusal(cached)
                                 else s["ai_title"] or _first_msg(s))
-            if len(fresh) <= 1000:
-                _build_forest(fresh)
+            if len(_forest_candidates(fresh)) <= 1000:
+                _build_forest(_forest_candidates(fresh))
             else:
                 for s in fresh:
                     s["parent_id"] = None
