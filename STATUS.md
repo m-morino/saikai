@@ -38,8 +38,8 @@ Current state, open threads, and next steps. Architecture and invariants live in
   to guess, so neither is re-keyed. They still work, but only as placeholders.
 
 ### Backlog
-- Merge `feature/remote-roots` (far behind master).
+- `feature/remote-roots` is FROZEN (2026-10-23): Claude Code's own Remote Control
+  covers reaching other machines; not merged. Its IME commit is superseded in master.
 - Live state from `claude agents --json` (positioning audit, 2026-08).
 - Release session memory (`#session-memory`, pushed, not released).
 - Claude Desktop–style multi-pane split view (future).
-- Remove the obsolete `feature/codex-provider` branch and worktree.
