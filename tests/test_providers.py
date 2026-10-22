@@ -51,7 +51,7 @@ def test_codex_provider_contract():
     provider = CodexProvider()
     caps = provider.capabilities
     assert provider.id == "codex"
-    assert provider.status_profile == "generic"
+    assert provider.status_profile == "codex"   # its own TUI conventions (test_codex_status.py)
     assert caps.can_resume and caps.can_create
     assert not caps.can_preassign_id
     assert not caps.has_reliable_live_status

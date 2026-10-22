@@ -271,9 +271,15 @@ SAIKAI_MIRROR=1 SAIKAI_MIRROR_HOST=192.168.1.50 saikai   # LAN から到達可�
 **`Space ,`** で Settings 画面が開き、リスト系オプションをその場で変更しつつ、
 全設定の解決値と出所を一覧できます（`e` で config.toml をエディタで開く）。
 
-対応しているのは今のところ Claude Code です。起動コマンドや状態の見方といった
-エージェントごとの違いは `saikai_provider.py` に切り出してあり、Codex 用も置いて
-ありますが、履歴の読み取りとライブ状態の連動が固まるまでは選べないようにしています。
+対応エージェントは Claude Code と **Codex CLI(experimental)** です。`~/.codex/sessions`
+(または `$CODEX_HOME`)があれば Codex のスレッドも同じ一覧に並び、混在時は行頭に
+`✻` claude / `⌬` codex が付きます。`Enter` で `codex resume` がライブペインで開き、
+**Claude と Codex のペインを同時に並べて動かせます**。Codex ペインの状態は Codex 自身の
+画面から判定します(番号付き選択肢に選択カーソルが付いたら `?`、`esc to interrupt`
+の間は `~`)。**新規 Codex セッション**は、新規セッション画面(`Shift+F8`)でもう一度
+`Shift+F8` を押してエージェントを切り替えます(最初のプロンプト後にスレッドと紐付きます)。
+`[providers] codex = false`(または `SAIKAI_CODEX=0`)で非表示。休眠スレッドの `!`・
+別所で開いているかの検出・checkpoint は Codex 行では未対応です。
 Claude の履歴は `CLAUDE_CONFIG_DIR` も見にいきます。
 
 ## プラットフォーム対応

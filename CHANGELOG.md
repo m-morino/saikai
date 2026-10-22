@@ -7,6 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Claude and Codex side by side.** Codex CLI threads (experimental) join the one
+  list (`⌬` beside `✻` when the list mixes providers), open with `codex resume` in a
+  live pane next to your claude panes, and report their state from Codex's own
+  screen, so "who needs you" covers both agents: `?` when Codex puts a numbered
+  choice under its selection cursor (command approval, folder trust), `~` while it
+  shows `esc to interrupt`. Start a NEW codex session from New session (`Shift+F8`,
+  then `Shift+F8` again to switch agent); the pane links to its thread after your
+  first prompt. Reads the codex 0.157+ rollout format, which no longer records user
+  turns as `user_message` events. `[providers] codex = false` hides it all.
 - **Sessions Claude deleted are still findable.** Claude Code removes
   `~/.claude/projects/**/<sid>.jsonl` once it is `cleanupPeriodDays` old — 30 days by
   default, swept at startup with no warning. The code and the git history survive

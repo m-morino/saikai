@@ -1514,9 +1514,35 @@ def classify_generic_status(screen_text: str, title: str = "") -> str:
     return "idle"
 
 
+# Codex's selection cursor on a numbered option — "› 1. Yes, proceed (y)". Every
+# Codex forced choice (command approval, folder trust) renders one; a finished
+# answer that merely CONTAINS a numbered list does not, and neither does the input
+# prompt ("› Ask Codex to do anything"), which carries the glyph but no number.
+# Verified against codex-cli 0.163.0 (tests/fixtures/codex_screens_0163.json).
+_CODEX_CHOICE_RE = re.compile(r"^\s*›\s*\d+\.\s+\S", re.MULTILINE)
+
+
+def classify_codex_status(screen_text: str, title: str = "") -> str:
+    """Status for a Codex pane, from its own TUI conventions.
+
+    waiting — a numbered option carries the selection cursor (approval, trust).
+              "Would you like…" alone is NOT enough: Codex also ends ordinary
+              answers that way, and the generic classifier's two-numbered-lines
+              rule left any finished answer with a list stuck at "needs you".
+    busy    — "Working (12s • esc to interrupt)".
+    idle    — everything else, including "Worked for 7s"."""
+    t = _ANSI_RE.sub("", (screen_text or "")[-3000:])
+    if _CODEX_CHOICE_RE.search(t):
+        return "waiting"
+    if _BUSY_RE.search(t):
+        return "busy"
+    return "idle"
+
+
 def classifier_for_profile(profile: str) -> Callable[[str, str], str]:
     """Resolve a provider's declared status profile to a terminal classifier."""
-    profiles = {"claude": classify_pty_status, "generic": classify_generic_status}
+    profiles = {"claude": classify_pty_status, "generic": classify_generic_status,
+                "codex": classify_codex_status}
     try:
         return profiles[profile]
     except KeyError as exc:

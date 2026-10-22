@@ -281,7 +281,157 @@ def test_pilot_codex_rows_listed_and_enter_resumes():
     assert argv[1:3] == ["resume", B], argv
 
 
+def test_pilot_new_session_shift_f8_switches_to_codex():
+    """Shift+F8 opens New session; Shift+F8 again inside it switches the agent to
+    codex (the App's own Shift+F8 is modal-blocked, so the key must fall through
+    to the screen), and Enter hands (path, "codex") to the launcher."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_new_session_shift_f8_switches_to_codex")
+        return
+    import asyncio
+    import shutil as _sh
+    from textual.app import App
+
+    _seed_standard()
+    _write_claude_session("Claude side work")
+    facts: dict = {}
+    calls = []
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(120, 32)) as pilot:
+                await pilot.pause(0.5)
+                self._open_new_live = lambda path, agent="claude": calls.append((path, agent))
+                await pilot.press("shift+f8")
+                for _ in range(20):
+                    await pilot.pause(0.2)
+                    if type(self.screen).__name__ == "NewSessionScreen":
+                        break
+                scr = self.screen
+                facts["opened"] = type(scr).__name__
+                facts["agents"] = getattr(scr, "_agents", None)
+                facts["before"] = getattr(scr, "_agent", None)
+                await pilot.press("shift+f8")
+                await pilot.pause(0.2)
+                facts["after"] = getattr(scr, "_agent", None)
+                inp = scr.query_one("#new-path")
+                inp.value = "/tmp"
+                await pilot.press("enter")
+                await pilot.pause(0.3)
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_which = _sh.which
+    _sh.which = lambda name, *a, **k: f"/usr/bin/{name}"   # codex "installed"
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        _sh.which = orig_which
+        sys.argv = orig_argv
+    assert facts.get("opened") == "NewSessionScreen", facts
+    assert facts.get("agents") == ("claude", "codex"), facts
+    assert facts["before"] == "claude" and facts["after"] == "codex", facts
+    assert calls == [("/tmp", "codex")], calls
+
+
+def test_codex_cache_is_not_mistaken_for_expired_claude_sessions():
+    """Codex rows cache into PARSED_DIR as codex-<uuid>.json. Session memory reads
+    PARSED_DIR for Claude records whose transcript is gone — and a codex record
+    never has a Claude transcript, so every codex thread came back a SECOND time
+    as a fake expired Claude row. The cache sweep then also kept them forever
+    and counted them against archive_max."""
+    _seed_standard()
+    rows = saikai.load_codex_sessions(None)
+    assert rows and any(f.name.startswith("codex-")
+                        for f in saikai.PARSED_DIR.glob("*.json"))
+    expired = saikai.load_expired_sessions({r["id"] for r in rows})
+    assert not [e for e in expired if "codex" in e["id"]
+                or e["id"] in {A, B, B2, C, G}], expired
+    # the sweep prunes a stale codex cache file like any re-parseable cache
+    import time as _t
+    old = _t.time() - 400 * 86400
+    for f in saikai.PARSED_DIR.glob("codex-*.json"):
+        os.utime(f, (old, old))
+    saikai._sweep_cache_litter()
+    assert not list(saikai.PARSED_DIR.glob("codex-*.json")), \
+        "stale codex caches were kept as if they were the last copy of a session"
+
+
+def test_codex_0157_user_turns_come_from_item_completed():
+    """codex 0.157 (Codex Desktop rollouts) emits NO event_msg/user_message; the
+    clean human turn is item_completed{UserMessage}. Without reading it every
+    current codex row had empty prompts — unsearchable, blank preview."""
+    _reset_codex_fixture()
+    dt = datetime(2026, 10, 17, 9, 0, 0)
+    rid = _uuid()
+    day = _CODEX_HOME / "sessions" / "2026" / "10" / "17"
+    day.mkdir(parents=True, exist_ok=True)
+    recs = [{"timestamp": _iso(dt), "type": "session_meta", "payload": {
+                "id": rid, "session_id": rid, "timestamp": _iso(dt),
+                "cwd": "/tmp/work-new", "source": "vscode", "thread_source": "user",
+                "originator": "Codex Desktop", "cli_version": "0.157.1"}},
+            {"timestamp": _iso(dt), "type": "response_item", "payload": {
+                "type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "# AGENTS.md instructions …"}]}},
+            {"timestamp": _iso(dt), "type": "event_msg", "payload": {
+                "type": "item_completed", "item": {"type": "UserMessage", "id": "x",
+                    "content": [{"type": "text", "text": "audit the card classifier"}]}}},
+            {"timestamp": _iso(dt), "type": "event_msg", "payload": {
+                "type": "item_completed", "item": {"type": "AgentMessage",
+                    "content": [{"type": "Text", "text": "looking"}]}}}]
+    p = day / f"rollout-2026-10-17T09-00-00-{rid}.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+    rows = saikai.load_codex_sessions(None)
+    assert len(rows) == 1, rows
+    assert rows[0]["real_msgs"] == ["audit the card classifier"], rows[0]["real_msgs"]
+    assert rows[0]["id"].endswith(rid) or rid in rows[0]["id"], rows[0]["id"]
+
+
+def test_match_new_codex_thread_finds_the_one_started_in_the_pane():
+    """A fresh `codex` cannot be handed an id the way `claude --session-id` can,
+    so a new pane starts under a placeholder and is re-keyed onto the thread
+    codex writes. The match must be exact or nothing: one thread, in the pane's
+    cwd, started after the launch, not already known."""
+    launched = 1_000_000.0
+    def row(i, cwd, first_ts):
+        return {"id": i, "provider": "codex", "cwd": cwd,
+                "first_ts": datetime.fromtimestamp(first_ts, timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%S.000Z")}
+    rows = [row("old", "/w", launched - 600),          # predates the launch
+            row("other", "/elsewhere", launched + 5),  # wrong folder
+            row("known", "/w", launched + 3),          # already a row before
+            row("new", "/w", launched + 4)]
+    m = saikai._match_new_codex_thread
+    assert m(rows, "/w", launched, {"known"}) == "new"
+    # two candidates → refuse rather than guess (the b2 rule)
+    rows.append(row("new2", "/w", launched + 6))
+    assert m(rows, "/w", launched, {"known"}) is None
+    # nothing yet → None, keep waiting
+    assert m([row("old", "/w", launched - 600)], "/w", launched, set()) is None
+
+
+def test_build_new_codex_invocation_runs_in_the_folder():
+    argv, cwd, env = saikai._build_new_codex_invocation("/tmp")
+    assert os.path.basename(argv[0]).startswith("codex") and argv[1:] == []
+    assert cwd == "/tmp" and isinstance(env, dict)
+
+
 if __name__ == "__main__":
+    test_pilot_new_session_shift_f8_switches_to_codex()
+    print("PASS test_pilot_new_session_shift_f8_switches_to_codex")
+    test_match_new_codex_thread_finds_the_one_started_in_the_pane()
+    print("PASS test_match_new_codex_thread_finds_the_one_started_in_the_pane")
+    test_build_new_codex_invocation_runs_in_the_folder()
+    print("PASS test_build_new_codex_invocation_runs_in_the_folder")
+    test_codex_0157_user_turns_come_from_item_completed()
+    print("PASS test_codex_0157_user_turns_come_from_item_completed")
+    test_codex_cache_is_not_mistaken_for_expired_claude_sessions()
+    print("PASS test_codex_cache_is_not_mistaken_for_expired_claude_sessions")
     test_codex_enabled_gate()
     print("PASS test_codex_enabled_gate")
     test_load_codex_sessions_one_row_per_thread()

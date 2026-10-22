@@ -150,7 +150,7 @@ class CodexProvider(AgentProvider):
     id = "codex"
     display_name = "Codex"
     executable_name = "codex"
-    status_profile = "generic"
+    status_profile = "codex"
     history_format = "codex-rollout-jsonl"
     capabilities = ProviderCapabilities()
 

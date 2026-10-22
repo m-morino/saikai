@@ -308,9 +308,17 @@ Search,
 preview, and `Enter` (which opens `codex resume <id>` in a normal live pane,
 web mirror included) work like any other row. Chained threads (codex's own
 resume) fold into one row; codex's internal assessor sessions are excluded.
-Set `[providers] codex = false` (or `SAIKAI_CODEX=0`) to hide them. Not yet
-wired for codex rows: the `!` attention marker, live/open detection, and
-checkpoint (claude-specific by design).
+**Claude and Codex side by side:** a codex pane and a claude pane run live at
+the same time in the same saikai, and a codex pane's state comes from Codex's
+own screen — `?` when it puts a numbered choice under its selection cursor
+(command approval, folder trust), `~` while it shows `esc to interrupt` — so
+"who needs you" covers both agents. To start a **new** codex session, open New
+session (`Shift+F8`) and press `Shift+F8` again to switch the agent from claude
+to codex; the pane is linked to its thread as soon as codex writes it (after
+your first prompt). Set `[providers] codex = false` (or `SAIKAI_CODEX=0`) to
+hide codex entirely. Not yet wired for codex rows: the `!` reply-due marker for
+DORMANT threads, open-elsewhere detection, and checkpoint (claude-specific by
+design).
 
 ## Platform support
 

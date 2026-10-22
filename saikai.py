@@ -2776,6 +2776,9 @@ def load_sessions_in_dir(project_dir: Path, since: datetime | None) -> list[dict
 # LATEST state across chained rollouts, and skips its "choose working
 # directory" prompt when spawned with cwd = the recorded cwd.
 _CODEX = get_provider("codex")
+# Bump when the rollout parse changes meaning: a cache written by an older
+# parser (e.g. one that found no user turns in a 0.157 rollout) must re-parse.
+_CODEX_CACHE_SCHEMA = 2
 
 # Provider glyphs for MIXED lists: ✻ (U+273B) is the scattered asterisk claude
 # code itself brands its CLI with; ⌬ (U+232C benzene ring) is the closest
@@ -2816,7 +2819,8 @@ def _parse_codex_rollout(path: Path) -> dict | None:
     cache_file = PARSED_DIR / f"codex-{path.stem[-36:]}.json"
     cached = _read_json(cache_file, None)
     if (isinstance(cached, dict) and abs(cached.get("mtime", 0) - mtime) < 0.5
-            and cached.get("size") == size):
+            and cached.get("size") == size
+            and cached.get("v") == _CODEX_CACHE_SCHEMA):
         if cached.get("skip"):
             return None
         r = dict(cached)
@@ -2825,6 +2829,7 @@ def _parse_codex_rollout(path: Path) -> dict | None:
     meta = None
     first_ts = last_ts = None
     real_msgs: list[str] = []
+    item_msgs: list[str] = []   # codex >= 0.157 (see the comment at the use site)
     try:
         with open(path, "rb") as f:
             for line in f:
@@ -2849,8 +2854,25 @@ def _parse_codex_rollout(path: Path) -> dict | None:
                     txt = payload.get("message")
                     if isinstance(txt, str) and txt.strip():
                         real_msgs.append(txt[:800].replace("\n", " "))
+                elif t == "event_msg" and payload.get("type") == "item_completed":
+                    # codex 0.157 (Codex Desktop rollouts) stopped emitting
+                    # event_msg/user_message altogether; the clean human turn is
+                    # now item_completed{item:{type:"UserMessage", content:[{type:
+                    # "text", text}]}}. Like the old event it carries none of the
+                    # AGENTS.md / environment preamble response_item does.
+                    item = payload.get("item")
+                    if isinstance(item, dict) and item.get("type") == "UserMessage":
+                        parts = [c.get("text") for c in (item.get("content") or [])
+                                 if isinstance(c, dict) and isinstance(c.get("text"), str)]
+                        txt = " ".join(x for x in parts if x.strip())
+                        if txt.strip():
+                            item_msgs.append(txt[:800].replace("\n", " "))
     except Exception:
         pass                              # keep a partial parse (locked tail)
+    # One source per rollout: a version that emits BOTH must not double every
+    # prompt, and a version that emits only the new form must not read as empty.
+    if not real_msgs:
+        real_msgs = item_msgs
     result: "dict | None"
     if not (isinstance(meta, dict) and isinstance(meta.get("id"), str)):
         result = None
@@ -2873,7 +2895,7 @@ def _parse_codex_rollout(path: Path) -> dict | None:
                 # internal assessor (guardian …) — cache the skip and bail
                 try:
                     _write_json(cache_file, {"mtime": mtime, "size": size,
-                                             "skip": True})
+                                             "skip": True, "v": _CODEX_CACHE_SCHEMA})
                 except Exception:
                     pass
                 return None
@@ -2889,10 +2911,12 @@ def _parse_codex_rollout(path: Path) -> dict | None:
             "parent_thread_id": parent,
             "agent_label": agent_label,
             "real_msgs": real_msgs,
+            "v": _CODEX_CACHE_SCHEMA,
         }
     if result is None:
         try:
-            _write_json(cache_file, {"mtime": mtime, "size": size, "skip": True})
+            _write_json(cache_file, {"mtime": mtime, "size": size, "skip": True,
+                                     "v": _CODEX_CACHE_SCHEMA})
         except Exception:
             pass
         return None
@@ -3020,6 +3044,49 @@ def _build_codex_resume_invocation(
         cwd = None
     spec = _CODEX.build_resume(full_id, cwd=cwd, env=_child_spawn_env())
     return spec.argv, spec.cwd, spec.env
+
+
+def _build_new_codex_invocation(target_cwd: str) -> tuple[list[str], str | None, dict]:
+    """A FRESH `codex` in target_cwd. Codex takes no pre-assigned thread id (unlike
+    `claude --session-id`), so the pane starts under a placeholder sid and is
+    re-keyed onto the thread once codex writes its rollout — see
+    _match_new_codex_thread. (#codex-provider)"""
+    spec = _CODEX.build_new(cwd=target_cwd, requested_id=None, env=_child_spawn_env())
+    return spec.argv, spec.cwd, spec.env
+
+
+# A placeholder sid for a codex pane whose thread id is not known yet.
+_CODEX_PENDING_PREFIX = "codex-new-"
+
+
+def _match_new_codex_thread(rows, cwd: str, launched_at: float, known) -> "str | None":
+    """The thread a fresh codex pane started, or None.
+
+    Exactly ONE codex row may qualify: same cwd as the launch, first record no
+    earlier than the launch (2s of clock slack), and not a thread that already
+    existed. Two candidates means two codex processes started in that folder at
+    once, and guessing would attach this pane to someone else's thread — so it
+    refuses, the same rule the checkpoint child-detection uses. (#codex-provider)"""
+    try:
+        want = os.path.normcase(os.path.realpath(cwd))
+    except Exception:
+        want = cwd
+    hits = []
+    for r in rows or ():
+        if r.get("provider") != "codex" or r.get("id") in known:
+            continue
+        rc = r.get("cwd") or ""
+        try:
+            rc = os.path.normcase(os.path.realpath(rc))
+        except Exception:
+            pass
+        if rc != want:
+            continue
+        ts = _parse_iso_aware(r.get("first_ts") or "")
+        if ts is None or ts.timestamp() < launched_at - 2.0:
+            continue
+        hits.append(r["id"])
+    return hits[0] if len(hits) == 1 else None
 
 
 # ── LLM summarization via claude -p ──────────────────────────────────────────
@@ -3221,6 +3288,15 @@ def _descriptive_prompt(prompts) -> str:
     return (prompts or [""])[0] if prompts else ""
 
 
+def _is_claude_record_file(f) -> bool:
+    """True for a PARSED_DIR file that records a CLAUDE session. Other providers
+    cache there too (codex-<uuid>.json) and never have a Claude transcript, so
+    session memory must not read them as deleted Claude sessions, and the cache
+    sweep must keep pruning them like any re-parseable cache. (#session-memory
+    #codex-provider)"""
+    return not f.stem.startswith("codex-")
+
+
 def _live_transcript_sids() -> set:
     """Every session id whose transcript is on disk right now. One shallow glob
     per project dir — the authority on 'this session is NOT expired', and the
@@ -3328,7 +3404,7 @@ def load_expired_sessions(known_sids, since=None, project_names=None) -> list[di
         parsed_files = []
     for f in parsed_files:
         sid = f.stem
-        if sid in known or sid in live:
+        if not _is_claude_record_file(f) or sid in known or sid in live:
             continue
         rec = _read_json(f, None)
         if not isinstance(rec, dict) or not rec.get("first_ts"):
@@ -6539,20 +6615,43 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # Tab = shell-style path completion; intercept before the
                     # default focus-next so typing a folder feels like a shell.
                     Binding("tab", "complete", show=False, priority=True),
-                    Binding("down", "focus_list", show=False)]
+                    Binding("down", "focus_list", show=False),
+                    # Shift+F8 again (the key that opened this) switches which
+                    # agent to start. Not a Ctrl+letter — those belong to readline
+                    # — and the App's own Shift+F8 is modal-blocked, so the key
+                    # falls through to here. Only offered when codex is usable.
+                    Binding("shift+f8", "cycle_agent", show=False)]
 
-        def __init__(self, base_dir, candidates):
+        def __init__(self, base_dir, candidates, agents=("claude",)):
             super().__init__()
+            self._agents = tuple(agents) or ("claude",)
+            self._agent = self._agents[0]
             self._base_dir = base_dir
             self._candidates = candidates           # list[(label, path)] recent dirs
             self._scan_cache: dict = {}             # parent → child names (per-keystroke reuse)
             self._opts: list = []                   # backs #new-dirs: (kind, path, label)
 
+        def _title_markup(self) -> str:
+            glyph = _PROVIDER_GLYPH.get(self._agent, "")
+            sw = ("  [dim]⇧F8: claude ⇄ codex[/dim]"
+                  if len(self._agents) > 1 else "")
+            return (f"[bold cyan]New {glyph} {self._agent} session[/bold cyan]   "
+                    "[dim]type a folder · Tab completes · ↓ picks · "
+                    "Enter launches · Esc cancels[/dim]" + sw)
+
+        def action_cycle_agent(self) -> None:
+            if len(self._agents) < 2:
+                return
+            i = self._agents.index(self._agent)
+            self._agent = self._agents[(i + 1) % len(self._agents)]
+            try:
+                self.query_one("#new-title", Static).update(self._title_markup())
+            except Exception:
+                pass
+
         def compose(self) -> ComposeResult:
             with Vertical(id="new-box"):
-                yield Static("[bold cyan]New claude session[/bold cyan]   "
-                             "[dim]type a folder · Tab completes · ↓ picks · "
-                             "Enter launches · Esc cancels[/dim]")
+                yield Static(self._title_markup(), id="new-title")
                 yield Input(value=self._base_dir, placeholder="folder path",
                             id="new-path")
                 yield Static("", id="new-hint")
@@ -6629,8 +6728,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception:
                 pass
 
+        def _launch(self, path) -> None:
+            # (path, agent) so the caller starts the agent the header shows.
+            self.dismiss((path, self._agent) if path else None)
+
         def on_input_submitted(self, event) -> None:
-            self.dismiss((event.value or "").strip() or None)
+            self._launch((event.value or "").strip() or None)
 
         def on_option_list_option_selected(self, event) -> None:
             try:
@@ -6639,7 +6742,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.dismiss(None)
                 return
             if kind == "recent":
-                self.dismiss(path)                  # recent dir → launch immediately
+                self._launch(path)                  # recent dir → launch immediately
                 return
             # completion → drill into that folder, keeping the modal open to go deeper
             try:
@@ -9307,10 +9410,13 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             return _spawn()
 
-        def _open_new_live(self, target_cwd: str) -> None:
-            """Start a FRESH claude session in target_cwd as a live pane. A
+        def _open_new_live(self, target_cwd: str, agent: str = "claude") -> None:
+            """Start a FRESH session in target_cwd as a live pane. claude: a
             pre-generated --session-id keys the pane so the new session links to
-            its list row once claude writes the JSONL (appears on the next scan)."""
+            its list row once claude writes the JSONL (appears on the next scan).
+            codex: no id can be pre-assigned, so the pane opens under a
+            placeholder and _poll_new_codex re-keys it onto the thread codex
+            writes. (#codex-provider)"""
             if _LIVE_TERM is None or self._live is None:
                 return
             try:
@@ -9321,6 +9427,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     return
             except Exception as e:
                 self.notify(f"bad path: {e!r}", severity="error", timeout=6)
+                return
+            if agent == "codex":
+                self._open_new_codex(d)
                 return
             sid = str(uuid.uuid4())
             try:
@@ -9340,6 +9449,121 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self._sid_index[sid] = stub
                 self._refresh_table()
                 self.notify(f"new claude session in {d}", timeout=4)
+
+        def _open_new_codex(self, d: Path) -> None:
+            """The codex half of _open_new_live. The stub row goes in BEFORE the
+            spawn: _spawn_live_pane picks the pane's status classifier from the
+            row's provider, and a placeholder with no row would get claude's."""
+            try:
+                argv, cwd, env = _build_new_codex_invocation(str(d))
+            except Exception as e:
+                self.notify(f"could not build codex command: {e!r}",
+                            severity="error", timeout=8)
+                return
+            placeholder = _CODEX_PENDING_PREFIX + uuid.uuid4().hex[:12]
+            title = d.name or str(d)
+            stub = _new_session_stub(placeholder, str(d), title)
+            stub["provider"] = "codex"
+            all_sessions.append(stub)
+            self._sid_index[placeholder] = stub
+            # Threads that already exist are never this pane's. The list already
+            # holds every codex row it scanned, so no rescan (and no wait) on the
+            # UI thread; a thread created after that scan but before this launch
+            # still fails the matcher's started-after-launch test.
+            known = {r["id"] for r in all_sessions if r.get("provider") == "codex"}
+            self._codex_pending = getattr(self, "_codex_pending", {})
+            self._codex_pending[placeholder] = {"cwd": str(d), "launched": time.time(),
+                                                "known": known}
+            if not self._spawn_live_pane(placeholder, argv, cwd, env, title,
+                                         refresh=False):
+                self._codex_pending.pop(placeholder, None)
+                try:
+                    all_sessions.remove(stub)
+                except ValueError:
+                    pass
+                self._sid_index.pop(placeholder, None)
+                return
+            self._refresh_table()
+            self.notify(f"new codex session in {d}", timeout=4)
+            if not getattr(self, "_codex_poll_timer", None):
+                self._codex_poll_timer = self.set_interval(2.0, self._poll_new_codex)
+
+        def _poll_new_codex(self) -> None:
+            """Re-key placeholder codex panes onto the thread codex wrote. The scan
+            runs off the UI thread; only the dict re-key comes back to it."""
+            pending = getattr(self, "_codex_pending", {}) or {}
+            # a pane closed before codex wrote anything: forget it
+            for ph in [ph for ph in pending if self._live is None or not self._live.has(ph)]:
+                pending.pop(ph, None)
+                self._drop_codex_stub(ph)
+            if not pending:
+                t = getattr(self, "_codex_poll_timer", None)
+                if t is not None:
+                    try:
+                        t.stop()
+                    except Exception:
+                        pass
+                self._codex_poll_timer = None
+                return
+            if getattr(self, "_codex_poll_busy", False):
+                return
+            self._codex_poll_busy = True
+            snap = {ph: dict(v) for ph, v in pending.items()}
+
+            def _work() -> None:
+                found = {}
+                try:
+                    rows = load_codex_sessions(None)
+                    for ph, v in snap.items():
+                        tid = _match_new_codex_thread(rows, v["cwd"], v["launched"],
+                                                      v.get("known") or set())
+                        if tid:
+                            found[ph] = (tid, next(r for r in rows if r["id"] == tid))
+                except Exception as e:
+                    _log(f"codex new-thread poll failed: {e!r}")
+                try:
+                    self.call_from_thread(self._apply_codex_rekeys, found)
+                except Exception:
+                    self._codex_poll_busy = False
+            threading.Thread(target=_work, daemon=True).start()
+
+        def _apply_codex_rekeys(self, found: dict) -> None:
+            self._codex_poll_busy = False
+            pending = getattr(self, "_codex_pending", {}) or {}
+            changed = False
+            for ph, (tid, row) in found.items():
+                if ph not in pending or self._live is None or not self._live.has(ph):
+                    continue
+                if self._live.has(tid):
+                    continue          # already a pane of its own — leave both alone
+                self._live.rekey(ph, tid)
+                term = self._live.get(tid)
+                if term is not None:
+                    try:
+                        term.sid = tid
+                    except Exception:
+                        pass
+                pending.pop(ph, None)
+                if ph in self._opened_sids:
+                    self._opened_sids.discard(ph)
+                    self._opened_sids.add(tid)
+                self._drop_codex_stub(ph)
+                if tid not in self._sid_index:
+                    all_sessions.append(row)
+                    self._sid_index[tid] = row
+                changed = True
+                _log(f"codex new pane {ph} -> thread {tid[:8]}")
+            if changed:
+                self._save_open_panes()
+                self._refresh_table()
+
+        def _drop_codex_stub(self, ph: str) -> None:
+            stub = self._sid_index.pop(ph, None)
+            if stub is not None:
+                try:
+                    all_sessions.remove(stub)
+                except ValueError:
+                    pass
 
         def _spawn_live_pane(self, sid, argv, cwd, env, title, refresh=True) -> bool:
             """Capacity/RAM-gate, mount, register and focus a live pane for an
@@ -9505,6 +9729,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     if isinstance(row, dict) and row.get("id") in active:
                         merged[row["id"]] = row
                 for sid in self._opened_sids:
+                    if sid.startswith(_CODEX_PENDING_PREFIX):
+                        continue      # placeholder — its thread id is not known yet
                     s = self._sid_index.get(sid) or {}
                     merged[sid] = {"id": sid,
                                    "cwd": s.get("origin_cwd") or s.get("cwd") or ""}
@@ -9906,9 +10132,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             base = str(repo) if repo else str(Path.cwd())
 
-            def _go(path):
+            def _go(choice):
+                if not choice:
+                    return
+                path, agent = choice if isinstance(choice, tuple) else (choice, "claude")
                 if path:
-                    self._open_new_live(path)
+                    self._open_new_live(path, agent=agent)
 
             # The candidate walk runs OFF the UI thread: it shells out to
             # `git worktree list` (5s timeout) and then stats up to 40 recent session
@@ -9924,7 +10153,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
             def _show(cands) -> None:
                 self._new_session_scanning = False
-                self.push_screen(NewSessionScreen(base, cands), _go)
+                # Codex is offered only when it would actually start. (#codex-provider)
+                agents = (("claude", "codex")
+                          if _codex_enabled() and shutil.which("codex") else ("claude",))
+                self.push_screen(NewSessionScreen(base, cands, agents), _go)
 
             def _scan() -> None:
                 try:
@@ -13874,7 +14106,8 @@ def _trim_remembered_sessions(live_sids: set) -> None:
     point — so this is what keeps a years-old cache dir finite. Best-effort."""
     cap = _archive_max()
     try:
-        gone = [f for f in PARSED_DIR.glob("*.json") if f.stem not in live_sids]
+        gone = [f for f in PARSED_DIR.glob("*.json")
+                if _is_claude_record_file(f) and f.stem not in live_sids]
     except OSError:
         return
     if len(gone) <= cap:
@@ -13945,7 +14178,8 @@ def _sweep_cache_litter() -> None:
         try:
             for f in d.glob("*"):
                 try:
-                    if remembered and d is PARSED_DIR and f.stem not in live_sids:
+                    if (remembered and d is PARSED_DIR and _is_claude_record_file(f)
+                            and f.stem not in live_sids):
                         continue
                     if f.is_file() and f.stat().st_mtime < cache_cutoff:
                         f.unlink()
