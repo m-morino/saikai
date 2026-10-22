@@ -20,7 +20,10 @@ Current state, open threads, and next steps. Architecture and invariants live in
       longer runs `claude --resume <thread>`;
     - no `claude -p` titles for codex threads;
     - a `› 1. …` prompt echoed in history is no longer read as a choice.
-  - Waiting for: approval of the UI screenshots, then merge to master and push.
+  - CI green on Windows/macOS/Linux (workflow_dispatch run 39833549208). Not yet
+    verified on a real Windows machine with a real `codex.cmd` (npm) / Windows codex TUI.
+  - Branch pushed to origin. Waiting for: approval of the UI screenshots, then
+    merge to master.
 
 ### Not done for codex
 - `!` reply-due on dormant codex threads, open-elsewhere detection, checkpoint.
