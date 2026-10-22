@@ -492,7 +492,7 @@ def test_pilot_new_codex_pane_lifecycle_review_fixes():
                 # Shift+F4 restore of a codex thread the list doesn't hold
                 gone = _uuid()
                 self._live = real_live or FakeLive([])
-                self._restore_candidates = [{"id": gone, "cwd": "/tmp",
+                self._restore_candidates = [{"id": gone, "cwd": str(_FAKE_HOME),
                                              "provider": "codex"}]
                 self._open_or_attach_live = lambda sid, **k: False
                 self.action_restore_panes()
