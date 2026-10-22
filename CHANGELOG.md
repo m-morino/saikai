@@ -15,7 +15,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shows `esc to interrupt`. Start a NEW codex session from New session (`Shift+F8`,
   then `Shift+F8` again to switch agent); the pane links to its thread after your
   first prompt. Reads the codex 0.157+ rollout format, which no longer records user
-  turns as `user_message` events. `[providers] codex = false` hides it all.
+  turns as `user_message` events. Reopening panes (`Shift+F4`, worksets) keeps each
+  pane's agent, and summaries never spend `claude -p` on a codex thread.
+  `[providers] codex = false` hides it all.
 - **Sessions Claude deleted are still findable.** Claude Code removes
   `~/.claude/projects/**/<sid>.jsonl` once it is `cleanupPeriodDays` old — 30 days by
   default, swept at startup with no warning. The code and the git history survive

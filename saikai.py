@@ -2963,7 +2963,7 @@ def load_codex_sessions(since: "datetime | None") -> list[dict]:
     rows: list[dict] = []
     cutoff = since.timestamp() if since is not None else None
     for tid, parts in threads.items():
-        parts.sort(key=lambda r: r["first_ts"])
+        parts.sort(key=lambda r: _iso_sort_key(r["first_ts"]))   # mixed Z/+09:00 (#audit-codex-tsort)
         latest = max(parts, key=lambda r: r["mtime"])
         if cutoff is not None and latest["mtime"] < cutoff:
             continue
@@ -3779,6 +3779,10 @@ def summarize_session(s: dict) -> str:
         _save_cache(s["id"], mtime, "", s.get("last_ts", ""))
         return ""
 
+    if (s.get("provider") or "claude") != "claude":
+        # don't spend claude credits titling other agents' threads (#codex-provider)
+        return s["ai_title"] or _first_msg(s)
+
     if not _summary_enabled():
         # Summaries are opt-in (no `claude -p`): use claude's own ai-title or the
         # first user message. Do NOT cache (no LLM result to memoise).
@@ -3803,6 +3807,7 @@ def summarize_session(s: dict) -> str:
 def summarize_all_parallel(sessions: list[dict], max_workers: int = 5):
     """Summarize all sessions in parallel, showing progress."""
     pending = [s for s in sessions if not s["ai_title"]
+               and (s.get("provider") or "claude") == "claude"
                and not s.get("is_open")   # active JSONL mtime changes → cache always stale
                and _load_cache(s["id"], s["mtime"], s.get("last_ts", "")) is None]
     if not pending:
@@ -3993,6 +3998,12 @@ def _pane_title(s: "dict | None", sid: str, term=None) -> str:
         if tt:
             return tt
     return sid[:8]
+
+
+def _workset_provider(session) -> str:
+    """The workset provider for a row (WorksetEntry only admits known ids)."""
+    p = (session or {}).get("provider") or _ACTIVE_PROVIDER.id
+    return p if p in ("claude", "codex") else "claude"
 
 
 def _new_session_stub(sid: str, cwd: str, title: str) -> dict:
@@ -4564,7 +4575,8 @@ def _marker_legend(s: dict, favorites: set, hidden: set) -> list:
     """Plain-language meaning of the activity + state markers THIS session
     currently shows — mirrors _activity_marker / _state_marker precedence so the
     preview can explain its own +/./*/@/&/… glyphs in context. At most one
-    activity entry + one state entry (the two columns each show one glyph)."""
+    activity entry + one state entry (the two columns each show one glyph),
+    plus the provider line on a codex row."""
     out = []
     if s.get("provider") == "codex":
         out.append("⌬ codex thread — Enter resumes it with `codex resume` in a pane")
@@ -9493,9 +9505,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             runs off the UI thread; only the dict re-key comes back to it."""
             pending = getattr(self, "_codex_pending", {}) or {}
             # a pane closed before codex wrote anything: forget it
-            for ph in [ph for ph in pending if self._live is None or not self._live.has(ph)]:
+            # (an open still mounting is in _opening_sids, not yet has())
+            gone = [ph for ph in pending if self._live is None or
+                    not (self._live.has(ph) or ph in self._opening_sids)]
+            for ph in gone:
                 pending.pop(ph, None)
                 self._drop_codex_stub(ph)
+            if gone:
+                self._refresh_table()
             if not pending:
                 t = getattr(self, "_codex_poll_timer", None)
                 if t is not None:
@@ -9535,8 +9552,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if ph not in pending or self._live is None or not self._live.has(ph):
                     continue
                 if self._live.has(tid):
-                    continue          # already a pane of its own — leave both alone
+                    # already a pane of its own — leave both alone, and stop
+                    # offering that thread to this placeholder every poll
+                    pending[ph].setdefault("known", set()).add(tid)
+                    continue
                 self._live.rekey(ph, tid)
+                # the attention sets are keyed by sid too; unlike a b2 checkpoint
+                # this is the SAME live session, so its state moves with it
+                for _set in (self._unread, self._busy_seen):
+                    if ph in _set:
+                        _set.discard(ph)
+                        _set.add(tid)
                 term = self._live.get(tid)
                 if term is not None:
                     try:
@@ -9605,7 +9631,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     f"SAIKAI_HARD_RAM_GATE=1 to block instead.",
                     severity="warning", timeout=7)
             # Status classification follows the ROW's provider (a codex pane
-            # gets the generic classifier), not the global default (#codex-provider)
+            # gets the codex classifier), not the global default (#codex-provider)
             _prov = ((self._sid_index.get(sid) or {}).get("provider")
                      or _ACTIVE_PROVIDER.id)
             term = _LIVE_TERM.AgentTerminal(
@@ -9733,7 +9759,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         continue      # placeholder — its thread id is not known yet
                     s = self._sid_index.get(sid) or {}
                     merged[sid] = {"id": sid,
-                                   "cwd": s.get("origin_cwd") or s.get("cwd") or ""}
+                                   "cwd": s.get("origin_cwd") or s.get("cwd") or "",
+                                   "provider": s.get("provider") or _ACTIVE_PROVIDER.id}
                 _write_json(OPEN_PANES_FILE, [merged[k] for k in sorted(merged)])
             except Exception:
                 pass
@@ -9757,12 +9784,16 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if not isinstance(sid, str) or not sid.strip():
                     skipped.append("pane without a Claude session ID")
                     continue
+                if sid.startswith(_CODEX_PENDING_PREFIX):
+                    skipped.append("new codex pane has no thread yet")
+                    continue
                 if not isinstance(cwd, str) or not cwd.strip():
                     skipped.append(f"{sid[:8]} has no saved cwd")
                     continue
                 session = self._sid_index.get(sid)
                 title = _pane_title(session, sid, term)
-                entries.append(WorksetEntry(str(uuid.uuid4()), "pending", cwd, "claude",
+                entries.append(WorksetEntry(str(uuid.uuid4()), "pending", cwd,
+                                            _workset_provider(session),
                                             ResumeTarget("id", sid), title))
             return tuple(entries), tuple(skipped)
 
@@ -9781,7 +9812,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     skipped.append(f"{sid[:8]} has no saved cwd")
                     continue
                 session = self._sid_index.get(sid)
-                entries.append(WorksetEntry(str(uuid.uuid4()), "pending", cwd, "claude",
+                prov = row.get("provider") if row.get("provider") in ("claude", "codex") \
+                    else _workset_provider(session)
+                entries.append(WorksetEntry(str(uuid.uuid4()), "pending", cwd, prov,
                                             ResumeTarget("id", sid),
                                             _pane_title(session, sid)))
             return tuple(entries), tuple(skipped)
@@ -10046,6 +10079,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 seen.add(sid)
                 if sid not in self._sid_index:
                     stub = _new_session_stub(sid, entry.cwd, entry.title or sid[:8])
+                    stub["provider"] = entry.provider
                     # _new_session_stub describes a NEW, already launched pane.
                     # A restore candidate has not launched: derive ownership from
                     # the existing registry reader instead of inventing is_open.
@@ -10097,6 +10131,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         usable_cwd = False
                     if usable_cwd:
                         stub = _new_session_stub(sid, cwd, Path(cwd).name or sid[:8])
+                        if isinstance(row, dict) and row.get("provider") == "codex":
+                            stub["provider"] = "codex"   # else `claude --resume <thread>`
                         all_sessions.append(stub)
                         self._sid_index[sid] = stub
                     else:

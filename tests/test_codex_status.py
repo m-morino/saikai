@@ -59,6 +59,17 @@ def test_the_input_prompt_cursor_is_not_a_choice():
     assert classify("› Ask Codex to do anything\n  ? for shortcuts") == "idle"
 
 
+def test_a_numbered_prompt_echoed_in_history_is_not_a_choice():
+    """A submitted prompt starting "1. …" is echoed as "› 1. …" — without the
+    dialog's enter/esc footer it is history, not a pending choice."""
+    screen = SCREENS["done"].replace(
+        "› Run the shell command", "› 1. Run the shell command")
+    assert "› 1. Run" in screen
+    assert classify(screen) == "idle"
+    busy = SCREENS["busy"].replace("› Run the shell command", "› 1. Run the shell command")
+    assert classify(busy) == "busy"
+
+
 if __name__ == "__main__":
     for _n, _fn in sorted(globals().items()):
         if _n.startswith("test_") and callable(_fn):

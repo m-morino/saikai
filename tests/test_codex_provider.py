@@ -421,6 +421,120 @@ def test_build_new_codex_invocation_runs_in_the_folder():
     assert cwd == "/tmp" and isinstance(env, dict)
 
 
+def test_pilot_new_codex_pane_lifecycle_review_fixes():
+    """Review fixes around the placeholder pane (#codex-parallel review):
+    - a pane still mounting (only in _opening_sids) is NOT treated as closed;
+    - the re-key moves the pane's !/done bookkeeping to the thread id;
+    - a thread that already has its own pane is not re-offered every poll;
+    - open-panes.json records the provider, and Shift+F4 restores an
+      out-of-scope codex pane as codex (it built a claude stub before)."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_new_codex_pane_lifecycle_review_fixes")
+        return
+    import asyncio
+    from textual.app import App
+
+    _seed_standard()
+    _write_claude_session("Claude side work")
+    facts: dict = {}
+
+    class FakeLive:
+        def __init__(self, sids):
+            self.sids = set(sids)
+            self.terms = {s: type("T", (), {"sid": s})() for s in sids}
+        def has(self, sid):
+            return sid in self.sids
+        def rekey(self, old, new):
+            self.sids.discard(old); self.sids.add(new)
+            self.terms[new] = self.terms.pop(old)
+        def get(self, sid):
+            return self.terms.get(sid)
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(120, 32)) as pilot:
+                await pilot.pause(0.5)
+                real_live = self._live
+                ph = saikai._CODEX_PENDING_PREFIX + "aaaaaaaaaaaa"
+                stub = saikai._new_session_stub(ph, "/tmp/work-a", "work-a")
+                stub["provider"] = "codex"
+                self._sid_index[ph] = stub      # (all_sessions is main()-local)
+                self._codex_pending = {ph: {"cwd": "/tmp/work-a",
+                                            "launched": time.time(), "known": set()}}
+                # still mounting: not registered, only in flight
+                self._live = FakeLive([])
+                self._opening_sids.add(ph)
+                self._codex_poll_busy = True        # keep the worker out of it
+                self._poll_new_codex()
+                facts["kept_in_flight"] = ph in self._codex_pending
+                self._opening_sids.discard(ph)
+                # registered now; codex wrote thread A
+                self._live = FakeLive([ph])
+                self._opened_sids.add(ph)
+                self._unread.add(ph); self._busy_seen.add(ph)
+                row = self._sid_index[A]
+                self._apply_codex_rekeys({ph: (A, row)})
+                facts["rekeyed"] = self._live.has(A) and not self._live.has(ph)
+                facts["unread_moved"] = A in self._unread and ph not in self._unread
+                facts["busy_moved"] = A in self._busy_seen and ph not in self._busy_seen
+                saved = json.loads(saikai.OPEN_PANES_FILE.read_text("utf-8"))
+                facts["saved"] = [r for r in saved if r.get("id") == A]
+                # a thread that already has a pane: remembered as known
+                ph2 = saikai._CODEX_PENDING_PREFIX + "bbbbbbbbbbbb"
+                self._codex_pending[ph2] = {"cwd": "/tmp/work-a",
+                                            "launched": time.time(), "known": set()}
+                self._live.sids.add(ph2); self._live.terms[ph2] = object()
+                self._apply_codex_rekeys({ph2: (A, row)})
+                facts["known_grew"] = A in self._codex_pending[ph2]["known"]
+                self._codex_pending.clear()
+                # Shift+F4 restore of a codex thread the list doesn't hold
+                gone = _uuid()
+                self._live = real_live or FakeLive([])
+                self._restore_candidates = [{"id": gone, "cwd": "/tmp",
+                                             "provider": "codex"}]
+                self._open_or_attach_live = lambda sid, **k: False
+                self.action_restore_panes()
+                facts["restore_provider"] = self._sid_index[gone].get("provider")
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_active = saikai._load_active_sessions
+    saikai._load_active_sessions = lambda *a, **k: {}
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        saikai._load_active_sessions = orig_active
+        sys.argv = orig_argv
+    assert facts.get("kept_in_flight"), facts
+    assert facts.get("rekeyed"), facts
+    assert facts.get("unread_moved") and facts.get("busy_moved"), facts
+    assert facts.get("saved") and facts["saved"][0].get("provider") == "codex", facts
+    assert facts.get("known_grew"), facts
+    assert facts.get("restore_provider") == "codex", facts
+
+
+def test_codex_threads_are_never_titled_with_claude():
+    """Summaries on: a codex thread falls back to its own first turn instead of a
+    `claude -p` call (the needs_llm gate alone let the worker title them)."""
+    calls = []
+    orig = (saikai.call_claude_haiku, saikai._summary_enabled)
+    saikai.call_claude_haiku = lambda *a, **k: calls.append(a) or "要約"
+    saikai._summary_enabled = lambda: True
+    try:
+        s = {"id": _uuid(), "provider": "codex", "ai_title": "", "mtime": 1.0,
+             "last_ts": "", "real_msgs": ["fix the sensor"], "is_open": False}
+        assert saikai.summarize_session(dict(s)) == "fix the sensor"
+        saikai.summarize_all_parallel([dict(s)])
+    finally:
+        saikai.call_claude_haiku, saikai._summary_enabled = orig
+    assert calls == [], calls
+
+
 if __name__ == "__main__":
     test_pilot_new_session_shift_f8_switches_to_codex()
     print("PASS test_pilot_new_session_shift_f8_switches_to_codex")
@@ -450,4 +564,8 @@ if __name__ == "__main__":
     print("PASS test_parse_codex_rollout_cache_roundtrip")
     test_pilot_codex_rows_listed_and_enter_resumes()
     print("PASS test_pilot_codex_rows_listed_and_enter_resumes")
+    test_pilot_new_codex_pane_lifecycle_review_fixes()
+    print("PASS test_pilot_new_codex_pane_lifecycle_review_fixes")
+    test_codex_threads_are_never_titled_with_claude()
+    print("PASS test_codex_threads_are_never_titled_with_claude")
     print("ALL PASS")

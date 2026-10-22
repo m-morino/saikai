@@ -1518,8 +1518,13 @@ def classify_generic_status(screen_text: str, title: str = "") -> str:
 # Codex forced choice (command approval, folder trust) renders one; a finished
 # answer that merely CONTAINS a numbered list does not, and neither does the input
 # prompt ("› Ask Codex to do anything"), which carries the glyph but no number.
+# A submitted prompt that itself starts "1. …" is echoed as "› 1. …" in the
+# history, so the cursor line must be followed by the dialog's enter/esc footer
+# ("Press enter to confirm or esc to cancel", "enter continue · esc back").
 # Verified against codex-cli 0.163.0 (tests/fixtures/codex_screens_0163.json).
-_CODEX_CHOICE_RE = re.compile(r"^\s*›\s*\d+\.\s+\S", re.MULTILINE)
+_CODEX_CHOICE_RE = re.compile(
+    r"^\s*›\s*\d+\.\s+\S[^\n]*(?:\n[^\n]*){0,12}?\n\s*(?:press\s+)?enter\b[^\n]*\besc\b",
+    re.MULTILINE | re.IGNORECASE)
 
 
 def classify_codex_status(screen_text: str, title: str = "") -> str:

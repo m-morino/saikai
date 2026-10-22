@@ -20,8 +20,12 @@ duplicating them is how this project would become a worse copy of its host.
 - `saikai_terminal.py` owns provider-neutral PTY spawn, rendering, input,
   resize, status delivery, clipboard behavior, and teardown.
 - `saikai_provider.py` owns agent-specific capabilities and invocation
-  contracts. Claude Code is the integrated provider; other providers stay
-  unavailable until their discovery and live-state contracts are complete.
+  contracts. Claude Code is the integrated provider. Codex CLI is opt-in
+  (`[providers] codex`): its threads are discovered from rollouts, resumed and
+  started in panes, and classified by their own `codex` status profile. It has
+  no live-state registry, so open-elsewhere detection, `!` on dormant threads
+  and checkpoint stay Claude-only. Other providers stay unavailable until their
+  discovery and live-state contracts are complete.
 
 Keep the boundary one-way: application policy may use the provider and terminal
 layers, but terminal code must not import application policy.
