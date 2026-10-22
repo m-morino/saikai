@@ -3349,8 +3349,8 @@ term.onData((d) => {
     menuEl.style.cssText = 'position:fixed;z-index:20;background:#222;border:1px solid #666;'+
       'border-radius:8px;padding:6px;display:flex;flex-direction:column;gap:4px;'+
       'box-shadow:0 6px 20px rgba(0,0,0,.6)';
-    const items = [['Resume','enter'],['Copy prompt','f9'],['Favorite','f6'],
-                   ['Hide / show','f7'],['Rename','shift+f2'],['Close','']];
+    const items = [['Resume','enter'],['Copy prompt','action:copy_prompt'],['Favorite','action:toggle_fav'],
+                   ['Hide / show','action:toggle_hide'],['Rename','action:rename'],['Close','']];
     items.forEach((it) => {
       const b = document.createElement('button');
       b.textContent = it[0];
@@ -3581,8 +3581,8 @@ kbBar.style.cssText =
 // right (↑ over ←↓→) so list/dropdown navigation reads like a real keypad.
 // Ergonomic v3 (user-flow measured): three tiers by thumb reach.
 //   Row 1 (stretch zone, smaller): rare keys — Tab / Leader / Ctrl / Select / More.
-//   Row 2 (shoulder, thumb side):  the LOOP keys — ☰List (pane→list, the only
-//     way back: typed text rides to the pane) and !Next (shift+f1, jump to the
+//   Row 2 (shoulder, thumb side):  the LOOP keys — ☰List (list⇄pane, the only
+//     way back: typed text rides to the pane) and !Next (next_attention, jump to the
 //     next needs-you session — saikai's hero flow, cyan like the TUI accent).
 //   Row 3 (prime band): Esc far-left (rare + high-stakes interrupt: MAXIMUM
 //     separation from confirm = error prevention), d-pad + tall green Enter in
@@ -3607,15 +3607,15 @@ kbBar.innerHTML =
   '</div>'+
   '<div class="kb-row" id="kb-row1">'+
     '<button class="sm" data-k="tab">Tab</button>'+
-    '<button class="sm" data-k="space">Leader</button>'+
+    '<button class="sm" data-k="action:arm_menu">Menu</button>'+
     '<button class="sm" id="kb-ctrl" data-k="">Ctrl</button>'+
     '<button class="sm" id="kb-select" data-k="">&#9986; Select</button>'+
     '<button class="sm" id="kb-kbd" data-k="">&#9000;</button>'+
     '<button class="sm" id="kb-more" data-k="">More</button>'+
   '</div>'+
   '<div class="kb-row" id="kb-row2">'+
-    '<button class="mid" data-k="ctrl+right_square_bracket">&#9776; List</button>'+
-    '<button class="mid next" data-k="shift+f1">! Next</button>'+
+    '<button class="mid" data-k="action:focus_swap">&#9776; List</button>'+
+    '<button class="mid next" data-k="action:next_attention">! Next</button>'+
   '</div>'+
   '<div class="kb-row" id="kb-row3">'+
     '<button class="esc" data-k="escape">Esc</button>'+
@@ -3629,23 +3629,22 @@ kbBar.innerHTML =
     '<button class="enter" data-k="enter">&#9166;<br>Enter</button>'+
   '</div>'+
   // Secondary row: saikai's OWN actions, hidden until 'More' so the default bar
-  // stays compact. f5/f9/f10/shift+f4 are PRIORITY bindings (fire even with a
-  // pane focused); "Find" (slash) opens search and PgUp/PgDn/Top/End page the
+  // stays compact. action: buttons run saikai actions directly (any focus); "Find" (slash) opens search and PgUp/PgDn/Top/End page the
   // list (these work when the list, not a pane, is focused).
   '<div class="kb-row" id="kb2" style="display:none;flex-wrap:wrap">'+
     '<button id="kb-view" data-k="">Pane view</button>'+
     '<button id="kb-fit" data-k="">Fit</button>'+
     '<button id="kb-hand" data-k="">&#8644; Right</button>'+
     '<button data-k="slash">Find</button>'+
-    '<button data-k="f5">Refresh</button>'+
-    '<button data-k="f10">Close pane</button>'+
-    '<button data-k="f9">Copy prompt</button>'+
-    '<button data-k="shift+f2">Rename</button>'+
-    '<button data-k="shift+f4">Restore</button>'+
-    '<button data-k="f11">Notifs</button>'+
-    '<button data-k="shift+f11">Compact</button>'+
-    '<button data-k="checkpoint">Checkpoint</button>'+
-    '<button data-k="f12">Mirror QR</button>'+
+    '<button data-k="action:refresh">Refresh</button>'+
+    '<button data-k="action:close_live">Close pane</button>'+
+    '<button data-k="action:copy_prompt">Copy prompt</button>'+
+    '<button data-k="action:rename">Rename</button>'+
+    '<button data-k="action:restore_panes">Restore</button>'+
+    '<button data-k="action:notifications">Notifs</button>'+
+    '<button data-k="action:context_refresh">Compact</button>'+
+    '<button data-k="action:checkpoint">Checkpoint</button>'+
+    '<button data-k="action:mirror_info">Mirror QR</button>'+
     '<button data-k="pageup">PgUp</button>'+
     '<button data-k="pagedown">PgDn</button>'+
     '<button data-k="home">Top</button>'+
@@ -3685,11 +3684,10 @@ if (paneView) {   // the toggle names the view a press switches TO
   // them here would fire blind (dispatchKey drops them too; hiding keeps the
   // bar honest about what works). Terminal keys (PgUp/PgDn/Top/End, d-pad,
   // Esc/Enter/Tab) and the view/hand toggles stay. (#review-invisible-app-keys)
-  const appOnly = ['slash', 'f5', 'f10', 'f9', 'shift+f2', 'shift+f4', 'f11',
-                   'shift+f11', 'checkpoint', 'f12',
-                   'ctrl+right_square_bracket', 'shift+f1'];
+  // every action: button is app-scoped (they name saikai actions)
   kbBar.querySelectorAll('button[data-k]').forEach((b) => {
-    if (appOnly.indexOf(b.getAttribute('data-k')) >= 0) b.style.display = 'none';
+    const k = b.getAttribute('data-k') || '';
+    if (k === 'slash' || k.indexOf('action:') === 0) b.style.display = 'none';
   });
   const r2 = document.getElementById('kb-row2');
   if (r2) r2.style.display = 'none';   // List/Next: both app-scoped

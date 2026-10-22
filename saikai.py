@@ -313,7 +313,9 @@ _CONFIG_TEMPLATE = (
     "auto_refresh = 0          # seconds between background re-scans (0 = off; minimum active value = 2)\n"
     "split_live   = true       # false = list-only browser (Enter = full-takeover resume)\n"
     'color_by     = "project"  # title hue: project | worktree | topic | none\n'
-    "split_ratio  = 0.34       # initial list share; dragging / Alt+arrows persists over it\n\n"
+    "split_ratio  = 0.34       # initial list share; dragging / menu < > persists over it\n"
+    "menu_icons   = true       # emoji family icons in the command menu (false if your\n"
+    "#                           terminal draws emoji at the wrong width, e.g. PuTTY)\n\n"
     "[history]                     # what saikai remembers after Claude forgets\n"
     "archive             = true    # keep a session findable after Claude Code deletes\n"
     "#                               its transcript (cleanupPeriodDays, 30 days by default)\n"
@@ -340,17 +342,16 @@ _CONFIG_TEMPLATE = (
     "# min_free_phys_pct    = 8     # keep >= this % of physical RAM free/available\n"
     "# hard_ram_gate        = false # true = refuse (vs warn) when crossed\n\n"
     "[keys]\n"
-    "# Keyboard-first: Space (in the list) is a LEADER key by default — press it,\n"
-    "# then a mnemonic letter: f=favorite h=hide e=rename r=refresh d=diff y=copy\n"
-    "# s=sort o=order g=group t=tree n=new p=restore z=freeze\n"
-    "# a=attention l=list x=close [=prev-tab ]=next-tab Space=mark. Press ? in the\n"
-    "# app for the live map. Everything below is optional fine-tuning:\n"
-    '# leader          = "ctrl+g"  # use another leader ("none" disables the mode)\n'
+    "# Every action is a letter in the command menu: Space in the list, Ctrl+] from\n"
+    "# anywhere (a live pane too; twice = list <-> pane), F9 anywhere. Letters are\n"
+    "# case-sensitive (x close / X close all). Press ? in the app for the live map.\n"
+    "# Everything below is optional fine-tuning:\n"
+    '# leader          = "ctrl+g"  # the list-side menu key ("none" = no menu; Ctrl+] = back to list)\n'
     "# leader_defaults = false     # start from an EMPTY letter map\n"
-    '# release         = "ctrl+]"  # return focus from a live pane to the session list\n'
-    '# favorite        = "v"       # single letter = leader sequence remap\n'
-    '# refresh         = "f5"      # multi-char    = direct key rebind\n\n'
-    "[checkpoint]                  # b2 checkpoint flow (leader Space-c)\n"
+    '# release         = "ctrl+]"  # the PREFIX: menu from anywhere, twice = list <-> pane\n'
+    '# favorite        = "v"       # single letter = menu letter remap\n'
+    '# refresh         = "f11"     # multi-char    = direct key (any action id)\n\n'
+    "[checkpoint]                  # b2 checkpoint flow (menu C)\n"
     '# handoff_prompt_file = ""    # path to a custom handoff prompt ("" = built-in).\n'
     "#   It MUST instruct the model to END with a fenced block whose first line is\n"
     "#   'NEW SESSION PROMPT'; a file dropping that is rejected (falls back to the\n"
@@ -396,7 +397,7 @@ def _leader_map(letters_cfg, id_to_action):
     (mapping, errors)."""
     out, errs, seen = {}, [], set()
     for action_id, key in (letters_cfg or {}).items():
-        k = str(key or "").lower()
+        k = str(key or "")          # case-sensitive: x and X are different actions
         if k != " ":          # a literal space IS a valid letter (leader-leader = mark)
             k = k.strip()
         if len(k) != 1:
@@ -419,51 +420,120 @@ def _leader_map(letters_cfg, id_to_action):
 # Everything here is overridable from [keys]; leader = "none" turns the mode off,
 # leader_defaults = false starts from an empty letter map.
 DEFAULT_LEADER_KEY = "space"
+# The command menu (keymap v2). ONE letter table, three ways in: Space in the
+# list, the PREFIX (Ctrl+], from anywhere — a live pane too) and F9 (no
+# modifier, for terminals where Ctrl is awkward). Every action is reachable
+# here; the unmodified F-keys are only accelerators. Shift/Ctrl/Alt+F-keys are
+# deliberately absent: PuTTY (default mode) and Termius don't distinguish them,
+# zellij drops F13-F24, and a modified F3 is eaten as a cursor-position report.
+# Lowercase = the everyday, safe action; uppercase = the stronger sibling of the
+# same letter (x/X close/close all, n/N new/new with the other agent, c/C
+# compact/checkpoint). Letters follow tmux / vi / opencode where they overlap.
 DEFAULT_LEADER_LETTERS = {           # action id -> letter (config orientation)
-    "favorite": "f", "hide": "h", "rename": "e", "refresh": "r",
-    "diff": "d", "copy": "y", "copy_summary": "i", "sort": "s", "order": "o",
-    "group": "g", "tree": "t", "new": "n",
-    "restore": "p", "freeze": "z", "attention": "a", "toggle_list": "l",
-    "close": "x", "prev_tab": "[", "next_tab": "]", "mark": " ",
-    "settings": ",", "search_bar": "/",
-    # 'notifs' (recall dismissed toasts) also has an F11 Binding, but Windows
-    # Terminal binds F11 to full-screen and eats it — so give it a leader letter
-    # (Space m) that no host terminal intercepts. (#wt-f11)
-    "notifs": "m",
-    # b2 (Task 11): the human-gated checkpoint→/clear→rehydrate flow. A LEADER
-    # action (not an F-key) because the F-key / Shift+F-key space is full AND a
-    # deliberate, discoverable two-keystroke gesture (which-key hinted) suits a
-    # flow that ends in a destructive /clear. b1's plain Shift+F11 stays
-    # /compact-only; b2 is its own entry-point sharing b1's idle-gate helpers.
-    "checkpoint": "c",
-    "worksets": "w",
+    # panes: move
+    "attention": "a", "prev_tab": "[", "next_tab": "]",
+    **{f"goto_tab_{i}": str(i) for i in range(1, 10)},
+    "toggle_list": "z", "shrink_list": "<", "grow_list": ">",
+    # panes: manage
+    "new": "n", "new_alt": "N", "close": "x", "close_all": "X",
+    "restore": "u", "freeze": "p", "copy_response": "v",
+    "ctx_refresh": "c", "checkpoint": "C", "worksets": "w",
+    "kill_agent": "K", "send_prefix": "q",
+    # session (a pane's own session when the menu was opened from that pane)
+    "favorite": "f", "hide": "h", "rename": "e", "diff": "d",
+    "copy": "y", "copy_summary": "Y", "open_parent": "P", "refresh": "r",
+    "mark": " ",
+    # view / app
+    "sort": "s", "order": "o", "group": "g", "tree": "t", "search_bar": "/",
+    "notifs": "m", "mirror_info": "M", "settings": ",", "help": "?",
+    "dump_pane": "D",
 }
-# Leader-only action ids (no Binding / F-key behind them): id -> action name.
-LEADER_VIRTUAL_ACTIONS = {"sort": "sort", "order": "order", "mark": "toggle_mark",
-                          "settings": "settings",
-                          "search_bar": "toggle_search_bar",
-                          "checkpoint": "checkpoint",
-                          "copy_summary": "copy_summary",
-                          "worksets": "manage_worksets"}
+# Extra letters for an action that already has one (typed by habit / shifted
+# layouts): "!" is the attention marker itself.
+LEADER_ALIASES = {"!": "attention"}
+# Menu actions behind ids: id -> action name. An F-key Binding with the same id
+# (see PickerApp.BINDINGS) is only a faster way to the same action.
+LEADER_VIRTUAL_ACTIONS = {
+    "attention": "next_attention", "prev_tab": "prev_tab", "next_tab": "next_tab",
+    **{f"goto_tab_{i}": f"goto_tab:{i}" for i in range(1, 10)},
+    "toggle_list": "toggle_list", "shrink_list": "shrink_list",
+    "grow_list": "grow_list", "focus_swap": "focus_swap",
+    "new": "new_session", "new_alt": "new_session_alt", "close": "close_live",
+    "close_all": "close_all_live", "restore": "restore_panes",
+    "freeze": "freeze_pane", "copy_response": "copy_response",
+    "ctx_refresh": "context_refresh", "checkpoint": "checkpoint",
+    "worksets": "manage_worksets", "kill_agent": "kill_agent",
+    "send_prefix": "send_prefix",
+    "favorite": "toggle_fav", "hide": "toggle_hide", "rename": "rename",
+    "diff": "preview_changes", "copy": "copy_prompt",
+    "copy_summary": "copy_summary", "open_parent": "open_parent",
+    "refresh": "refresh", "mark": "toggle_mark",
+    "sort": "sort", "order": "order", "group": "cycle_group", "tree": "toggle_tree",
+    "search_bar": "toggle_search_bar", "notifs": "notifications",
+    "mirror_info": "mirror_info", "settings": "settings", "help": "help",
+    "dump_pane": "dump_pane",
+}
+# Repeatable letters (tmux `bind -r`): the menu stays open this long after one
+# of these runs, so Ctrl+] > > > widens the list three steps.
+# Actions a mirror button may run directly ("action:<name>"): the menu's own,
+# plus the two loop keys. Never toggle_mirror_control (enabling control is
+# local-only) and never send_prefix / dump_pane (pane-internal, no use remote).
+_MIRROR_ACTIONS = (frozenset(LEADER_VIRTUAL_ACTIONS.values()) | {"focus_swap", "arm_menu"}) \
+    - {"send_prefix", "dump_pane", "toggle_mirror_control"}
+LEADER_REPEATABLE = frozenset("<>[]")
+# The ? help's action table, in reading order: (action id, description). The
+# keys shown beside each come from the keymap in force (PickerApp._keys_for).
+_HELP_ACTIONS = (
+    ("attention", "next pane needing you (? waiting / ! reply due)"),
+    ("prev_tab", "previous tab"), ("next_tab", "next tab"),
+    ("focus_swap", "list ⇄ pane"),
+    ("new", "new session — Agent row: same key / ←→ / click picks claude or codex"),
+    ("new_alt", "new session with the other agent preselected"),
+    ("toggle_list", "zoom: hide / show the list"),
+    ("copy_response", "copy mode (vi keys) over the transcript"),
+    ("diff", "what this session changed"),
+    ("close", "close the active tab"), ("close_all", "close ALL tabs (confirmed)"),
+    ("restore", "reopen the panes from your last session"),
+    ("freeze", "freeze the pane (Shift+drag selects while it streams)"),
+    ("ctx_refresh", "send /compact to the pane"),
+    ("checkpoint", "checkpoint: /clear and reseed (confirmed)"),
+    ("worksets", "named worksets"),
+    ("favorite", "★ favorite"), ("hide", "hide / unhide"), ("rename", "rename"),
+    ("copy", "copy the opening prompt"), ("copy_summary", "copy the summary text"),
+    ("open_parent", "open the parent session"),
+    ("kill_agent", "stop an agent / background process (confirmed)"),
+    ("shrink_list", "narrower list"), ("grow_list", "wider list"),
+    ("refresh", "refresh the list"), ("notifs", "notification history"),
+    ("mirror_info", "web mirror QR (c there toggles phone control)"),
+    ("send_prefix", "send Ctrl-] itself to the pane"),
+)
+LEADER_REPEAT_S = 0.5
 
 # Leader families: action name -> family, in display order. The which-key hint
-# and the ? help render the map grouped this way (Session / View / Panes)
-# instead of an alphabetical soup — the LETTERS stay flat (two keystrokes),
-# only the presentation is systematic. Unknown actions (user remaps of new ids)
-# fall into the last family rather than vanishing from the hint.
-LEADER_FAMILY_ORDER = ("Session", "View", "Panes")
+# and the ? help render the map grouped this way instead of an alphabetical
+# soup — the LETTERS stay flat (two keystrokes), only the presentation is
+# systematic. Unknown actions (user remaps of new ids) fall into the last family
+# rather than vanishing from the hint.
+LEADER_FAMILY_ORDER = ("Move", "Panes", "Session", "View")
 LEADER_FAMILY_OF = {
+    "next_attention": "Move", "prev_tab": "Move", "next_tab": "Move",
+    **{f"goto_tab:{i}": "Move" for i in range(1, 10)},
+    "toggle_list": "Move", "shrink_list": "Move", "grow_list": "Move",
+    "focus_swap": "Move",
+    "new_session": "Panes", "new_session_alt": "Panes", "close_live": "Panes",
+    "close_all_live": "Panes", "restore_panes": "Panes", "freeze_pane": "Panes",
+    "copy_response": "Panes", "context_refresh": "Panes", "checkpoint": "Panes",
+    "manage_worksets": "Panes", "kill_agent": "Panes", "send_prefix": "Panes",
     "toggle_fav": "Session", "toggle_hide": "Session", "rename": "Session",
-    "copy_prompt": "Session", "copy_summary": "Session",
-    "preview_changes": "Session", "refresh": "Session",
-    "sort": "View", "order": "View", "cycle_group": "View",
-    "toggle_tree": "View", "toggle_list": "View", "notifications": "View",
-    "settings": "View", "toggle_search_bar": "View",
-    "new_session": "Panes", "restore_panes": "Panes", "freeze_pane": "Panes",
-    "next_attention": "Panes", "close_live": "Panes", "prev_tab": "Panes",
-    "next_tab": "Panes", "toggle_mark": "Panes", "checkpoint": "Panes",
-    "manage_worksets": "Panes",
+    "preview_changes": "Session", "copy_prompt": "Session",
+    "copy_summary": "Session", "open_parent": "Session", "refresh": "Session",
+    "toggle_mark": "Session",
+    "sort": "View", "order": "View", "cycle_group": "View", "toggle_tree": "View",
+    "toggle_search_bar": "View", "notifications": "View", "mirror_info": "View",
+    "settings": "View", "help": "View", "dump_pane": "View",
 }
+# action -> reading order inside a family (the menu panel follows it)
+_LEADER_ACTION_ORDER = {a: i for i, a in enumerate(LEADER_FAMILY_OF)}
 
 
 def _leader_groups(actions: dict) -> list:
@@ -472,10 +542,90 @@ def _leader_groups(actions: dict) -> list:
     LEADER_FAMILY_ORDER, families with no letters omitted, letters within a
     family sorted. Pure — unit-tested."""
     fams: dict = {f: [] for f in LEADER_FAMILY_ORDER}
-    for letter, act in sorted((actions or {}).items()):
+    digits = sorted(k for k, a in (actions or {}).items()
+                    if k.isdigit() and a == f"goto_tab:{k}")
+    # x next to X: case-folded order, lowercase first, so each pair reads together
+    for letter, act in sorted((actions or {}).items(),
+                              key=lambda kv: (kv[0].lower(), kv[0].isupper())):
+        if letter in digits:
+            continue                      # shown once, as "1-9 tab N"
         fam = LEADER_FAMILY_OF.get(act, LEADER_FAMILY_ORDER[-1])
         fams[fam].append((letter, _leader_label(act)))
+    if digits:
+        rng = digits[0] if len(digits) == 1 else f"{digits[0]}-{digits[-1]}"
+        fams["Move"].append((rng, "tab N"))
     return [(f, fams[f]) for f in LEADER_FAMILY_ORDER if fams[f]]
+
+
+_KEY_GLYPHS = {"right_square_bracket": "]", "left_square_bracket": "[",
+               "backslash": "\\", "circumflex_accent": "^", "underscore": "_",
+               "space": "␣", "greater_than_sign": ">", "less_than_sign": "<",
+               "question_mark": "?", "slash": "/", "exclamation_mark": "!"}
+
+
+def _fmt_key(key: str) -> str:
+    """Human form of a Textual key name: 'f1' → 'F1',
+    'ctrl+right_square_bracket' → 'Ctrl+]'. Display only."""
+    parts = [p for p in str(key or "").split("+") if p]
+    out = []
+    for p in parts:
+        if p in _KEY_GLYPHS:
+            out.append(_KEY_GLYPHS[p])
+        elif len(p) > 1 and p[0] == "f" and p[1:].isdigit():
+            out.append(p.upper())
+        elif len(p) > 1:
+            out.append(p.capitalize())
+        else:
+            out.append(p)
+    return "+".join(out)
+
+
+# Family headers of the menu panel. Only emoji with Emoji_Presentation=Yes
+# (always two cells, no VS16 needed) — a width the host terminal and Textual
+# disagree on would shift the whole row.
+LEADER_FAMILY_ICON = {"Move": "🧭", "Panes": "📑", "Session": "💬", "View": "👀"}
+
+
+def _leader_hint_lines(actions: dict, width: int, icons: bool = True) -> list:
+    """The menu panel as aligned rows: one block per family (icon + name in a
+    fixed left column), entries on a shared grid so every key and label lines up
+    across families. Within a family, entries follow LEADER_FAMILY_OF's reading
+    order, so the pairs sit together (n N, x X, c C, y Y). UPPERCASE keys — the
+    stronger, confirmed siblings — are coloured apart. Pure; unit-tested."""
+    from rich.cells import cell_len
+    groups = []
+    for fam, pairs in _leader_groups(actions):
+        def _order(kl):
+            act = (actions or {}).get(kl[0]) or ("goto_tab:1" if "-" in kl[0] else "")
+            return _LEADER_ACTION_ORDER.get(act, 999)
+        pairs = sorted(pairs, key=_order)
+        groups.append((fam, pairs))
+    if not groups:
+        return []
+    key_w = max(cell_len("␣" if k == " " else k) for _f, ps in groups for k, _l in ps)
+    lbl_w = min(13, max(cell_len(l) for _f, ps in groups for _k, l in ps))
+    cell_w = key_w + 1 + lbl_w + 2
+    head_w = 11                                   # "🧭 Move    "
+    cols = max(1, (max(width, 40) - 2 - head_w) // cell_w)
+    lines = ["[bold cyan]Command menu[/bold cyan]  [dim]press a key · Esc cancels · "
+             "[/dim][bold #f7768e]UPPER[/bold #f7768e][dim] = stronger, confirmed[/dim]"]
+    for fam, pairs in groups:
+        for r in range(0, len(pairs), cols):
+            if r == 0:
+                icon = LEADER_FAMILY_ICON.get(fam, "  ") if icons else "  "
+                head = f"{icon} [bold cyan]{fam:<{head_w - 3}}[/bold cyan]"
+            else:
+                head = " " * head_w
+            cells = []
+            for k, lbl in pairs[r:r + cols]:
+                shown = "␣" if k == " " else k
+                pad = " " * (key_w - cell_len(shown))
+                style = "bold #f7768e" if shown.isalpha() and shown.isupper() else "bold yellow"
+                lbl = lbl if cell_len(lbl) <= lbl_w else lbl[:lbl_w - 1] + "…"
+                cells.append(f"{pad}[{style}]{shown.replace('[', chr(92) + '[')}[/{style}] "
+                             f"{lbl}{' ' * (lbl_w - cell_len(lbl) + 2)}")
+            lines.append(head + "".join(cells).rstrip())
+    return lines
 
 
 def _leader_hint_item(key: str, label: str) -> str:
@@ -502,7 +652,7 @@ def _resolve_leader(keys_cfg, id_to_action):
     for act_id, key in kc.items():
         if act_id in ("leader", "leader_defaults", "release"):
             continue
-        k = str(key or "").lower()
+        k = str(key or "")          # case-sensitive (x / X)
         if k != " ":
             k = k.strip()
         if len(k) != 1:
@@ -516,14 +666,23 @@ def _resolve_leader(keys_cfg, id_to_action):
 def _leader_label(action: str) -> str:
     """Short human label for a leader hint / help row, derived from the action
     name (toggle_fav → fav, preview_changes → diff, next_attention → next!)."""
-    special = {"toggle_fav": "fav", "preview_changes": "diff",
-               "copy_prompt": "copy", "copy_summary": "copy text",
-               "next_attention": "next!",
-               "new_session": "new", "restore_panes": "restore",
+    special = {"toggle_fav": "favorite", "toggle_hide": "hide",
+               "preview_changes": "diff",
+               "copy_prompt": "copy prompt", "copy_summary": "copy summary",
+               "next_attention": "needs you!",
+               "new_session": "new", "new_session_alt": "new ⇄ agent",
+               "restore_panes": "restore",
                "freeze_pane": "freeze", "close_live": "close",
-               "prev_tab": "tab◀", "next_tab": "tab▶",
-               "toggle_list": "list", "toggle_mark": "mark",
-               "toggle_search_bar": "bar"}
+               "close_all_live": "close all", "copy_response": "copy mode",
+               "context_refresh": "/compact", "send_prefix": "send Ctrl+]",
+               "kill_agent": "kill agent", "open_parent": "parent",
+               "manage_worksets": "worksets", "mirror_info": "mirror QR",
+               "dump_pane": "dump pane", "focus_swap": "list⇄pane",
+               "shrink_list": "list −", "grow_list": "list +",
+               "prev_tab": "prev tab", "next_tab": "next tab",
+               "toggle_list": "zoom", "toggle_mark": "mark",
+               "notifications": "notifications", "toggle_search_bar": "search bar",
+               "cycle_group": "group", "toggle_tree": "tree"}
     if action in special:
         return special[action]
     for pre in ("toggle_", "cycle_"):
@@ -558,6 +717,7 @@ _CONFIG_SPECS = [
     ("summary", "model", "SAIKAI_SUMMARIZE_MODEL", "haiku"),
     ("display", "auto_refresh", "SAIKAI_AUTO_REFRESH", 0),
     ("display", "split_live", "SAIKAI_SPLIT_LIVE", True),
+    ("display", "menu_icons", "SAIKAI_MENU_ICONS", True),
     ("display", "color_by", "SAIKAI_COLOR_BY", "project"),
     ("display", "split_ratio", "SAIKAI_SPLIT_RATIO", 0.34),
     ("launch", "auto_permission", "SAIKAI_AUTO_PERMISSION", False),
@@ -622,8 +782,18 @@ def _summary_model() -> str:
 
 
 def _release_focus_key() -> str:
-    """Configured human-form key that releases a focused live pane."""
+    """Configured human-form PREFIX key ([keys] release, historical name): opens
+    the command menu from anywhere, a live pane included; twice = list ⇄ pane."""
     return _cfg("keys", "release", "SAIKAI_RELEASE_KEY", "ctrl+]", str)
+
+
+def _prefix_key() -> str:
+    """The PREFIX as a Textual key name ('ctrl+right_square_bracket')."""
+    try:
+        import saikai_terminal as _st      # already imported when split-live is on
+        return _st.RELEASE_FOCUS_KEY or "ctrl+right_square_bracket"
+    except Exception:
+        return "ctrl+right_square_bracket"
 
 
 def _at_live_capacity(live_count: int, pending: int, max_live: int) -> bool:
@@ -6014,14 +6184,23 @@ class _MirrorControl:
         if not isinstance(key, str) or key == "":
             return                             # never post a garbage Key
         if key == "checkpoint":
-            # The mirror's More row exposes checkpoint directly: in the TUI it is
-            # a LEADER gesture (␣ c), so there is no single key to synthesize —
-            # dispatch the action itself. All of b2's own gates (already-running,
-            # no live target, mid-turn) still apply inside. (#mirror-checkpoint)
-            try:
-                self.action_checkpoint()
-            except Exception:
-                pass
+            key = "action:checkpoint"          # the pre-v2 spelling
+        if key.startswith("action:"):
+            # The mirror's buttons name the ACTION, not a key: the keymap can
+            # change without breaking the phone, and menu-only actions (no single
+            # key to synthesize) are reachable. Allow-listed: the command menu's
+            # own actions, never toggle_mirror_control (enabling control stays
+            # local-only). Each action's own gates still apply. (#mirror-actions)
+            name = key[len("action:"):]
+            if name not in _MIRROR_ACTIONS:
+                return
+            act, _, arg = name.partition(":")
+            fn = getattr(self, "action_" + act, None)
+            if callable(fn):
+                try:
+                    fn(arg) if arg else fn()
+                except Exception:
+                    pass
             return
         from textual import events
         character = key if len(key) == 1 else None
@@ -6099,6 +6278,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         from textual.app import App, ComposeResult
         from textual.actions import SkipAction
         from textual.binding import Binding
+        from textual.message import Message
         from textual.containers import Horizontal, Vertical, VerticalScroll
         from textual.screen import ModalScreen
         from textual.widgets import (DataTable, Footer, Input, OptionList, RichLog,
@@ -6409,41 +6589,24 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             body = (
                 "[bold]Learn THREE things — the rest is on screen:[/bold]  "
                 "keys you already know ([yellow]↑↓ ⏎ / Esc ?[/yellow])  ·  "
-                "[yellow]␣[/yellow] = the menu (pause to see it)  ·  "
-                "[yellow]Ctrl-][/yellow] = pane → list\n\n"
-                "[bold cyan]Navigation[/bold cyan]\n"
-                "  [yellow]↑[/yellow] [yellow]↓[/yellow]         Move rows\n"
-                "  [yellow]Enter[/yellow]       Resume session\n"
+                "[yellow]{LEADER}[/yellow] in the list / [yellow]{PREFIX}[/yellow] anywhere = the menu  ·  "
+                "[yellow]{SWAP}[/yellow] = list ⇄ pane\n\n"
+                "[bold cyan]The menu[/bold cyan]  [dim](every action is a letter in it — pause to see the map)[/dim]\n"
+                "  [yellow]{LEADER:<11}[/yellow] in the list\n"
+                "  [yellow]{PREFIX:<11}[/yellow] from anywhere, a live pane too · twice = list ⇄ pane\n"
+                "  [yellow]{MENU:<11}[/yellow] from anywhere, map shown at once (for terminals where Ctrl is awkward)\n"
+                "  lowercase = everyday · UPPERCASE = the stronger sibling, confirmed (x/X close/close all,\n"
+                "  n/N new/new with the other agent, c/C /compact/checkpoint) · [yellow]< > [ ][/yellow] repeat\n"
+                "  From a pane, session letters (f h e d y Y P) act on THAT pane's session.\n\n"
+                "{ACTIONS}"
+                "[bold cyan]List[/bold cyan]\n"
+                "  [yellow]↑[/yellow] [yellow]↓[/yellow]         Move rows   ·   [yellow]Enter[/yellow] resume / open in a pane\n"
                 "  [yellow]/[/yellow]           Jump to search (or just start typing) · [yellow]␣/[/yellow] hides/shows the bar\n"
-                "  [yellow]Esc[/yellow]         Leave the current context: search/dropdown → list · list → quit (Esc twice)\n"
+                "  [yellow]␣␣[/yellow]          Mark rows (▣) — then ␣f / ␣h / Enter act on ALL marked\n"
+                "  [yellow]Tab[/yellow]         Preview: full ↔ summary\n"
+                "  [yellow]Esc[/yellow]         search/dropdown → list · list → quit (Esc twice) + snapshot panes (␣u reopens)\n"
+                "  [yellow]Ctrl-C[/yellow]      interrupt the agent in a focused pane; from saikai controls, quit-all (twice)\n"
                 "  [yellow]?[/yellow]           Help (this screen)\n\n"
-                "[bold cyan]Session ops[/bold cyan]  [dim](␣x = Space then x; F-keys are the aliases)[/dim]\n"
-                "  [yellow]␣f[/yellow] [dim]F6[/dim]     Toggle ★ favorite   ([dim]:fav[/dim] in search to filter)\n"
-                "  [yellow]␣h[/yellow] [dim]F7[/dim]     Toggle hide/unhide  ([dim]:hidden[/dim] in search to find them)\n"
-                "  [yellow]␣␣[/yellow]        Mark rows (▣) — then ␣f / ␣h / Enter act on ALL marked\n"
-                "  [yellow]␣e[/yellow] [dim]⇧F2[/dim]    Rename — type your own name (empty clears → auto-title)\n"
-                "  [yellow]␣y[/yellow] [dim]F9[/dim]     Copy this session's opening prompt\n"
-                "  [yellow]␣d[/yellow] [dim]F8[/dim]     Show what this session changed (transcript diff)\n"
-                "  [yellow]␣r[/yellow] [dim]F5[/dim]     Refresh list  (auto: SAIKAI_AUTO_REFRESH=secs)\n\n"
-                "[bold cyan]View[/bold cyan]\n"
-                "  [yellow]␣g[/yellow] [dim]⇧F7[/dim]    Cycle grouping: Date / Project / State / none\n"
-                "  [yellow]␣s[/yellow] / [yellow]␣o[/yellow]    Cycle the sort column / flip its direction\n"
-                "  [yellow]␣t[/yellow] [dim]⇧F5[/dim]    Tree (parent/child) mode\n"
-                "  [yellow]␣,[/yellow]         Settings — list options + the resolved config\n"
-                "  [yellow]Tab[/yellow]        Preview: full ↔ summary\n\n"
-                "[bold cyan]Split-live (default · SAIKAI_SPLIT_LIVE=0 to disable)[/bold cyan]\n"
-                "  [yellow]Enter[/yellow]      Open / focus the live claude pane\n"
-                "  [yellow]␣n[/yellow] [dim]⇧F8[/dim]    New claude session in a folder / git worktree\n"
-                "  [yellow]␣p[/yellow] [dim]⇧F4[/dim]    Reopen the panes from your last session (resume) — anytime\n"
-                "  [yellow]␣\\[ ␣][/yellow] [dim]F2/F3[/dim] Prev / next live tab   ·   [yellow]␣a[/yellow] [dim]⇧F1[/dim]  Next pane needing attention (?/!)\n"
-                "  [yellow]␣l[/yellow] [dim]F4[/dim]     Hide / show the session list\n"
-                "  [yellow]Alt-←/→[/yellow]    Resize the list/pane split — or drag the divider (persists)\n"
-                "  [yellow]Ctrl-][/yellow]     Return focus: pane → list  (SAIKAI_RELEASE_KEY to change)\n"
-                "  [yellow]␣x[/yellow] [dim]F10[/dim]    Close the active tab   ·   [dim]⇧F10[/dim]  Close ALL tabs\n"
-                "  [yellow]Esc[/yellow]        from the list: quit (press twice) + snapshot panes (␣p reopens)\n"
-                "  [yellow]Ctrl-C[/yellow]     interrupt claude in a focused pane; from saikai controls, quit-all (press twice)\n"
-                "  [yellow]␣z[/yellow] [dim]⇧F9[/dim]    Freeze the pane in place (copy mode): Shift+drag selects while\n"
-                "             claude streams · scroll up also freezes · ␣z / typing resumes\n\n"
                 "[bold cyan]Filter / Group / Sort (top-right dropdowns, Desktop-style)[/bold cyan]\n"
                 "  Group by  Date / Project / State / None   (␣g cycles)\n"
                 "  Sort by   Recency / Created time / Alphabetically\n"
@@ -6460,6 +6623,35 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 "  (a column-header click still sorts too)\n\n"
                 f"[bold cyan]Colours[/bold cyan]  {_color_legend(_cby)} "
                 "([dim]display.color_by = project/worktree/topic/none[/dim])\n\n")
+            # The action table is generated from the keymap IN FORCE (defaults +
+            # [keys] remaps) so the help can never name a key that isn't bound.
+            try:
+                _app = self.app
+                _lk = getattr(_app, "_leader_key", "")
+                for _ph, _val in (("LEADER", _fmt_key(_lk) if _lk else "—"),
+                                  ("PREFIX", _fmt_key(_prefix_key())),
+                                  ("SWAP", _app._keys_for("focus_swap").split(" / ")[0]),
+                                  ("MENU", _app._keys_for("menu").split(" / ")[0])):
+                    _v = _esc_markup(_val)
+                    body = body.replace("{%s:<11}" % _ph, f"{_v:<11}").replace(
+                        "{%s}" % _ph, _v)
+            except Exception:
+                pass
+            try:
+                _rows = []
+                for _id, _desc in _HELP_ACTIONS:
+                    # pad BEFORE escaping: a bare "[" key (␣[) must not open a tag
+                    _k = f"{self.app._keys_for(_id):<15}".replace("[", "\\[")
+                    _rows.append(f"  [yellow]{_k}[/yellow] {_desc}")
+                body = body.replace("{ACTIONS}", (
+                    "[bold cyan]Actions[/bold cyan]  [dim](direct key / menu letter — "
+                    f"␣ in the list, {_esc_markup(_fmt_key(_prefix_key()))} or "
+                    f"{_esc_markup(self.app._keys_for('menu').split(' / ')[0])} anywhere)[/dim]\n"
+                    + "\n".join(_rows) +
+                    "\n  [dim]No Shift/Ctrl+F-keys by default: PuTTY / Termius / zellij don't "
+                    "deliver them. F11 is left to your terminal.[/dim]\n\n"))
+            except Exception:
+                body = body.replace("{ACTIONS}", "")
             # Reflect live remaps + leader so the help can't drift from [keys] config.
             try:
                 app = self.app
@@ -6469,8 +6661,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         f"{a}→[yellow]{k}[/yellow]" for a, k in list(_rm.items())[:12]) + "\n")
                 if getattr(app, "_leader_key", ""):
                     _lk = "Space" if app._leader_key == "space" else app._leader_key
-                    body += (f"[bold cyan]Menu key[/bold cyan]  [yellow]{_esc_markup(_lk)}[/yellow] "
-                             "in the list, then one letter (pause to see this map in place):\n")
+                    body += (f"[bold cyan]Menu letters[/bold cyan]  [yellow]{_esc_markup(_lk)}[/yellow] "
+                             "in the list / Ctrl-] / F9, then one letter:\n")
                     _groups = _leader_groups(getattr(app, "_leader_actions", {}))
                     for _fam, _pairs in _groups:
                         _seq = "  ".join(_leader_hint_item(k, lbl)
@@ -6610,15 +6802,82 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             except Exception as e:
                 self.notify(f"could not open an editor: {e!r}", severity="error")
 
+    class AgentPicker(Static):
+        """The New-session agent choice as one focusable row: [✻ claude] ⌬ codex.
+        Click / tap an agent, or focus it (↑ from the path) and use ←/→/Space.
+        Plain keys and the mouse work everywhere — PuTTY and Termius don't send
+        Shift+F-keys, so a modifier chord can't be the only way."""
+        can_focus = True
+        BINDINGS = [Binding("left", "pick(-1)", show=False),
+                    Binding("right", "pick(1)", show=False),
+                    Binding("space", "pick(1)", show=False),
+                    Binding("down", "leave", show=False)]
+
+        def __init__(self, agents, agent, cycle_label="", **kw):
+            super().__init__("", **kw)
+            self._cycle_label = cycle_label
+            self._agents = tuple(agents)
+            self.agent = agent
+            self._spans: list = []           # (x0, x1, agent) for clicks
+
+        def on_mount(self) -> None:
+            self._paint()
+
+        def _paint(self) -> None:
+            parts, x = [], 0
+            self._spans = []
+            for a in self._agents:
+                label = f" {_PROVIDER_GLYPH.get(a, '')} {a} "
+                cell = (f"[reverse bold]{label}[/reverse bold]" if a == self.agent
+                        else f"[dim]{label}[/dim]")
+                parts.append(cell)
+                self._spans.append((x, x + len(label), a))
+                x += len(label) + 1
+            how = " / ".join(x for x in (self._cycle_label, "←→", "click") if x)
+            self.update("Agent  " + " ".join(parts)
+                        + f"   [dim]{_esc_markup(how)} to switch[/dim]")
+
+        def set_agent(self, agent: str) -> None:
+            if agent in self._agents and agent != self.agent:
+                self.agent = agent
+                self._paint()
+                self.post_message(self.Changed(self))
+
+        def action_pick(self, step: int) -> None:
+            i = self._agents.index(self.agent)
+            self.set_agent(self._agents[(i + int(step)) % len(self._agents)])
+
+        def action_leave(self) -> None:
+            try:
+                self.screen.query_one("#new-path", Input).focus()
+            except Exception:
+                pass
+
+        def on_click(self, event) -> None:
+            x = getattr(event, "x", 0) - len("Agent  ")
+            for x0, x1, a in self._spans:
+                if x0 <= x < x1:
+                    self.set_agent(a)
+                    return
+            self.action_pick(1)
+
+        class Changed(Message):
+            def __init__(self, picker) -> None:
+                super().__init__()
+                self.picker = picker
+
     class NewSessionScreen(ModalScreen):
-        """Pick a folder / git worktree, then start a FRESH claude session there.
+        """Pick a folder / git worktree, then start a FRESH agent session there.
         Type a path (Tab completes child folders shell-style, ↓ picks from the
-        list), or select a recent dir; Enter launches, Esc cancels. Returns the
-        chosen path (or None) via dismiss()."""
+        list), or select a recent dir; Enter launches, Esc cancels. With codex
+        available the Agent row picks claude or codex. Returns (path, agent) (or
+        None) via dismiss()."""
         CSS = """
         NewSessionScreen { align: center middle; }
         #new-box { background: $panel; border: solid $accent; padding: 1 2;
-                   width: 84; height: auto; max-height: 28; }
+                   width: 84; height: auto; max-height: 30; }
+        #new-agent { height: 1; margin-top: 1; }
+        #new-agent:focus { background: $boost; }
         #new-path { margin: 1 0; border: tall $accent; }
         #new-hint { height: 1; }
         #new-dirs { height: auto; max-height: 16; }
@@ -6628,16 +6887,19 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     # default focus-next so typing a folder feels like a shell.
                     Binding("tab", "complete", show=False, priority=True),
                     Binding("down", "focus_list", show=False),
-                    # Shift+F8 again (the key that opened this) switches which
-                    # agent to start. Not a Ctrl+letter — those belong to readline
-                    # — and the App's own Shift+F8 is modal-blocked, so the key
-                    # falls through to here. Only offered when codex is usable.
-                    Binding("shift+f8", "cycle_agent", show=False)]
+                    Binding("up", "focus_agent", show=False)]
+        # The key that opened this (the "new" binding, F5 by default or its
+        # [keys] remap) switches the agent: bound in __init__ from cycle_key. The
+        # App's own binding for it is modal-blocked, so the key falls through.
 
-        def __init__(self, base_dir, candidates, agents=("claude",)):
+        def __init__(self, base_dir, candidates, agents=("claude",), agent=None,
+                     cycle_key=None):
             super().__init__()
             self._agents = tuple(agents) or ("claude",)
-            self._agent = self._agents[0]
+            self._agent = agent if agent in self._agents else self._agents[0]
+            self._cycle_key = cycle_key or ""
+            if self._cycle_key:
+                self._bindings.bind(self._cycle_key, "cycle_agent", show=False)
             self._base_dir = base_dir
             self._candidates = candidates           # list[(label, path)] recent dirs
             self._scan_cache: dict = {}             # parent → child names (per-keystroke reuse)
@@ -6645,17 +6907,28 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
         def _title_markup(self) -> str:
             glyph = _PROVIDER_GLYPH.get(self._agent, "")
-            sw = ("  [dim]⇧F8: claude ⇄ codex[/dim]"
-                  if len(self._agents) > 1 else "")
             return (f"[bold cyan]New {glyph} {self._agent} session[/bold cyan]   "
                     "[dim]type a folder · Tab completes · ↓ picks · "
-                    "Enter launches · Esc cancels[/dim]" + sw)
+                    "Enter launches · Esc cancels[/dim]")
 
         def action_cycle_agent(self) -> None:
             if len(self._agents) < 2:
                 return
-            i = self._agents.index(self._agent)
-            self._agent = self._agents[(i + 1) % len(self._agents)]
+            try:
+                self.query_one("#new-agent", AgentPicker).action_pick(1)
+            except Exception:
+                pass
+
+        def action_focus_agent(self) -> None:
+            if len(self._agents) < 2:
+                return
+            try:
+                self.query_one("#new-agent", AgentPicker).focus()
+            except Exception:
+                pass
+
+        def on_agent_picker_changed(self, event) -> None:
+            self._agent = event.picker.agent
             try:
                 self.query_one("#new-title", Static).update(self._title_markup())
             except Exception:
@@ -6664,6 +6937,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def compose(self) -> ComposeResult:
             with Vertical(id="new-box"):
                 yield Static(self._title_markup(), id="new-title")
+                if len(self._agents) > 1:
+                    yield AgentPicker(self._agents, self._agent, id="new-agent",
+                                      cycle_label=_fmt_key(self._cycle_key))
                 yield Input(value=self._base_dir, placeholder="folder path",
                             id="new-path")
                 yield Static("", id="new-hint")
@@ -7136,7 +7412,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         BINDINGS = [
             Binding("escape", "dismiss", show=False),
             Binding("f12", "dismiss", show=False),
+            # Interactive control lives HERE (it used to be Shift+F12): a local
+            # key on the local screen only — never a mirror button. (#mirror-control)
+            Binding("c", "toggle_control", show=False),
         ]
+
+        def action_toggle_control(self) -> None:
+            try:
+                self.app.action_toggle_mirror_control()
+            except Exception:
+                pass
+            self.dismiss()
 
         def __init__(self, url, matrix, copied=True, clients=0):
             super().__init__()
@@ -7154,8 +7440,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 yield Static(_render_qr(self._matrix), id="mirror-qr")
                 _tail = ("URL copied to clipboard" if self._copied
                          else "copy the URL above")
+                _ctl = ("ON" if getattr(self.app, "_control_enabled", False)
+                        else "off")
                 yield Static(f"or open: [cyan]{self._url}[/cyan]\n"
-                             f"[dim]{_tail} · Esc / F12 to close[/dim]")
+                             f"[dim]{_tail} · [b]c[/b] control ({_ctl}) · "
+                             f"Esc / F12 to close[/dim]")
 
     class PickerApp(App, _MirrorControl):
         TITLE = "saikai"
@@ -7189,92 +7478,38 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # "Space did nothing" can't happen there. A focused Input, Select,
             # or claude pane consumes space first, exactly as designed.
             Binding("space", "arm_leader", "Menu", key_display="␣"),
-            # Session/pane actions live on FUNCTION KEYS. Ordinary readline
-            # Ctrl+letters pass through; release and app-level quit handling are
-            # deliberate exceptions.
-            # Ctrl+W/K/R/D/Y/P/G/T/O/L/X are all readline editing keys the user
-            # types constantly — and claude itself binds Ctrl+R (history search),
-            # Ctrl+T (todos), Ctrl+L (clear). Stealing them broke editing in the
-            # search box and inside live panes, and Ctrl+K once nuked every pane.
-            # Claude Code binds NO F-keys (verified), so F5-F10 / Shift+F5-7 are
-            # safe to capture (priority) even while a claude pane is focused; the
-            # ordinary Ctrl+letters now pass straight through to Input / claude.
-            # id= makes each remappable via [keys] in config (App.set_keymap in
-            # on_mount). The id is the user-facing name typed in [keys]. quit /
-            # quit_all / resume / preview have NO id (core nav, not remappable).
-            # show=False on the F-keys: the footer stays at the four core keys
-            # (⏎ Tab ? Esc — low learning load); the full set lives in ? help,
-            # the leader hint, and the statusbar's "␣ leader · ? keys" crumb.
-            Binding("f5", "refresh", "Refresh", id="refresh", show=False, priority=True),
-            Binding("f6", "toggle_fav", "★", id="favorite", show=False, priority=True),
-            Binding("f7", "toggle_hide", "Hide", id="hide", show=False, priority=True),
-            Binding("f8", "preview_changes", "Changes", id="diff", show=False, priority=True),
-            Binding("f9", "copy_prompt", "Copy", id="copy", show=False, priority=True),
-            # F1: vi-style copy mode over the transcript — select & yank any of
-            # claude's output with the keyboard, including replies that scrolled
-            # off the alt-screen pane (can't be selected there, but the JSONL has
-            # the full text). priority so it fires inside a focused claude pane
-            # (Space-leader is eaten by claude there). (#copy-mode)
-            Binding("f1", "copy_response", "Copy mode", id="copy_response", show=False, priority=True),
-            Binding("shift+f5", "toggle_tree", "Tree", id="tree", show=False, priority=True),
-            Binding("shift+f7", "cycle_group", "Group", id="group", show=False, priority=True),
-            Binding("shift+f8", "new_session", "New", id="new", show=False, priority=True),
-            Binding("shift+f9", "freeze_pane", "Freeze", id="freeze", show=False, priority=True),
-            Binding("shift+f4", "restore_panes", "Restore", id="restore", show=False, priority=True),
-            Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
-            Binding("question_mark", "help", "Help", id="help", priority=True),
-            # Split-live tab management (opt-in). F10 closes the ACTIVE tab;
-            # Shift+F10 closes ALL — two keys apart so a single stray press can't
-            # wipe every pane (that was the accidental "全件終了"). Esc from the
-            # list snapshots + quits; Ctrl+] returns focus pane → list.
-            Binding("f10", "close_live", "Close tab", id="close", show=False, priority=True),
-            Binding("f11", "notifications", "Notifs", id="notifs", show=False, priority=True),
-            Binding("shift+f10", "close_all_live", "Close all", id="close_all", show=False, priority=True),
-            # Shift+K: terminate the focused row's AGENT/bg process (kind=agent/bg —
-            # the & marker). NOT a Ctrl+letter (those are readline keys); confirmed,
-            # identity-verified; never touches an interactive claude. (#agent-kill)
-            Binding("K", "kill_agent", "Kill agent", id="kill_agent", show=False, priority=True),
+            # Keymap v2. Every session/pane action lives in the command menu
+            # (DEFAULT_LEADER_LETTERS — Space in the list, Ctrl+] from anywhere,
+            # F9). The bindings below are only the UNMODIFIED F-key accelerators
+            # for the most frequent ones. No Shift/Ctrl/Alt+F-key and no Alt+arrow
+            # by default: PuTTY (default mode) and Termius don't distinguish
+            # Shift+F, zellij drops F13-F24 and takes Alt+arrows, and a modified F3
+            # is eaten as a cursor-position report (#f3-cpr). F11 stays with the
+            # host terminal (full screen in WT / GNOME / macOS).
+            # Ctrl+letters stay with readline and the agents: Claude Code and
+            # Codex bind none of F1-F12 (verified), so these are safe as priority
+            # bindings even while a pane is focused.
+            # id= makes each remappable via [keys] (App.set_keymap in on_mount).
+            # show=False: the footer stays at the core keys; the full map lives in
+            # ? help and the which-key menu.
+            Binding("f1", "next_attention", "Next!", id="attention", show=False, priority=True),
             Binding("f2", "prev_tab", "◀Tab", id="prev_tab", show=False, priority=True),
             Binding("f3", "next_tab", "Tab▶", id="next_tab", show=False, priority=True),
-            # NOT Shift+F3: a POSIX terminal spells F3-with-any-modifier
-            # `CSI 1;<mod>R`, and that final R is the cursor-position report —
-            # Textual's parser eats the whole sequence as a DSR reply, so the
-            # binding never fired on Linux/macOS. It only ever worked on Windows
-            # (native key events) and on kitty-protocol terminals, which spell F3
-            # `CSI 13;<mod>~` precisely to dodge the same collision. Shift+F1 is
-            # the one shifted F-key left that survives every encoding; the id and
-            # the ␣a leader letter are unchanged, so [keys] configs still bind.
-            # tests/test_keyboard_leader.py round-trips the whole F-key set through
-            # the terminal encoding to keep the next one from going dark. (#f3-cpr)
-            Binding("shift+f1", "next_attention", "Next!", id="attention", show=False, priority=True),
-            Binding("f4", "toggle_list", "Hide list", id="toggle_list", show=False, priority=True),
-            Binding("shift+f2", "rename", "Rename", id="rename", show=False, priority=True),
-            # Keyboard divider — footer-hidden (documented in ? help); the
-            # actions SkipAction-forward when a pane / input is focused.
-            Binding("alt+left", "shrink_list", "List◀", id="shrink_list",
-                    show=False, priority=True),
-            Binding("alt+right", "grow_list", "▶List", id="grow_list",
-                    show=False, priority=True),
-            Binding("f12", "mirror_info", "Mirror QR", id="mirror_info", show=False),
-            # Ctrl+F12: dump the focused/active pane's visible pyte screen to
-            # ~/.cache/saikai/pane-dump.txt so a garbled render can be inspected
-            # off the live UI. priority so it fires inside a focused pane. (#pane-dump)
-            Binding("ctrl+f12", "dump_pane", "Dump pane", id="dump_pane", show=False, priority=True),
-            # Phase B: toggle web-mirror INTERACTIVE control. priority=True so it
-            # fires even while a live pane is focused (a leader letter would be
-            # swallowed by the focused pane — unreachable exactly when control is
-            # used). Default OFF; Shift+F12 because F12 is the QR. Local only —
-            # never a browser button.
-            Binding("shift+f12", "toggle_mirror_control", "Mirror control",
-                    id="mirror_control", show=False, priority=True),
-            # Phase C: jump to the session this one was forked/cleared from.
-            # priority=True so it fires even while a live pane is focused.
-            Binding("shift+f6", "open_parent", "Parent", id="open_parent",
-                    show=False, priority=True),
-            # Phase B1: inject /compact into the focused live pane (non-destructive).
-            # priority=True so it fires even while a live pane is focused.
-            Binding("shift+f11", "context_refresh", "Refresh ctx", id="ctx_refresh",
-                    show=False, priority=True),
+            Binding("f4", "focus_swap", "List⇄pane", id="focus_swap", show=False, priority=True),
+            Binding("f5", "new_session", "New", id="new", show=False, priority=True),
+            Binding("f6", "toggle_list", "Zoom", id="toggle_list", show=False, priority=True),
+            # vi-style copy mode over the transcript — select & yank any of the
+            # agent's output with the keyboard, including replies that scrolled
+            # off the alt-screen pane. (#copy-mode)
+            Binding("f7", "copy_response", "Copy mode", id="copy_response", show=False, priority=True),
+            Binding("f8", "preview_changes", "Changes", id="diff", show=False, priority=True),
+            Binding("f9", "arm_menu", "Menu", id="menu", show=False, priority=True),
+            # F10 closes the ACTIVE tab; close-all is the menu's X (confirmed) so a
+            # single stray press can't wipe every pane.
+            Binding("f10", "close_live", "Close tab", id="close", show=False, priority=True),
+            Binding("f12", "mirror_info", "Mirror QR", id="mirror_info", show=False, priority=True),
+            Binding("tab", "toggle_preview", "Preview", priority=True),  # priority overrides Textual's default focus-cycling
+            Binding("question_mark", "help", "Help", id="help", priority=True),
         ]
         # The practical limit on concurrent live claude panes is MEMORY — each
         # is a full node process tree that sits CPU-idle waiting for input — so
@@ -7306,7 +7541,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         /* margin-bottom lifts the panel clear of the 1-row Footer: two
            dock:bottom siblings don't stack — both pin to the screen edge and the
            hint would otherwise paint over the "tab Preview" footer row. */
-        #leaderhint { dock: bottom; height: auto; max-height: 12; margin-bottom: 1;
+        #leaderhint { dock: bottom; height: auto; max-height: 16; margin-bottom: 1;
                       background: $panel; color: $text; border-top: solid $accent;
                       padding: 0 1; display: none; }
         /* Transient toasts move to the TOP-RIGHT — Textual defaults to bottom-right,
@@ -7433,6 +7668,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             "grow_list", "notifications", "open_parent", "context_refresh",
             "checkpoint", "copy_response",
             "manage_worksets", "save_workset",
+            "focus_swap", "arm_menu", "mirror_info", "new_session_alt",
         })
 
         def check_action(self, action: str, parameters):
@@ -7617,6 +7853,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._leader_pending = False   # waiting for the post-leader key
             self._leader_gen = 0           # bumps each arm; a stale timer no-ops on mismatch
             self._suppress_arm = False     # eat the spurious arm_leader after a leader-key dispatch (#H10)
+            self._leader_src = None        # the live pane the menu was opened from (Ctrl+] / F9), else None
+            self._leader_repeat_only = False   # the short window after < > [ ]: only those continue
+            self._leader_repeat_keys = LEADER_REPEATABLE   # read by the pane's on_key
+            self._leader_dispatching = False   # a menu letter is running its action (not typed text)
             self._applied_keymap = {}      # direct rebinds applied (shown in ? help)
             try:
                 _kc = _load_config().get("keys", {})
@@ -7627,9 +7867,17 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _direct = {k: v for k, v in _kc.items()
                            if k not in ("leader", "leader_defaults", "release")
                            and len(str(v).strip()) != 1}
-                _applied, _errs = _validate_keymap(_direct, _ids)
+                _applied, _errs = _validate_keymap(
+                    _direct, _ids | set(LEADER_VIRTUAL_ACTIONS))
                 if _applied:
-                    self.set_keymap(_applied)
+                    self.set_keymap({k: v for k, v in _applied.items() if k in _ids})
+                    # a menu-only action given a direct key: add the binding
+                    for _id, _key in _applied.items():
+                        if _id in _ids:
+                            continue
+                        _name, _, _arg = LEADER_VIRTUAL_ACTIONS[_id].partition(":")
+                        self._bindings.bind(_key, f"{_name}({_arg})" if _arg else _name,
+                                            show=False, priority=True)
                     self._applied_keymap = _applied
                 self._leader_key, self._leader_actions, _lerr = (
                     _resolve_leader(_kc, _id2act))
@@ -7674,7 +7922,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.set_interval(1.5, self._poll_live_status)
                 if self._restore_candidates:
                     self.notify(f"{len(self._restore_candidates)} pane(s) from last "
-                                f"session — Shift+F4 to reopen", timeout=8)
+                                f"session — {self._keys_for('restore')} to reopen", timeout=8)
             # One-time hint: AI summaries are opt-in (claude -p spends credits).
             # Show once, only when there's no config file and summaries are off.
             try:
@@ -8519,7 +8767,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _rk_disp = "+".join(
                     p.capitalize() if len(p) > 1 else p
                     for p in _rk.split("+"))  # "ctrl+]" → "Ctrl+]"
-                _kb_parts.append(f"[bold]{_rk_disp}[/bold] [dim]list[/dim]")
+                _kb_parts.append(f"[bold]{_esc_markup(_rk_disp)}[/bold] [dim]menu · "
+                                 f"{_esc_markup(self._keys_for('focus_swap').split(' / ')[0])}"
+                                 f" list⇄pane[/dim]")
             if self._leader_key:
                 _kb_parts.append("[dim]␣ menu · ? keys[/dim]")
             else:
@@ -8559,6 +8809,9 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.query_one("#statusbar", Static).update(text, layout=False)
 
         def _cursor_sid(self) -> str | None:
+            ctx = getattr(self, "_leader_ctx_sid", None)
+            if ctx:
+                return ctx            # menu opened from a pane → that pane's session
             table = self.query_one("#table", DataTable)
             if table.row_count == 0:
                 return None
@@ -8579,6 +8832,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             — the gesture is uniform, not a per-action special case. Filtering the
             marks through `all_sessions` also drops a stale mark (a session that
             left the list) here rather than acting on it."""
+            if getattr(self, "_leader_ctx_sid", None):
+                return [self._leader_ctx_sid]    # menu from a pane: just that pane
             if self._marked:
                 return [s["id"] for s in all_sessions if s["id"] in self._marked]
             sid = self._cursor_sid()
@@ -8782,12 +9037,34 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # own keys, while the App binding may arm Space from other non-input,
             # non-dropdown saikai controls. Handled BEFORE search-as-you-type so
             # the post-leader letter doesn't fall through and open the search box.
-            if self._leader_key:
+            # The PREFIX (Ctrl+]) reaching the App: from the list / a saikai
+            # control it opens the menu; a second press while the menu is open
+            # swaps focus list ⇄ pane. (A focused pane turns its own Ctrl+] into
+            # FocusReleased → on_agent_terminal_focus_released, same rules.)
+            if (event.key == _prefix_key() and len(self.screen_stack) == 1
+                    and self._leader_actions):
+                event.stop()
+                event.prevent_default()
+                if self._leader_pending:
+                    self._cancel_leader()
+                    self.action_focus_swap()
+                else:
+                    self._arm_menu(src=None)
+                return
+            if self._leader_pending and self._leader_repeat_only and (
+                    (event.character or "") not in LEADER_REPEATABLE):
+                # tmux `bind -r`: a non-repeatable key ends the repeat window and
+                # is handled as an ordinary key (typed, searched, …).
+                self._cancel_leader()
+            if self._leader_key or self._leader_pending:
                 if self._leader_pending:
                     self._leader_pending = False
+                    self._leader_repeat_only = False
                     self._set_leader_hint(None)
                     event.stop()
-                    if event.key == self._leader_key:
+                    event.prevent_default()
+                    src, self._leader_src = self._leader_src, None
+                    if event.key == self._leader_key and src is None:
                         # event.stop() does NOT block the App's OWN non-priority
                         # space→arm_leader binding, which fires AFTER this dispatch
                         # with _leader_pending now False and re-arms — leaving the
@@ -8795,19 +9072,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         # hijacked. Eat that one spurious arm. (#H10)
                         self._suppress_arm = True
                     if event.key != "escape":
-                        _act = self._leader_actions.get((event.character or "").lower())
-                        _fn = getattr(self, "action_" + _act, None) if _act else None
-                        if callable(_fn):
-                            try:
-                                _fn()
-                            except Exception:
-                                pass
+                        ch = event.character or ""
+                        _act = self._leader_actions.get(ch)
+                        if _act is None and ch in LEADER_ALIASES:
+                            _act = self._leader_actions.get(
+                                DEFAULT_LEADER_LETTERS.get(LEADER_ALIASES[ch], ""))
+                        if _act:
+                            self._run_menu_action(_act, src)
+                            if ch in LEADER_REPEATABLE:
+                                self._rearm_repeat(src)
                     return
                 try:
                     _tbl = self.query_one("#table", DataTable)
                 except Exception:
                     _tbl = None
-                if event.key == self._leader_key and self.focused is _tbl:
+                if self._leader_key and event.key == self._leader_key and self.focused is _tbl:
                     self._leader_pending = True
                     self._leader_gen += 1
                     _g = self._leader_gen
@@ -8878,7 +9157,175 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if gen is not None and gen != self._leader_gen:
                 return
             self._leader_pending = False
+            self._leader_repeat_only = False
             self._set_leader_hint(None)
+
+        def _arm_menu(self, src=None, immediate=None) -> None:
+            """Open the command menu. `src` is the live pane it was opened from
+            (Ctrl+] / F9 in a pane): the next key is then a menu letter, never
+            input for that pane, and session actions target the pane's session.
+            From a pane the menu shows at once (the pane would otherwise look
+            unresponsive); from the list it waits for a hesitation, as before."""
+            if not self._leader_actions:
+                return
+            if src is None and self._focused_terminal() is None:
+                # an Input / Select would eat the letter before the App sees it
+                try:
+                    tbl = self.query_one("#table", DataTable)
+                    if self.focused is not tbl:
+                        tbl.focus()
+                except Exception:
+                    pass
+            self._leader_src = src
+            self._leader_pending = True
+            self._leader_gen += 1
+            _g = self._leader_gen
+            if immediate is None:
+                immediate = src is not None
+            if immediate:
+                self._show_leader_hint(_g)
+            else:
+                self.set_timer(0.6, lambda: self._show_leader_hint(_g))
+            self.set_timer(6.0, lambda: self._cancel_leader(_g))
+
+        def _direct_key(self, action_id: str) -> str:
+            """The Textual key bound directly to `action_id` now ([keys] remap,
+            else the default binding), or ""."""
+            return (getattr(self, "_applied_keymap", {}) or {}).get(action_id) or next(
+                (b.key for b in type(self).BINDINGS
+                 if getattr(b, "id", None) == action_id), "")
+
+        def _keys_for(self, action_id: str, pane: bool = False) -> str:
+            """How to reach `action_id` with the keymap actually in force — the
+            direct key ([keys] remap, else the default binding) and the menu
+            letter. Every on-screen key hint goes through here, so a [keys]
+            remap can't leave the help, statusbar or toasts naming the old key.
+            `pane`: phrase the menu path as it works from inside a pane."""
+            direct = self._direct_key(action_id)
+            want = LEADER_VIRTUAL_ACTIONS.get(action_id)
+            letter = next((k for k, a in (self._leader_actions or {}).items()
+                           if a == want), None) if want else None
+            out = []
+            if direct:
+                out.append(_fmt_key(direct))
+            if letter is not None:
+                shown = "␣" if letter == " " else letter
+                if pane or not self._leader_key:
+                    out.append(f"{_fmt_key(_prefix_key())} {shown}")
+                else:
+                    out.append(f"{_fmt_key(self._leader_key)}{shown}")
+            return " / ".join(out) or "(unbound)"
+
+        def action_arm_menu(self) -> None:
+            """F9: the command menu from anywhere, shown at once."""
+            self._arm_menu(src=self._focused_terminal(), immediate=True)
+
+        def _rearm_repeat(self, src) -> None:
+            """Keep the menu open briefly after a repeatable letter (< > [ ])."""
+            self._leader_src = src
+            self._leader_pending = True
+            self._leader_repeat_only = True
+            self._leader_gen += 1
+            _g = self._leader_gen
+            self.set_timer(LEADER_REPEAT_S, lambda: self._cancel_leader(_g))
+
+        def _run_menu_action(self, act: str, src=None) -> None:
+            """Run one menu action. `name:arg` passes one argument
+            (goto_tab:3). From a pane, the session actions see that pane's
+            session as the cursor row, and the "keys belong to the pane" guards
+            stand down — the letter was a menu choice, not typed text."""
+            name, _, arg = act.partition(":")
+            fn = getattr(self, "action_" + name, None)
+            if not callable(fn):
+                return
+            self._leader_dispatching = True
+            self._leader_ctx_sid = getattr(src, "sid", None) if src is not None else None
+            try:
+                fn(arg) if arg else fn()
+            except Exception:
+                pass
+            finally:
+                self._leader_dispatching = False
+                self._leader_ctx_sid = None
+
+        def _keys_go_to_pane(self) -> bool:
+            """True when a key press belongs to the focused live pane (typed
+            text) — never while a menu letter is running its action."""
+            return (not getattr(self, "_leader_dispatching", False)
+                    and self._focused_terminal() is not None)
+
+        def _active_pane(self):
+            """The live terminal on the active tab, or None (dead panes too)."""
+            if self._live is None:
+                return None
+            try:
+                active = self.query_one("#right", TabbedContent).active or ""
+                for s in self._live.statuses():
+                    if self._live.pane_id(s) == active:
+                        return self._live.get(s)
+            except Exception:
+                pass
+            return None
+
+        def action_focus_swap(self) -> None:
+            """F4 / Ctrl+] Ctrl+]: list ⇄ the active pane."""
+            if self._focused_terminal() is not None or (
+                    _LIVE_TERM is not None
+                    and isinstance(self.focused, _LIVE_TERM.AgentTerminal)):
+                self.query_one("#table", DataTable).focus()
+                return
+            term = self._active_pane()
+            if term is None and self._live is not None:
+                for s in self._live.statuses():
+                    t = self._live.get(s)
+                    if t is not None and not getattr(t, "is_dead", False):
+                        term = t
+                        break
+                if term is not None:
+                    try:
+                        self.query_one("#right", TabbedContent).active = \
+                            self._live.pane_id(term.sid)
+                    except Exception:
+                        pass
+            if term is not None and not getattr(term, "is_dead", False):
+                try:
+                    term.focus()
+                except Exception:
+                    pass
+            elif self._live is None or self._live.count == 0:
+                self.notify("no live pane — Enter opens one", timeout=3)
+
+        def action_goto_tab(self, n) -> None:
+            """Menu 1-9: the N-th live tab (the preview tab is not counted)."""
+            if _LIVE_TERM is None:
+                return
+            try:
+                i = int(n) - 1
+                tabs = self.query_one("#right", TabbedContent)
+                ids = [p.id for p in tabs.query(TabPane) if p.id != "tab-preview"]
+            except Exception:
+                return
+            if not 0 <= i < len(ids):
+                self.notify(f"no tab {n}", timeout=2)
+                return
+            cur = tabs.active
+            all_ids = [p.id for p in tabs.query(TabPane)]
+            if cur in all_ids:
+                self._cycle_tab(all_ids.index(ids[i]) - all_ids.index(cur))
+            else:
+                tabs.active = ids[i]
+
+        def action_send_prefix(self) -> None:
+            """Menu q: send the PREFIX byte itself (Ctrl+] = 0x1d) to the pane the
+            menu was opened from — for a program that wants it."""
+            term = self._live.get(self._leader_ctx_sid) if (
+                self._live is not None and self._leader_ctx_sid) else self._focused_terminal()
+            if term is None:
+                return
+            try:
+                term._write_child("\x1d")
+            except Exception:
+                pass
 
         def action_arm_leader(self) -> None:
             """The footer's ␣ Menu binding: arm the leader from any non-typing
@@ -8928,12 +9375,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if not self._leader_pending or not self._leader_actions:
                 self._set_leader_hint(None)
                 return
-            lines = ["[bold cyan]Command menu[/bold cyan]  "
-                     "[dim]press one key · Esc cancels[/dim]"]
-            for fam, pairs in _leader_groups(self._leader_actions):
-                seq = "  ".join(_leader_hint_item(k, lbl) for k, lbl in pairs)
-                lines.append(f"[bold cyan]{fam:<7}[/bold cyan] {seq}")
-            self._set_leader_hint(lines)
+            try:
+                width = self.size.width - 2           # panel padding
+            except Exception:
+                width = 100
+            icons = _cfg("display", "menu_icons", "SAIKAI_MENU_ICONS", True, _cfg_bool)
+            self._set_leader_hint(_leader_hint_lines(self._leader_actions, width, icons))
 
         def _over_tab_bar(self, event) -> bool:
             """True when the mouse is over the split-live tab bar. Textual's Tabs
@@ -9930,7 +10377,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._save_workset_entries(entries, skipped)
 
         def action_manage_worksets(self) -> None:
-            if self._focused_terminal() is not None or isinstance(self.focused, (Input, Select)):
+            if self._keys_go_to_pane() or isinstance(self.focused, (Input, Select)):
                 raise SkipAction()
             def loaded(state):
                 self._workset_manage_state = state
@@ -10159,9 +10606,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             else:
                 self.notify("nothing to restore", timeout=3)
 
-        def action_new_session(self) -> None:
-            """Shift+F8: pick a folder / git worktree and start a FRESH claude
-            session there as a live pane (split-live only)."""
+        def action_new_session_alt(self) -> None:
+            """Menu N: New session with the OTHER agent preselected."""
+            self.action_new_session(alt=True)
+
+        def action_new_session(self, alt: bool = False) -> None:
+            """F5 / menu n: pick a folder / git worktree and start a FRESH agent
+            session there as a live pane (split-live only). The agent defaults to
+            the one used last; `alt` preselects the other one."""
             if _LIVE_TERM is None or self._live is None:
                 self.notify(f"new session needs split-live — disabled: {_LIVE_TERM_REASON}",
                             severity="warning", timeout=6)
@@ -10173,6 +10625,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     return
                 path, agent = choice if isinstance(choice, tuple) else (choice, "claude")
                 if path:
+                    if agent != (_load_options().get("new_agent") or "claude"):
+                        _save_options({"new_agent": agent})
                     self._open_new_live(path, agent=agent)
 
             # The candidate walk runs OFF the UI thread: it shells out to
@@ -10192,7 +10646,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # Codex is offered only when it would actually start. (#codex-provider)
                 agents = (("claude", "codex")
                           if _codex_enabled() and shutil.which("codex") else ("claude",))
-                self.push_screen(NewSessionScreen(base, cands, agents), _go)
+                last = _load_options().get("new_agent")
+                agent = last if last in agents else agents[0]
+                if alt and len(agents) > 1:
+                    agent = agents[(agents.index(agent) + 1) % len(agents)]
+                self.push_screen(NewSessionScreen(base, cands, agents, agent,
+                                                  cycle_key=self._direct_key("new")), _go)
 
             def _scan() -> None:
                 try:
@@ -10475,12 +10934,24 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 pass
 
         def on_agent_terminal_focus_released(self, event) -> None:
-            """The terminal's Ctrl+] (SAIKAI_RELEASE_KEY) escape hatch: refocus the list."""
-            self.query_one("#table", DataTable).focus()
+            """The PREFIX (Ctrl+], [keys] release / SAIKAI_RELEASE_KEY) pressed in a
+            focused pane. Opens the command menu for that pane; pressed again
+            while the menu is open it swaps focus to the list (screen's C-a C-a).
+            With the menu disabled ([keys] leader = "none" and no letters) it is
+            the old one-key escape hatch."""
             try:
                 event.stop()
             except Exception:
                 pass
+            term = getattr(event, "terminal", None) or self._focused_terminal()
+            if not self._leader_actions:
+                self.query_one("#table", DataTable).focus()
+                return
+            if self._leader_pending:
+                self._cancel_leader()
+                self.action_focus_swap()
+                return
+            self._arm_menu(src=term)
 
         def on_resize(self, event=None) -> None:
             # The terminal changed size (window/font resize) — the mirror models
@@ -10892,7 +11363,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # SkipAction so Textual forwards the key to the AgentTerminal (its
             # on_key writes it to the PTY) instead of killing an agent while the
             # user is typing — mirrors action_resume's Enter guard. (#agent-kill)
-            if self._focused_terminal() is not None:
+            if self._keys_go_to_pane():
                 raise SkipAction()
             sid = self._cursor_sid()
             s = self._sid_index.get(sid) if sid else None
@@ -11058,7 +11529,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             frozen = term.toggle_freeze()
             self.notify(
-                "pane frozen — Shift+drag to copy · Shift+F9 / type to resume"
+                f"pane frozen — Shift+drag to copy · {self._keys_for('freeze', pane=True)} / type to resume"
                 if frozen else "pane resumed", timeout=4)
 
         def _cycle_tab(self, step: int) -> None:
@@ -11228,7 +11699,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def action_rename(self) -> None:
             # A focused live pane owns Shift+F2 (it goes to claude); only rename
             # when the list has focus.
-            if self._focused_terminal() is not None:
+            if self._keys_go_to_pane():
                 raise SkipAction()
             sid = self._cursor_sid()
             if not sid:
@@ -11553,7 +12024,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _log(f"reload: 0 sessions returned — KEPT current {len(all_sessions)} (transient?)")
                 try:
                     self.notify("re-scan returned 0 sessions — kept the current "
-                                "list (likely transient; F5 to retry)",
+                                f"list (likely transient; {self._keys_for('refresh')} to retry)",
                                 severity="warning", timeout=6)
                 except Exception:
                     pass
@@ -11705,7 +12176,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     return
                 self._empty_reload_armed = True
                 self.notify("re-scan returned 0 sessions — kept the list. "
-                            "Press F5 again to confirm it's really empty.",
+                            f"Press {self._keys_for('refresh')} again to confirm it's really empty.",
                             severity="warning", timeout=6)
                 return
             self._empty_reload_armed = False
@@ -11899,7 +12370,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # restore reminder is actually seen.
             if getattr(self, "_restore_candidates", None):
                 self.notify(f"{len(self._restore_candidates)} pane(s) from last "
-                            f"session — Shift+F4 to reopen", timeout=8)
+                            f"session — {self._keys_for('restore')} to reopen", timeout=8)
 
         def action_mirror_info(self, on_close=None) -> None:
             # F12 — (re)show the web-mirror QR + URL. No-op when the mirror is off.
@@ -12731,7 +13202,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                                     "warning")
                 else:
                     self._b2_finish("checkpoint done — fresh session reseeded "
-                                    "(Shift+F6 jumps back to the parent)")
+                                    f"({self._keys_for('open_parent', pane=True)} jumps back to the parent)")
                 return
 
             # Unknown state — fail safe.
@@ -12741,7 +13212,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # '?' is a priority binding; don't pop the help modal over a focused
             # terminal (typing into claude) or the search box (typing a '?' query).
             # SkipAction forwards the key to that widget rather than eating it.
-            if self._focused_terminal() is not None or isinstance(self.focused, Input):
+            if self._keys_go_to_pane() or isinstance(self.focused, Input):
                 raise SkipAction()
             self.push_screen(HelpScreen())
 
@@ -12774,7 +13245,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._nudge_split(+0.04)
 
         def _nudge_split(self, delta: float) -> None:
-            if self._focused_terminal() is not None or isinstance(
+            if self._keys_go_to_pane() or isinstance(
                     self.focused, (Select, Input)):
                 raise SkipAction()
             self._split_ratio = _nudge_split_ratio(
@@ -12903,7 +13374,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     except OSError:
                         _url_file = None
                     print(_c(f"  ⚠ saikai mirror LIVE ({_mode}, {_in_mode}; "
-                             f"control default OFF, Shift+F12): {_hub.url()}",
+                             f"control default OFF — c on the QR screen): {_hub.url()}",
                              YELLOW), file=sys.stderr)
                     if _url_file is not None:
                         print(_c(f"    (also saved to {_url_file})", YELLOW), file=sys.stderr)
@@ -14302,12 +14773,12 @@ def _main():
     g_view = p.add_argument_group(
         "view & sort",
         "persist a display preference from the shell; inside the picker set them "
-        "live (F6 favorite-view, Shift-F5 tree, a column-header click to sort)")
+        "live (Space t tree, a column-header click to sort)")
     g_view.add_argument("--toggle-view", action="store_true",
                    help="Toggle saved default/show-hidden view mode (persistent).")
     g_view.add_argument("--toggle-tree", action="store_true",
                    help="Toggle saved flat/nested tree-display mode (persistent). "
-                        "Same effect as Shift-F5 inside the picker.")
+                        "Same effect as Space t inside the picker.")
     g_view.add_argument("--cycle-sort", type=int, metavar="N", choices=[1, 2, 3],
                    help="Advance the Nth sort priority to the next column. Persistent. "
                         "In the picker, click a column header instead.")
@@ -14349,7 +14820,7 @@ def _main():
                    help="Forget saved --days/--here/--all defaults. Preserves "
                         "split ratio and filter-bar visibility. Does NOT clear "
                         "hidden/favorite/view-mode/tree-mode/sort — "
-                        "toggle those via F7 / F6 / Shift-F5 in the "
+                        "toggle those via Space h / Space f / Space t in the "
                         "picker, ':hidden' in search for hidden rows, a column-header "
                         "click to sort (or the matching "
                         "--toggle-* / --cycle-sort / --reset-sort flags).")

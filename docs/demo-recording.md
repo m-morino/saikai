@@ -144,7 +144,7 @@ reset of a bloated session. One theme, two beats; do not tour every feature.
    running as live panes. Do not begin with help or a menu.
 2. Flip between two live panes (`F3`/`F2`); show the status markers `~` working /
    `?` waiting / `!` finished-needs-you, grouped/sorted by status.
-3. Next-attention (`Shift+F1`) jumps straight to the pane that needs you.
+3. Next-attention (`F1`) jumps straight to the pane that needs you.
    Caption: **"Every Claude Code session, across every repo — live, grouped by
    what needs you."**
 
@@ -153,15 +153,15 @@ reset of a bloated session. One theme, two beats; do not tour every feature.
 4. Focus a pane whose statusbar gauge is **red** — e.g. `ctx 712K/1.0M (71%)`.
    Caption: **"Real context fill per pane — straight from the transcript. This one's
    bloated and getting dumber."**
-5. *(optional, cut if tight)* `Shift+F11` injects `/compact`; the gauge drops and
-   recolours toward green. Caption: **"Shift+F11 = one-key /compact."**
+5. *(optional, cut if tight)* `Ctrl+]` `c` injects `/compact`; the gauge drops and
+   recolours toward green. Caption: **"Ctrl+] c = one-key /compact."**
 6. Leader `Space` then `c` (Checkpoint). Show the row's `↻` marker, then the
    confirm modal with the extracted `NEW SESSION PROMPT`. **Hold here — the trust
    beat.** Caption: **"It shows you the new prompt before anything clears. You decide."**
 7. Press `Enter`: `/clear` runs, the pane reseeds lean, the gauge goes green.
    Caption: **"Enter → /clear → fresh, lean session, auto-seeded."**
-8. Press `Shift+F6`: the parent (pre-clear) session is still there.
-   Caption: **"Shift+F6 → back to the old session if you need it. Nothing lost."**
+8. Press `Ctrl+]` `P`: the parent (pre-clear) session is still there.
+   Caption: **"Ctrl+] P → back to the old session if you need it. Nothing lost."**
 9. End on: **See what's bloated. Reset it in one key. Resume lean — safely.**
 
 Money-shot still (for the social/OG card): the split view with the status-grouped

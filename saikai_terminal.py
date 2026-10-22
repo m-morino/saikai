@@ -1830,8 +1830,9 @@ def _normalize_key(spec: str) -> str:
         return f"{head}+{repl.get(tail, tail)}"
     return repl.get(s, s)
 
-#: The key that releases focus back to the session list (the escape hatch). A
-#: focused terminal swallows every key, so without this the user is trapped. Esc
+#: The PREFIX: the one key a focused pane never forwards. The host turns it into
+#: its command menu (twice = back to the session list); without it the user
+#: would be trapped, since a focused terminal swallows every key. Esc
 #: goes to claude (interrupt) and the readline editing keys (Ctrl+A/B/E/W/K/…) are
 #: forwarded, so the default is Ctrl+] — a control char ConPTY delivers reliably,
 #: rarely needed in claude (readline char-search). Override with SAIKAI_RELEASE_KEY
@@ -3923,6 +3924,24 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
             self.post_message(self.FocusReleased())
             event.stop()
             return
+        try:
+            _app = self.app
+        except Exception:           # no active app (headless harness / teardown)
+            _app = None
+        if getattr(_app, "_leader_pending", False) and not (
+                getattr(_app, "_leader_repeat_only", False)
+                and (getattr(event, "character", None) or "")
+                not in getattr(_app, "_leader_repeat_keys", ())):
+            # The host's command menu is open (PREFIX / F9): the next key is a
+            # menu letter — let it bubble to the host, never write it to the PTY
+            # (not even Esc, which would interrupt the agent). In the short repeat
+            # window after < > [ ] only those keys are the menu's.
+            return
+        if getattr(_app, "_leader_pending", False):
+            try:
+                _app._cancel_leader()   # a typed key ends the repeat window
+            except Exception:
+                pass
         if self._pty is None or self.is_dead:
             # Dead pane: let keys bubble so the host's bindings (close tab,
             # switch tab) still work.
@@ -7043,8 +7062,8 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
         from textual.message import Message as _Message  # type: ignore
 
         class FocusReleased(_Message):  # type: ignore[misc]
-            """Posted when the user presses RELEASE_FOCUS_KEY. The host moves
-            focus back to the session list."""
+            """Posted when the user presses RELEASE_FOCUS_KEY (the PREFIX). The
+            host opens its command menu for this pane (twice: focus the list)."""
 
 
 def _safe_isalive(pty) -> bool:

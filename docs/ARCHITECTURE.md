@@ -228,9 +228,24 @@ wrong both times.
 
 ## UI contracts
 
-- Session and pane actions use function keys. Ordinary bare `Ctrl+letter`
-  editing keys belong to readline and the hosted agent. The configurable
-  pane-release key and app-level quit handling are deliberate exceptions.
+- **Every session and pane action is a letter in the command menu**
+  (`DEFAULT_LEADER_LETTERS`), reached by `Space` in the list, the PREFIX `Ctrl+]`
+  from anywhere (a focused pane forwards every key except the PREFIX; while the
+  menu is open it writes nothing to the PTY), or `F9`. Unmodified F-keys are
+  accelerators only. **No default Shift/Ctrl/Alt+F-key or Alt+arrow**: PuTTY's
+  default mode and Termius don't deliver them, zellij drops F13–F24 and takes
+  Alt+arrows, and a modified F3 is a cursor-position report (`#f3-cpr`). F11 is
+  the host terminal's. Ordinary bare `Ctrl+letter` editing keys belong to
+  readline and the hosted agent; the PREFIX and app-level quit are the exceptions.
+  `tests/test_keyboard_leader.py` holds all of this
+  (`test_no_default_binding_uses_a_modified_fkey_or_alt`,
+  `test_every_action_is_reachable_from_the_menu`).
+- **No key name is hard-coded on screen.** Help, the statusbar, toasts and the
+  New-session Agent row ask `PickerApp._keys_for(action_id)`, which reads the
+  keymap in force (`[keys]` remaps included). Mirror buttons send
+  `action:<name>` (allow-listed in `_MIRROR_ACTIONS`), never a key name. Core
+  navigation (Enter, Esc, Tab, arrows, `/`, `?`) and modal-local keys (copy
+  mode's vi keys, dialog Enter/Esc) are fixed by design.
 - `Select.BLANK` is `False` in supported Textual versions. Omit `value=` when a
   Select must start without a selection.
 - Title color groups context; ASCII markers report state. Help and Settings use
@@ -316,7 +331,7 @@ Contract:
   and `subprocess.run(claude_argv)` — Textual/driver/pyte are gone, so the
   mirror goes dark until the App returns. Work in split-live panes to stay
   mirrored.
-- Interactive control (default OFF, opt-in): a local `Shift+F12` toggle arms
+- Interactive control (default OFF, opt-in): a local `c` on the F12 QR screen arms
   browser control; only then do `POST /input` (typed text), `/mouse` (tap/scroll
   → synthesized Textual mouse events), and `/key` (on-screen key bar →
   `events.Key`) inject. Every route is gated identically — Host allow-list +

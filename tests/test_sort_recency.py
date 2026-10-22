@@ -381,7 +381,7 @@ def test_no_app_binding_steals_a_readline_ctrl_key():
                       if re.fullmatch(r"ctrl\+[a-z]", k) and k != "ctrl+c"]
     assert not offenders, f"app bindings on readline Ctrl+letter keys: {offenders}"
     # the function keys we relocated them onto must actually be bound
-    for must in ("f5", "f6", "f7", "f8", "f9", "f10", "shift+f10"):
+    for must in ("f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f12"):
         assert must in keys, f"expected F-key binding {must!r} missing: {keys}"
 
 

@@ -63,7 +63,7 @@ python scripts/record_demo.py --record-real --root /home/demo/saikai-demo \
 - **Caption:** *"See what's working, what's waiting, what needs you — at a glance."*
 
 ### A5 — Jump to what needs you
-- **Action:** `Shift+F1` (or `Space` then `a`) — next-attention.
+- **Action:** `F1` (or `Ctrl+]` then `a`) — next-attention.
 - **Show:** focus jumping straight to the `?`/`!` pane, skipping idle ones.
 - **Caption:** *"Jump only to the sessions that actually need a human."*
 
@@ -76,9 +76,9 @@ python scripts/record_demo.py --record-real --root /home/demo/saikai-demo \
   session is bloated and getting dumber."*
 
 ### A5c — One-key /compact (the everyday stay-lean)
-- **Action:** on the bloated pane, `Shift+F11`.
+- **Action:** on the bloated pane, `Ctrl+]` `c`.
 - **Show:** `/compact` injected in place; the gauge drops and recolours toward green.
-- **Caption:** *"Shift+F11 = /compact in place — the everyday way to stay lean."*
+- **Caption:** *"Ctrl+] c = /compact in place — the everyday way to stay lean."*
 
 ### A5d — Checkpoint: reset on purpose, safely (the standout)
 - **Action:** leader `Space` then `c`. Let the handoff turn run (the row shows
@@ -90,9 +90,9 @@ python scripts/record_demo.py --record-real --root /home/demo/saikai-demo \
   only on your Enter clears + restarts lean. It never /clears on its own."*
 
 ### A5e — Jump back to the parent (recovery)
-- **Action:** `Shift+F6`.
+- **Action:** `Ctrl+]` `P`.
 - **Show:** the cursor moves to / opens the pre-clear parent session — still intact.
-- **Caption:** *"Missed a detail in the lean handoff? Shift+F6 → back to the old session."*
+- **Caption:** *"Missed a detail in the lean handoff? Ctrl+] P → back to the old session."*
 
 > **Recording note for A5b–A5e:** the fixture needs a high-context seeded session so
 > the gauge reads red, and the pane must run the real Checkpoint flow (handoff →
@@ -110,12 +110,12 @@ python scripts/record_demo.py --record-real --root /home/demo/saikai-demo \
   prompt reuse, all two keystrokes."*
 
 ### A7 — Start something new, anywhere
-- **Action:** `Shift+F8`, pick the `data-pipeline` folder, start a new session.
+- **Action:** `F5`, pick the `data-pipeline` folder, start a new session.
 - **Caption:** *"New session in any repo or worktree — without leaving saikai."*
 
 ### A8 — Quit and restore the working set
 - **Action:** `Esc` (quit — snapshots open panes), relaunch `saikai`, then
-  `Shift+F4`.
+  `Space` `u`.
 - **Show:** the previous panes reopening (snapshot + resume). No daemon ran in
   between.
 - **Caption:** *"Close the terminal; reopen the same working set later. No daemon,
@@ -148,7 +148,7 @@ SAIKAI_MIRROR=1 SAIKAI_MIRROR_HOST=<demo-lan-ip> SAIKAI_MIRROR_ALLOW_LAN_INPUT=1
   read-only by default."*
 
 ### B2 — Turn on control (locally only)
-- **Action:** on the **host**, press `Shift+F12`.
+- **Action:** on the **host**, press `F12` then `c`.
 - **Show:** the phone banner flips to **`CONTROL ON`**; the host status bar shows
   the **`🌐 1`** connected-browser count.
 - **Caption:** *"Control is off by default and can only be armed at the terminal —

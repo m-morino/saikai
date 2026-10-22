@@ -53,10 +53,10 @@ The screen is two panes (shown above): **the session list on the left, the
 Claude session you picked on the right** — saikai calls this *split-live*, on by
 default.
 
-> **Back and forth:** `Enter` opens the selected session on the right · `Ctrl+]`
-> returns to the list · `F2`/`F3` switch panes.
+> **Back and forth:** `Enter` opens the selected session on the right · `F4`
+> (or `Ctrl+]` twice) swaps list ⇄ pane · `F2`/`F3` switch panes.
 
-![The split-live layout: the session list on the left, a live claude session on the right, with the Enter / Ctrl+] / F2 / F3 keys that move between them](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-split-live.svg)
+![The split-live layout: the session list on the left, a live claude session on the right, with the Enter / F4 / F2 / F3 keys that move between them](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-split-live.svg)
 
 - **Who needs you, at a glance.** The list opens grouped by state — **Needs
   input** first — with one cyan accent reserved for "this needs you right now"
@@ -73,7 +73,7 @@ default.
   (`f`); reuse a prompt, follow inferred parent/child chains across context
   resets.
 - **Quit without losing your work.** Reopen the same working set later with
-  `Shift+F4`. No daemon, no database — it just reads Claude's own history files
+  `Space u`. No daemon, no database — it just reads Claude's own history files
   (AI summaries are opt-in).
 - **Sessions Claude deleted are still here.** Claude Code removes its transcripts
   after 30 days (`cleanupPeriodDays`) — silently, on startup. saikai keeps its own
@@ -84,10 +84,10 @@ default.
   to December. Turn it off with `[history] archive = false`.
 - **★ (experimental) Reset a bloated session in one keystroke.** Each pane shows
   its real context fill — the actual numbers Claude records, not a `chars/4`
-  guess (`ctx 662K/1.0M (66%)`, green/yellow/red). `Shift+F11` drops a `/compact`;
+  guess (`ctx 662K/1.0M (66%)`, green/yellow/red). menu `c` drops a `/compact`;
   **Checkpoint** (`Space` `c`) has the session write a handoff, shows you the
   reseed prompt to approve, and only on your Enter clears + reseeds a fresh, lean
-  session (`Shift+F6` jumps back to the parent). Still experimental.
+  session (menu `P` jumps back to the parent). Still experimental.
 - **Mirror to your phone / another browser** (experimental, token-authenticated,
   off by default) — see [Web mirror](#web-mirror-experimental).
 
@@ -112,7 +112,7 @@ memory checks, and confirmation for sessions open elsewhere still apply.
 Queued launches are not reported as completed launches.
 
 Worksets use `platformdirs.user_data_dir("saikai")/workspaces.json`, separate
-from the cache and the automatic `Shift+F4` previous-pane snapshot. Changes are
+from the cache and the automatic previous-pane snapshot (menu `u`). Changes are
 explicit, locked, and atomically saved; conflicting edits ask you to reload
 instead of overwriting newer data. Invalid files are preserved and reported.
 Run saikai on the SSH host whose sessions you want to restore. This feature
@@ -175,32 +175,44 @@ saikai --help
 
 ### Keys
 
-Start with the way out. **`Ctrl+]` returns from a pane to the list**, and
-**`Esc` steps back one level** (search → list → quit). Know those two and you
-can't get stuck; everything else is on screen (the footer, `?` for the full
-list, and the `␣` menu that pops up when you pause).
+Start with the way out. **`F4` swaps list ⇄ pane** (so does `Ctrl+]` pressed
+twice), and **`Esc` steps back one level** (search → list → quit). Know those two
+and you can't get stuck; everything else is on screen (`?` for the full list, and
+the menu that pops up when you pause).
 
-The everyday keys are the ones you'd guess: `↑` `↓` move · `Enter` open/resume ·
-`F2`/`F3` switch panes · `Shift+F1` jump to the next pane needing attention · `/`
-or any character searches · `Tab` toggles the preview.
+**One menu, every action.** Open it with `Space` in the list, `Ctrl+]` from
+anywhere (inside a live pane too), or `F9` anywhere; then press one letter. Pause
+and the whole map appears in place, grouped by family (which-key style). From a
+pane, the session letters act on that pane's session. Lowercase is the everyday
+action, UPPERCASE its stronger, confirmed sibling:
 
-**`Space` is the menu.** Press `Space` in the list, then one mnemonic letter;
-pause and the whole menu appears in place, grouped by family (which-key style —
-nothing to memorize). Every other session and pane action lives here:
+| Move | Panes | Session | View |
+|---|---|---|---|
+| `a` (or `!`) next pane needing you | `n` new · `N` new with the other agent | `f` ★ favorite | `s` sort column · `o` order |
+| `[` `]` prev / next tab | `x` close tab · `X` close all | `h` hide | `g` grouping · `t` tree |
+| `1`–`9` tab N | `u` restore last panes | `e` rename | `/` search bar |
+| `z` zoom (hide the list) | `p` freeze · `v` copy mode | `d` diff (changes) | `m` notifications |
+| `<` `>` narrower / wider list | `c` /compact · `C` checkpoint | `y` copy prompt · `Y` summary | `M` mirror QR |
+| `Ctrl+]` again: list ⇄ pane | `w` worksets · `K` stop agent | `P` parent · `r` refresh | `,` settings · `?` help |
+|  | `q` send `Ctrl+]` to the pane | `Space` mark for batch launch | `D` dump pane |
 
-| Session | View | Panes |
-|---|---|---|
-| `f` ★ favorite | `s` cycle **s**ort column | `n` new session |
-| `h` hide | `o` flip sort **o**rder | `p` restore panes |
-| `e` rename (edit) | `g` cycle grouping | `z` freeze pane |
-| `y` copy prompt (yank) | `t` tree | `a` next attention |
-| `d` diff (changes) | `l` hide/show list | `x` close tab · `[` `]` tabs |
-| `r` refresh | `,` settings · `/` hide/show bar | `Space` mark for batch launch |
+`<` `>` `[` `]` repeat for half a second (tmux-style): `Ctrl+] > > >`.
+
+**F-keys are shortcuts, never the only way** — no Shift/Ctrl/Alt chords, because
+PuTTY (default mode), Termius and zellij don't deliver them:
+
+| F1 | F2 / F3 | F4 | F5 | F6 | F7 | F8 | F9 | F10 | F12 |
+|---|---|---|---|---|---|---|---|---|---|
+| next pane needing you | prev / next tab | list ⇄ pane | new session | zoom | copy mode | diff | menu | close tab | mirror QR |
+
+F11 is left to your terminal (full screen). GNOME Terminal claims F1 / F10 unless
+you turn that off in its preferences; the menu letters work regardless.
 
 Search tokens `:fav` `:hidden` `:open` `:active` `:recent` `:expired` (combine with text),
-`Alt+←/→` to nudge the list/pane divider, full mouse support (column sort, row
-click, drag-to-copy inside a pane), and key/leader remaps via `config.toml`'s
-`[keys]` — all covered by `?` and [Configuration](#configuration-environment-variables).
+drag the list/pane divider (or menu `<` `>`), full mouse support (column sort, row
+click, drag-to-copy inside a pane), and remaps via `config.toml`'s `[keys]` (any action id
+to a direct key, or to a menu letter; `?` and every hint follow your remaps) —
+all covered by `?` and [Configuration](#configuration-environment-variables).
 
 If the PTY deps aren't available, saikai automatically drops to a **list-only
 mode** (`Enter` resumes the selected session full-screen). Search, previews, and
@@ -224,16 +236,17 @@ to bring it back anytime. The URL carries a per-run access token.
 
 ![saikai's F12 web-mirror screen: a scannable QR and the tokened LAN URL to open the session on another device](https://raw.githubusercontent.com/m-morino/saikai/master/docs/assets/saikai-mirror.png)
 
-The mirror is **read-only by default**. Press **`Shift+F12`** (a local-only key)
-to toggle browser **control** on — then the browser drives saikai with:
+The mirror is **read-only by default**. On the QR screen (`F12`), press **`c`**
+(local only) to toggle browser **control** on — then the browser drives saikai with:
 
 - **tap** to click (select a row, sort a column, focus a pane) and **swipe** to scroll;
-- an **on-screen key bar** (Leader, Esc, Tab, Enter, arrows, Ctrl, F12, List) for a soft keyboard;
+- an **on-screen key bar** (Menu, Esc, Tab, Enter, arrows, Ctrl, List, Next) for a soft keyboard —
+  its buttons name saikai actions, not keys, so they keep working whatever your keymap;
 - a **physical keyboard**, terminal-equivalent — arrows, Home/End, F-keys, Ctrl/Alt
-  combos, `Ctrl+]` to leave a pane, `Ctrl+C` to interrupt claude.
+  combos, `Ctrl+]` for the menu, `Ctrl+C` to interrupt claude.
 
 Control auto-disables after a spell of inactivity, and **only the local
-`Shift+F12` can enable it** — a browser can never turn on its own control. Over a
+the local `c` on the QR screen can enable it** — a browser can never turn on its own control. Over a
 LAN bind the mirror stays read-only unless you also opt in with
 `SAIKAI_MIRROR_ALLOW_LAN_INPUT=1`. Use it only on a network you trust: the access
 token travels in the URL, while the separate write-key required for input is
@@ -268,7 +281,7 @@ mirror to watch *all* your local sessions from the couch.
 | `SAIKAI_COLOR_BY` | project | what tints the session title: `project` / `worktree` / `topic` / `none` |
 | `SAIKAI_SPLIT_RATIO` | 0.34 | initial list/pane split (drag the divider to change; the dragged value persists) |
 | `SAIKAI_RELEASE_KEY` | `ctrl+]` | key that returns focus from a live pane to the list |
-| `SAIKAI_MIRROR` | off | mirror the live UI to a browser; a truthy value (`1`/`true`/`yes`/`on`) enables it (token-authenticated, read-only until `Shift+F12`) |
+| `SAIKAI_MIRROR` | off | mirror the live UI to a browser; a truthy value (`1`/`true`/`yes`/`on`) enables it (token-authenticated, read-only until `c` on the F12 QR screen) |
 | `SAIKAI_MIRROR_HOST` | `127.0.0.1` | mirror bind address; set to a LAN IP to reach it from another device |
 | `SAIKAI_MIRROR_PORT` | `0` | fixed mirror port so a firewall rule can target it; `0` lets the OS pick a free port |
 | `SAIKAI_MIRROR_ALLOW_LAN_INPUT` | off | allow control **input** over a non-loopback bind; otherwise a LAN mirror stays read-only (loopback always permits input) |
@@ -313,8 +326,8 @@ the same time in the same saikai, and a codex pane's state comes from Codex's
 own screen — `?` when it puts a numbered choice under its selection cursor
 (command approval, folder trust), `~` while it shows `esc to interrupt` — so
 "who needs you" covers both agents. To start a **new** codex session, open New
-session (`Shift+F8`) and press `Shift+F8` again to switch the agent from claude
-to codex; the pane is linked to its thread as soon as codex writes it (after
+session (`F5`) and pick codex on its Agent row (`F5` again, `↑` then `←/→`, or a
+click — saikai remembers the last choice; menu `N` starts with the other agent); the pane is linked to its thread as soon as codex writes it (after
 your first prompt). Set `[providers] codex = false` (or `SAIKAI_CODEX=0`) to
 hide codex entirely. Not yet wired for codex rows: the `!` reply-due marker for
 DORMANT threads, open-elsewhere detection, and checkpoint (claude-specific by

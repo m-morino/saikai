@@ -25,6 +25,13 @@ Current state, open threads, and next steps. Architecture and invariants live in
   - Branch pushed to origin. Waiting for: approval of the UI screenshots, then
     merge to master.
 
+- **`feature/keymap-v2`** (from codex-parallel): keymap redesign (2026-10-23).
+  Design: one command menu (Space / Ctrl+] / F9) holds every action; unmodified
+  F-keys only; key hints generated from the live keymap; mirror buttons send action
+  ids. Design doc from the expert pass:
+  scratchpad `keymap-design.md` (not in the repo). Waiting for: UI screenshot
+  approval. Not done (phase 2): mirror "Menu" as a tappable letter sheet.
+
 ### Not done for codex
 - `!` reply-due on dormant codex threads, open-elsewhere detection, checkpoint.
 - Two new codex panes in the same folder before either prompt: the matcher refuses

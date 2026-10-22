@@ -102,7 +102,7 @@ def test_nudge_split_ratio_clamps():
 
 
 def test_leader_label_short_names():
-    assert saikai._leader_label("toggle_fav") == "fav"
+    assert saikai._leader_label("toggle_fav") == "favorite"
     assert saikai._leader_label("preview_changes") == "diff"
     assert saikai._leader_label("cycle_group") == "group"
     assert saikai._leader_label("sort") == "sort"
@@ -117,13 +117,16 @@ def test_leader_groups_by_family():
     fams = [f for f, _ in groups]
     assert fams == list(saikai.LEADER_FAMILY_ORDER), fams
     flat = [(k, lbl) for _, pairs in groups for k, lbl in pairs]
-    assert len(flat) == len(m), "a letter vanished from the grouped view"
+    # 1-9 (goto tab N) collapse into ONE "1-9" entry; every other letter shows
+    digits = [k for k in m if k.isdigit()]
+    assert len(flat) == len(m) - len(digits) + 1, "a letter vanished from the grouped view"
     by_fam = dict(groups)
-    assert ("f", "fav") in by_fam["Session"]
+    assert ("f", "favorite") in by_fam["Session"] and (" ", "mark") in by_fam["Session"]
     assert ("s", "sort") in by_fam["View"] and ("g", "group") in by_fam["View"]
     assert (",", "settings") in by_fam["View"]
-    assert ("/", "bar") in by_fam["View"]
-    assert (" ", "mark") in by_fam["Panes"] and ("[", "tab◀") in by_fam["Panes"]
+    assert ("/", "search bar") in by_fam["View"]
+    assert ("[", "prev tab") in by_fam["Move"] and ("1-9", "tab N") in by_fam["Move"]
+    assert ("x", "close") in by_fam["Panes"] and ("X", "close all") in by_fam["Panes"]
     # unknown action -> last family, not dropped
     g2 = saikai._leader_groups({"q": "made_up_action"})
     assert g2 and g2[-1][0] == saikai.LEADER_FAMILY_ORDER[-1]
@@ -191,7 +194,7 @@ def test_pilot_space_leader_and_divider():
                 favs = saikai._read_json(saikai.FAVORITE_FILE, [])
                 facts["favorited"] = sid in (favs or [])
                 before = getattr(self, "_split_ratio", None)
-                await pilot.press("alt+right")      # keyboard divider nudge
+                await pilot.press("space", "greater_than_sign")  # menu > widens the list
                 await pilot.pause(0.2)
                 facts["ratio_before"] = before
                 facts["ratio_after"] = getattr(self, "_split_ratio", None)
@@ -801,7 +804,7 @@ def test_launch_qr_dismiss_reshows_restore_hint():
         sys.argv = orig_argv
 
     assert facts.get("notes_no_cand") == 0, f"no candidates -> no hint: {facts}"
-    assert "Shift+F4" in facts.get("hint", "") and "2 pane" in facts.get("hint", ""), \
+    assert "␣u" in facts.get("hint", "") and "2 pane" in facts.get("hint", ""), \
         f"the deferred hint must re-show with the count: {facts}"
 
 
@@ -853,6 +856,8 @@ def test_pilot_mirror_control_toggle():
             pass
         def url(self):
             return "http://127.0.0.1:0/?token=x"
+        def client_count(self):
+            return 0
 
     def fake_run(self, *a, **kw):
         async def go():
@@ -866,11 +871,18 @@ def test_pilot_mirror_control_toggle():
                 class _T:
                     title = "Demo session"
                 self._focused_terminal = lambda: _T()
-                await pilot.press("shift+f12")        # the priority toggle
+                if type(self.screen).__name__ == "MirrorScreen":
+                    await pilot.press("escape")       # the launch QR auto-shows
+                    await pilot.pause(0.2)
+                await pilot.press("f12")              # mirror QR …
+                await pilot.pause(0.3)
+                await pilot.press("c")                # … c = control (local only)
                 await pilot.pause(0.2)
                 facts["after_enabled"] = self._control_enabled
                 facts["hub_calls"] = list(self._mirror_hub.calls)
-                await pilot.press("shift+f12")        # toggle back off
+                await pilot.press("f12")              # toggle back off
+                await pilot.pause(0.3)
+                await pilot.press("c")
                 await pilot.pause(0.2)
                 facts["after_off"] = self._control_enabled
                 facts["hub_calls2"] = list(self._mirror_hub.calls)
@@ -925,7 +937,7 @@ def test_pilot_mirror_tap_and_key_drive_ui():
                 # F6 flipped that row's favorite state via the priority binding.
                 target_sid = self._cursor_sid()
                 before = target_sid in (saikai._read_json(saikai.FAVORITE_FILE, []) or [])
-                self._mirror_inject_key("f6")
+                self._mirror_inject_key("action:toggle_fav")
                 await pilot.pause(0.3)
                 after = target_sid in (saikai._read_json(saikai.FAVORITE_FILE, []) or [])
                 facts["cursor_sid"] = target_sid
@@ -1575,7 +1587,7 @@ def test_pilot_rename_modal_enter_saves_not_resumes():
                 # process seed extra sessions, so capture the actual target sid
                 # rather than assuming the cursor sits on our demo row.
                 facts["target"] = self._cursor_sid()
-                await pilot.press("shift+f2")            # open the rename modal
+                await pilot.press("space", "e")          # open the rename modal
                 await pilot.pause(0.2)
                 facts["modal_open"] = type(self.screen).__name__ == "RenameScreen"
                 for ch in "myname":
@@ -1671,7 +1683,7 @@ def test_pilot_notification_center_records_and_opens():
                 await pilot.pause(0.1)
                 facts["logged"] = any("recall-me-xyz" in e[3]
                                       for e in getattr(self, "_notif_log", []))
-                await pilot.press("f11")               # open the notification center
+                await pilot.press("space", "m")        # open the notification center
                 await pilot.pause(0.2)
                 facts["screen"] = type(self.screen).__name__
                 await pilot.press("escape")            # close it
@@ -2786,7 +2798,7 @@ def test_kill_agent_yields_key_to_a_focused_live_pane():
     assert i != -1, "action_kill_agent not found"
     j = src.find("\n        def ", i + 1)   # next method at the class-body indent
     body = src[i:j] if j != -1 else src[i:i + 2000]
-    assert ("self._focused_terminal() is not None" in body
+    assert ("self._keys_go_to_pane()" in body
             and "SkipAction" in body), \
         "action_kill_agent must yield Shift+K to a focused live pane (raise SkipAction)"
 
@@ -3341,7 +3353,7 @@ def test_pilot_fkey_bindings_survive_posix_terminal_encoding():
         if got[:1] != [key]:
             dead.append((key, action, seq, got))
 
-    assert len(checked) >= 20, \
+    assert len(checked) >= 11, \
         f"expected saikai's full F-key set, only saw {checked}"
     assert not dead, (
         "these bindings can never fire on a POSIX terminal — the terminal's own "
@@ -3349,7 +3361,348 @@ def test_pilot_fkey_bindings_survive_posix_terminal_encoding():
         "\n  ".join(f"{k} ({a}): sent {s!r} -> parsed {g}" for k, a, s, g in dead))
 
 
+# ── keymap v2 (#keymap-v2) ──────────────────────────────────────────────────
+
+def _default_bindings():
+    """(key, action, id) of the shipped PickerApp bindings, read from source so
+    the headless tests need no textual."""
+    import re
+    src = Path(saikai.__file__).read_text(encoding="utf-8")
+    i = src.index("class PickerApp(App, _MirrorControl):")
+    j = src.index("        ]\n", i)
+    return re.findall(r'Binding\("([^"]+)",\s*"([^"]+)"[^)]*?(?:id="([^"]+)")?[^)]*\)',
+                      src[i:j])
+
+
+def test_no_default_binding_uses_a_modified_fkey_or_alt():
+    """Shift+F-keys don't reach saikai over PuTTY (default mode) / Termius,
+    zellij drops F13-F24 and takes Alt+arrows, and any modified F3 is eaten as a
+    cursor-position report — so the shipped map uses none of them."""
+    import re
+    bad = [k for k, _a, _i in _default_bindings()
+           if re.match(r"(shift|ctrl|alt)\+", k)]
+    assert not bad, f"modified F-key / Alt default bindings: {bad}"
+    keys = [k for k, _a, _i in _default_bindings()]
+    assert "f11" not in keys, "F11 belongs to the host terminal (full screen)"
+
+
+def test_every_action_is_reachable_from_the_menu():
+    """The menu is the one path that works on every terminal: each id-bearing
+    binding (the F-key accelerators) must also have a menu letter."""
+    _lk, m, errs = saikai._resolve_leader({}, {})
+    assert not errs, errs
+    reachable = set(m.values())
+    missing = [(k, a) for k, a, i in _default_bindings()
+               if i and i not in ("menu", "help") and a not in reachable]
+    assert not missing, f"F-key actions with no menu letter: {missing}"
+    for vid, act in saikai.LEADER_VIRTUAL_ACTIONS.items():
+        if vid == "focus_swap":
+            continue                     # the prefix pressed twice
+        assert act in reachable, f"menu action {vid} ({act}) has no letter"
+
+
+def test_menu_letters_are_case_sensitive():
+    _lk, m, _e = saikai._resolve_leader({}, {})
+    assert m["x"] == "close_live" and m["X"] == "close_all_live"
+    assert m["n"] == "new_session" and m["N"] == "new_session_alt"
+    assert m["c"] == "context_refresh" and m["C"] == "checkpoint"
+    assert m["3"] == "goto_tab:3"
+    # a [keys] uppercase letter stays uppercase
+    _lk, m2, _e = saikai._resolve_leader({"favorite": "F"}, {})
+    assert m2.get("F") == "toggle_fav" and m2.get("f") is None
+
+
+def test_mirror_buttons_name_actions_not_keys():
+    """Mirror buttons send `action:<name>` (or a plain navigation key), so the
+    keymap can change without breaking the phone; every action is allow-listed
+    and enabling control never is (local-only)."""
+    import re
+    src = Path(saikai.__file__).with_name("saikai_mirror.py").read_text(encoding="utf-8")
+    plain = {"tab", "escape", "enter", "up", "down", "left", "right", "slash",
+             "pageup", "pagedown", "home", "end", ""}
+    vals = set(re.findall(r'data-k="([^"]*)"', src)) | set(
+        re.findall(r"\['[^']+','([^']*)'\]", src))
+    for v in vals:
+        if v.startswith("action:"):
+            assert v[len("action:"):] in saikai._MIRROR_ACTIONS, v
+        else:
+            assert v in plain, f"mirror button sends a raw key name: {v!r}"
+    assert "toggle_mirror_control" not in saikai._MIRROR_ACTIONS
+
+
+def test_fmt_key_is_human():
+    assert saikai._fmt_key("f1") == "F1"
+    assert saikai._fmt_key("ctrl+right_square_bracket") == "Ctrl+]"
+    assert saikai._fmt_key("space") == "␣"
+
+
+def test_pane_lets_menu_keys_bubble_and_writes_nothing():
+    """With the host menu open, a focused pane must NOT write the key to the
+    PTY (not even Esc — it would interrupt the agent); it bubbles to the host.
+    In the repeat window after < > [ ] only those keys are the menu's."""
+    try:
+        import saikai_terminal as st
+        if not hasattr(st, "AgentTerminal") or st.Widget is object:
+            raise ImportError
+    except Exception:
+        print("SKIP test_pane_lets_menu_keys_bubble_and_writes_nothing")
+        return
+
+    class FakeApp:
+        _leader_pending = True
+        _leader_repeat_only = False
+        _leader_repeat_keys = frozenset("<>[]")
+        cancelled = 0
+        def _cancel_leader(self):
+            FakeApp.cancelled += 1
+            self._leader_pending = False
+
+    fake = FakeApp()
+
+    class T(st.AgentTerminal):
+        app = fake
+
+    t = T.__new__(T)
+    t._pty = object(); t.is_dead = False; t._frozen = False
+    written = []
+    t._write_child = lambda d: written.append(d) or True
+    t._note_input = lambda: None; t._snap_to_live = lambda: None
+    t._kitty_flags = lambda: 0; t._app_cursor = False
+
+    class Ev:
+        def __init__(self, key, ch):
+            self.key, self.character, self.stopped = key, ch, False
+        def stop(self):
+            self.stopped = True
+
+    for key, ch in (("f", "f"), ("escape", None)):
+        ev = Ev(key, ch)
+        t.on_key(ev)
+        assert not written and not ev.stopped, (key, written)
+    # repeat window: '>' is the menu's, 'h' is typed (and ends the window)
+    fake._leader_repeat_only = True
+    ev = Ev("greater_than_sign", ">")
+    t.on_key(ev)
+    assert not written and not ev.stopped
+    ev = Ev("h", "h")
+    t.on_key(ev)
+    assert written == ["h"] and ev.stopped and FakeApp.cancelled == 1
+
+
+def test_pilot_prefix_from_a_pane_opens_the_menu_for_that_pane():
+    """Ctrl+] in a pane: the menu opens at once for THAT pane — f favorites the
+    pane's session, not the row under the list cursor — and the prefix pressed
+    twice swaps focus (no action runs)."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_prefix_from_a_pane_opens_the_menu_for_that_pane")
+        return
+    import asyncio
+    from types import SimpleNamespace
+    from textual.app import App
+
+    pane_sid = _write_demo_session()
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                if type(self.screen).__name__ == "MirrorScreen":
+                    await pilot.press("escape")
+                cursor = self._cursor_sid()
+                facts["cursor_is_other"] = cursor != pane_sid
+                term = SimpleNamespace(sid=pane_sid)
+                ev = SimpleNamespace(stop=lambda: None, terminal=term)
+                self.on_agent_terminal_focus_released(ev)
+                await pilot.pause(0.05)
+                facts["pending"] = self._leader_pending
+                facts["hint_shown"] = bool(self.query_one("#leaderhint").display)
+                await pilot.press("f")
+                await pilot.pause(0.2)
+                favs = saikai._read_json(saikai.FAVORITE_FILE, []) or []
+                facts["pane_faved"] = pane_sid in favs
+                facts["cursor_faved"] = cursor in favs
+                saikai._write_json(saikai.FAVORITE_FILE,
+                                   [x for x in favs if x != pane_sid])   # leave no trace
+                # twice = swap, nothing else runs
+                self.on_agent_terminal_focus_released(ev)
+                self.on_agent_terminal_focus_released(ev)
+                await pilot.pause(0.05)
+                facts["pending_after_twice"] = self._leader_pending
+                facts["keys_for_restore"] = self._keys_for("restore")
+                # the generated help must render: a "␣[" key once opened a tag
+                # and turned every following row into literal markup
+                self.action_help()
+                await pilot.pause(0.3)
+                from textual.widgets import Static as _S
+                _txt = " ".join(str(w.render()) for w in self.screen.query(_S))
+                facts["help_has_prev_tab"] = "previous tab" in _txt
+                facts["help_leaks_markup"] = "[/yellow]" in _txt
+                await pilot.press("escape")
+                await pilot.pause(0.2)
+                self._applied_keymap = {"attention": "f11"}
+                facts["keys_for_remapped"] = self._keys_for("attention")
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+    assert facts.get("cursor_is_other"), facts
+    assert facts.get("pending") and facts.get("hint_shown"), facts
+    assert facts.get("pane_faved") and not facts.get("cursor_faved"), facts
+    assert facts.get("pending_after_twice") is False, facts
+    assert facts.get("keys_for_restore") == "␣u", facts
+    assert facts.get("help_has_prev_tab") and not facts.get("help_leaks_markup"), facts
+    assert facts.get("keys_for_remapped") == "F11 / ␣a", facts
+
+
+def test_pilot_new_session_agent_row_switches_by_key_arrows_and_click():
+    """The Agent row: the key that opened the dialog (F5) switches it, ↑ then ←
+    switches back, and a click picks an agent — no Shift+F needed anywhere."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_new_session_agent_row_switches_by_key_arrows_and_click")
+        return
+    import asyncio
+    import shutil as _sh
+    from textual.app import App
+
+    _write_demo_session()
+    facts: dict = {}
+    calls = []
+    codex_home = _FAKE_HOME / ".codex" / "sessions"
+    codex_home.mkdir(parents=True, exist_ok=True)
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(120, 32)) as pilot:
+                await pilot.pause(0.4)
+                if type(self.screen).__name__ == "MirrorScreen":
+                    await pilot.press("escape")
+                self._open_new_live = lambda path, agent="claude": calls.append((path, agent))
+                await pilot.press("f5")
+                for _ in range(20):
+                    await pilot.pause(0.2)
+                    if type(self.screen).__name__ == "NewSessionScreen":
+                        break
+                scr = self.screen
+                facts["opened"] = type(scr).__name__
+                facts["start"] = scr._agent
+                await pilot.press("f5")
+                await pilot.pause(0.1)
+                facts["after_f5"] = scr._agent
+                await pilot.press("up")
+                await pilot.press("left")
+                await pilot.pause(0.1)
+                facts["after_left"] = scr._agent
+                await pilot.click("#new-agent",
+                                  offset=(len("Agent  ") + len(" ✻ claude ") + 3, 0))
+                await pilot.pause(0.1)
+                facts["after_click"] = scr._agent
+                await pilot.press("down")
+                scr.query_one("#new-path").value = str(_FAKE_HOME)
+                await pilot.press("enter")
+                await pilot.pause(0.3)
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_which = _sh.which
+    _sh.which = lambda name, *a, **k: f"/usr/bin/{name}"
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        _sh.which = orig_which
+        sys.argv = orig_argv
+    assert facts.get("opened") == "NewSessionScreen", facts
+    assert facts["start"] == "claude" and facts["after_f5"] == "codex", facts
+    assert facts["after_left"] == "claude", facts
+    assert facts["after_click"] == "codex", facts       # click on the codex cell
+    assert calls == [(str(_FAKE_HOME), "codex")], calls
+    assert saikai._load_options().get("new_agent") == "codex"   # remembered
+
+
+def test_mirror_action_injection_is_allow_listed():
+    """`action:<name>` from a mirror button runs only allow-listed actions —
+    enabling control stays local-only — and only while control is on."""
+    ran = []
+
+    class Fake(saikai._MirrorControl):
+        _control_enabled = True
+        def action_toggle_fav(self):
+            ran.append("fav")
+        def action_toggle_mirror_control(self):
+            ran.append("CONTROL")
+        def action_goto_tab(self, n):
+            ran.append(f"tab{n}")
+
+    f = Fake()
+    f._mirror_inject_key("action:toggle_fav")
+    f._mirror_inject_key("action:toggle_mirror_control")
+    f._mirror_inject_key("action:goto_tab:2")
+    f._mirror_inject_key("action:quit_all")
+    f._control_enabled = False
+    f._mirror_inject_key("action:toggle_fav")
+    assert ran == ["fav", "tab2"], ran
+
+
+def test_leader_hint_lines_align_and_pair():
+    """The menu panel: every row starts its entries at the same column, the
+    family header carries its icon, pairs sit together (x next to X), and a
+    narrow terminal wraps into more rows instead of overflowing."""
+    from rich.text import Text
+    from rich.cells import cell_len
+    _lk, m, _e = saikai._resolve_leader({}, {})
+    for width in (148, 80):
+        lines = saikai._leader_hint_lines(m, width)
+        plain = [Text.from_markup(l).plain for l in lines]
+        assert all(cell_len(p) <= width for p in plain), (width, plain)
+        body = plain[1:]
+        assert body[0].startswith(saikai.LEADER_FAMILY_ICON["Move"])
+        # entries begin at the same column on every row
+        starts = {cell_len(p[:len(p) - len(p[11:].lstrip())]) for p in body}
+        assert len(starts) <= 2, (width, starts)    # key width right-aligns 1-9
+        flat = " ".join(body)
+        assert flat.index("x close") < flat.index("X close all") < flat.index("u restore")
+    assert len(saikai._leader_hint_lines(m, 80)) > len(saikai._leader_hint_lines(m, 148))
+    assert saikai._leader_hint_lines({}, 100) == []
+    # [display] menu_icons = false: no emoji at all (PuTTY draws them at the wrong width)
+    no_icons = " ".join(saikai._leader_hint_lines(m, 148, icons=False))
+    assert not any(i in no_icons for i in saikai.LEADER_FAMILY_ICON.values())
+
+
 if __name__ == "__main__":
+    test_leader_hint_lines_align_and_pair()
+    print("PASS test_leader_hint_lines_align_and_pair")
+    test_mirror_action_injection_is_allow_listed()
+    print("PASS test_mirror_action_injection_is_allow_listed")
+    test_no_default_binding_uses_a_modified_fkey_or_alt()
+    print("PASS test_no_default_binding_uses_a_modified_fkey_or_alt")
+    test_every_action_is_reachable_from_the_menu()
+    print("PASS test_every_action_is_reachable_from_the_menu")
+    test_menu_letters_are_case_sensitive()
+    print("PASS test_menu_letters_are_case_sensitive")
+    test_mirror_buttons_name_actions_not_keys()
+    print("PASS test_mirror_buttons_name_actions_not_keys")
+    test_fmt_key_is_human()
+    print("PASS test_fmt_key_is_human")
+    test_pane_lets_menu_keys_bubble_and_writes_nothing()
+    print("PASS test_pane_lets_menu_keys_bubble_and_writes_nothing")
+    test_pilot_prefix_from_a_pane_opens_the_menu_for_that_pane()
+    print("PASS test_pilot_prefix_from_a_pane_opens_the_menu_for_that_pane")
+    test_pilot_new_session_agent_row_switches_by_key_arrows_and_click()
+    print("PASS test_pilot_new_session_agent_row_switches_by_key_arrows_and_click")
     test_pilot_fkey_bindings_survive_posix_terminal_encoding()
     print("PASS test_pilot_fkey_bindings_survive_posix_terminal_encoding")
     test_resolve_leader_defaults_on()

@@ -812,19 +812,18 @@ def test_page_routes_mouse_and_has_key_bar():
         # (b) postKey single-flight to /key with the write-key header.
         assert "/key" in page and "X-Mirror-Write-Key" in page, page
         # (c) the on-screen key bar buttons (F12 rides kb2 as "Mirror QR").
-        for label in ("Leader", "Esc", "Tab", "Enter", "Ctrl", "List", "Mirror QR"):
+        for label in ("Menu", "Esc", "Tab", "Enter", "Ctrl", "List", "Mirror QR"):
             assert label in page, f"key bar missing {label}: {page[:200]}"
-        assert 'data-k="f12"' in page, page
+        # buttons name ACTIONS (keymap-independent), not keys (#mirror-actions)
+        assert 'data-k="action:mirror_info"' in page, page
         # Enter (resume + focus a pane from the list, or submit to a focused
         # pane) and the release key (ctrl+] -> drop pane focus back to the list)
         # MUST be tappable: typed text rides /input to the focused pane, so these
         # app-level keys can only reach the app via the key bar. Without Enter the
         # browser can never focus a pane and typed characters go nowhere.
         assert 'data-k="enter"' in page, page
-        # List must send the Textual-normalized release key name (the literal
-        # "ctrl+]" does NOT match RELEASE_FOCUS_KEY=="ctrl+right_square_bracket",
-        # so it would never release pane focus).
-        assert 'data-k="ctrl+right_square_bracket"' in page, page
+        # List swaps list ⇄ pane by ACTION (Ctrl+] is now the menu prefix).
+        assert 'data-k="action:focus_swap"' in page, page
         # Mobile fit: a viewport meta so phones render at device-width (not a
         # ~980px zoomed-out layout that shrinks every control), and touch-sized
         # key-bar buttons (>=44px target, 16px font to avoid iOS focus-zoom).
@@ -857,9 +856,10 @@ def test_page_key_bar_has_saikai_action_keys():
         ).read().decode("utf-8")
     finally:
         hub.stop()
-    for k in ('data-k="f5"', 'data-k="shift+f1"', 'data-k="f10"', 'data-k="f9"',
-              'data-k="shift+f2"', 'data-k="shift+f4"', 'data-k="f11"',
-              'data-k="shift+f11"',
+    for k in ('data-k="action:refresh"', 'data-k="action:next_attention"',
+              'data-k="action:close_live"', 'data-k="action:copy_prompt"',
+              'data-k="action:rename"', 'data-k="action:restore_panes"',
+              'data-k="action:notifications"', 'data-k="action:context_refresh"',
               'data-k="slash"', 'data-k="pageup"', 'data-k="pagedown"'):
         assert k in page, f"key bar missing {k}"
     # A 'More' toggle reveals a secondary action row (keeps the default compact).
@@ -1059,9 +1059,9 @@ def test_page_key_bar_flow_and_labels():
     finally:
         hub.stop()
     # F12 present but wired to the secondary row with a descriptive label.
-    assert 'data-k="f12"' in page and ">Mirror QR<" in page, page
-    # shift+f11 relabelled Compact; exactly one "Refresh" (f5) — the collision is gone.
-    assert 'data-k="shift+f11"' in page and ">Compact<" in page, page
+    assert 'data-k="action:mirror_info"' in page and ">Mirror QR<" in page, page
+    # /compact labelled Compact; exactly one "Refresh" — the collision is gone.
+    assert 'data-k="action:context_refresh"' in page and ">Compact<" in page, page
     assert page.count("Refresh") == 1, \
         f"'Refresh' must be unambiguous (f5 only), found {page.count('Refresh')}"
     # Ergonomic v3 tiers (reach-ordered, not reading-ordered): row1 rare keys,
@@ -1069,8 +1069,8 @@ def test_page_key_bar_flow_and_labels():
     assert 'id="kb-row1"' in page and 'id="kb-row2"' in page \
         and 'id="kb-row3"' in page, "three-tier bar missing"
     r2 = page[page.index('id="kb-row2"'):page.index('id="kb-row3"')]
-    assert 'data-k="ctrl+right_square_bracket"' in r2 \
-        and 'data-k="shift+f1"' in r2, "loop keys (List/Next) must ride row 2"
+    assert 'data-k="action:focus_swap"' in r2 \
+        and 'data-k="action:next_attention"' in r2, "loop keys (List/Next) must ride row 2"
     r3 = page[page.index('id="kb-row3"'):page.index('id="kb2"')]
     assert r3.index('data-k="escape"') < r3.index('id="kb-arrows"') \
         < r3.index('data-k="enter"'), \
@@ -1093,7 +1093,7 @@ def test_page_key_bar_flow_and_labels():
     assert "pointer: coarse" in page and "pointerType" in page, \
         "touch taps must not focus the xterm textarea"
     # Checkpoint rides the More row as a pseudo-key the app dispatches.
-    assert 'data-k="checkpoint"' in page and ">Checkpoint<" in page, \
+    assert 'data-k="action:checkpoint"' in page and ">Checkpoint<" in page, \
         "no Checkpoint button in the More row"
     # Handedness: a ⇄ Hand toggle mirrors the bars (row-reverse) so the d-pad
     # cluster sits under the LEFT thumb for left-handed users, persisted per
@@ -1127,7 +1127,7 @@ def test_page_wires_long_press_context_menu():
     # The menu rides the existing senders: select the row (postMouse), then the
     # action keys (postKey -> /key). The action labels reference saikai's keys.
     assert "postKey" in page and "postMouse" in page, page
-    assert "shift+f2" in page and "f9" in page, "menu must offer rename/copy"
+    assert "action:rename" in page and "action:copy_prompt" in page, "menu must offer rename/copy"
 
 
 def test_sgr_mouse_regex_is_escaping_safe_and_correct():
@@ -1229,7 +1229,7 @@ def test_page_pane_view_contracts():
     # keys with no raw encoding are dropped in pane view (never the invisible app)
     assert "never forwarded to" in page and "postKey(k);" in page
     # app-only buttons hidden in pane view
-    assert "const appOnly = ['slash', 'f5', 'f10', 'f9', 'shift+f2', 'shift+f4', 'f11'," in page
+    assert "if (k === 'slash' || k.indexOf('action:') === 0) b.style.display = 'none';" in page
     # composer draft survives the view toggle / seed retry
     assert "function stashDraft()" in page and "sessionStorage.getItem('saikai-draft')" in page
     # unseeded-but-open pane view retries (bounded)

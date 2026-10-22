@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed (BREAKING — keymap v2)
+- **One command menu, every action; no Shift+F-keys.** Shift/Ctrl/Alt+F-keys never
+  reached saikai over PuTTY (default mode), Termius or zellij, and a modified F3 is
+  a cursor-position report — so a third of the actions were unreachable there. Now
+  every action is a letter in the menu, opened by `Space` in the list, **`Ctrl+]`
+  from anywhere (inside a live pane too)** or `F9`. From a pane the menu acts on
+  that pane's session. Lowercase = everyday, UPPERCASE = the stronger sibling
+  (`x`/`X` close/close all, `n`/`N` new/new with the other agent, `c`/`C`
+  /compact/checkpoint); `1`–`9` jump to tab N; `<` `>` `[` `]` repeat for half a
+  second (tmux-style).
+- **Unmodified F-keys, by frequency:** `F1` next pane needing you · `F2`/`F3` tabs ·
+  `F4` list ⇄ pane · `F5` new session · `F6` zoom · `F7` copy mode · `F8` diff ·
+  `F9` menu · `F10` close tab · `F12` mirror QR. F11 is left to the terminal.
+- **`Ctrl+]` no longer returns to the list in one press** — press it twice, or `F4`.
+- Mirror control is toggled with `c` on the F12 QR screen (was `Shift+F12`).
+- New session has an **Agent row** (`[✻ claude] ⌬ codex`): switch with `F5` again,
+  `↑` then `←/→`, or a click/tap; the last choice is remembered, menu `N` starts
+  with the other agent.
+- Every on-screen key hint (help, statusbar, toasts, the Agent row) is generated
+  from the keymap in force, so a `[keys]` remap is reflected everywhere; `[keys]`
+  can also give any menu-only action a direct key. Mirror buttons send action
+  names instead of key names.
+
 ### Added
 - **Claude and Codex side by side.** Codex CLI threads (experimental) join the one
   list (`⌬` beside `✻` when the list mixes providers), open with `codex resume` in a

@@ -281,14 +281,14 @@ def test_pilot_codex_rows_listed_and_enter_resumes():
     assert argv[1:3] == ["resume", B], argv
 
 
-def test_pilot_new_session_shift_f8_switches_to_codex():
-    """Shift+F8 opens New session; Shift+F8 again inside it switches the agent to
-    codex (the App's own Shift+F8 is modal-blocked, so the key must fall through
-    to the screen), and Enter hands (path, "codex") to the launcher."""
+def test_pilot_new_session_f5_switches_to_codex():
+    """F5 opens New session; F5 again inside it switches the agent to codex (the
+    App's own F5 is modal-blocked, so the key must fall through to the screen),
+    and Enter hands (path, "codex") to the launcher."""
     try:
         from textual.app import App  # noqa: F401
     except Exception:
-        print("SKIP test_pilot_new_session_shift_f8_switches_to_codex")
+        print("SKIP test_pilot_new_session_f5_switches_to_codex")
         return
     import asyncio
     import shutil as _sh
@@ -304,7 +304,7 @@ def test_pilot_new_session_shift_f8_switches_to_codex():
             async with self.run_test(size=(120, 32)) as pilot:
                 await pilot.pause(0.5)
                 self._open_new_live = lambda path, agent="claude": calls.append((path, agent))
-                await pilot.press("shift+f8")
+                await pilot.press("f5")
                 for _ in range(20):
                     await pilot.pause(0.2)
                     if type(self.screen).__name__ == "NewSessionScreen":
@@ -313,7 +313,7 @@ def test_pilot_new_session_shift_f8_switches_to_codex():
                 facts["opened"] = type(scr).__name__
                 facts["agents"] = getattr(scr, "_agents", None)
                 facts["before"] = getattr(scr, "_agent", None)
-                await pilot.press("shift+f8")
+                await pilot.press("f5")
                 await pilot.pause(0.2)
                 facts["after"] = getattr(scr, "_agent", None)
                 inp = scr.query_one("#new-path")
@@ -536,8 +536,8 @@ def test_codex_threads_are_never_titled_with_claude():
 
 
 if __name__ == "__main__":
-    test_pilot_new_session_shift_f8_switches_to_codex()
-    print("PASS test_pilot_new_session_shift_f8_switches_to_codex")
+    test_pilot_new_session_f5_switches_to_codex()
+    print("PASS test_pilot_new_session_f5_switches_to_codex")
     test_match_new_codex_thread_finds_the_one_started_in_the_pane()
     print("PASS test_match_new_codex_thread_finds_the_one_started_in_the_pane")
     test_build_new_codex_invocation_runs_in_the_folder()

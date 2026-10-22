@@ -112,6 +112,12 @@ wrong in exactly this way, and each cost a round of blind patching:
 
 ## A key that does nothing
 
+First try the same action through the menu (`Ctrl+]` or `F9`, then its letter):
+every action has one, and a menu letter is a plain printable key that survives every
+terminal. If the menu works and the F-key doesn't, the key is being lost upstream —
+read on. (The default map has no modified F-keys for exactly this reason; this
+section matters for `[keys]` remaps that add them back.)
+
 "The binding is wrong" is almost never the answer. A modified F-key crosses three layers
 before saikai sees it, and each can destroy it — so measure the layers instead of editing
 the binding. Run `cat -v` in the same terminal, press the key, then Enter:
