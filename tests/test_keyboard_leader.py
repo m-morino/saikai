@@ -3502,8 +3502,8 @@ def test_pilot_prefix_from_a_pane_opens_the_menu_for_that_pane():
     from types import SimpleNamespace
     from textual.app import App
 
-    pane_sid = _write_demo_session()
-    _write_demo_session()
+    demo_sids = (_write_demo_session(), _write_demo_session())
+    pane_sid = demo_sids[0]
     facts: dict = {}
 
     def fake_run(self, *a, **kw):
@@ -3513,6 +3513,10 @@ def test_pilot_prefix_from_a_pane_opens_the_menu_for_that_pane():
                 if type(self.screen).__name__ == "MirrorScreen":
                     await pilot.press("escape")
                 cursor = self._cursor_sid()
+                # the pane is whichever demo session the cursor is NOT on (the
+                # two share timestamps, so their list order is platform-dependent)
+                nonlocal pane_sid
+                pane_sid = next(x for x in demo_sids if x != cursor)
                 facts["cursor_is_other"] = cursor != pane_sid
                 term = SimpleNamespace(sid=pane_sid)
                 ev = SimpleNamespace(stop=lambda: None, terminal=term)
@@ -3728,8 +3732,8 @@ def test_pilot_menu_state_never_dangles():
     from types import SimpleNamespace
     from textual.app import App
 
-    pane_sid = _write_demo_session()
-    _write_demo_session()
+    demo_sids = (_write_demo_session(), _write_demo_session())
+    pane_sid = demo_sids[0]
     facts: dict = {}
 
     def fake_run(self, *a, **kw):
@@ -3739,6 +3743,10 @@ def test_pilot_menu_state_never_dangles():
                 if type(self.screen).__name__ == "MirrorScreen":
                     await pilot.press("escape")
                 cursor = self._cursor_sid()
+                # the pane is whichever demo session the cursor is NOT on (the
+                # two share timestamps, so their list order is platform-dependent)
+                nonlocal pane_sid
+                pane_sid = next(x for x in demo_sids if x != cursor)
                 ev = SimpleNamespace(stop=lambda: None, terminal=SimpleNamespace(sid=pane_sid))
                 self.on_agent_terminal_focus_released(ev)
                 self._cancel_leader()                    # the 6 s timeout
