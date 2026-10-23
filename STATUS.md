@@ -10,7 +10,7 @@ Current state, open threads, and next steps. Architecture and invariants live in
   - C1: codex threads in the list; Enter → `codex resume` in a pane.
   - Status classifier built from real codex-cli 0.163.0 screens
     (`tests/fixtures/codex_screens_0163.json`).
-  - New codex session: Shift+F8, then Shift+F8 inside the dialog. The pane starts
+  - New codex session: F5, Agent row (or menu N). The pane starts
     under a `codex-new-…` placeholder and is re-keyed to the thread once codex
     writes its rollout, which happens after the first prompt.
   - Review fixes (5-angle audit, 2026-10-22):

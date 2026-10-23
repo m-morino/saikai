@@ -3814,7 +3814,7 @@ class AgentTerminal(Widget):  # type: ignore[misc]  # Widget is object w/o textu
                 return Strip([Segment(
                     msg[:width] if width else msg, Style(reverse=True))])
         if _froz and not _dead and s == 0 and y == 0:
-            msg = " ❄ frozen — Shift+drag to copy · Shift+F9 / type to resume "
+            msg = " ❄ frozen — Shift+drag to copy · type (or menu p) to resume "
             return Strip([Segment(msg[:width] if width else msg, Style(reverse=True))])
 
         if cells is None:

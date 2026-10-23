@@ -3217,7 +3217,7 @@ term.onData((d) => {
         // so instead of silently not scrolling. (#mirror-edge-hint)
         const hint = document.getElementById('sel-hint');
         if (hint) hint.textContent =
-          'edge reached — scrolling the host needs CONTROL ON (Shift+F12 at the terminal)';
+          'edge reached — scrolling the host needs CONTROL ON (c on the F12 QR screen at the terminal)';
         return;
       }
       window.__dbg.st2++;

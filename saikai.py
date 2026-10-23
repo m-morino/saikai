@@ -350,7 +350,8 @@ _CONFIG_TEMPLATE = (
     "# leader_defaults = false     # start from an EMPTY letter map\n"
     '# release         = "ctrl+]"  # the PREFIX: menu from anywhere, twice = list <-> pane\n'
     '# favorite        = "v"       # single letter = menu letter remap\n'
-    '# refresh         = "f11"     # multi-char    = direct key (any action id)\n\n'
+    '# refresh         = "f11"     # multi-char    = direct key (any action id;\n'
+    "#                             F11 is full screen in Windows Terminal)\n\n"
     "[checkpoint]                  # b2 checkpoint flow (menu C)\n"
     '# handoff_prompt_file = ""    # path to a custom handoff prompt ("" = built-in).\n'
     "#   It MUST instruct the model to END with a fenced block whose first line is\n"
@@ -473,13 +474,15 @@ LEADER_VIRTUAL_ACTIONS = {
     "mirror_info": "mirror_info", "settings": "settings", "help": "help",
     "dump_pane": "dump_pane",
 }
-# Repeatable letters (tmux `bind -r`): the menu stays open this long after one
-# of these runs, so Ctrl+] > > > widens the list three steps.
 # Actions a mirror button may run directly ("action:<name>"): the menu's own,
 # plus the two loop keys. Never toggle_mirror_control (enabling control is
-# local-only) and never send_prefix / dump_pane (pane-internal, no use remote).
+# local-only), send_prefix / dump_pane (pane-internal), and nothing destructive
+# or settings-changing from a phone (close all, kill agent, settings).
 _MIRROR_ACTIONS = (frozenset(LEADER_VIRTUAL_ACTIONS.values()) | {"focus_swap", "arm_menu"}) \
-    - {"send_prefix", "dump_pane", "toggle_mirror_control"}
+    - {"send_prefix", "dump_pane", "toggle_mirror_control", "close_all_live",
+       "kill_agent", "settings"}
+# Repeatable letters (tmux `bind -r`): the menu stays open LEADER_REPEAT_S after
+# one of these runs, so Ctrl+] > > > widens the list three steps.
 LEADER_REPEATABLE = frozenset("<>[]")
 # The ? help's action table, in reading order: (action id, description). The
 # keys shown beside each come from the keymap in force (PickerApp._keys_for).
@@ -505,7 +508,7 @@ _HELP_ACTIONS = (
     ("shrink_list", "narrower list"), ("grow_list", "wider list"),
     ("refresh", "refresh the list"), ("notifs", "notification history"),
     ("mirror_info", "web mirror QR (c there toggles phone control)"),
-    ("send_prefix", "send Ctrl-] itself to the pane"),
+    ("send_prefix", "send the prefix key itself to the pane"),
 )
 LEADER_REPEAT_S = 0.5
 
@@ -622,15 +625,22 @@ def _leader_hint_lines(actions: dict, width: int, icons: bool = True) -> list:
                 pad = " " * (key_w - cell_len(shown))
                 style = "bold #f7768e" if shown.isalpha() and shown.isupper() else "bold yellow"
                 lbl = lbl if cell_len(lbl) <= lbl_w else lbl[:lbl_w - 1] + "…"
-                cells.append(f"{pad}[{style}]{shown.replace('[', chr(92) + '[')}[/{style}] "
+                cells.append(f"{pad}[{style}]{_esc_key(shown)}[/{style}] "
                              f"{lbl}{' ' * (lbl_w - cell_len(lbl) + 2)}")
             lines.append(head + "".join(cells).rstrip())
     return lines
 
 
+def _esc_key(text: str) -> str:
+    """Markup-escape a KEY NAME inside a style tag: every "[" (a key like "␣["
+    must not open a tag) and backslashes (a remapped "\\" letter would escape
+    the closing tag). (#audit-self-option-markup)"""
+    return text.replace("\\", "\\\\").replace("[", "\\[")
+
+
 def _leader_hint_item(key: str, label: str) -> str:
     """Render one menu choice with an unambiguous key/action separator."""
-    shown_key = "␣" if key == " " else key.replace("[", "\\[")
+    shown_key = "␣" if key == " " else _esc_key(key)
     return f"[yellow]{shown_key}[/yellow] [dim]→[/dim] {label}"
 
 
@@ -674,7 +684,7 @@ def _leader_label(action: str) -> str:
                "restore_panes": "restore",
                "freeze_pane": "freeze", "close_live": "close",
                "close_all_live": "close all", "copy_response": "copy mode",
-               "context_refresh": "/compact", "send_prefix": "send Ctrl+]",
+               "context_refresh": "/compact", "send_prefix": "send prefix",
                "kill_agent": "kill agent", "open_parent": "parent",
                "manage_worksets": "worksets", "mirror_info": "mirror QR",
                "dump_pane": "dump pane", "focus_swap": "list⇄pane",
@@ -788,12 +798,24 @@ def _release_focus_key() -> str:
 
 
 def _prefix_key() -> str:
-    """The PREFIX as a Textual key name ('ctrl+right_square_bracket')."""
-    try:
-        import saikai_terminal as _st      # already imported when split-live is on
-        return _st.RELEASE_FOCUS_KEY or "ctrl+right_square_bracket"
-    except Exception:
-        return "ctrl+right_square_bracket"
+    """The PREFIX as a Textual key name ('ctrl+right_square_bracket'), from
+    [keys] release / SAIKAI_RELEASE_KEY — also when split-live is off."""
+    s = (_release_focus_key() or "ctrl+]").strip().lower()
+    repl = {"]": "right_square_bracket", "[": "left_square_bracket",
+            "\\": "backslash", "_": "underscore", "^": "circumflex_accent", "@": "at"}
+    head, sep, tail = s.rpartition("+")
+    return f"{head}{sep}{repl.get(tail, tail)}"
+
+
+def _prefix_bytes() -> str:
+    """The byte the PREFIX sends to a terminal (Ctrl+] = 0x1d)."""
+    k = _prefix_key()
+    tail = {"right_square_bracket": "]", "left_square_bracket": "[",
+            "backslash": "\\", "underscore": "_", "circumflex_accent": "^",
+            "at": "@"}.get(k.rpartition("+")[2], k.rpartition("+")[2])
+    if k.startswith("ctrl+") and len(tail) == 1:
+        return chr(ord(tail.upper()) & 0x1f)
+    return "\x1d"
 
 
 def _at_live_capacity(live_count: int, pending: int, max_live: int) -> bool:
@@ -6194,6 +6216,13 @@ class _MirrorControl:
             name = key[len("action:"):]
             if name not in _MIRROR_ACTIONS:
                 return
+            stack = getattr(self, "screen_stack", None)
+            if stack is not None and len(stack) > 1:
+                return          # a host dialog owns the keyboard (#mirror-actions)
+            run = getattr(self, "_run_menu_action", None)
+            if callable(run):
+                run(name, None)  # same dispatch + guards as a menu letter
+                return
             act, _, arg = name.partition(":")
             fn = getattr(self, "action_" + act, None)
             if callable(fn):
@@ -6260,12 +6289,12 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
 
     All toggles reflect in-app (no restart required):
       Enter        resume                Esc (saikai controls) leave / quit (×2)
-      Ctrl-]       pane → list           Ctrl-C        pane interrupt / quit (×2)
-      F7           hide/unhide row       F6            favorite toggle
-      Shift-F5     toggle tree display
+      Space        command menu (list)   Ctrl-]        command menu (anywhere; ×2 list⇄pane)
+      F4           list ⇄ pane           Ctrl-C        pane interrupt / quit (×2)
       Tab          preview full/summary  ?             help overlay
-      (ordinary Ctrl+letter editing keys stay with the search box / live
-       claude; app shortcuts use function keys plus the configurable release key)
+      (every action is a menu letter — see DEFAULT_LEADER_LETTERS; unmodified
+       F-keys are accelerators; Ctrl+letter editing keys stay with the search
+       box / the agent)
       (":hidden" in the search box reveals hidden rows;
        click a column header to sort, click again to reverse)
 
@@ -6641,7 +6670,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 _rows = []
                 for _id, _desc in _HELP_ACTIONS:
                     # pad BEFORE escaping: a bare "[" key (␣[) must not open a tag
-                    _k = f"{self.app._keys_for(_id):<15}".replace("[", "\\[")
+                    _k = _esc_key(f"{self.app._keys_for(_id):<15}")
                     _rows.append(f"  [yellow]{_k}[/yellow] {_desc}")
                 body = body.replace("{ACTIONS}", (
                     "[bold cyan]Actions[/bold cyan]  [dim](direct key / menu letter — "
@@ -6662,7 +6691,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 if getattr(app, "_leader_key", ""):
                     _lk = "Space" if app._leader_key == "space" else app._leader_key
                     body += (f"[bold cyan]Menu letters[/bold cyan]  [yellow]{_esc_markup(_lk)}[/yellow] "
-                             "in the list / Ctrl-] / F9, then one letter:\n")
+                             f"in the list / {_esc_markup(_fmt_key(_prefix_key()))} / "
+                             f"{_esc_markup(app._keys_for('menu').split(' / ')[0])}, then one letter:\n")
                     _groups = _leader_groups(getattr(app, "_leader_actions", {}))
                     for _fam, _pairs in _groups:
                         _seq = "  ".join(_leader_hint_item(k, lbl)
@@ -7201,11 +7231,40 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def action_cancel(self) -> None:
             self.dismiss(False)
 
+    class CloseAllScreen(ModalScreen):
+        """Confirm closing EVERY live pane (menu X). Its lowercase sibling x closes
+        one tab, one key away, so the strong version is gated: Enter closes all,
+        Esc cancels. (Shift+F10 used to be the "two keys apart" guard.)"""
+        CSS = """
+        CloseAllScreen { align: center middle; }
+        #ca-box { background: $panel; border: solid $error; padding: 1 2;
+                  width: 70; max-width: 96%; height: auto; }
+        """
+        BINDINGS = [Binding("enter", "proceed", show=False),
+                    Binding("escape", "cancel", show=False)]
+
+        def __init__(self, n: int):
+            super().__init__()
+            self._n = n
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="ca-box"):
+                yield Static(f"[bold red]Close all {self._n} pane(s)?[/bold red]")
+                yield Static("[dim]Every live agent in saikai is stopped and the restore "
+                             "snapshot is cleared (quitting keeps it instead).[/dim]")
+                yield Static("[dim]Enter closes all · Esc cancels[/dim]")
+
+        def action_proceed(self) -> None:
+            self.dismiss(True)
+
+        def action_cancel(self) -> None:
+            self.dismiss(False)
+
     class NotificationsScreen(ModalScreen):
-        """Recent-notifications recall (F11). Toasts auto-dismiss; this lists the
+        """Recent-notifications recall (menu m). Toasts auto-dismiss; this lists the
         ones that already vanished — newest first, with time + severity colour —
         so a missed 'needs input' / 'done' / error / memory-pressure warning can
-        be reviewed after the fact. Esc / F11 close. Drawn in the TUI, so it is
+        be reviewed after the fact. Esc closes. Drawn in the TUI, so it is
         mirrored to the browser too."""
         CSS = """
         NotificationsScreen { align: center middle; }
@@ -7418,11 +7477,14 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         ]
 
         def action_toggle_control(self) -> None:
+            # Close first: with this dialog on top no pane is focused, so the hub
+            # would be told "no target". Toggle once focus is back. (#mirror-control)
+            app = self.app
+            self.dismiss()
             try:
-                self.app.action_toggle_mirror_control()
+                app.call_after_refresh(app.action_toggle_mirror_control)
             except Exception:
                 pass
-            self.dismiss()
 
         def __init__(self, url, matrix, copied=True, clients=0):
             super().__init__()
@@ -7669,7 +7731,21 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             "checkpoint", "copy_response",
             "manage_worksets", "save_workset",
             "focus_swap", "arm_menu", "mirror_info", "new_session_alt",
-        })
+        }) | {a.split(":")[0] for a in LEADER_VIRTUAL_ACTIONS.values()}
+
+        async def run_action(self, action, default_namespace=None, namespaces=None):
+            """A priority binding (F-key, Enter, Tab, ?) bypasses on_key, so one
+            that RAN while the menu was open would leave it armed and the next
+            typed key would be eaten as a menu letter. Close the menu after an
+            action actually ran; a SkipAction (the key belongs to a focused pane)
+            returns False and leaves it, so the key still reaches the menu."""
+            ran = await super().run_action(action, default_namespace, namespaces)
+            if (ran and getattr(self, "_leader_pending", False)
+                    and not getattr(self, "_leader_dispatching", False)):
+                name = action if isinstance(action, str) else ""
+                if name.split("(")[0] not in ("arm_menu", "arm_leader"):
+                    self._cancel_leader()
+            return ran
 
         def check_action(self, action: str, parameters):
             # Gate the list/pane priority bindings while a modal / pushed screen
@@ -7689,6 +7765,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # an arm could dangle into the keystrokes after the screen closes (a
             # later single Esc quitting, or a letter running a leader action).
             self._leader_pending = False
+            self._leader_repeat_only = False
+            self._leader_src = None
             self._set_leader_hint(None)
             if getattr(self, "_quit_armed", False):
                 self._disarm_quit()
@@ -7697,7 +7775,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
         def notify(self, message, **kwargs):
             # Keep a bounded recall log of every toast — they auto-dismiss, so a
             # missed "needs input" / "done" / error / memory-pressure warning is
-            # otherwise gone. F11 (action_notifications) surfaces it. Lazy-init so
+            # otherwise gone. The notification history (menu m) surfaces it. Lazy-init so
             # toasts raised during mount/startup are captured too.
             #
             # markup=False: toast messages carry USER content — session titles
@@ -9056,6 +9134,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 # tmux `bind -r`: a non-repeatable key ends the repeat window and
                 # is handled as an ordinary key (typed, searched, …).
                 self._cancel_leader()
+            if self._leader_pending and len(self.screen_stack) > 1:
+                self._cancel_leader()          # a dialog opened: its keys are its own
             if self._leader_key or self._leader_pending:
                 if self._leader_pending:
                     self._leader_pending = False
@@ -9087,6 +9167,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 except Exception:
                     _tbl = None
                 if self._leader_key and event.key == self._leader_key and self.focused is _tbl:
+                    self._leader_src = None
+                    self._leader_repeat_only = False
                     self._leader_pending = True
                     self._leader_gen += 1
                     _g = self._leader_gen
@@ -9158,6 +9240,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 return
             self._leader_pending = False
             self._leader_repeat_only = False
+            self._leader_src = None        # a stale pane must never scope a later list menu
             self._set_leader_hint(None)
 
         def _arm_menu(self, src=None, immediate=None) -> None:
@@ -9178,6 +9261,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                     pass
             self._leader_src = src
             self._leader_pending = True
+            self._leader_repeat_only = False
             self._leader_gen += 1
             _g = self._leader_gen
             if immediate is None:
@@ -9242,8 +9326,10 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._leader_ctx_sid = getattr(src, "sid", None) if src is not None else None
             try:
                 fn(arg) if arg else fn()
-            except Exception:
+            except SkipAction:
                 pass
+            except Exception as e:
+                _log(f"menu action {act} failed: {e!r}")
             finally:
                 self._leader_dispatching = False
                 self._leader_ctx_sid = None
@@ -9323,7 +9409,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if term is None:
                 return
             try:
-                term._write_child("\x1d")
+                term._write_child(_prefix_bytes())
             except Exception:
                 pass
 
@@ -9343,6 +9429,8 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             if (self._focused_terminal() is not None
                     or isinstance(self.focused, (Input, Select))):
                 return
+            self._leader_src = None
+            self._leader_repeat_only = False
             self._leader_pending = True
             self._leader_gen += 1
             _g = self._leader_gen
@@ -10549,7 +10637,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         f"{skipped} skipped; saved set unchanged", timeout=6)
 
         def action_restore_panes(self) -> None:
-            """Shift+F4: reopen the PREVIOUS session's panes (snapshot loaded at
+            """Menu u: reopen the PREVIOUS session's panes (snapshot loaded at
             startup) — resume each, skipping ones already open. Available anytime,
             not just at launch. An out-of-scope sid (different project dir) gets a
             stub injected with its saved cwd so resume targets the right dir."""
@@ -10775,7 +10863,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 pass
 
         def action_dump_pane(self) -> None:
-            """Ctrl+F12: write the focused (else active-tab) live pane's visible
+            """Menu D: write the focused (else active-tab) live pane's visible
             pyte screen + geometry to ~/.cache/saikai/pane-dump.txt, so a garbled
             render can be inspected as plain text off the live UI. (#pane-dump)"""
             if _LIVE_TERM is None or self._live is None:
@@ -11191,7 +11279,11 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             # into a leader action. Priority bindings can move focus while
             # bypassing on_key, where the leader is normally resolved.
             try:
-                if getattr(self, "_leader_pending", False):
+                if (getattr(self, "_leader_pending", False)
+                        and not getattr(self, "_leader_repeat_only", False)
+                        and getattr(self, "_leader_src", None) is None):
+                    # (the repeat window after [ ] moves focus to the new tab by
+                    # design, and a pane-opened menu never sat on the table)
                     if getattr(event, "widget", None) is not self.query_one("#table", DataTable):
                         self._leader_pending = False
                         self._leader_gen += 1          # kill the pending show/cancel timers
@@ -11396,7 +11488,20 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                         severity="information", title="saikai", timeout=5)
 
         def action_close_all_live(self) -> None:
-            # Shift+F10: close ALL live panes at once (parallel kill) but STAY in
+            """Menu X: confirm, then close every live pane (_close_all_live_now)."""
+            if self._live is None:
+                return
+            n = len(self._live_pane_ids())
+            if not n:
+                return
+
+            def _go(ok):
+                if ok:
+                    self._close_all_live_now()
+            self.push_screen(CloseAllScreen(n), _go)
+
+        def _close_all_live_now(self) -> None:
+            # Close ALL live panes at once (parallel kill) but STAY in
             # saikai — unlike Ctrl-C / Esc, which snapshot the set + quit. This is an
             # EXPLICIT close, so it CLEARS the restore snapshot (you won't get these
             # back via Shift+F4); quitting preserves it, this discards it. Removes
@@ -11481,7 +11586,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self._cycle_tab(-1)
 
         def action_next_attention(self) -> None:
-            """Shift+F1: jump to the next live pane needing attention — waiting (?)
+            """F1 / menu a: jump to the next live pane needing attention — waiting (?)
             or finished-unread (!) — in tab order, wrapping. Toast if none. Lets you
             step through exactly the panes that need you instead of every tab."""
             if _LIVE_TERM is None or self._live is None:
@@ -11511,7 +11616,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 self.call_after_refresh(lambda: self._focus_live_pane(sid))
 
         def action_freeze_pane(self) -> None:
-            """Shift+F9: freeze / resume the focused live pane so it holds still for
+            """Menu p: freeze / resume the focused live pane so it holds still for
             a Shift+drag copy while claude keeps streaming (any keypress also
             resumes). Without this a streaming pane repaints over your selection."""
             term = self._focused_terminal()
@@ -11562,7 +11667,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                 pass
 
         def action_toggle_list(self) -> None:
-            """F4: hide/show the left session list. Hidden -> the live pane (or
+            """F6 / menu z: hide/show the left session list. Hidden -> the live pane (or
             preview) is full-width and the active live terminal takes focus so
             you can type; shown -> focus returns to the list."""
             main = self.query_one("#main")
@@ -11995,7 +12100,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             self.notify(f"copied opening prompt ({len(text)} chars)", timeout=3)
 
         def action_copy_response(self) -> None:
-            """F1: open vi-style copy mode over the session transcript for the
+            """F7 / menu v: open vi-style copy mode over the session transcript for the
             focused live pane (else the list cursor). Navigate with j/k/g/G, select
             with v, yank with y — so you can copy ANY of claude's output, including
             replies that scrolled off the alt-screen pane (which can't be selected).
@@ -12360,7 +12465,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             """␣, — the Settings modal (list options + resolved config). Leader
             entry only fires from the LIST, so no extra focus guard is needed;
             the guard below covers any future direct binding."""
-            if self._focused_terminal() is not None or isinstance(self.focused, Input):
+            if self._keys_go_to_pane() or isinstance(self.focused, Input):
                 return
             self.push_screen(SettingsScreen())
 
@@ -12396,7 +12501,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                             title="saikai mirror", severity="warning", timeout=15)
 
         def action_toggle_mirror_control(self) -> None:
-            """Shift+F12 — flip web-mirror interactive control (default OFF). The
+            """c on the F12 QR screen — flip web-mirror interactive control (default OFF). The
             app's _control_enabled is the authority; push the new state + the
             focused-pane title (read HERE on the UI thread) into the hub, which
             keeps an advisory copy and broadcasts a control frame. No-op when the
@@ -12436,7 +12541,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
                             title="saikai mirror", timeout=4)
 
         def action_open_parent(self) -> None:
-            """Shift+F6 — jump to the session this one was forked/cleared from
+            """Menu P — jump to the session this one was forked/cleared from
             (lineage recovery). No-op + toast when there is no recorded parent
             or the parent is not in the current session index."""
             sid = self._cursor_sid()
@@ -12473,7 +12578,7 @@ def textual_pick(sessions: list[dict], repo: Path | None, show_project: bool,
             return status in ("busy", "waiting")
 
         def action_context_refresh(self) -> None:
-            """Shift+F11 — inject /compact into the focused live pane to summarise
+            """Menu c — inject /compact into the focused live pane to summarise
             the context in place (non-destructive). No-op + toast when no pane is
             focused or the pane is mid-turn (busy/waiting — don't interrupt a
             running turn or a pending permission prompt).

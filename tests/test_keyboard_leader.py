@@ -3652,6 +3652,10 @@ def test_mirror_action_injection_is_allow_listed():
     f._mirror_inject_key("action:toggle_mirror_control")
     f._mirror_inject_key("action:goto_tab:2")
     f._mirror_inject_key("action:quit_all")
+    f.screen_stack = [1, 2]                      # a host dialog is open
+    f._mirror_inject_key("action:toggle_fav")
+    f.screen_stack = [1]
+    f._mirror_inject_key("action:close_all_live")  # destructive: not from a phone
     f._control_enabled = False
     f._mirror_inject_key("action:toggle_fav")
     assert ran == ["fav", "tab2"], ran
@@ -3682,7 +3686,121 @@ def test_leader_hint_lines_align_and_pair():
     assert not any(i in no_icons for i in saikai.LEADER_FAMILY_ICON.values())
 
 
+def test_review_fixes_keymap_v2_units():
+    """Review findings (#keymap-v2 review): every menu action is modal-blocked
+    (covers [keys] direct remaps), key names escape '[' AND backslash, and the
+    prefix honours [keys] release even without split-live."""
+    from rich.text import Text
+    acts = {a.split(":")[0] for a in saikai.LEADER_VIRTUAL_ACTIONS.values()}
+    src = Path(saikai.__file__).read_text(encoding="utf-8")
+    assert "| {a.split(\":\")[0] for a in LEADER_VIRTUAL_ACTIONS.values()}" in src
+    assert acts                                      # (the set union above covers them)
+    for key in ("␣[", "\\", "a\\"):
+        shown = Text.from_markup(f"[b]{saikai._esc_key(key)}[/b] after").plain
+        assert shown == f"{key} after", (key, shown)
+    old = os.environ.get("SAIKAI_RELEASE_KEY")
+    os.environ["SAIKAI_RELEASE_KEY"] = "ctrl+\\"
+    try:
+        if hasattr(saikai, "_reset_config_cache"):
+            saikai._reset_config_cache()
+        assert saikai._prefix_key() == "ctrl+backslash"
+        assert saikai._prefix_bytes() == "\x1c"
+    finally:
+        if old is None:
+            os.environ.pop("SAIKAI_RELEASE_KEY", None)
+        else:
+            os.environ["SAIKAI_RELEASE_KEY"] = old
+        if hasattr(saikai, "_reset_config_cache"):
+            saikai._reset_config_cache()
+    assert saikai._prefix_key() == "ctrl+right_square_bracket"
+
+
+def test_pilot_menu_state_never_dangles():
+    """A pane-opened menu that times out must not scope the NEXT list menu to
+    that pane, double-Space after it must not leave the leader armed (#H10), a
+    priority binding that runs closes the menu, and close-all asks first."""
+    try:
+        from textual.app import App  # noqa: F401
+    except Exception:
+        print("SKIP test_pilot_menu_state_never_dangles")
+        return
+    import asyncio
+    from types import SimpleNamespace
+    from textual.app import App
+
+    pane_sid = _write_demo_session()
+    _write_demo_session()
+    facts: dict = {}
+
+    def fake_run(self, *a, **kw):
+        async def go():
+            async with self.run_test(size=(110, 30)) as pilot:
+                await pilot.pause(0.4)
+                if type(self.screen).__name__ == "MirrorScreen":
+                    await pilot.press("escape")
+                cursor = self._cursor_sid()
+                ev = SimpleNamespace(stop=lambda: None, terminal=SimpleNamespace(sid=pane_sid))
+                self.on_agent_terminal_focus_released(ev)
+                self._cancel_leader()                    # the 6 s timeout
+                facts["src_cleared"] = self._leader_src is None
+                await pilot.press("space", "h")          # list menu: hide the CURSOR row
+                await pilot.pause(0.2)
+                hidden = saikai._read_json(saikai.HIDDEN_FILE, []) or []
+                facts["cursor_hidden"] = cursor in hidden
+                facts["pane_hidden"] = pane_sid in hidden
+                await pilot.press("space", "h")          # undo
+                await pilot.pause(0.1)
+                self.on_agent_terminal_focus_released(ev)
+                self._cancel_leader()
+                await pilot.press("space", "space")      # mark (double Space)
+                await pilot.pause(0.2)
+                facts["armed_after_double"] = self._leader_pending
+                if self._leader_pending:
+                    self._cancel_leader()
+                await pilot.press("space")
+                await pilot.press("f8")                  # a priority binding RUNS
+                await pilot.pause(0.2)
+                facts["armed_after_f8"] = self._leader_pending
+                if type(self.screen).__name__ != "Screen":
+                    await pilot.press("escape")
+                # close-all is confirmed
+                closed = []
+                self._live_pane_ids = lambda: ["p1", "p2"]
+                self._close_all_live_now = lambda: closed.append(1)
+                self.action_close_all_live()
+                await pilot.pause(0.2)
+                facts["confirm_screen"] = type(self.screen).__name__
+                await pilot.press("escape")
+                await pilot.pause(0.1)
+                facts["closed_after_esc"] = list(closed)
+                self.action_close_all_live()
+                await pilot.pause(0.2)
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                facts["closed_after_enter"] = list(closed)
+        asyncio.run(go())
+
+    orig_run, App.run = App.run, fake_run
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["saikai", "--all"]
+        saikai.main()
+    finally:
+        App.run = orig_run
+        sys.argv = orig_argv
+    assert facts.get("src_cleared"), facts
+    assert facts.get("cursor_hidden") and not facts.get("pane_hidden"), facts
+    assert facts.get("armed_after_double") is False, facts
+    assert facts.get("armed_after_f8") is False, facts
+    assert facts.get("confirm_screen") == "CloseAllScreen", facts
+    assert facts.get("closed_after_esc") == [] and facts.get("closed_after_enter") == [1], facts
+
+
 if __name__ == "__main__":
+    test_review_fixes_keymap_v2_units()
+    print("PASS test_review_fixes_keymap_v2_units")
+    test_pilot_menu_state_never_dangles()
+    print("PASS test_pilot_menu_state_never_dangles")
     test_leader_hint_lines_align_and_pair()
     print("PASS test_leader_hint_lines_align_and_pair")
     test_mirror_action_injection_is_allow_listed()
